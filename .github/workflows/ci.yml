@@ -1,0 +1,37 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Lint (ruff)
+        run: ruff check .
+
+      - name: Format check (black)
+        run: black --check .
+
+      - name: Type check (mypy)
+        run: mypy .
+
+      # Only the mocked unit test suite runs in CI -- scripts/run_eval.py and
+      # scripts/integration_test.py both require a live database + a running
+      # Ollama instance with a model pulled, neither of which exist in this
+      # runner. See CONTRIBUTING.md.
+      - name: Run tests
+        run: pytest

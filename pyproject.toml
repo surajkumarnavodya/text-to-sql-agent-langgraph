@@ -1,0 +1,40 @@
+[project]
+name = "text-to-sql-dashboard"
+version = "0.1.0"
+description = "Text-to-SQL Gen AI dashboard, connected to your own database (Ollama + LangGraph + ChromaDB + SQLAlchemy + Streamlit)."
+requires-python = ">=3.11"
+
+[tool.black]
+line-length = 100
+target-version = ["py311"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+src = ["agent", "config", "db", "embeddings", "scripts", "tests", "ui"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+ignore = [
+    "E501",  # line length is enforced by black, not ruff
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["agent", "config", "db", "embeddings", "scripts", "ui"]
+
+[tool.mypy]
+# Deliberately not pinned to 3.11 (the project's nominal target, see
+# requires-python above): this machine's venv runs 3.14 (see CLAUDE.md's
+# Python-version note), and pinning to 3.11 here makes mypy parse installed
+# stubs (e.g. numpy's) using 3.11 grammar even though they were built for
+# 3.14, which errors out immediately. Leaving this unset makes mypy infer
+# the version from the interpreter actually running it.
+ignore_missing_imports = true
+warn_unused_ignores = true
+warn_redundant_casts = true
+check_untyped_defs = true
+exclude = ["\\.venv"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

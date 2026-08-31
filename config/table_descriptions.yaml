@@ -1,0 +1,341 @@
+# Table purpose & relationship notes -- the source of truth for table MEANING.
+#
+# *** DRAFT -- NOT YET REVIEWED (except where noted) ***
+# Generated 2026-08-31 from live schema introspection against
+# AdventureWorksDW2025 (31 tables). Every `purpose` and `key_relationships`
+# value below is an AI-authored first guess, based on table/column naming
+# conventions and the introspected foreign keys -- NOT verified against
+# actual data, EXCEPT the `column_notes` on DimProduct and
+# DimProductCategory, which were added after querying real distinct values
+# (see the ProductLine/EnglishProductCategoryName confusion bug) and are
+# reviewed. This file is read fresh on every single question (`config/
+# table_descriptions.py::load_table_descriptions()`, called from
+# `agent.nodes.retrieve_schema_node` -- NOT baked into the Chroma embeddings
+# at build time), so an edit here takes effect on the very next question
+# with no embeddings rebuild needed. The remaining un-reviewed entries still
+# flow into the LLM prompt as-is, so reviewing the rest for accuracy is
+# worth doing, not just optional cleanup.
+#
+# Going forward, this file -- not code, not a re-run of any generator -- is
+# the single source of truth for table meaning. Code reads it; nothing
+# should regenerate or overwrite it silently. If a table is added or
+# dropped in the real database, add/remove its entry here by hand (a
+# generator could offer a *starting point* for a brand-new table, but must
+# never touch existing entries).
+#
+# Fields per table:
+#   table_name:        exact DB table name (must match schema introspection)
+#   purpose:            one sentence -- what real-world thing this table stores
+#   key_relationships:   plain-language notes on how it joins to other tables
+#                        and what that join means
+
+tables:
+  - table_name: DimCustomer
+    purpose: >-
+      One row per individual customer who has bought (or could buy) products
+      online, including name, contact info, and demographics (income,
+      education, occupation, marital status, number of children/cars owned).
+    key_relationships: >-
+      Joins to DimGeography via GeographyKey to get the customer's
+      city/state/country. Referenced by FactInternetSales and
+      FactSurveyResponse via CustomerKey (one customer can have many sales
+      line items / survey responses).
+
+  - table_name: DimProduct
+    purpose: >-
+      One row per sellable product (a specific model/color/size SKU),
+      including cost, list price, weight, and descriptive attributes.
+    key_relationships: >-
+      Joins to DimProductSubcategory via ProductSubcategoryKey, which in
+      turn joins to DimProductCategory via ProductCategoryKey (Product ->
+      Subcategory -> Category is a 3-level hierarchy). Referenced by
+      FactInternetSales, FactResellerSales, FactProductInventory, and
+      FactAdditionalInternationalProductDescription via ProductKey.
+    column_notes:
+      - column: ProductLine
+        note: >-
+          A short manufacturing product-line CODE ('M', 'R', 'S', 'T', or
+          NULL) -- NOT the product category name. A question about a
+          category like "Bikes", "Components", "Clothing", or "Accessories"
+          means DimProductCategory.EnglishProductCategoryName, reached via
+          DimProduct -> DimProductSubcategory -> DimProductCategory, never
+          this column.
+      - column: Class
+        note: >-
+          A short quality/class CODE ('H', 'L', 'M', or NULL), unrelated to
+          product category.
+      - column: Style
+        note: >-
+          A short style CODE ('M', 'U', 'W', or NULL), unrelated to product
+          category.
+
+  - table_name: DimProductSubcategory
+    purpose: >-
+      One row per product subcategory (e.g. "Mountain Bikes", "Road Bikes"),
+      the middle level of the product hierarchy.
+    key_relationships: >-
+      Joins to DimProductCategory via ProductCategoryKey. Referenced by
+      DimProduct via ProductSubcategoryKey.
+
+  - table_name: DimProductCategory
+    purpose: >-
+      One row per top-level product category (e.g. "Bikes", "Accessories",
+      "Clothing"), the top of the product hierarchy.
+    key_relationships: >-
+      Referenced by DimProductSubcategory via ProductCategoryKey.
+    column_notes:
+      - column: EnglishProductCategoryName
+        note: >-
+          The actual, human-readable category name (only 4 values exist:
+          Bikes, Components, Clothing, Accessories). This is what a question
+          referring to a category by name means -- not DimProduct.ProductLine,
+          which is an unrelated manufacturing code.
+
+  - table_name: DimDate
+    purpose: >-
+      One row per calendar day, with pre-computed calendar and fiscal
+      attributes (day/week/month/quarter/year, day-of-week names in three
+      languages) so date-based grouping/filtering doesn't need date-function
+      logic in every query.
+    key_relationships: >-
+      Referenced by nearly every Fact table via a DateKey-style column (e.g.
+      FactInternetSales.OrderDateKey/DueDateKey/ShipDateKey,
+      FactResellerSales.OrderDateKey, FactFinance.DateKey,
+      FactCallCenter.DateKey, FactCurrencyRate.DateKey,
+      FactProductInventory.DateKey, FactSalesQuota.DateKey,
+      FactSurveyResponse.DateKey) -- join on DateKey = DateKey to turn an
+      integer date key into a real calendar date and its attributes.
+
+  - table_name: DimGeography
+    purpose: >-
+      One row per city/state/postal-code combination, with the country and
+      sales territory that location belongs to.
+    key_relationships: >-
+      Joins to DimSalesTerritory via SalesTerritoryKey. Referenced by
+      DimCustomer and DimReseller via GeographyKey to place a customer or
+      reseller in a location.
+
+  - table_name: DimSalesTerritory
+    purpose: >-
+      One row per sales territory (a region/country/group grouping used for
+      sales reporting, e.g. "Northwest", "Canada", "Europe").
+    key_relationships: >-
+      Referenced by DimGeography, DimEmployee, FactInternetSales, and
+      FactResellerSales via SalesTerritoryKey to attribute a location or
+      sale to a territory.
+
+  - table_name: DimEmployee
+    purpose: >-
+      One row per employee, including sales staff (SalesPersonFlag) and a
+      self-referencing manager hierarchy (ParentEmployeeKey).
+    key_relationships: >-
+      Self-joins to itself via ParentEmployeeKey = EmployeeKey to walk the
+      management chain. Joins to DimSalesTerritory via SalesTerritoryKey.
+      Referenced by FactResellerSales and FactSalesQuota via EmployeeKey
+      (which salesperson made a reseller sale / was assigned a quota).
+
+  - table_name: DimReseller
+    purpose: >-
+      One row per reseller (a business partner/retailer that buys products
+      to resell), including business type, size, and location.
+    key_relationships: >-
+      Joins to DimGeography via GeographyKey. Referenced by
+      FactResellerSales via ResellerKey (which reseller made the purchase).
+
+  - table_name: DimCurrency
+    purpose: >-
+      One row per currency (ISO code + name) used to record a sale's
+      transaction currency.
+    key_relationships: >-
+      Referenced by FactInternetSales, FactResellerSales, and
+      FactCurrencyRate via CurrencyKey; also referenced by DimOrganization
+      via CurrencyKey (an organization's reporting currency).
+
+  - table_name: DimPromotion
+    purpose: >-
+      One row per sales/marketing promotion (discount campaign), with
+      discount percentage, promotion type/category, and validity dates.
+    key_relationships: >-
+      Referenced by FactInternetSales and FactResellerSales via
+      PromotionKey (which promotion, if any, applied to a sale line item).
+
+  - table_name: DimSalesReason
+    purpose: >-
+      One row per reason a customer gave for making a purchase (e.g.
+      "Price", "On Promotion", "Quality").
+    key_relationships: >-
+      Referenced by FactInternetSalesReason via SalesReasonKey.
+
+  - table_name: DimAccount
+    purpose: >-
+      One row per financial general-ledger account (e.g. revenue, expense
+      categories) in a self-referencing chart-of-accounts hierarchy.
+    key_relationships: >-
+      Self-joins via ParentAccountKey = AccountKey to walk the account
+      hierarchy. Referenced by FactFinance via AccountKey.
+
+  - table_name: DimDepartmentGroup
+    purpose: >-
+      One row per organizational department group, in a self-referencing
+      hierarchy, used for grouping finance facts by department.
+    key_relationships: >-
+      Self-joins via ParentDepartmentGroupKey = DepartmentGroupKey.
+      Referenced by FactFinance via DepartmentGroupKey.
+
+  - table_name: DimOrganization
+    purpose: >-
+      One row per legal/reporting organizational unit (subsidiary/division),
+      in a self-referencing ownership hierarchy.
+    key_relationships: >-
+      Self-joins via ParentOrganizationKey = OrganizationKey. Joins to
+      DimCurrency via CurrencyKey. Referenced by FactFinance via
+      OrganizationKey.
+
+  - table_name: DimScenario
+    purpose: >-
+      One row per financial planning scenario (e.g. "Actual", "Budget",
+      "Forecast") used to tag FactFinance rows.
+    key_relationships: >-
+      Referenced by FactFinance via ScenarioKey.
+
+  - table_name: FactInternetSales
+    purpose: >-
+      One row per line item sold directly to individual customers online,
+      including quantity, unit price, discounts, cost, and tax/freight --
+      the core "online sales" fact table.
+    key_relationships: >-
+      Joins to DimCustomer via CustomerKey (who bought it), DimProduct via
+      ProductKey (what was bought), DimDate via OrderDateKey/DueDateKey/
+      ShipDateKey (when), DimPromotion via PromotionKey, DimCurrency via
+      CurrencyKey, and DimSalesTerritory via SalesTerritoryKey. The
+      composite (SalesOrderNumber, SalesOrderLineNumber) is the primary key
+      and is referenced by FactInternetSalesReason.
+
+  - table_name: FactInternetSalesReason
+    purpose: >-
+      Bridge table recording every reason (possibly more than one) a
+      customer gave for a specific online sales line item.
+    key_relationships: >-
+      Joins to FactInternetSales via (SalesOrderNumber,
+      SalesOrderLineNumber) and to DimSalesReason via SalesReasonKey --
+      resolves the many-to-many between sales line items and sales reasons.
+
+  - table_name: FactResellerSales
+    purpose: >-
+      One row per line item sold through a reseller (business-to-business
+      channel), including quantity, price, discounts, cost, and
+      tax/freight -- the reseller-channel counterpart to FactInternetSales.
+    key_relationships: >-
+      Joins to DimReseller via ResellerKey (who bought it), DimEmployee via
+      EmployeeKey (which salesperson), DimProduct via ProductKey, DimDate
+      via OrderDateKey/DueDateKey/ShipDateKey, DimPromotion via
+      PromotionKey, DimCurrency via CurrencyKey, and DimSalesTerritory via
+      SalesTerritoryKey.
+
+  - table_name: FactProductInventory
+    purpose: >-
+      One row per product per day describing inventory movement (units in,
+      units out, resulting balance) and unit cost at that point in time.
+    key_relationships: >-
+      Joins to DimProduct via ProductKey and DimDate via DateKey.
+
+  - table_name: FactSalesQuota
+    purpose: >-
+      One row per employee per calendar quarter/year recording their
+      assigned sales quota (target) amount.
+    key_relationships: >-
+      Joins to DimEmployee via EmployeeKey and DimDate via DateKey. Compare
+      against actual sales in FactResellerSales/FactInternetSales
+      (aggregated by the same employee/date period) to measure
+      quota attainment.
+
+  - table_name: FactCurrencyRate
+    purpose: >-
+      One row per currency per day recording that day's average and
+      end-of-day exchange rate versus the reporting currency.
+    key_relationships: >-
+      Joins to DimCurrency via CurrencyKey and DimDate via DateKey. Use
+      this to convert amounts in FactInternetSales/FactResellerSales
+      between currencies for a given order date.
+
+  - table_name: NewFactCurrencyRate
+    purpose: >-
+      An apparently newer/alternate currency-rate table with the same shape
+      as FactCurrencyRate but no declared foreign keys and an extra
+      natural-key style CurrencyID/CurrencyDate pair -- likely a staging or
+      replacement table. CONFIRM with the user whether this or
+      FactCurrencyRate is the one actually in use before either is embedded.
+    key_relationships: >-
+      Has CurrencyKey/DateKey columns matching DimCurrency/DimDate's keys
+      but no enforced foreign key, so any join must be verified rather than
+      assumed.
+
+  - table_name: FactCallCenter
+    purpose: >-
+      One row per call-center shift, recording staffing levels and call
+      volume/quality metrics (calls, automatic responses, orders placed,
+      issues raised, service grade) for that shift.
+    key_relationships: >-
+      Joins to DimDate via DateKey.
+
+  - table_name: FactFinance
+    purpose: >-
+      One row per financial ledger amount for a given date, organization,
+      department group, scenario, and account -- the general-ledger fact
+      table behind budget/actual/forecast reporting.
+    key_relationships: >-
+      Joins to DimDate via DateKey, DimOrganization via OrganizationKey,
+      DimDepartmentGroup via DepartmentGroupKey, DimScenario via
+      ScenarioKey, and DimAccount via AccountKey.
+
+  - table_name: FactSurveyResponse
+    purpose: >-
+      One row per customer survey response about a product category/
+      subcategory, capturing customer feedback tied to a date.
+    key_relationships: >-
+      Joins to DimCustomer via CustomerKey and DimDate via DateKey. Also
+      carries denormalized ProductCategoryKey/ProductSubcategoryKey and
+      their English names directly on the row (not a clean FK to
+      DimProductCategory/DimProductSubcategory in the introspected schema --
+      verify before joining).
+
+  - table_name: FactAdditionalInternationalProductDescription
+    purpose: >-
+      One row per product per language/culture, holding a translated
+      product description.
+    key_relationships: >-
+      Composite key (ProductKey, CultureName); ProductKey lines up with
+      DimProduct.ProductKey though no enforced foreign key was found in
+      introspection.
+
+  - table_name: ProspectiveBuyer
+    purpose: >-
+      One row per prospective (not-yet-a-customer) contact captured for
+      marketing purposes, with the same demographic/contact shape as
+      DimCustomer but for people who haven't purchased yet.
+    key_relationships: >-
+      No foreign keys to other tables -- appears to be a standalone
+      marketing-list table, not joined into the sales fact tables.
+
+  - table_name: AdventureWorksDWBuildVersion
+    purpose: >-
+      Single-row database metadata table recording which version of the
+      AdventureWorksDW sample database this is. Not business data --
+      almost certainly irrelevant to natural-language business questions.
+    key_relationships: >-
+      None. Standalone metadata table.
+
+  - table_name: DatabaseLog
+    purpose: >-
+      Audit/change-log table recording DDL events (who changed what
+      schema object, when, and the T-SQL that did it). Not business data.
+    key_relationships: >-
+      None. Standalone audit table.
+
+  - table_name: sysdiagrams
+    purpose: >-
+      SQL Server Management Studio's internal storage for user-created
+      database diagrams. Not business data, not meant to be queried by
+      end users.
+    key_relationships: >-
+      None. SSMS-internal system table.

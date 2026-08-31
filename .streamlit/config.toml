@@ -1,0 +1,10 @@
+# Light, modern theme for the Text-to-SQL dashboard.
+# Widget-level theming (buttons, inputs, sliders) lives here; the rest of the
+# visual polish (cards, hero header, spacing) is CSS injected in ui/app.py.
+[theme]
+base = "light"
+primaryColor = "#4F46E5"
+backgroundColor = "#FFFFFF"
+secondaryBackgroundColor = "#F1F5F9"
+textColor = "#1E293B"
+font = "sans serif"

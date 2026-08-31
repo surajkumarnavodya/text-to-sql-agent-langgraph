@@ -1,0 +1,52 @@
+# Regression questions for the Text-to-SQL agent, run via scripts/run_eval.py.
+#
+# Each entry is a real natural-language question with a machine-checkable
+# expectation, so a join/filter/output regression shows up as a failing eval
+# run instead of shipping silently. Requires a live DB + Ollama, like
+# scripts/integration_test.py -- not part of the pytest suite, never run by
+# CI automatically.
+#
+# Fields per question:
+#   question:                the exact natural-language question to ask
+#   min_rows:                minimum acceptable row count (usually 1 -- "must
+#                             not come back empty")
+#   expect_readable_result:  if true, fail if every column in the first
+#                             result row looks like a bare integer surrogate
+#                             key (guards against "returns a raw *Key instead
+#                             of a name" regressions)
+#   expect_tables_used:      list of table names that MUST appear in the
+#                             executed SQL text. Exists because row count +
+#                             readability alone can pass on a query that
+#                             skipped a required join hop and only returned
+#                             a plausible-looking result by key-range
+#                             coincidence -- this catches that directly by
+#                             requiring evidence the real join chain was used.
+#   notes:                   why this question is here -- which bug it guards
+
+questions:
+  - question: "Which sales territory had the highest sales for the Bikes category?"
+    min_rows: 1
+    expect_readable_result: true
+    expect_tables_used:
+      - DimProductSubcategory
+    notes: >-
+      Regression guard for the ProductLine/EnglishProductCategoryName
+      confusion bug: DimProduct.ProductLine holds unrelated short
+      manufacturing codes (M/R/S/T), not category names -- the real category
+      name lives in DimProductCategory.EnglishProductCategoryName, reached
+      via DimProduct -> DimProductSubcategory -> DimProductCategory. This
+      question has twice caught the model skipping DimProductSubcategory
+      entirely and comparing an unrelated surrogate-key pair directly (once
+      inventing a nonexistent FactResellerSales.ProductCategoryKey column,
+      once comparing DimProduct.ProductSubcategoryKey to
+      DimProductCategory.ProductCategoryKey) -- the second case returned a
+      plausible non-empty, readable result purely by coincidence (subcategory
+      ID 1 happens to equal category ID 1 in this data), which is exactly
+      why expect_tables_used exists: row count and readability alone did not
+      catch it.
+      NOTE: this question is ambiguous between the Internet and Reseller
+      sales channels, which disagree on the top territory (Australia via
+      FactInternetSales vs. Southwest via FactResellerSales -- both
+      independently verified against real data). No specific territory name
+      is asserted, so this entry doesn't falsely fail if the agent picks a
+      different (still internally consistent) channel interpretation.
