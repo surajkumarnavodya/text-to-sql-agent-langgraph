@@ -193,8 +193,9 @@ results table with an auto-picked chart._
 - [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — detailed technical
   walkthrough of the LangGraph node design, retry/self-correction logic,
   and schema-retrieval pipeline.
-- [`docs/User_Guide.pdf`](docs/User_Guide.pdf) — a plain end-user guide to
-  using the app (not a setup/technical reference).
+- [`docs/User_Guide.pdf`](docs/User_Guide.pdf) — comprehensive documentation
+  covering both the functional (how to use the app) and technical (how it's
+  built, configured, and secured) sides, written for a general audience.
 - [`SECURITY.md`](SECURITY.md) — this project's security posture.
 - [`CONTRIBUTING.md`](CONTRIBUTING.md) — dev setup, coding standards, how
   to add eval questions.
