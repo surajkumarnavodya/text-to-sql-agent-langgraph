@@ -20,6 +20,7 @@ a silently broken agent deeper in the flow.
 
 from __future__ import annotations
 
+import html
 import logging
 import sys
 from pathlib import Path
@@ -38,6 +39,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from agent.exceptions import SchemaRetrievalError
 from agent.graph import run_agent
 from agent.nodes import execute_readonly_sql
+from agent.rate_limit import QUESTION_LIMIT_MESSAGE, SlidingWindowRateLimiter
 from agent.sql_validator import enforce_row_limit, validate_sql
 from config.settings import configure_logging, get_settings
 from db.connection import get_read_only_engine, get_sqlglot_dialect, test_connection
@@ -45,6 +47,17 @@ from db.schema_introspection import TableSchemaInfo, introspect_schema
 from db.value_sampling import attach_sample_values
 from embeddings.schema_indexer import build_index
 from ui.column_formatting import format_column_label, get_display_columns, get_key_column_names
+from ui.session_history import (
+    QueryHistoryEntry,
+    append_entry,
+    build_conversation_history,
+    clear_history,
+    new_history_entry,
+    replace_entry,
+    status_label,
+    with_confirmed_error,
+    with_confirmed_result,
+)
 
 configure_logging()
 logger = logging.getLogger(__name__)
@@ -185,6 +198,29 @@ def _inject_custom_css() -> None:
             border-radius: 10px;
         }
 
+        /* AI insight callout -- deliberately distinct from both the chat
+           bubbles and the results table, so it reads as an interpretation
+           layered on top of the data rather than part of the data itself. */
+        .tsql-insight {
+            display: flex;
+            align-items: flex-start;
+            gap: 0.6rem;
+            background: var(--tsql-primary-light);
+            border: 1px solid #c7d2fe;
+            border-left: 4px solid var(--tsql-primary);
+            border-radius: 10px;
+            padding: 0.75rem 1rem;
+            margin: 0.75rem 0 1.25rem;
+            font-size: 0.92rem;
+            color: var(--tsql-text);
+        }
+        .tsql-insight-icon { font-size: 1.1rem; line-height: 1.4; }
+        .tsql-insight-label {
+            font-weight: 700;
+            color: var(--tsql-primary);
+            margin-right: 0.35rem;
+        }
+
         /* Responsive tweaks for narrow / mobile viewports */
         @media (max-width: 768px) {
             .block-container { padding-left: 0.75rem; padding-right: 0.75rem; }
@@ -282,16 +318,24 @@ def _run_readonly_query(
 # carry inline type annotations -- mypy rejects `obj.attr: T = ...` for any
 # object other than `self`):
 #   chat_history: list[dict]                          [{"role": ..., "content": ...}]
-#   nl_question_cache: dict[str, dict]                 question text -> agent final state
+#   nl_question_cache: dict[tuple, dict]               (question text, prior-question tuple) -> agent final state
 #   current_agent_state: dict | None
 #   editable_sql: str
 #   display_result: tuple[list[str], list[tuple]] | None
 #   display_error: str | None
+#   query_history: list[QueryHistoryEntry]             every question asked this session, oldest first
+#   active_entry_id: str | None                        which query_history entry the SQL box / Confirm-and-Run applies to
+#   display_sql: str | None                            the exact SQL text that produced display_result, if any
+#   enable_insight: bool                                whether to generate a plain-English insight (sidebar toggle)
+#   question_rate_limiter: SlidingWindowRateLimiter     per-session cap on question submissions (see agent/rate_limit.py)
 if "chat_history" not in st.session_state:
     st.session_state.chat_history = []
 if "nl_question_cache" not in st.session_state:
     # Skips redundant LLM calls for repeated identical questions within a
-    # session (see CLAUDE.md "Caching").
+    # session (see CLAUDE.md "Caching"). Keyed on (question, prior-questions)
+    # rather than question text alone -- the same follow-up phrasing ("now
+    # break that down by month") can resolve to a different query depending
+    # on what it's following up on, so the cache must not conflate those.
     st.session_state.nl_question_cache = {}
 if "current_agent_state" not in st.session_state:
     st.session_state.current_agent_state = None
@@ -301,6 +345,25 @@ if "display_result" not in st.session_state:
     st.session_state.display_result = None
 if "display_error" not in st.session_state:
     st.session_state.display_error = None
+if "query_history" not in st.session_state:
+    st.session_state.query_history = []
+if "active_entry_id" not in st.session_state:
+    st.session_state.active_entry_id = None
+if "display_sql" not in st.session_state:
+    st.session_state.display_sql = None
+if "enable_insight" not in st.session_state:
+    st.session_state.enable_insight = True  # default ON -- see sidebar toggle
+if "question_rate_limiter" not in st.session_state:
+    # Genuinely per-session (unlike the process-wide LLM-call limiter
+    # generate_sql_node enforces) -- lives in st.session_state itself, one
+    # instance per browser session, exactly matching "max N questions per
+    # minute per session." See agent/rate_limit.py's module docstring for
+    # why the two limiters have different scopes.
+    st.session_state.question_rate_limiter = SlidingWindowRateLimiter(
+        max_events=settings.question_rate_limit_per_minute,
+        window_seconds=60.0,
+        name="question_submissions",
+    )
 
 
 # --------------------------------------------------------------------------
@@ -338,6 +401,88 @@ with st.sidebar:
             st.markdown(f"**{table.table_name}**")
             column_summary = ", ".join(f"{c.name} ({c.type})" for c in table.columns)
             st.caption(column_summary)
+
+    st.divider()
+    st.subheader("⚙️ Options")
+    st.session_state.enable_insight = st.checkbox(
+        "💡 Generate AI insight",
+        value=st.session_state.enable_insight,
+        help=(
+            "After a successful query, generate a short plain-English sentence "
+            "summarizing the result. Strictly grounded in the returned data -- "
+            "turn off for the cleanest possible demo view, or if it's ever inaccurate."
+        ),
+    )
+
+    st.divider()
+    st.subheader("📜 History")
+    st.caption("This session only -- cleared on refresh or app restart.")
+
+    history: list[QueryHistoryEntry] = st.session_state.query_history
+    if not history:
+        st.caption("No questions asked yet.")
+    else:
+        for entry in reversed(history):
+            icon, label = status_label(entry)
+            with st.container(border=True):
+                st.markdown(f"{icon} **{label}** -- {entry.timestamp.strftime('%H:%M:%S')}")
+                st.caption(entry.question)
+                view_col, rerun_col = st.columns(2)
+                with view_col:
+                    if st.button("👁 View", key=f"view_{entry.entry_id}", use_container_width=True):
+                        st.session_state.active_entry_id = entry.entry_id
+                        st.session_state.current_agent_state = entry.final_state
+                        st.session_state.editable_sql = entry.sql or ""
+                        if entry.confirmed_columns is not None:
+                            st.session_state.display_result = (
+                                entry.confirmed_columns,
+                                entry.confirmed_rows,
+                            )
+                            st.session_state.display_error = None
+                            st.session_state.display_sql = entry.sql
+                        elif entry.confirmed_error is not None:
+                            st.session_state.display_result = None
+                            st.session_state.display_error = entry.confirmed_error
+                            st.session_state.display_sql = None
+                        else:
+                            st.session_state.display_result = None
+                            st.session_state.display_error = None
+                            st.session_state.display_sql = None
+                with rerun_col:
+                    if st.button(
+                        "🔄 Re-run", key=f"rerun_{entry.entry_id}", use_container_width=True
+                    ):
+                        # A re-run is a fresh submission for rate-limiting
+                        # purposes too -- it costs exactly as much LLM/DB
+                        # work as typing the question again would.
+                        rerun_limit = st.session_state.question_rate_limiter.check()
+                        if not rerun_limit.allowed:
+                            st.warning(QUESTION_LIMIT_MESSAGE)
+                        else:
+                            with st.spinner("Re-running against the live database..."):
+                                prior_context = build_conversation_history(history)
+                                rerun_state = run_agent(
+                                    entry.question,
+                                    prior_context,
+                                    enable_insight=st.session_state.enable_insight,
+                                )
+                            new_entry = new_history_entry(entry.question, rerun_state)
+                            st.session_state.query_history = append_entry(history, new_entry)
+                            st.session_state.active_entry_id = new_entry.entry_id
+                            st.session_state.current_agent_state = rerun_state
+                            st.session_state.editable_sql = rerun_state.get("sql", "") or ""
+                            st.session_state.display_result = None
+                            st.session_state.display_error = None
+                            st.session_state.display_sql = None
+
+        if st.button("🗑️ Clear history", use_container_width=True):
+            st.session_state.query_history = clear_history()
+            st.session_state.active_entry_id = None
+            st.session_state.current_agent_state = None
+            st.session_state.editable_sql = ""
+            st.session_state.display_result = None
+            st.session_state.display_error = None
+            st.session_state.display_sql = None
 
 
 # --------------------------------------------------------------------------
@@ -421,46 +566,110 @@ if question:
         st.markdown(question)
 
     with st.chat_message("assistant"):
-        cache_key = question.strip().lower()
-        if cache_key in st.session_state.nl_question_cache:
-            logger.info("Serving question from in-session cache: %r", question)
-            st.caption("(served from this session's cache -- no LLM call made)")
-            final_state = st.session_state.nl_question_cache[cache_key]
-        else:
-            try:
-                with st.spinner("Retrieving schema, generating SQL, self-correcting if needed..."):
-                    final_state = run_agent(question)
-                st.session_state.nl_question_cache[cache_key] = final_state
-            except SchemaRetrievalError as exc:
-                final_state = {"status": "failed", "error_history": [str(exc)]}
-
-        st.session_state.current_agent_state = final_state
-        st.session_state.display_result = None
-        st.session_state.display_error = None
-
-        if final_state.get("status") == "failed":
-            explanation = (
-                final_state.get("failure_explanation")
-                or (final_state.get("error_history") or ["Unknown error."])[-1]
-            )
-            last_sql = final_state.get("sql")
-            st.error(f"Agent could not produce a working query: {explanation}")
-            if last_sql:
-                st.caption("Last SQL attempted:")
-                st.code(last_sql, language="sql")
+        # Checked before anything else -- including the dup-question cache
+        # lookup below, which is a separate, independent mechanism (see
+        # agent/rate_limit.py's module docstring). A denial here means no
+        # run_agent call, no query_history entry: nothing was actually
+        # attempted, so there's nothing to record beyond the chat message.
+        rate_limit_result = st.session_state.question_rate_limiter.check()
+        if not rate_limit_result.allowed:
+            st.warning(QUESTION_LIMIT_MESSAGE)
             st.session_state.chat_history.append(
-                {"role": "assistant", "content": f"Failed: {explanation}"}
+                {"role": "assistant", "content": QUESTION_LIMIT_MESSAGE}
             )
         else:
-            st.session_state.editable_sql = final_state.get("sql", "")
-            retries = final_state.get("retry_count", 0)
-            summary = (
-                f"Generated SQL after {retries} retr{'y' if retries == 1 else 'ies'}."
-                if retries
-                else "Generated SQL."
+            # Built from the *current* history, before this turn is appended
+            # to it -- a question is never its own follow-up context (see
+            # Part 3's "one source of truth" note in ui/session_history.py).
+            prior_context = build_conversation_history(st.session_state.query_history)
+            # enable_insight is part of the cache key too -- toggling it and
+            # re-asking the identical question must not silently serve a
+            # cached answer generated under the opposite setting.
+            cache_key = (
+                question.strip().lower(),
+                tuple(e["question"] for e in prior_context),
+                st.session_state.enable_insight,
             )
-            st.markdown(summary)
-            st.session_state.chat_history.append({"role": "assistant", "content": summary})
+            if cache_key in st.session_state.nl_question_cache:
+                logger.info("Serving question from in-session cache: %r", question)
+                st.caption("(served from this session's cache -- no LLM call made)")
+                final_state = st.session_state.nl_question_cache[cache_key]
+            else:
+                try:
+                    with st.spinner(
+                        "Retrieving schema, generating SQL, self-correcting if needed..."
+                    ):
+                        final_state = run_agent(
+                            question, prior_context, enable_insight=st.session_state.enable_insight
+                        )
+                    st.session_state.nl_question_cache[cache_key] = final_state
+                except SchemaRetrievalError as exc:
+                    final_state = {"status": "failed", "error_history": [str(exc)]}
+
+            new_entry = new_history_entry(question, final_state)
+            st.session_state.query_history = append_entry(st.session_state.query_history, new_entry)
+            st.session_state.active_entry_id = new_entry.entry_id
+            st.session_state.current_agent_state = final_state
+            st.session_state.display_result = None
+            st.session_state.display_error = None
+            st.session_state.display_sql = None
+
+            if final_state.get("status") == "rate_limited":
+                # Distinct from "rejected": a temporary, systemic load
+                # condition, not a judgment about the question. Reached via
+                # the LLM-call limiter tripping mid-retry-loop (see
+                # generate_sql_node) -- rarer than the submission-level
+                # check above, but must be just as visibly communicated.
+                message = final_state.get("rate_limit_message") or QUESTION_LIMIT_MESSAGE
+                st.warning(message)
+                st.session_state.chat_history.append({"role": "assistant", "content": message})
+            elif final_state.get("status") == "rejected":
+                # Standardized, non-technical message only -- never the raw
+                # rejection_reason or which pattern matched (CLAUDE.md's Part 3:
+                # a rejection must not confirm to an attacker exactly what was
+                # detected, and must not alarm a legitimate user over an
+                # unusual phrasing). st.warning rather than st.error: this is a
+                # normal "I can't help with that" outcome, not a system fault.
+                message = final_state.get("rejection_message") or (
+                    "I couldn't process that question. Try rephrasing it as a "
+                    "direct question about your data."
+                )
+                st.warning(message)
+                st.session_state.chat_history.append({"role": "assistant", "content": message})
+            elif final_state.get("status") == "needs_clarification":
+                message = (
+                    final_state.get("clarification_message") or "Could not tell what was asked."
+                )
+                st.warning(f"Needs clarification: {message}")
+                st.session_state.chat_history.append(
+                    {"role": "assistant", "content": f"Needs clarification: {message}"}
+                )
+            elif final_state.get("status") == "failed":
+                explanation = (
+                    final_state.get("failure_explanation")
+                    or (final_state.get("error_history") or ["Unknown error."])[-1]
+                )
+                last_sql = final_state.get("sql")
+                st.error(f"Agent could not produce a working query: {explanation}")
+                if last_sql:
+                    st.caption("Last SQL attempted:")
+                    st.code(last_sql, language="sql")
+                st.session_state.chat_history.append(
+                    {"role": "assistant", "content": f"Failed: {explanation}"}
+                )
+            else:
+                if final_state.get("followup_classification") == "followup":
+                    resolved_against = final_state.get("followup_resolved_against") or {}
+                    st.caption(f"↪ Following up on: “{resolved_against.get('question', '')}”")
+                st.session_state.editable_sql = final_state.get("sql", "")
+                retries = final_state.get("retry_count", 0)
+                summary = (
+                    f"Generated SQL after {retries} retr{'y' if retries == 1 else 'ies'}."
+                    if retries
+                    else "Generated SQL."
+                )
+                st.markdown(summary)
+                st.session_state.chat_history.append({"role": "assistant", "content": summary})
 
 
 # --------------------------------------------------------------------------
@@ -474,6 +683,9 @@ _OUTCOME_ICONS = {
     "succeeded": "✅",
     "safety_violation": "\U0001f6d1",
     "timeout": "⏱️",
+    "high_cost": "\U0001f4c8",
+    "rate_limited": "\U0001f40c",
+    "off_topic": "\U0001f6ab",
 }
 
 
@@ -500,7 +712,12 @@ state = st.session_state.current_agent_state
 if state:
     _render_attempt_timeline(state.get("attempt_history", []))
 
-if state and state.get("status") != "failed":
+if state and state.get("status") not in (
+    "failed",
+    "needs_clarification",
+    "rejected",
+    "rate_limited",
+):
     with st.expander("🔍 Retrieved schema context", expanded=False):
         tables = state.get("schema_tables", [])
         if not tables:
@@ -520,6 +737,16 @@ if state and state.get("status") != "failed":
         label_visibility="collapsed",
     )
 
+    # Proactive "this may take a moment" notice from the moderate-cost path
+    # in estimate_query_cost_node (see db/query_cost.py) -- shown before the
+    # user clicks Confirm and Run, not after, so they aren't left wondering
+    # if the app has frozen. Only shown while the SQL box still matches what
+    # the notice was computed for -- same "don't show something stale after
+    # an edit" rule as the AI insight callout below.
+    cost_notice = state.get("cost_notice")
+    if cost_notice and st.session_state.editable_sql == state.get("sql"):
+        st.caption(f"⏳ {cost_notice}")
+
     confirm_clicked = st.button("▶ Confirm and Run", type="primary")
 
     if confirm_clicked:
@@ -535,6 +762,10 @@ if state and state.get("status") != "failed":
                 validation.normalized_sql, settings.max_result_rows, dialect=dialect
             )
             st.session_state.editable_sql = safe_sql
+            active_id = st.session_state.active_entry_id
+            active_entry = next(
+                (e for e in st.session_state.query_history if e.entry_id == active_id), None
+            )
             try:
                 with st.spinner("Running query..."):
                     columns, rows = _run_readonly_query(
@@ -542,9 +773,21 @@ if state and state.get("status") != "failed":
                     )
                 st.session_state.display_result = (columns, rows)
                 st.session_state.display_error = None
+                st.session_state.display_sql = safe_sql
+                if active_entry is not None:
+                    updated_entry = with_confirmed_result(active_entry, columns, rows)
+                    st.session_state.query_history = replace_entry(
+                        st.session_state.query_history, active_id, updated_entry
+                    )
             except (SQLAlchemyError, TimeoutError) as exc:
                 st.session_state.display_result = None
                 st.session_state.display_error = f"Execution failed: {exc}"
+                st.session_state.display_sql = None
+                if active_entry is not None:
+                    updated_entry = with_confirmed_error(active_entry, str(exc))
+                    st.session_state.query_history = replace_entry(
+                        st.session_state.query_history, active_id, updated_entry
+                    )
 
     if st.session_state.display_error:
         st.error(st.session_state.display_error)
@@ -554,6 +797,29 @@ if state and state.get("status") != "failed":
         df = pd.DataFrame(rows, columns=columns)
 
         st.subheader(f"📊 Results ({len(df)} row{'s' if len(df) != 1 else ''})")
+
+        # Only shown when the currently displayed (confirmed) result was
+        # produced by running exactly the SQL the insight was generated
+        # for -- if the user edited the SQL box before clicking Confirm and
+        # Run, the insight would describe a different query than what's on
+        # screen, so it's correctly withheld rather than shown stale. This
+        # is what keeps the insight a narrative layer on top of already-
+        # correct results, never something that could contradict them.
+        insight_text = state.get("insight")
+        insight_matches_displayed_sql = (
+            st.session_state.display_sql is not None
+            and st.session_state.display_sql == state.get("sql")
+        )
+        if insight_text and insight_matches_displayed_sql:
+            st.markdown(
+                f"""
+                <div class="tsql-insight">
+                    <span class="tsql-insight-icon">💡</span>
+                    <span><span class="tsql-insight-label">AI insight</span>{html.escape(insight_text)}</span>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
 
         key_columns = get_key_column_names(discovered_tables)
         display_columns, used_fallback = get_display_columns(list(df.columns), key_columns)

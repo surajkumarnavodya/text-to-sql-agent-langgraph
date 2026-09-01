@@ -152,6 +152,49 @@ def validate_sql(sql: str, dialect: str | None = DEFAULT_DIALECT) -> ValidationR
     )
 
 
+def find_unexpected_table_references(
+    sql: str, known_tables: set[str], dialect: str | None = DEFAULT_DIALECT
+) -> list[str]:
+    """Flags tables `sql` references that were never part of the retrieved schema context.
+
+    This is a *detection* signal, not a new gate -- the SELECT-only
+    allowlist above plus the read-only database connection already bound
+    what any generated SQL can actually do, regardless of which tables it
+    names. What this catches is a different thing: one concrete symptom of
+    a successful prompt injection via poisoned schema/sampled-value content
+    (see `db/value_sampling.py`'s security note) is the model suddenly
+    referencing a table or column it was never shown, because something in
+    the data it was given told it to. A table appearing here doesn't by
+    itself prove an injection happened -- it's also what a plain
+    hallucinated table name looks like -- but either way it's worth logging
+    distinctly so a pattern of it is inspectable (see `agent.nodes.
+    validate_sql_node`, the caller, for how this is logged).
+
+    Args:
+        sql: Already-validated SQL (only called after `validate_sql`
+            confirms it parses and is SELECT-shaped; a parse failure here
+            is treated as "nothing to flag," not re-raised -- that
+            diagnosis is `validate_sql`'s job).
+        known_tables: Table names that were actually part of the retrieved
+            schema context for this attempt (`AgentState["schema_tables"]`),
+            compared case-insensitively.
+        dialect: sqlglot dialect to parse with.
+
+    Returns:
+        Sorted list of table names referenced in `sql` that aren't in
+        `known_tables` -- empty if none (the common case) or if `sql`
+        doesn't parse.
+    """
+    try:
+        statement = sqlglot.parse_one(sql, read=dialect)
+    except ParseError:
+        return []
+
+    referenced = {table.name for table in statement.find_all(exp.Table) if table.name}
+    known_lower = {name.lower() for name in known_tables}
+    return sorted(name for name in referenced if name.lower() not in known_lower)
+
+
 def enforce_row_limit(sql: str, max_rows: int, dialect: str | None = DEFAULT_DIALECT) -> str:
     """Clamps or adds a `LIMIT` clause so a query can never return more than `max_rows`.
 
@@ -189,4 +232,38 @@ def enforce_row_limit(sql: str, max_rows: int, dialect: str | None = DEFAULT_DIA
     if current_limit is None or current_limit > max_rows:
         statement = statement.limit(max_rows)
 
+    return statement.sql(dialect=dialect)
+
+
+def strip_row_limit(sql: str, dialect: str | None = DEFAULT_DIALECT) -> str:
+    """Removes a `LIMIT`/`TOP` clause -- for cost *estimation* only, never for execution.
+
+    A row cap dramatically changes what a query optimizer estimates: a
+    `TOP 1000` (or `LIMIT 1000`) lets the engine stop scanning/joining as
+    soon as 1000 rows are found, so a plan's reported row estimate collapses
+    to ~1000 regardless of how expensive satisfying the query's actual
+    WHERE/JOIN logic would be -- verified against a real accidental cross
+    join on AdventureWorksDW2025, where adding `TOP 1000` made SQL Server
+    report ~1,000 estimated rows for a query that, unlimited, estimates
+    over 1.1 *billion*. `agent.nodes.estimate_query_cost_node` calls this
+    to see the query's true shape before the cap is applied, but the SQL
+    that's actually *executed* always keeps the real limit (`state["sql"]`
+    is never replaced by this function's output) -- this exists purely to
+    give the cost-estimation step an accurate picture, not to change what
+    runs.
+
+    Args:
+        sql: Already row-limited SQL (the output of `enforce_row_limit`).
+        dialect: sqlglot dialect to parse/render with.
+
+    Returns:
+        The same SQL with its `LIMIT`/`TOP` clause removed.
+    """
+    statement = sqlglot.parse_one(sql, read=dialect)
+    if not isinstance(statement, exp.Query):
+        raise TypeError(
+            f"strip_row_limit expects already-validated SELECT-shaped SQL, "
+            f"got a {type(statement).__name__} statement instead."
+        )
+    statement.set("limit", None)
     return statement.sql(dialect=dialect)

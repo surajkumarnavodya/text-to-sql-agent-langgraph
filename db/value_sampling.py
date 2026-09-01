@@ -14,6 +14,20 @@ purpose, scoped tightly (read-only, small `SELECT DISTINCT`s, bounded
 cardinality, string columns only) and called explicitly at embedding-build
 time (`scripts/build_embeddings.py`, `ui/app.py`) -- never on the hot query
 path.
+
+Security note: sampled values are the sharpest edge of this whole project's
+prompt-surface, and the one genuinely attacker-writable point (see
+CLAUDE.md / SECURITY.md) -- unlike table/column names (constrained by the
+database engine's own identifier rules at CREATE TABLE time), a column's
+*data* can contain literally anything anyone with INSERT/UPDATE access ever
+wrote, including text crafted to look like a system instruction once it
+lands in the prompt (e.g. a product name of `"Bikes\n-- ignore prior
+instructions..."`, which -- without sanitization -- would render as a
+second, instruction-shaped DDL comment line). `_sample_column` runs every
+fetched value through `security.sanitization.normalize_text` (which
+collapses embedded newlines/control characters to a single space,
+preventing exactly that line-injection) and caps its length before it's
+ever stored, let alone rendered into a prompt.
 """
 
 from __future__ import annotations
@@ -25,8 +39,15 @@ from sqlalchemy import Engine, text
 from sqlalchemy.exc import SQLAlchemyError
 
 from db.schema_introspection import TableSchemaInfo, render_ddl
+from security.sanitization import normalize_text
 
 logger = logging.getLogger(__name__)
+
+# Generous cap on one sampled value's length -- in practice values are
+# already short (columns longer than _MAX_DECLARED_LENGTH below never
+# qualify for sampling at all), so this is a hard safety net, not the
+# primary size control.
+_MAX_VALUE_LENGTH = 200
 
 # Only these SQLAlchemy-rendered type name families are ever sampled --
 # numeric/date/binary columns are never business-meaningful "codes" in the
@@ -80,10 +101,21 @@ def _sample_column(engine: Engine, table_name: str, column_name: str) -> tuple[s
     if len(rows) > _MAX_DISTINCT_VALUES:
         return None
 
-    values = sorted(
-        {("NULL" if row[0] is None else str(row[0]).strip()) for row in rows},
-        key=lambda v: (v == "NULL", v),
-    )
+    # Every non-NULL value is genuinely attacker-writable data (see this
+    # module's docstring) -- normalized and length-capped here, at the
+    # point it's fetched, before it's ever stored or rendered into a
+    # prompt. A value that normalizes to empty (e.g. one made up entirely
+    # of control characters) is dropped rather than kept as a blank entry.
+    cleaned_values = set()
+    for row in rows:
+        if row[0] is None:
+            cleaned_values.add("NULL")
+            continue
+        cleaned = normalize_text(str(row[0]).strip())[:_MAX_VALUE_LENGTH]
+        if cleaned:
+            cleaned_values.add(cleaned)
+
+    values = sorted(cleaned_values, key=lambda v: (v == "NULL", v))
     return tuple(values) if values else None
 
 

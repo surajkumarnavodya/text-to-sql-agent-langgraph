@@ -27,3 +27,16 @@ class SchemaRetrievalError(AgentError):
 
 class SqlExecutionTimeoutError(AgentError):
     """Raised when query execution exceeds the configured timeout."""
+
+
+class OffTopicQuestionError(AgentError):
+    """Raised when the LLM itself judges the question unanswerable as SQL.
+
+    The defense-in-depth backstop for anything that slipped past
+    `agent.input_guard`'s cheaper pre-filter: the system prompt instructs
+    the model to respond with a fixed sentinel (`agent.llm_client.
+    OFF_TOPIC_SENTINEL`) rather than attempt SQL when a question isn't a
+    database question at all. `generate_sql_from_llm` raises this instead
+    of returning the sentinel as if it were candidate SQL, so it can never
+    reach the validator/executor by accident.
+    """

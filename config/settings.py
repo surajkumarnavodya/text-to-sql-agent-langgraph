@@ -62,6 +62,14 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+def _env_bool(name: str, default: bool) -> bool:
+    """Read a boolean environment variable ("true"/"1"/"yes", case-insensitive), falling back to `default`."""
+    raw = os.environ.get(name)
+    if raw is None or raw.strip() == "":
+        return default
+    return raw.strip().lower() in ("true", "1", "yes")
+
+
 def _env_optional_int_strict(name: str) -> int | None:
     """Read an optional integer environment variable.
 
@@ -121,6 +129,39 @@ class Settings:
         max_result_rows: Row cap applied to every executed query.
         query_timeout_seconds: Wall-clock timeout for query execution.
         llm_max_tokens: Max tokens the LLM may generate per call (sandboxing).
+        insight_max_tokens: Max tokens the LLM may generate for the post-query
+            plain-English insight sentence (see `agent.llm_client.
+            generate_insight_from_llm`) -- deliberately small and separate
+            from `llm_max_tokens`, since this is 1-2 sentences, not SQL.
+        max_question_length: Maximum accepted raw length (characters) of a
+            user's typed question, enforced by `agent.input_guard.
+            check_input` before any normalization or LLM call -- see
+            CLAUDE.md's adversarial-input-hardening notes.
+        question_rate_limit_per_minute: Max question submissions per minute,
+            per Streamlit session -- see `agent.rate_limit`. A basic,
+            in-memory safeguard for local/single-user use, not a
+            multi-tenant rate limiter (see SECURITY.md).
+        llm_call_rate_limit_per_minute: Max LLM *generation* calls per
+            minute, process-wide -- deliberately stricter than and separate
+            from `question_rate_limit_per_minute`, since a single
+            question's self-correction retries (up to `max_retries + 1`
+            calls) could otherwise multiply load well past what the
+            question-level limit alone would suggest.
+        cost_estimation_enabled: Whether `db.query_cost` runs a proactive,
+            non-executing cost estimate (EXPLAIN/SHOWPLAN) before running a
+            validated query. Fails open regardless (see
+            `cost_estimation_timeout_seconds`); this flag is an extra,
+            simpler off-switch if it's ever undesirable for a given setup.
+        cost_estimation_timeout_seconds: Short timeout for the plan-only
+            EXPLAIN/SHOWPLAN call itself -- getting an execution plan
+            should be fast; if it isn't, the check is abandoned and the
+            query proceeds to the existing timeout-based protection rather
+            than blocking the pipeline on plan estimation.
+        cost_moderate_row_threshold: Estimated row count above which a
+            query gets a "this may take a moment" notice but still runs.
+        cost_high_row_threshold: Estimated row count above which a query is
+            not run at all -- treated as a retryable error fed back to
+            `generate_sql`, same as any other correctable mistake.
         log_level: Root logging level, e.g. "INFO", "DEBUG".
         project_root: Absolute path to the repository root.
     """
@@ -147,6 +188,14 @@ class Settings:
     max_result_rows: int
     query_timeout_seconds: int
     llm_max_tokens: int
+    insight_max_tokens: int
+    max_question_length: int
+    question_rate_limit_per_minute: int
+    llm_call_rate_limit_per_minute: int
+    cost_estimation_enabled: bool
+    cost_estimation_timeout_seconds: int
+    cost_moderate_row_threshold: int
+    cost_high_row_threshold: int
     log_level: str
     project_root: Path = PROJECT_ROOT
 
@@ -190,6 +239,14 @@ def get_settings() -> Settings:
         max_result_rows=_env_int("MAX_RESULT_ROWS", 1000),
         query_timeout_seconds=_env_int("QUERY_TIMEOUT_SECONDS", 15),
         llm_max_tokens=_env_int("LLM_MAX_TOKENS", 1024),
+        insight_max_tokens=_env_int("INSIGHT_MAX_TOKENS", 120),
+        max_question_length=_env_int("MAX_QUESTION_LENGTH", 500),
+        question_rate_limit_per_minute=_env_int("QUESTION_RATE_LIMIT_PER_MINUTE", 10),
+        llm_call_rate_limit_per_minute=_env_int("LLM_CALL_RATE_LIMIT_PER_MINUTE", 20),
+        cost_estimation_enabled=_env_bool("COST_ESTIMATION_ENABLED", True),
+        cost_estimation_timeout_seconds=_env_int("COST_ESTIMATION_TIMEOUT_SECONDS", 3),
+        cost_moderate_row_threshold=_env_int("COST_MODERATE_ROW_THRESHOLD", 50_000),
+        cost_high_row_threshold=_env_int("COST_HIGH_ROW_THRESHOLD", 1_000_000),
         log_level=_env_str("LOG_LEVEL", "INFO"),
     )
     return settings

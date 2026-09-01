@@ -9,7 +9,12 @@ from __future__ import annotations
 
 import pytest
 
-from agent.sql_validator import SAFETY_VIOLATION_TYPES, enforce_row_limit, validate_sql
+from agent.sql_validator import (
+    SAFETY_VIOLATION_TYPES,
+    enforce_row_limit,
+    strip_row_limit,
+    validate_sql,
+)
 
 
 class TestValidateSqlAcceptsReadOnlyQueries:
@@ -192,3 +197,43 @@ class TestEnforceRowLimit:
         sql = enforce_row_limit("SELECT * FROM customers LIMIT 10", max_rows=1000)
         assert "LIMIT 10" in sql.upper()
         assert "LIMIT 1000" not in sql.upper()
+
+
+class TestStripRowLimit:
+    """Regression coverage for a real bug found during development: a
+    `TOP`/`LIMIT` clause makes a query's optimizer stop scanning/joining
+    early, so its reported estimate collapses to roughly the cap
+    regardless of the true underlying cost -- verified against a real
+    accidental cross join on AdventureWorksDW2025 (SECURITY.md has the
+    numbers). db.query_cost's cost-estimation step is useless against
+    already-row-limited SQL (which is *all* generated SQL, since
+    validate_sql_node always applies enforce_row_limit first) without this.
+    """
+
+    def test_removes_limit_clause(self):
+        sql = strip_row_limit("SELECT * FROM customers LIMIT 1000")
+        assert "LIMIT" not in sql.upper()
+
+    def test_removes_mssql_top_clause(self):
+        sql = strip_row_limit("SELECT TOP 1000 * FROM customers", dialect="tsql")
+        assert "TOP" not in sql.upper()
+
+    def test_no_limit_present_is_a_no_op(self):
+        sql = strip_row_limit("SELECT * FROM customers WHERE id = 1")
+        assert "customers" in sql
+        assert "WHERE" in sql.upper()
+
+    def test_never_mutates_the_actual_sql_text_used_for_execution(self):
+        """The whole point: enforce_row_limit's output must stay usable for
+        real execution -- strip_row_limit only ever produces a *separate*
+        string for cost estimation, never replacing the caller's original."""
+        limited = enforce_row_limit("SELECT * FROM customers", max_rows=1000)
+        unlimited_copy = strip_row_limit(limited)
+        assert "LIMIT" in limited.upper()
+        assert "LIMIT" not in unlimited_copy.upper()
+
+    def test_rejects_non_query_statement_shape(self):
+        # Precondition: only ever called on SQL that already passed
+        # validate_sql, which guarantees a Select/Union/Except/Intersect.
+        with pytest.raises(TypeError):
+            strip_row_limit("INSERT INTO customers VALUES (1)")

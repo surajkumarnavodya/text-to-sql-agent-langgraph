@@ -48,6 +48,14 @@ def _settings(**overrides) -> Settings:
         max_result_rows=1000,
         query_timeout_seconds=15,
         llm_max_tokens=1024,
+        insight_max_tokens=120,
+        max_question_length=500,
+        question_rate_limit_per_minute=10,
+        llm_call_rate_limit_per_minute=20,
+        cost_estimation_enabled=True,
+        cost_estimation_timeout_seconds=3,
+        cost_moderate_row_threshold=50_000,
+        cost_high_row_threshold=1_000_000,
         log_level="INFO",
     )
     defaults.update(overrides)

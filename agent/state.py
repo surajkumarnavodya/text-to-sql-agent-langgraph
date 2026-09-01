@@ -13,15 +13,32 @@ from __future__ import annotations
 import operator
 from typing import Annotated, Literal, TypedDict
 
+from agent.insight import ResultSummary
+from db.query_cost import CostEstimate
+
 AgentStatus = Literal[
     "pending",
+    "sanitizing_input",
+    "classifying_followup",
     "retrieving_schema",
     "generating",
     "validating",
+    "estimating_cost",
     "executing",
     "succeeded",
     "failed",
+    "needs_clarification",
+    "rejected",
+    "rate_limited",
 ]
+
+# Why a question never reached generation at all -- either the input gate
+# (`agent.input_guard.check_input`) rejected it before any LLM call, or the
+# model itself refused via `agent.llm_client.OFF_TOPIC_SENTINEL` (the
+# defense-in-depth backstop for anything the gate's cheaper pre-filter
+# missed). Both land on the same "rejected" status/reason space so the UI
+# has one place to look, regardless of which layer caught it.
+RejectionReason = Literal["too_long", "empty", "injection_detected", "off_topic"]
 
 
 class TableSchema(TypedDict):
@@ -30,6 +47,27 @@ class TableSchema(TypedDict):
     table_name: str
     ddl: str
     similarity_score: float
+
+
+class ConversationExchange(TypedDict):
+    """One prior turn's resolved shape, for follow-up reference resolution.
+
+    Deliberately holds *structure*, not result data: the question text, the
+    SQL that was generated for it, and which tables that SQL ended up using
+    -- never result rows. This is what `agent.followup.classify_followup`
+    and `generate_sql_node`'s follow-up prompt block are allowed to see; it
+    keeps the reference-resolution prompt bounded regardless of how large
+    the actual result set was (see CLAUDE.md's constraint on this).
+
+    Built by the caller (`ui/session_history.py`) from the same session
+    query history that powers the UI's History panel -- one source of truth
+    for "what was asked and what happened," not a parallel state.
+    """
+
+    question: str
+    sql: str | None
+    tables: list[str]
+    status: str  # "succeeded" | "failed" | "needs_clarification"
 
 
 class StageTiming(TypedDict):
@@ -83,6 +121,43 @@ class AgentState(TypedDict, total=False):
     # Input
     question: str
 
+    # Set by sanitize_input_node -- None/"passed" means the question is
+    # clean and may proceed. On rejection, status becomes "rejected" and
+    # rejection_message holds the standardized, non-technical text shown to
+    # the user (see agent.input_guard._MESSAGES) -- never the raw reason or
+    # which pattern matched, per CLAUDE.md's "don't confirm what was
+    # detected" rule. `question` itself is overwritten with the normalized
+    # (NFKC + confusables-folded + control-stripped) text on a pass, so
+    # every downstream node operates on sanitized text.
+    rejection_reason: RejectionReason | None
+    rejection_message: str | None
+
+    # Set by generate_sql_node when the process-wide LLM-call rate limiter
+    # (agent.rate_limit) denies a generation attempt -- including a retry
+    # attempt, not just the first one. Distinct from "rejected": this is a
+    # temporary, systemic load condition, not a judgment about the question
+    # itself, so it gets its own status/message rather than reusing
+    # rejection_reason/rejection_message.
+    rate_limit_message: str | None
+
+    # Input, set once by the caller (see agent.graph.run_agent) from the
+    # UI's session query history, capped to the last few exchanges -- never
+    # mutated by a node during a single run, just read by
+    # classify_followup_node / retrieve_schema_node / generate_sql_node.
+    conversation_history: list[ConversationExchange]
+
+    # Set by classify_followup_node
+    followup_classification: Literal["standalone", "followup", "ambiguous"] | None
+    # The specific prior exchange a "followup" classification was resolved
+    # against (the most recent one in conversation_history) -- surfaced in
+    # the UI as "Following up on: ..." so a wrong interpretation is visible
+    # before the user runs anything.
+    followup_resolved_against: ConversationExchange | None
+    # Set only when status becomes "needs_clarification" -- a plain-language
+    # explanation of why the agent couldn't tell what was being asked,
+    # mirroring failure_explanation's role for the "failed" status.
+    clarification_message: str | None
+
     # Set by retrieve_schema
     schema_tables: list[TableSchema]
     schema_context_text: str
@@ -90,14 +165,56 @@ class AgentState(TypedDict, total=False):
     # Set by generate_sql
     sql: str | None
 
+    # Set by validate_sql -- table names the generated SQL referenced that
+    # were never part of the retrieved schema context for this attempt (see
+    # agent.sql_validator.find_unexpected_table_references). Detection/
+    # logging signal only, not a new gate -- see that function's docstring.
+    # Empty list is the overwhelmingly common case.
+    schema_anomaly_tables: list[str]
+
     # Set by validate_sql
     validation_error: str | None
+
+    # Set by estimate_query_cost_node -- the non-executing EXPLAIN/SHOWPLAN
+    # estimate for the validated SQL (see db.query_cost), or None if
+    # estimation was disabled, unsupported for this DB_TYPE, or failed open
+    # (timed out / errored -- see that module's docstring on why this must
+    # never block a legitimate query). Logged at debug level regardless of
+    # severity, so "what does normal look like" can be tuned from real data
+    # rather than guessed.
+    cost_estimate: CostEstimate | None
+    # Set only when cost_estimate.severity == "moderate" -- a UI-facing
+    # "this may take a moment" notice shown before/during execution. A
+    # "high" severity estimate never reaches execute_sql at all (see
+    # route_after_cost_estimate): it's routed back to generate_sql as a
+    # retryable error instead, the same as any other correctable mistake.
+    cost_notice: str | None
 
     # Set by execute_sql
     execution_error: str | None
     result_columns: list[str] | None
     result_rows: list[tuple] | None
     row_count: int | None
+
+    # Input, set once by the caller -- whether generate_insight_node should
+    # even attempt an insight. True (the default) is normally low-risk and
+    # high-value; the UI exposes this as a toggle so it can be turned off
+    # per-question without touching anything else in the pipeline.
+    enable_insight: bool
+
+    # Set by generate_insight_node, only after execute_sql_node succeeds.
+    # None means "no insight" -- disabled via enable_insight, the result was
+    # a redundant single-value shape (see agent.insight.should_skip_insight),
+    # the LLM call itself failed, or the generated text failed the
+    # groundedness check (see agent.insight.is_insight_grounded) and was
+    # dropped rather than shown. Never influences sql/result_rows/row_count
+    # above -- purely a narrative layer rendered alongside them.
+    insight: str | None
+    # The exact ResultSummary the insight (if any) was generated from --
+    # kept on state so scripts/run_eval.py's grounding checks reuse the
+    # same summary the node itself graded against, rather than recomputing
+    # it and risking the two definitions of "grounded" drifting apart.
+    insight_summary: ResultSummary | None
 
     # Retry bookkeeping, shared across validate_sql / execute_sql
     error_history: Annotated[list[str], operator.add]

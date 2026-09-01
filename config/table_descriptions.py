@@ -22,6 +22,8 @@ from pathlib import Path
 
 import yaml
 
+from security.sanitization import normalize_text
+
 _DEFAULT_PATH = Path(__file__).resolve().parent / "table_descriptions.yaml"
 
 
@@ -78,15 +80,22 @@ def apply_table_description(ddl: str, description: TableDescription | None) -> s
     `table_descriptions.yaml` is reflected in the very next generation
     prompt. Tables with no entry get `ddl` back unchanged; expected for most
     tables until the file is fully reviewed (see its header).
+
+    This file is hand-authored (repo-committed, not database-sourced -- see
+    its own module docstring), so it isn't the same risk class as schema
+    introspection or sampled values (a database an attacker can write to
+    vs. a file only a repo committer can edit). Still normalized here for
+    consistency/defense-in-depth -- e.g. a stray control character pasted
+    in by mistake shouldn't reach the prompt unnormalized either.
     """
     if description is None:
         return ddl
 
     lines = [ddl]
     if description.purpose:
-        lines.append(f"-- Purpose: {description.purpose}")
+        lines.append(f"-- Purpose: {normalize_text(description.purpose)}")
     if description.key_relationships:
-        lines.append(f"-- Relationships: {description.key_relationships}")
+        lines.append(f"-- Relationships: {normalize_text(description.key_relationships)}")
     for column, note in description.column_notes.items():
-        lines.append(f"-- {column}: {note}")
+        lines.append(f"-- {normalize_text(column)}: {normalize_text(note)}")
     return "\n".join(lines)

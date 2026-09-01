@@ -11,7 +11,7 @@ target-version = ["py311"]
 [tool.ruff]
 line-length = 100
 target-version = "py311"
-src = ["agent", "config", "db", "embeddings", "scripts", "tests", "ui"]
+src = ["agent", "config", "db", "embeddings", "scripts", "security", "tests", "ui"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM"]
@@ -20,7 +20,7 @@ ignore = [
 ]
 
 [tool.ruff.lint.isort]
-known-first-party = ["agent", "config", "db", "embeddings", "scripts", "ui"]
+known-first-party = ["agent", "config", "db", "embeddings", "scripts", "security", "ui"]
 
 [tool.mypy]
 # Deliberately not pinned to 3.11 (the project's nominal target, see
