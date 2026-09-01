@@ -35,7 +35,7 @@ from agent.nodes import (
     route_after_validation,
     validate_sql_node,
 )
-from agent.state import AgentState, ConversationExchange
+from agent.state import AgentState, ConversationExchange, TableSchema
 from config.settings import Settings
 from db.query_cost import MODERATE_COST_NOTICE, CostEstimate
 from security.secrets import SecretStr
@@ -597,6 +597,131 @@ class TestExecuteSqlNode:
 
         assert result["status"] == "failed"
         assert result["failure_explanation"] is not None
+
+    def test_missing_reference_suggests_the_real_locale_prefixed_column(self, monkeypatch):
+        """Regression coverage for a real, reproduced failure: the model
+        dropped the 'English' prefix real columns in this schema use (e.g.
+        writing 'ProductSubcategoryName' instead of the actual
+        'EnglishProductSubcategoryName') -- repeatedly, even after adding an
+        explicit system-prompt instruction not to. See
+        `agent.nodes._suggest_correct_column`."""
+
+        def _raise(sql, timeout, max_rows):
+            raise SQLAlchemyError(
+                "(pyodbc.ProgrammingError) ('42S22', \"[42S22] [Microsoft]"
+                "[ODBC Driver 17 for SQL Server][SQL Server]Invalid column "
+                "name 'ProductSubcategoryName'. (207)\")"
+            )
+
+        monkeypatch.setattr("agent.nodes.execute_readonly_sql", _raise)
+
+        # Two tables present -- DimProduct (no matching column) and
+        # DimProductSubcategory (the real owner) -- reproduces the exact
+        # scenario that surfaced the alias-confusion bug: an earlier
+        # version of this fix suggested only a bare column name, and the
+        # model attached it to DimProduct's alias instead of
+        # DimProductSubcategory's. The suggestion must name the *correct*
+        # owning table so the retry prompt can tell the model which alias
+        # to actually use.
+        schema_tables: list[TableSchema] = [
+            TableSchema(
+                table_name="DimProduct",
+                ddl=(
+                    "CREATE TABLE DimProduct (\n"
+                    "    ProductKey INTEGER PRIMARY KEY,\n"
+                    "    EnglishProductName NVARCHAR(50) NOT NULL\n"
+                    ");"
+                ),
+                similarity_score=0.95,
+            ),
+            TableSchema(
+                table_name="DimProductSubcategory",
+                ddl=(
+                    "CREATE TABLE DimProductSubcategory (\n"
+                    "    ProductSubcategoryKey INTEGER PRIMARY KEY,\n"
+                    "    EnglishProductSubcategoryName NVARCHAR(50) NOT NULL,\n"
+                    "    ProductCategoryKey INTEGER,\n"
+                    "    FOREIGN KEY (ProductCategoryKey) REFERENCES DimProductCategory "
+                    "(ProductCategoryKey)\n"
+                    ");"
+                ),
+                similarity_score=0.9,
+            ),
+        ]
+        state: AgentState = {
+            "sql": "SELECT ProductSubcategoryName FROM DimProductSubcategory",
+            "retry_count": 0,
+            "schema_tables": schema_tables,
+        }
+        result = execute_sql_node(state)
+
+        assert result["status"] == "retrieving_schema"
+        suggestion_text = result["error_history"][0]
+        assert "EnglishProductSubcategoryName" in suggestion_text
+        # Must name the correct owning table, not the other candidate table.
+        assert "table 'DimProductSubcategory'" in suggestion_text
+        assert result["attempt_history"][0]["error"] is not None
+        assert "EnglishProductSubcategoryName" in result["attempt_history"][0]["error"]
+
+    def test_missing_reference_suggestion_included_in_final_failure_message(self, monkeypatch):
+        def _raise(sql, timeout, max_rows):
+            raise SQLAlchemyError("Invalid column name 'ProductName'.")
+
+        monkeypatch.setattr("agent.nodes.execute_readonly_sql", _raise)
+
+        schema_tables: list[TableSchema] = [
+            TableSchema(
+                table_name="DimProduct",
+                ddl=(
+                    "CREATE TABLE DimProduct (\n"
+                    "    ProductKey INTEGER PRIMARY KEY,\n"
+                    "    EnglishProductName NVARCHAR(50) NOT NULL\n"
+                    ");"
+                ),
+                similarity_score=0.9,
+            )
+        ]
+        state: AgentState = {
+            "sql": "SELECT ProductName FROM DimProduct",
+            "retry_count": 3,  # already at max_retries (3, TestExecuteSqlNode's default)
+            "schema_tables": schema_tables,
+        }
+        result = execute_sql_node(state)
+
+        assert result["status"] == "failed"
+        assert "EnglishProductName" in result["failure_explanation"]
+
+    def test_no_suggestion_when_no_close_column_exists(self, monkeypatch):
+        """Silence, not a wrong guess, when nothing in the retrieved schema
+        is actually close to the invalid name."""
+
+        def _raise(sql, timeout, max_rows):
+            raise SQLAlchemyError("Invalid column name 'TotallyUnrelatedThing'.")
+
+        monkeypatch.setattr("agent.nodes.execute_readonly_sql", _raise)
+
+        schema_tables: list[TableSchema] = [
+            TableSchema(
+                table_name="DimProduct",
+                ddl=(
+                    "CREATE TABLE DimProduct (\n"
+                    "    ProductKey INTEGER PRIMARY KEY,\n"
+                    "    EnglishProductName NVARCHAR(50) NOT NULL\n"
+                    ");"
+                ),
+                similarity_score=0.9,
+            )
+        ]
+        state: AgentState = {
+            "sql": "SELECT TotallyUnrelatedThing FROM DimProduct",
+            "retry_count": 0,
+            "schema_tables": schema_tables,
+        }
+        result = execute_sql_node(state)
+
+        assert result["error_history"][0] == (
+            "SQL execution error: Invalid column name 'TotallyUnrelatedThing'."
+        )
 
     def test_syntax_error_retries_via_generate_sql(self, monkeypatch):
         def _raise(sql, timeout, max_rows):

@@ -16,8 +16,10 @@ terminal "rejected"/"needs_clarification"/"rate_limited" shapes.
 
 from __future__ import annotations
 
+import difflib
 import functools
 import logging
+import re
 import time
 from collections.abc import Callable
 from typing import Any
@@ -116,6 +118,128 @@ def _give_up_explanation(state: AgentState, detailed_message: str) -> str:
     if not state.get("schema_tables"):
         return NO_RELEVANT_DATA_MESSAGE
     return detailed_message
+
+
+# Patterns for the invalid identifier named in a "missing reference" driver
+# error, across the four supported engines -- deliberately separate from
+# (and narrower than) `agent.error_classification`'s own broader keyword
+# list, since these need to *capture* the actual name, not just detect the
+# error's category. Order doesn't matter; only the first pattern that
+# matches is used, per error text.
+_INVALID_IDENTIFIER_PATTERNS = (
+    re.compile(r"invalid column name\s+['\"`]([A-Za-z_][A-Za-z0-9_]*)['\"`]", re.IGNORECASE),
+    re.compile(r"unknown column\s+['\"`]([A-Za-z_][A-Za-z0-9_]*)['\"`]", re.IGNORECASE),
+    re.compile(r"no such column:?\s+['\"`]?([A-Za-z_][A-Za-z0-9_]*)['\"`]?", re.IGNORECASE),
+    re.compile(r'column\s+"([A-Za-z_][A-Za-z0-9_]*)"\s+does not exist', re.IGNORECASE),
+    re.compile(r'ora-00904:\s*(?:"[^"]+"\.)?"([A-Za-z_][A-Za-z0-9_]*)"', re.IGNORECASE),
+)
+
+# A generated SQL identifier this short is never worth fuzzy-suggesting a
+# correction for -- too many unrelated real columns would coincidentally
+# score above the cutoff (e.g. "id"), producing a confidently wrong "did
+# you mean."
+_MIN_SUGGESTION_LENGTH = 4
+
+
+def _extract_column_names(ddl: str) -> list[str]:
+    """Pulls column names out of one table's synthesized DDL text.
+
+    Relies only on `db.schema_introspection.render_ddl`'s consistent
+    one-column-per-line rendering (`    ColumnName TYPE ...,`) -- takes the
+    first whitespace-separated token of each body line, skipping the
+    `CREATE TABLE`/closing-paren lines and `FOREIGN KEY (...)`/
+    `PRIMARY KEY (...)` table-level constraint lines (which would otherwise
+    contribute "FOREIGN"/"PRIMARY" as false column names).
+    """
+    names = []
+    for line in ddl.splitlines():
+        stripped = line.strip().rstrip(",")
+        if not stripped or stripped.startswith(("CREATE TABLE", "FOREIGN KEY", "PRIMARY KEY", ")")):
+            continue
+        first_token = stripped.split(None, 1)[0]
+        if first_token.isidentifier():
+            names.append(first_token)
+    return names
+
+
+def _suggest_correct_column(
+    error_text: str, schema_tables: list[TableSchema]
+) -> tuple[str, str] | None:
+    """Best-effort "did you mean" suggestion for a missing-reference column error.
+
+    A mechanical backstop for a real, recurring, two-part failure mode:
+    this schema's naming convention prefixes many descriptive columns with
+    a locale (e.g. `EnglishProductName`, `EnglishProductSubcategoryName`),
+    and the model was observed -- reliably, across multiple questions,
+    even after adding an explicit system-prompt instruction not to --
+    generating the shorter, unprefixed variant instead. Worse, even after
+    being told the correct column name (an earlier version of this
+    function returned a bare name), the model was then observed attaching
+    the corrected name to the *wrong table's* alias (e.g.
+    `DimProduct`'s alias, when the column actually belongs to
+    `DimProductSubcategory`) -- so the suggestion here names both the
+    column *and* the table it actually belongs to, not just the column.
+
+    Extracts the invalid identifier from the driver's own error text, then:
+
+    1. First looks for a real column that plainly *contains* the guessed
+       name (e.g. "EnglishProductSubcategoryName" contains
+       "ProductSubcategoryName") -- the dominant real-world shape of this
+       failure. Deliberately checked before fuzzy matching:
+       `difflib.SequenceMatcher.ratio()`'s formula normalizes by combined
+       string length, so it can score a short, unrelated column *higher*
+       than the long-but-correct one purely because of the length
+       difference (verified empirically: for invalid name "ProductName",
+       plain `difflib` preferred "ProductKey" (0.76) over the actually-
+       correct "EnglishProductName" (0.76, narrowly *lower*) -- exactly
+       backwards for this failure mode). Ties among several containing
+       candidates (e.g. this schema's English/Spanish/French name
+       variants) prefer an "English"-named one, this app's conventional
+       default language column for an otherwise-unqualified question.
+    2. Falls back to `difflib` fuzzy matching (stdlib, no new dependency)
+       only when no containing column exists -- for genuine typos/near-
+       misses that aren't a clean substring relationship.
+
+    Returns `(column_name, table_name)`, or None -- never a guess of its
+    own -- if no identifier could be parsed out, it's too short to match
+    safely, or no sufficiently close real column exists; silence is better
+    than a confidently wrong suggestion.
+    """
+    invalid_name = None
+    for pattern in _INVALID_IDENTIFIER_PATTERNS:
+        match = pattern.search(error_text)
+        if match:
+            invalid_name = match.group(1)
+            break
+    if invalid_name is None or len(invalid_name) < _MIN_SUGGESTION_LENGTH:
+        return None
+
+    # First table (in retrieval order) that actually declares a given
+    # column name -- good enough for a "here's where to find it" pointer;
+    # this isn't trying to resolve genuine cross-table name collisions.
+    column_owner: dict[str, str] = {}
+    for table in schema_tables:
+        for column_name in _extract_column_names(table["ddl"]):
+            column_owner.setdefault(column_name, table["table_name"])
+    if not column_owner:
+        return None
+
+    lowered_invalid = invalid_name.lower()
+    containing = [
+        col
+        for col in column_owner
+        if col.lower() != lowered_invalid and lowered_invalid in col.lower()
+    ]
+    if containing:
+        containing.sort(key=lambda col: ("english" not in col.lower(), len(col), col))
+        best = containing[0]
+        return best, column_owner[best]
+
+    matches = difflib.get_close_matches(invalid_name, list(column_owner), n=1, cutoff=0.6)
+    if not matches or matches[0].lower() == lowered_invalid:
+        return None
+    best = matches[0]
+    return best, column_owner[best]
 
 
 @_timed_node("sanitize_input")
@@ -849,11 +973,24 @@ def execute_sql_node(state: AgentState) -> dict[str, Any]:
             if category is ExecutionErrorCategory.MISSING_REFERENCE
             else "syntax_error" if category is ExecutionErrorCategory.SYNTAX else "unknown_error"
         )
+
+        error_text = str(exc)
+        if category is ExecutionErrorCategory.MISSING_REFERENCE:
+            suggestion = _suggest_correct_column(error_text, state.get("schema_tables", []))
+            if suggestion:
+                suggested_column, owning_table = suggestion
+                error_text = (
+                    f"{error_text}\nThe schema does not have that column, but table "
+                    f"'{owning_table}' has a column named '{suggested_column}' -- if that's what "
+                    f"you meant, use that exact name, qualified with whichever alias you already "
+                    f"gave to '{owning_table}' in this query (not any other table's alias)."
+                )
+
         record = {
             "attempt": attempt_number,
             "sql": sql,
             "outcome": outcome,
-            "error": str(exc),
+            "error": error_text,
             "will_retry": can_retry,
         }
         next_status = (
@@ -867,7 +1004,7 @@ def execute_sql_node(state: AgentState) -> dict[str, Any]:
         )
         update: dict[str, Any] = {
             "execution_error": str(exc),
-            "error_history": [f"SQL execution error: {exc}"],
+            "error_history": [f"SQL execution error: {error_text}"],
             "attempt_history": [record],
             "last_error_category": category.value,
             "retry_count": attempt_number,
@@ -875,7 +1012,7 @@ def execute_sql_node(state: AgentState) -> dict[str, Any]:
         }
         if not can_retry:
             update["failure_explanation"] = _give_up_explanation(
-                state, f"Gave up after {attempt_number} attempts. Last error: {exc}"
+                state, f"Gave up after {attempt_number} attempts. Last error: {error_text}"
             )
         return update
 
