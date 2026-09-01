@@ -102,6 +102,47 @@ covered by `tests/test_sql_validator.py`/`tests/test_adversarial_input.py`.
 
 ---
 
+## 2026-09-01 — Production-readiness pass: REST API surface + rate limiting/auth scope widened
+
+**Change:** A minimal REST API (`api/`, FastAPI) was added, exposing the
+same `agent.graph.run_agent` the Streamlit UI already calls. This widens
+two existing control surfaces rather than introducing new ones from
+scratch:
+
+1. **Rate limiting scope widened.** `QUESTION_RATE_LIMIT_PER_MINUTE` now
+   also governs a new per-client-IP `SlidingWindowRateLimiter` instance in
+   `api/main.py::_limiter_for` (one limiter per source IP, mirroring the
+   UI's existing per-Streamlit-session limiter) — no threshold value
+   changed, but a new call site now enforces it. The existing process-wide
+   `LLM_CALL_RATE_LIMIT_PER_MINUTE` limiter required no change: it already
+   applies inside `generate_sql_node`, which `POST /ask` reaches through
+   the same `run_agent` call as the UI.
+2. **New optional auth control.** `API_AUTH_TOKEN` (`config/settings.py`,
+   `api/auth.py`) is a new, off-by-default shared-bearer-token check on
+   `/ask` and `/schema/tables`. Explicitly documented (`docs/API.md`) as a
+   lightweight hook, not real authentication — see
+   `docs/RISK_REGISTER.md`'s R-001, which this does not close.
+
+No change to the SQL validator's allowlist, the sensitivity-classification
+config, or either rate-limit *threshold* value — logged here because a new
+enforcement call site and a new auth mechanism are exactly the kind of
+security-relevant addition this changelog's discipline is meant to catch,
+even when it widens `docs/security-changelog.md`'s originally-listed scope
+(validator/classification/rate-limits/cost-thresholds) rather than falling
+strictly inside it.
+
+**Why:** Requested as part of a comprehensive production-readiness audit
+(`docs/PRODUCTION_READINESS_REPORT.md`) that also found `requirements.txt`
+and a prior commit message referenced a `fastapi`-based API layer that was
+never actually built — this closes that specific gap for real, with the
+same safety guarantees as the existing UI path, rather than leaving the
+mismatch between what was claimed and what existed.
+
+**Status:** Permanent. New regression coverage: `tests/test_api_health.py`,
+`tests/test_api_ask.py`.
+
+---
+
 <!--
 Template for new entries — copy this block:
 

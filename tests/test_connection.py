@@ -9,6 +9,7 @@ raises.
 
 from __future__ import annotations
 
+import dataclasses
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -23,44 +24,56 @@ from db.connection import ConnectionErrorCategory, build_connection_url, get_sql
 # `db.connection.test_connection` function itself (it takes an optional
 # arg, so pytest can call it with none) and run it as a bogus test.
 from db.connection import test_connection as check_connection
+from security.secrets import SecretStr
+
+_BASE_SETTINGS = Settings(
+    ollama_host="http://localhost:11434",
+    ollama_model="llama3.1:8b",
+    ollama_request_timeout_seconds=60,
+    db_type="postgresql",
+    db_host="db.example.com",
+    db_port=None,
+    db_name="mydb",
+    db_user="reader",
+    db_password=SecretStr("secret"),
+    db_connection_string=None,
+    db_schema=None,
+    db_odbc_driver="ODBC Driver 17 for SQL Server",
+    chroma_persist_dir=Path("/tmp/chroma"),
+    chroma_collection_name="schema_ddl",
+    embedding_model_name="all-MiniLM-L6-v2",
+    schema_top_k=4,
+    max_retries=3,
+    max_result_rows=1000,
+    query_timeout_seconds=15,
+    llm_max_tokens=1024,
+    insight_max_tokens=120,
+    max_question_length=500,
+    question_rate_limit_per_minute=10,
+    llm_call_rate_limit_per_minute=20,
+    cost_estimation_enabled=True,
+    cost_estimation_timeout_seconds=3,
+    cost_moderate_row_threshold=50_000,
+    cost_high_row_threshold=1_000_000,
+    log_level="INFO",
+    log_redaction_level="standard",
+)
 
 
-def _settings(**overrides) -> Settings:
-    """Builds a Settings instance with sane defaults, overridable per test."""
-    defaults = dict(
-        ollama_host="http://localhost:11434",
-        ollama_model="llama3.1:8b",
-        ollama_request_timeout_seconds=60,
-        db_type="postgresql",
-        db_host="db.example.com",
-        db_port=None,
-        db_name="mydb",
-        db_user="reader",
-        db_password="secret",
-        db_connection_string=None,
-        db_schema=None,
-        db_odbc_driver="ODBC Driver 17 for SQL Server",
-        chroma_persist_dir=Path("/tmp/chroma"),
-        chroma_collection_name="schema_ddl",
-        embedding_model_name="all-MiniLM-L6-v2",
-        schema_top_k=4,
-        max_retries=3,
-        max_result_rows=1000,
-        query_timeout_seconds=15,
-        llm_max_tokens=1024,
-        insight_max_tokens=120,
-        max_question_length=500,
-        question_rate_limit_per_minute=10,
-        llm_call_rate_limit_per_minute=20,
-        cost_estimation_enabled=True,
-        cost_estimation_timeout_seconds=3,
-        cost_moderate_row_threshold=50_000,
-        cost_high_row_threshold=1_000_000,
-        log_level="INFO",
-        log_redaction_level="standard",
-    )
-    defaults.update(overrides)
-    return Settings(**defaults)
+def _settings(**overrides: object) -> Settings:
+    """A `_BASE_SETTINGS` copy with `overrides` applied, per test.
+
+    `_BASE_SETTINGS` itself is a normal, fully type-checked `Settings(...)`
+    call (every one of its ~30 fields is verified against the real dataclass
+    signature). Only the per-test `**overrides` spread -- inherently
+    arbitrary, since any test may override any subset of fields -- can't be
+    verified statically and needs the one `type: ignore` below, same as
+    `dataclasses.replace` would need spreading an untyped dict into any
+    dataclass constructor. That's a much smaller surface than the previous
+    pattern, which spread an untyped `dict` into the constructor for *every*
+    field, defaults included.
+    """
+    return dataclasses.replace(_BASE_SETTINGS, **overrides)  # type: ignore[arg-type]
 
 
 class TestBuildConnectionUrl:
@@ -75,16 +88,19 @@ class TestBuildConnectionUrl:
 
     def test_uses_db_types_default_port_when_unset(self):
         url = build_connection_url(_settings(db_type="mysql", db_port=None))
+        assert isinstance(url, URL)
         assert url.port == 3306
 
     def test_uses_explicit_port_when_set(self):
         url = build_connection_url(_settings(db_port=6543))
+        assert isinstance(url, URL)
         assert url.port == 6543
 
     def test_mssql_includes_odbc_driver_query_param(self):
         url = build_connection_url(
             _settings(db_type="mssql", db_odbc_driver="ODBC Driver 18 for SQL Server")
         )
+        assert isinstance(url, URL)
         assert url.drivername == "mssql+pyodbc"
         assert url.query["driver"] == "ODBC Driver 18 for SQL Server"
 

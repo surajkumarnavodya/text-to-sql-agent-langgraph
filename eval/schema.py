@@ -280,7 +280,7 @@ class BenchmarkReport:
     model: str
     database: str
     total_cases: int
-    metrics: dict[str, float]
+    metrics: dict[str, float | None]
     per_category: dict[str, dict[str, float]]
     per_difficulty: dict[str, dict[str, float]]
     results: list[CaseRunResult]

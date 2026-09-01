@@ -20,9 +20,10 @@ from __future__ import annotations
 import logging
 from collections import Counter
 from decimal import Decimal
+from typing import Any, Protocol
 
 import sqlglot
-from sqlalchemy import Engine, text
+from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlglot import exp
 from sqlglot.errors import ParseError
@@ -30,6 +31,38 @@ from sqlglot.errors import ParseError
 from eval.schema import BenchmarkCase, CaseRunResult, ExpectedResultSpec, FollowUpTurn
 
 logger = logging.getLogger(__name__)
+
+
+class _CursorResultLike(Protocol):
+    """The minimal shape `fetch_gold_result` actually needs from a query
+    result -- matches both a real SQLAlchemy `CursorResult` and the
+    `_FakeCursorResult` test double in `tests/test_eval_evaluators.py`,
+    so tests don't need to construct a real `Engine`/`Connection`."""
+
+    def keys(self) -> Any: ...
+    def fetchmany(self, n: int) -> Any: ...
+
+
+class _ConnectionLike(Protocol):
+    def __enter__(self) -> _ConnectionLike: ...
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: object,
+    ) -> bool | None: ...
+    def execute(self, statement: Any) -> _CursorResultLike: ...
+
+
+class EngineLike(Protocol):
+    """Structural stand-in for `sqlalchemy.Engine`, scoped to exactly what
+    `fetch_gold_result`/`evaluate_result_set` call (`.connect()`). A real
+    `Engine` satisfies this structurally, so production call sites
+    (`eval/runner.py`) need no change; test doubles satisfy it too, without
+    needing to fake the rest of `Engine`'s large real interface."""
+
+    def connect(self) -> _ConnectionLike: ...
+
 
 _NUMERIC_TYPES = (int, float, Decimal)
 _DATE_NAME_HINTS = ("date", "year", "month", "quarter", "day", "week")
@@ -92,8 +125,8 @@ def compare_result_sets(
 
 
 def fetch_gold_result(
-    sql: str, engine: Engine, row_cap: int = 5000
-) -> tuple[list[str], list[tuple]] | None:
+    sql: str, engine: EngineLike, row_cap: int = 5000
+) -> tuple[list[str], list[tuple[Any, ...]]] | None:
     """Executes `sql` (gold SQL from the dataset, not agent-generated) and
     returns its (columns, rows), or None if it fails to execute.
 
@@ -110,8 +143,12 @@ def fetch_gold_result(
     try:
         with engine.connect() as connection:
             cursor_result = connection.execute(text(sql))
-            columns = list(cursor_result.keys())
-            rows = cursor_result.fetchmany(row_cap)
+            # cursor_result is a query-result cursor, not a dict -- .keys()
+            # returns the result's column names, not mapping keys, so
+            # ruff's "use `x in dict` instead of `x in dict.keys()`" heuristic
+            # (SIM118) is a false positive here.
+            columns = [str(key) for key in cursor_result.keys()]  # noqa: SIM118
+            rows = [tuple(row) for row in cursor_result.fetchmany(row_cap)]
         return columns, rows
     except SQLAlchemyError as exc:
         logger.error("[evaluators] gold SQL failed to execute (dataset bug?): %r -- %s", sql, exc)
@@ -121,7 +158,7 @@ def fetch_gold_result(
 def evaluate_result_set(
     run: CaseRunResult,
     case: BenchmarkCase | FollowUpTurn,
-    engine: Engine,
+    engine: EngineLike,
 ) -> None:
     """Fills `run.result_set_correct`/`run.gold_*` by comparing against gold.
 
@@ -321,7 +358,10 @@ def evaluate_sql_structure(
 
     if category == "conditional_aggregation":
         checks["conditional_aggregation_present"] = any(
-            any(isinstance(n, exp.AggFunc) for n in agg.find_ancestor(exp.Select).walk())
+            any(
+                isinstance(n, exp.AggFunc)
+                for n in (agg.find_ancestor(exp.Select) or statement).walk()
+            )
             for agg in case_exprs
         ) or bool(case_exprs and aggs)
 
@@ -334,7 +374,7 @@ def evaluate_sql_structure(
 
     if category == "date_filtering":
         where = statement.args.get("where")
-        date_funcs = list(statement.find_all((exp.Year, exp.Month, exp.DateTrunc, exp.Between)))
+        date_funcs = list(statement.find_all(exp.Year, exp.Month, exp.DateTrunc, exp.Between))
         date_named_cols = [
             c
             for c in statement.find_all(exp.Column)

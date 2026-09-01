@@ -116,15 +116,20 @@ wrong, not as a parallel supported mode.
 ## Key design decisions
 
 ### Self-correcting retry loop (LangGraph)
-`retrieve_schema → generate_sql → validate_sql → execute_sql`. On a validation
-or execution failure, a conditional edge routes back to `generate_sql` with
-the error message appended to the state's message history, so the LLM sees
-what went wrong and can correct itself. Capped at `MAX_RETRIES = 3`
-(`config/settings.py`) — after that, the graph ends in a terminal `failed`
-state and the UI surfaces the last error rather than looping forever. This is
-the interview-relevant piece: it's a small explicit state machine, not a
-ReAct-style free-form agent, specifically so the retry/error-feedback path is
-inspectable and boundable.
+The full graph (`agent/graph.py`) is eight nodes, not four:
+`sanitize_input → classify_followup → retrieve_schema → generate_sql →
+validate_sql → estimate_cost → execute_sql → generate_insight`. On a
+validation, cost-estimate, or execution failure, a conditional edge routes
+back to `generate_sql` (or, for a "missing reference" execution error,
+back to `retrieve_schema`) with the error message appended to the state's
+history, so the LLM sees what went wrong and can correct itself. Capped at
+`MAX_RETRIES = 3` (`config/settings.py`) — after that, the graph ends in a
+terminal `failed` state and the UI surfaces the last error rather than
+looping forever. This is the interview-relevant piece: it's a small
+explicit state machine, not a ReAct-style free-form agent, specifically so
+the retry/error-feedback path is inspectable and boundable. See
+[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the full per-node
+walkthrough and the complete retry-routing table.
 
 ### Schema scoping (why ChromaDB at all)
 For a large real schema, dumping every table's DDL into the prompt burns

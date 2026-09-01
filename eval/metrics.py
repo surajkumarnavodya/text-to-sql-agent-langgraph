@@ -185,14 +185,10 @@ def compute_metrics(results: list[CaseRunResult]) -> dict[str, float | None]:
         "avg_llm_calls_per_case": _mean([float(c) for c in llm_calls]),
         "total_llm_calls": float(sum(llm_calls)) if llm_calls else None,
         "avg_prompt_tokens": _mean(
-            [r.prompt_tokens for r in results if getattr(r, "prompt_tokens", None) is not None]
+            [float(r.prompt_tokens) for r in results if r.prompt_tokens is not None]
         ),
         "avg_completion_tokens": _mean(
-            [
-                r.completion_tokens
-                for r in results
-                if getattr(r, "completion_tokens", None) is not None
-            ]
+            [float(r.completion_tokens) for r in results if r.completion_tokens is not None]
         ),
         # 24-25: complexity / cost
         "avg_query_complexity": _mean([float(c) for c in complexities]),

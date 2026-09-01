@@ -11,6 +11,7 @@ from __future__ import annotations
 from agent.state import AgentState
 from ui.session_history import (
     MAX_FOLLOWUP_EXCHANGES,
+    QueryHistoryEntry,
     append_entry,
     build_conversation_history,
     clear_history,
@@ -60,7 +61,7 @@ class TestNewHistoryEntry:
 
 class TestAddAndClear:
     def test_append_entry_does_not_mutate_original_list(self):
-        history = []
+        history: list[QueryHistoryEntry] = []
         entry = new_history_entry("q1", _succeeded_state())
         new_history = append_entry(history, entry)
 

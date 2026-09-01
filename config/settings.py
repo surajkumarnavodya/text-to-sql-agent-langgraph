@@ -181,6 +181,14 @@ class Settings:
             schemas (e.g. `ssn`, `salary`) even though the data isn't
             logged, hence the stricter option rather than treating
             "no cell values" as sufficient on its own.
+        api_auth_token: Optional bearer token required on every `api/`
+            request (`Authorization: Bearer <token>`) when set. None
+            (default, unset in `.env`) means the API has no auth check of
+            its own -- a deliberate, documented "lightweight hook, not a
+            full auth system" posture (see `docs/DEPLOYMENT.md`): anything
+            beyond local/trusted-network use should sit behind a real
+            authenticating reverse proxy regardless of whether this is set.
+            Stored as `SecretStr` for the same reason `db_password` is.
         project_root: Absolute path to the repository root.
     """
 
@@ -216,6 +224,7 @@ class Settings:
     cost_high_row_threshold: int
     log_level: str
     log_redaction_level: str
+    api_auth_token: SecretStr | None = None
     project_root: Path = PROJECT_ROOT
 
     def __post_init__(self) -> None:
@@ -234,6 +243,7 @@ class Settings:
         """
         object.__setattr__(self, "db_password", as_secret(self.db_password))
         object.__setattr__(self, "db_connection_string", as_secret(self.db_connection_string))
+        object.__setattr__(self, "api_auth_token", as_secret(self.api_auth_token))
         self._validate_security_settings()
 
     def _validate_security_settings(self) -> None:
@@ -332,6 +342,7 @@ def get_settings() -> Settings:
         cost_high_row_threshold=_env_int("COST_HIGH_ROW_THRESHOLD", 1_000_000),
         log_level=_env_str("LOG_LEVEL", "INFO"),
         log_redaction_level=_env_str("LOG_REDACTION_LEVEL", "standard").strip().lower(),
+        api_auth_token=as_secret(_env_optional_str("API_AUTH_TOKEN")),
     )
     return settings
 

@@ -48,8 +48,10 @@ from __future__ import annotations
 
 import logging
 import re
+from typing import Any, Protocol
 
-from sqlalchemy import Engine, text
+from sqlalchemy import text
+from sqlalchemy.engine.interfaces import Dialect
 from sqlalchemy.exc import SQLAlchemyError
 
 from config.sensitive_columns import SensitivityTier, is_restricted, load_sensitive_columns
@@ -57,6 +59,38 @@ from db.schema_introspection import TableSchemaInfo, render_ddl
 from security.sanitization import normalize_text
 
 logger = logging.getLogger(__name__)
+
+
+class _CursorResultLike(Protocol):
+    def fetchmany(self, n: int) -> Any: ...
+
+
+class _ConnectionLike(Protocol):
+    def __enter__(self) -> _ConnectionLike: ...
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: object,
+    ) -> bool | None: ...
+    def execute(self, statement: Any) -> _CursorResultLike: ...
+
+
+class EngineLike(Protocol):
+    """Structural stand-in for `sqlalchemy.Engine`, scoped to exactly what
+    `_sample_column`/`attach_sample_values` call (`.dialect.identifier_preparer`
+    for quoting, `.connect()` for the actual query). A real `Engine`
+    satisfies this structurally, so production call sites need no change;
+    the fake engines in `tests/test_value_sampling_injection.py`,
+    `tests/test_adversarial_input.py`, and `tests/test_sensitive_columns.py`
+    (which use a real `sqlalchemy.engine.default.DefaultDialect` for
+    `.dialect`, not a stub) satisfy it too."""
+
+    @property
+    def dialect(self) -> Dialect: ...
+
+    def connect(self) -> _ConnectionLike: ...
+
 
 # Generous cap on one sampled value's length -- in practice values are
 # already short (columns longer than _MAX_DECLARED_LENGTH below never
@@ -99,7 +133,7 @@ def _is_sampling_candidate(column_name: str, column_type: str, is_primary_key: b
     return not (length_match and int(length_match.group(1)) > _MAX_DECLARED_LENGTH)
 
 
-def _sample_column(engine: Engine, table_name: str, column_name: str) -> tuple[str, ...] | None:
+def _sample_column(engine: EngineLike, table_name: str, column_name: str) -> tuple[str, ...] | None:
     """Returns up to `_MAX_DISTINCT_VALUES` distinct values, or None if too many/failed.
 
     `table_name`/`column_name` are quoted via the connected engine's own
@@ -144,7 +178,7 @@ def _sample_column(engine: Engine, table_name: str, column_name: str) -> tuple[s
 
 
 def attach_sample_values(
-    engine: Engine,
+    engine: EngineLike,
     tables: list[TableSchemaInfo],
     sensitive_columns: dict[tuple[str, str], SensitivityTier] | None = None,
 ) -> list[TableSchemaInfo]:

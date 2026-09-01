@@ -4,26 +4,57 @@ This is the detailed technical walkthrough — the README's diagram is the
 30-second version. This document covers three things: the LangGraph node
 design, the retry/self-correction logic, and the schema-retrieval pipeline.
 
+Two interfaces sit on top of everything described here: `ui/app.py`
+(Streamlit, the primary surface) and `api/main.py` (a thin FastAPI wrapper
+added for programmatic access — see [`docs/API.md`](API.md)). Both call
+the exact same `agent.graph.run_agent` entry point below — the graph
+design, not either interface, is the architectural core.
+
 ## 1. The LangGraph state machine
 
 The agent is a small, explicit `StateGraph` (`agent/graph.py`), not a
 free-form ReAct-style agent. That's a deliberate choice: every possible
 transition is a named edge in a fixed graph, so the retry/error-feedback
 path is something you can read off the graph definition, not something
-that emerges from a model's own planning.
+that emerges from a model's own planning. The graph has **eight nodes**,
+not just the four covering the "happy path" of retrieval → generation →
+validation → execution — the full picture, straight from
+`agent/graph.py::build_graph()`:
 
-```
-retrieve_schema -> generate_sql -> validate_sql -+-> execute_sql -+-> END (succeeded)
-     ^                    ^                       |                |
-     |                    |                       +---(retry)------+
-     |                    +---------------(retry, up to max_retries)
-     +----------(retry, only on a missing_reference execution error)
+```mermaid
+flowchart TD
+    START(["run_agent(question)"]) --> SI["sanitize_input<br/>length cap, Unicode normalization,<br/>injection-pattern pre-filter"]
+    SI -->|rejected| ENDREJ1(["END — rejected"])
+    SI --> CF["classify_followup<br/>standalone / follow-up / ambiguous"]
+    CF -->|ambiguous| ENDCLAR(["END — needs_clarification"])
+    CF --> RS["retrieve_schema<br/>ChromaDB top-k + FK-adjacency bridge"]
+    RS --> GS["generate_sql<br/>Ollama via agent/llm_client.py"]
+    GS -->|off-topic sentinel| ENDREJ2(["END — rejected"])
+    GS -->|LLM/Ollama error| ENDFAIL1(["END — failed"])
+    GS -->|LLM-call rate limit tripped| ENDRATE(["END — rate_limited"])
+    GS --> VS["validate_sql<br/>sqlglot AST allowlist"]
+    VS -->|safety violation, no retry| ENDFAIL2(["END — failed"])
+    VS -->|retryable parse error| GS
+    VS --> CE["estimate_cost<br/>non-executing EXPLAIN / SHOWPLAN"]
+    CE -->|high cost, retryable| GS
+    CE -->|estimation budget exhausted| ENDFAIL3(["END — failed"])
+    CE --> ES["execute_sql<br/>read-only engine, row cap, timeout"]
+    ES -->|unknown table/column| RS
+    ES -->|other error, retries left| GS
+    ES -->|timeout, no retry| ENDFAIL4(["END — failed"])
+    ES -->|retry budget exhausted| ENDFAIL5(["END — failed"])
+    ES -->|success| GI["generate_insight<br/>optional, grounded plain-English summary"]
+    GI --> ENDOK(["END — succeeded"])
 ```
 
-Two failure shapes go straight to `END (failed)` and never loop back at
-all: a validator **safety violation** (non-SELECT, stacked query, `SELECT
-... INTO`) and a query **timeout**. Both are deliberate "don't retry"
-decisions — see §2.
+Three failure shapes go straight to `END (failed)`/`END (rejected)` and
+never loop back at all: a validator **safety violation** (non-SELECT,
+stacked query, `SELECT ... INTO`, an embedded write inside a CTE, a
+dangerous function call), a `generate_sql` **LLM/Ollama error**, and a
+query **timeout**. All three are deliberate "don't retry" decisions — see
+§2. `needs_clarification` (an ambiguous follow-up) and `rate_limited` (the
+process-wide LLM-call limiter tripped) are likewise terminal, but aren't
+failures in the same sense — they're clean, expected stops, not errors.
 
 State is threaded through every node as an `AgentState` TypedDict
 (`agent/state.py`, `total=False` — each node only sets the fields it owns).
@@ -35,7 +66,25 @@ lets `generate_sql` see the full trail of prior failures on a retry, and
 what lets the UI render a complete "Attempt 1: ..., Attempt 2: ..." timeline
 instead of just the latest attempt.
 
-### The four nodes
+### The eight nodes
+
+**`sanitize_input_node`** — the graph's true entry point, before anything
+else (including follow-up classification) touches the question. Runs
+`agent.input_guard.check_input`: a length cap (`MAX_QUESTION_LENGTH`),
+Unicode normalization (NFKC plus an explicit confusables-folding step that
+closes a homoglyph-substitution gap plain NFKC alone leaves open — see
+`security/sanitization.py`), a regex pre-filter for common prompt-injection
+phrasings, and an off-topic/gibberish check. On rejection, `status`
+becomes `"rejected"` and the graph ends immediately with a standardized,
+non-technical message — never the raw reason or which pattern matched, so
+a rejection gives an attacker no signal to iterate against.
+
+**`classify_followup_node`** — a cheap, regex-only heuristic
+(`agent.followup.classify_followup`) deciding whether the (already
+sanitized) question is standalone, a follow-up to the most recent prior
+exchange, or ambiguous — before any schema retrieval or LLM call. On
+`"ambiguous"`, the graph ends immediately with `status="needs_clarification"`
+rather than guessing.
 
 **`retrieve_schema_node`** — embeds the question, retrieves the top-k most
 relevant tables from ChromaDB, expands that set with FK-adjacency bridge
@@ -44,44 +93,90 @@ on each table's DDL, and concatenates the result into
 `schema_context_text`. This is also the re-entry point on a
 `missing_reference` execution failure — see §2.
 
-**`generate_sql_node`** — calls Ollama (`agent/llm_client.py`) with the
-schema context and, on a retry, the previous SQL plus the specific error
-that came back (with a category-specific hint — e.g. "you referenced a
-column that doesn't exist, use only what's shown in the schema"). Returns
-raw SQL text, not yet validated.
+**`generate_sql_node`** — checks the process-wide LLM-call rate limiter
+(`agent.rate_limit.get_llm_call_limiter`) before every attempt, including
+retries; a denial ends the run immediately at `status="rate_limited"`,
+never retried (see `agent/rate_limit.py`'s docstring for why the retry
+loop specifically needs its own, stricter limit, separate from the
+question-submission limiter the UI enforces per session). Otherwise calls
+Ollama (`agent/llm_client.py`) with the schema context and, on a retry,
+the previous SQL plus the specific error that came back (with a
+category-specific hint — e.g. "you referenced a column that doesn't
+exist, use only what's shown in the schema"). Returns raw SQL text, not
+yet validated. The system prompt also instructs the model to refuse (via
+a fixed sentinel) if a question isn't answerable as SQL — a second,
+independent off-topic backstop for anything `sanitize_input_node`'s
+cheaper regex pre-filter missed, which this node turns into the same
+`"rejected"` terminal state.
 
 **`validate_sql_node`** — runs the candidate through
 `agent/sql_validator.py`'s allowlist (§ below) in the dialect matching
 `DB_TYPE`. A safety violation fails closed immediately. An ordinary parse
 mistake increments `retry_count` and routes back to `generate_sql` if
 budget remains. A pass gets a `LIMIT` clause applied
-(`enforce_row_limit`) and moves to `execute_sql`.
+(`enforce_row_limit`) and moves to `estimate_cost`.
+
+**`estimate_query_cost_node`** — runs a non-executing `EXPLAIN`/`SHOWPLAN`
+estimate on the validated SQL (`db/query_cost.py`) — an earlier, additional
+layer in front of `execute_sql`'s existing timeout, not a replacement for
+it. Always fails open: any estimation problem (unsupported dialect,
+timeout, driver error) is logged and treated exactly like "low cost,
+proceed." **Low** severity (or estimation unavailable) proceeds silently;
+**moderate** proceeds but sets `cost_notice` so the UI can show a
+"this may take a moment" caption before execution; **high** does not
+execute at all — treated exactly like any other retryable correctness
+mistake, sharing the same `max_retries` budget as a parse error, so the
+model gets a chance to add a filter on its own before the agent gives up.
 
 **`execute_sql_node`** — runs the validated SQL against a read-only engine
 with a row cap and timeout (§ "Execution safety" below), classifies any
 failure (`agent/error_classification.py`) into `TIMEOUT` /
 `MISSING_REFERENCE` / `SYNTAX` / `UNKNOWN`, and routes accordingly (§2). On
-success, results and row count go into state and the graph ends.
+success, results and row count go into state and the graph proceeds to
+`generate_insight`.
+
+**`generate_insight_node`** — only reachable from `execute_sql_node`'s
+*success* path; a failed, needs-clarification, or rejected run never
+generates one. Generates a short, plain-English sentence about the result
+(`agent/insight.py::summarize_result`) — skipped entirely (no LLM call)
+when the UI's insight toggle is off, or when the result is empty or a
+single-cell value that a sentence would just restate. Before it's ever
+shown, the generated text is checked by
+`agent.insight.is_insight_grounded`: every number in the sentence must be
+traceable to the actual result data (a derived stat like a sum/min/max/
+top-value share, or a literal value from the question/SQL itself, e.g. a
+filter year) within a small rounding tolerance. An insight that fails this
+check is **dropped and never shown** — this is a real, tested hallucination
+guard (`tests/test_insight.py`), not just a prompt instruction; nothing
+here can alter the already-final `sql`/`result_rows`/`row_count`.
 
 ## 2. Retry / self-correction semantics
 
 Not every failure is treated the same way — the routing logic
-(`route_after_validation`, `route_after_execution` in `agent/nodes.py`)
+(`route_after_sanitization`, `route_after_classification`,
+`route_after_generation`, `route_after_validation`,
+`route_after_cost_estimate`, `route_after_execution` in `agent/nodes.py`)
 distinguishes failures by *what kind of mistake it was*, because "try
 again" isn't equally useful for all of them:
 
 | Failure category | Retries? | Where it routes | Why |
 |---|---|---|---|
+| Input rejected (`sanitize_input`: too long, empty, injection-pattern match, off-topic) | **Never** | `END (rejected)` | Not a mistake to coach through — the input itself is the problem. |
+| Follow-up classification ambiguous | **Never** | `END (needs_clarification)` | Fail-closed on "I don't know what you're asking" rather than guessing and possibly answering the wrong question. |
 | Parse error / ordinary validation failure | Yes, up to `MAX_RETRIES` | `generate_sql` | An ordinary correctness mistake — the model has the right context, just wrote bad SQL. |
-| Safety violation (non-SELECT, stacked query, `SELECT ... INTO`) | **Never** | `END (failed)` | A security-gate failure, not a mistake worth coaching through — the agent fails closed immediately regardless of remaining budget. |
+| Safety violation (non-SELECT, stacked query, `SELECT ... INTO`, embedded write, dangerous function) | **Never** | `END (failed)` | A security-gate failure, not a mistake worth coaching through — the agent fails closed immediately regardless of remaining budget. |
+| `generate_sql` off-topic sentinel | **Never** | `END (rejected)` | The model itself judged the question unanswerable as SQL — a defense-in-depth backstop for `sanitize_input`'s pre-filter, not a correctness mistake. |
+| `generate_sql` LLM/Ollama error | **Never** | `END (failed)` | The LLM call itself never returned usable text — retrying the same call is unlikely to help within this run. |
+| LLM-call rate limit tripped | **Never** | `END (rate_limited)` | A load-shedding stop, not a correctness issue — retrying immediately would just re-trip the same limiter. |
+| Query cost estimate: **high** severity | Yes, up to `MAX_RETRIES` | `generate_sql` | Treated exactly like a correctness mistake — the model may be able to add a filter on its own. |
 | Execution error, category `SYNTAX`/`UNKNOWN` | Yes, up to `MAX_RETRIES` | `generate_sql` | Schema context was fine; the SQL text wasn't. Same retry shape as a validation failure. |
 | Execution error, category `MISSING_REFERENCE` | Yes, up to `MAX_RETRIES` | **`retrieve_schema`**, not `generate_sql` | If the SQL referenced a table/column that doesn't exist, the *wrong tables may have been retrieved* in the first place — re-running generation with the same (possibly wrong) schema context would likely repeat the mistake. This re-entry also folds the DB error text into the retrieval query and widens `top_k` (`settings.schema_top_k + 2`), since the error usually names the missing identifier — a genuinely useful extra signal for similarity search. |
 | Execution error, category `TIMEOUT` | **Never** | `END (failed)` | Retrying an expensive query with the same shape wastes the whole retry budget on something a retry can't fix. The failure message suggests narrowing the question instead. |
 
-`retry_count` is incremented in `validate_sql_node`/`execute_sql_node`
-themselves (not in the routing functions), so "retry vs. give up" is
-decided from a single, freshly-incremented count rather than two places
-disagreeing about how many attempts have happened.
+`retry_count` is incremented in `validate_sql_node`/`estimate_query_cost_node`/
+`execute_sql_node` themselves (not in the routing functions), so "retry
+vs. give up" is decided from a single, freshly-incremented count rather
+than multiple places disagreeing about how many attempts have happened.
 
 Every attempt — successful or not — gets exactly one `AttemptRecord`
 appended to `attempt_history`: `{attempt, sql, outcome, error, will_retry}`.

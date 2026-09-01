@@ -13,7 +13,11 @@ SECURITY.md.
 
 from __future__ import annotations
 
+import dataclasses
 from pathlib import Path
+from typing import cast
+
+from sqlalchemy import Engine
 
 import db.query_cost as query_cost
 from config.settings import Settings
@@ -25,6 +29,14 @@ from db.query_cost import (
     estimate_query_cost,
     high_cost_error_message,
 )
+from security.secrets import SecretStr
+
+# These tests only ever exercise estimate_query_cost's dispatch/severity
+# logic (mocked at the _STRATEGIES level, or short-circuited before the
+# engine is ever touched -- e.g. cost_estimation_enabled=False) -- never a
+# real Engine. `cast` documents that "engine" is an intentionally-untyped
+# placeholder for these call sites, rather than a real connection.
+_UNUSED_ENGINE = cast(Engine, object())
 
 
 def _mock_mssql_strategy(monkeypatch, strategy) -> None:
@@ -32,41 +44,45 @@ def _mock_mssql_strategy(monkeypatch, strategy) -> None:
     monkeypatch.setitem(query_cost._STRATEGIES, "mssql", strategy)
 
 
-def _settings(**overrides) -> Settings:
-    defaults = dict(
-        ollama_host="http://localhost:11434",
-        ollama_model="llama3.1:8b",
-        ollama_request_timeout_seconds=60,
-        db_type="mssql",
-        db_host="db.example.com",
-        db_port=None,
-        db_name="AdventureWorksDW2025",
-        db_user="reader",
-        db_password="secret",
-        db_connection_string=None,
-        db_schema=None,
-        db_odbc_driver="ODBC Driver 17 for SQL Server",
-        chroma_persist_dir=Path("/tmp/chroma"),
-        chroma_collection_name="schema_ddl",
-        embedding_model_name="all-MiniLM-L6-v2",
-        schema_top_k=4,
-        max_retries=3,
-        max_result_rows=1000,
-        query_timeout_seconds=15,
-        llm_max_tokens=1024,
-        insight_max_tokens=120,
-        max_question_length=500,
-        question_rate_limit_per_minute=10,
-        llm_call_rate_limit_per_minute=20,
-        cost_estimation_enabled=True,
-        cost_estimation_timeout_seconds=3,
-        cost_moderate_row_threshold=50_000,
-        cost_high_row_threshold=1_000_000,
-        log_level="INFO",
-        log_redaction_level="standard",
-    )
-    defaults.update(overrides)
-    return Settings(**defaults)
+_BASE_SETTINGS = Settings(
+    ollama_host="http://localhost:11434",
+    ollama_model="llama3.1:8b",
+    ollama_request_timeout_seconds=60,
+    db_type="mssql",
+    db_host="db.example.com",
+    db_port=None,
+    db_name="AdventureWorksDW2025",
+    db_user="reader",
+    db_password=SecretStr("secret"),
+    db_connection_string=None,
+    db_schema=None,
+    db_odbc_driver="ODBC Driver 17 for SQL Server",
+    chroma_persist_dir=Path("/tmp/chroma"),
+    chroma_collection_name="schema_ddl",
+    embedding_model_name="all-MiniLM-L6-v2",
+    schema_top_k=4,
+    max_retries=3,
+    max_result_rows=1000,
+    query_timeout_seconds=15,
+    llm_max_tokens=1024,
+    insight_max_tokens=120,
+    max_question_length=500,
+    question_rate_limit_per_minute=10,
+    llm_call_rate_limit_per_minute=20,
+    cost_estimation_enabled=True,
+    cost_estimation_timeout_seconds=3,
+    cost_moderate_row_threshold=50_000,
+    cost_high_row_threshold=1_000_000,
+    log_level="INFO",
+    log_redaction_level="standard",
+)
+
+
+def _settings(**overrides: object) -> Settings:
+    """A `_BASE_SETTINGS` copy with `overrides` applied -- see
+    `tests/test_connection.py::_settings` for why `dataclasses.replace` is
+    used here instead of spreading a dict into `Settings(**...)` directly."""
+    return dataclasses.replace(_BASE_SETTINGS, **overrides)  # type: ignore[arg-type]
 
 
 class TestClassifySeverity:
@@ -100,14 +116,14 @@ class TestEstimateQueryCost:
         _mock_mssql_strategy(monkeypatch, lambda *a: called.append(1))
         settings = _settings(cost_estimation_enabled=False)
 
-        result = estimate_query_cost(engine=object(), sql="SELECT 1", settings=settings)
+        result = estimate_query_cost(engine=_UNUSED_ENGINE, sql="SELECT 1", settings=settings)
 
         assert result is None
         assert called == []
 
     def test_unsupported_db_type_returns_none(self):
         settings = _settings(db_type="not_a_real_engine")
-        result = estimate_query_cost(engine=object(), sql="SELECT 1", settings=settings)
+        result = estimate_query_cost(engine=_UNUSED_ENGINE, sql="SELECT 1", settings=settings)
         assert result is None
 
     def test_moderate_estimate_from_mocked_strategy(self, monkeypatch):
@@ -124,7 +140,7 @@ class TestEstimateQueryCost:
         settings = _settings()
 
         result = estimate_query_cost(
-            engine=object(), sql="SELECT * FROM FactInternetSales", settings=settings
+            engine=_UNUSED_ENGINE, sql="SELECT * FROM FactInternetSales", settings=settings
         )
 
         assert result is not None
@@ -143,7 +159,9 @@ class TestEstimateQueryCost:
         )
         settings = _settings()
 
-        result = estimate_query_cost(engine=object(), sql="SELECT * FROM a, b", settings=settings)
+        result = estimate_query_cost(
+            engine=_UNUSED_ENGINE, sql="SELECT * FROM a, b", settings=settings
+        )
 
         assert result is not None
         assert result.severity == "high"
@@ -163,7 +181,7 @@ class TestEstimateQueryCost:
         _mock_mssql_strategy(monkeypatch, _raise)
         settings = _settings()
 
-        result = estimate_query_cost(engine=object(), sql="SELECT 1", settings=settings)
+        result = estimate_query_cost(engine=_UNUSED_ENGINE, sql="SELECT 1", settings=settings)
 
         assert result is None
 
@@ -171,7 +189,7 @@ class TestEstimateQueryCost:
         _mock_mssql_strategy(monkeypatch, lambda engine, sql: None)
         settings = _settings()
 
-        result = estimate_query_cost(engine=object(), sql="SELECT 1", settings=settings)
+        result = estimate_query_cost(engine=_UNUSED_ENGINE, sql="SELECT 1", settings=settings)
 
         assert result is None
 

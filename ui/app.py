@@ -431,16 +431,21 @@ with st.sidebar:
 
     if st.button("🔄 Refresh Schema", use_container_width=True):
         with st.spinner("Re-introspecting schema and refreshing embeddings..."):
-            _initialize_schema.clear()
+            # st.cache_resource's real runtime object exposes .clear() (see
+            # Streamlit's caching docs), but its type stub types a decorated
+            # function as a plain Callable preserving the wrapped signature,
+            # which doesn't declare .clear() -- a stub gap, not an app bug.
+            _initialize_schema.clear()  # type: ignore[attr-defined]
             refreshed_tables = _initialize_schema()
         st.success(f"Schema refreshed: {len(refreshed_tables)} table(s).")
         discovered_tables = refreshed_tables
 
     with st.expander(f"📋 Discovered tables ({len(discovered_tables)})", expanded=False):
-        for table in discovered_tables:
-            st.markdown(f"**{escape_markdown(table.table_name)}**")
+        for discovered_table in discovered_tables:
+            st.markdown(f"**{escape_markdown(discovered_table.table_name)}**")
             column_summary = ", ".join(
-                f"{escape_markdown(c.name)} ({escape_markdown(c.type)})" for c in table.columns
+                f"{escape_markdown(c.name)} ({escape_markdown(c.type)})"
+                for c in discovered_table.columns
             )
             st.caption(column_summary)
 

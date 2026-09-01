@@ -1,0 +1,71 @@
+# Two services from one image (see Dockerfile): the Streamlit UI and the
+# FastAPI layer (api/, docs/API.md). Deliberately does NOT include Ollama
+# or the target database as services here -- both are external/
+# user-provided by this project's own design (config-driven "connect to
+# your own DB", fully local Ollama you already run) -- see
+# docs/DEPLOYMENT.md for how to point these containers at a host-run Ollama
+# and an external database. No Kubernetes: this is the whole deployment
+# footprint for a single-instance production deployment; see
+# docs/PRODUCTION_READINESS_REPORT.md's roadmap for when that might change.
+
+services:
+  app:
+    build: .
+    image: text-to-sql-dashboard:latest
+    ports:
+      - "8501:8501"
+    env_file:
+      - .env
+    extra_hosts:
+      # Lets OLLAMA_HOST=http://host.docker.internal:11434 in .env reach an
+      # Ollama server running on the host -- Docker Desktop (Windows/Mac)
+      # resolves this automatically; `host-gateway` makes it also resolve
+      # on Linux (Docker Engine 20.10+). A no-op if OLLAMA_HOST points
+      # somewhere else. See docs/DEPLOYMENT.md.
+      - "host.docker.internal:host-gateway"
+    volumes:
+      # Named volume, not a bind mount: the Chroma index is regenerated
+      # data (scripts/build_embeddings.py / the UI's "Refresh Schema"
+      # button own its lifecycle), not source you'd want to edit from the
+      # host -- see the volume's own comment below for the schema-change
+      # implication.
+      - chroma_index:/app/embeddings/.chroma
+    restart: unless-stopped
+
+  api:
+    build: .
+    image: text-to-sql-dashboard:latest
+    command:
+      [
+        "uvicorn",
+        "api.main:app",
+        "--host",
+        "0.0.0.0",
+        "--port",
+        "8000",
+      ]
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      # Same named volume as `app` -- both services must see the same
+      # Chroma index (one build_embeddings.py run should serve both), not
+      # two independently-empty ones.
+      - chroma_index:/app/embeddings/.chroma
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+      retries: 3
+    restart: unless-stopped
+
+volumes:
+  # Persists the schema embedding index across container restarts/recreates.
+  # Rebuilding the image does not clear this -- run
+  # `docker compose exec app python scripts/build_embeddings.py` after a
+  # real schema change, same as the non-Docker README instructs locally.
+  chroma_index:

@@ -268,3 +268,252 @@ D:\Gen_AI_Project_TSQL\db\query_cost.py:196: SAWarning: Unrecognized server vers
 [PASS] (48/52) followup_sales_by_year_then_quarter turn=1 [real_world/follow_up] 'Show total sales by year' -- status=succeeded rows=4 time=50.2s
 [PASS] (48/52) followup_sales_by_year_then_quarter turn=2 [real_world/follow_up] 'Now break that down by quarter' -- status=succeeded rows=4 time=46.8s
 20:40:40 | INFO     | agent.llm_client | [timing] stage=prompt_assembly duration_ms=0.03 prompt_chars=9230
+20:41:30 | INFO     | agent.llm_client | [timing] stage=llm_call total_ms=48662.1 load_ms=3.1 prompt_eval_ms=29802.0 generation_ms=18722.6 prompt_tokens=3127 output_tokens=103
+20:41:38 | INFO     | agent.llm_client | [timing] stage=llm_call total_ms=5086.9 load_ms=2.8 prompt_eval_ms=2805.9 generation_ms=2087.7 prompt_tokens=570 output_tokens=23
+20:41:38 | WARNING  | agent.nodes | [generate_insight] dropped ungrounded insight (contains a number not supported by the result): "The top product subcategory by total sales is 'Road Bikes' with 2,935,820."
+20:41:39 | INFO     | agent.llm_client | [timing] stage=prompt_assembly duration_ms=0.03 prompt_chars=11987
+20:42:29 | INFO     | agent.llm_client | [timing] stage=llm_call total_ms=48104.5 load_ms=2.6 prompt_eval_ms=28806.8 generation_ms=19148.0 prompt_tokens=3704 output_tokens=100
+[PASS] (49/52) followup_top_subcategories_then_top3 turn=1 [real_world/follow_up] 'Which product subcategories have the highest total sales?' -- status=succeeded rows=10 time=59.0s
+[PASS] (49/52) followup_top_subcategories_then_top3 turn=2 [real_world/follow_up] 'Just show the top 3 of those' -- status=succeeded rows=3 time=51.2s
+20:42:30 | INFO     | agent.llm_client | [timing] stage=prompt_assembly duration_ms=0.01 prompt_chars=6233
+20:42:41 | INFO     | agent.llm_client | [timing] stage=llm_call total_ms=9284.3 load_ms=1.8 prompt_eval_ms=5442.6 generation_ms=3452.1 prompt_tokens=2112 output_tokens=25
+20:42:42 | INFO     | agent.llm_client | [timing] stage=prompt_assembly duration_ms=0.01 prompt_chars=8203
+20:43:10 | INFO     | agent.llm_client | [timing] stage=llm_call total_ms=26297.3 load_ms=1.9 prompt_eval_ms=22642.7 generation_ms=3540.3 prompt_tokens=2558 output_tokens=25
+[FAIL] (50/52) followup_2012_sales_then_2013 turn=1 [real_world/follow_up] 'What were total internet sales in 2012?' -- status=succeeded rows=1 time=12.0s
+         failure_category=retrieval_miss -- only 50% of expected tables were retrieved (retrieved=['FactResellerSales', 'FactInternetSales', 'FactCurrencyRate', 'NewFactCurrencyRate', 'DimCurrency'])
+         sql='SELECT TOP 1000 SUM(SalesAmount) FROM FactInternetSales WHERE OrderDateKey BETWEEN 20120101 AND 20121231'
+[FAIL] (50/52) followup_2012_sales_then_2013 turn=2 [real_world/follow_up] 'What about for 2013 instead?' -- status=succeeded rows=1 time=29.0s
+         failure_category=retrieval_miss -- only 50% of expected tables were retrieved (retrieved=['FactCurrencyRate', 'NewFactCurrencyRate', 'FactInternetSales', 'FactResellerSales', 'DimSalesReason', 'DimCurrency', 'FactInternetSalesReason'])
+         sql='SELECT TOP 1000 SUM(SalesAmount) FROM FactInternetSales WHERE OrderDateKey BETWEEN 20130101 AND 20131231'
+20:43:11 | INFO     | agent.llm_client | [timing] stage=prompt_assembly duration_ms=0.02 prompt_chars=6231
+20:43:33 | INFO     | agent.llm_client | [timing] stage=llm_call total_ms=19764.1 load_ms=3.6 prompt_eval_ms=15242.4 generation_ms=4254.3 prompt_tokens=2181 output_tokens=31
+20:43:33 | WARNING  | agent.nodes | [execute_sql] attempt 1 failed (category=missing_reference): (pyodbc.ProgrammingError) ('42S22', "[42S22] [Microsoft][ODBC Driver 17 for SQL Server][SQL Server]Invalid column name 'SalesTerritoryRegion'. (207) (SQLExecDirectW); [42S22] [Microsoft][ODBC Driver 17 for SQL Server][SQL Server]Invalid column name 'SalesTerritoryRegion'. (207)")
+[SQL: SELECT TOP 10 SalesTerritoryRegion FROM FactResellerSales GROUP BY SalesTerritoryRegion ORDER BY SUM(SalesAmount) DESC]
+(Background on this error at: https://sqlalche.me/e/20/f405)
+20:43:33 | INFO     | agent.llm_client | [timing] stage=prompt_assembly duration_ms=0.02 prompt_chars=10695
+20:43:58 | INFO     | agent.llm_client | [timing] stage=llm_call total_ms=22942.9 load_ms=3.7 prompt_eval_ms=17741.1 generation_ms=4919.0 prompt_tokens=3312 output_tokens=31
+20:43:58 | WARNING  | agent.nodes | [execute_sql] attempt 2 failed (category=missing_reference): (pyodbc.ProgrammingError) ('42S22', "[42S22] [Microsoft][ODBC Driver 17 for SQL Server][SQL Server]Invalid column name 'SalesAmount'. (207) (SQLExecDirectW)")
+[SQL: SELECT TOP 10 SalesTerritoryRegion FROM DimSalesTerritory GROUP BY SalesTerritoryRegion ORDER BY SUM(SalesAmount) DESC]
+(Background on this error at: https://sqlalche.me/e/20/f405)
+20:43:59 | INFO     | agent.llm_client | [timing] stage=prompt_assembly duration_ms=0.02 prompt_chars=9920
+20:44:32 | INFO     | agent.llm_client | [timing] stage=llm_call total_ms=31033.6 load_ms=3.2 prompt_eval_ms=26124.0 generation_ms=4714.4 prompt_tokens=3045 output_tokens=31
+20:44:32 | WARNING  | agent.nodes | [execute_sql] attempt 3 failed (category=missing_reference): (pyodbc.ProgrammingError) ('42S22', "[42S22] [Microsoft][ODBC Driver 17 for SQL Server][SQL Server]Invalid column name 'SalesAmount'. (207) (SQLExecDirectW)")
+[SQL: SELECT TOP 10 SalesTerritoryRegion FROM DimSalesTerritory GROUP BY SalesTerritoryRegion ORDER BY SUM(SalesAmount) DESC]
+(Background on this error at: https://sqlalche.me/e/20/f405)
+20:44:32 | INFO     | agent.llm_client | [timing] stage=prompt_assembly duration_ms=0.02 prompt_chars=9920
+20:44:40 | INFO     | agent.llm_client | [timing] stage=llm_call total_ms=5373.6 load_ms=3.0 prompt_eval_ms=255.0 generation_ms=5098.5 prompt_tokens=3045 output_tokens=31
+20:44:40 | WARNING  | agent.nodes | [execute_sql] attempt 4 failed (category=missing_reference): (pyodbc.ProgrammingError) ('42S22', "[42S22] [Microsoft][ODBC Driver 17 for SQL Server][SQL Server]Invalid column name 'SalesAmount'. (207) (SQLExecDirectW)")
+[SQL: SELECT TOP 10 SalesTerritoryRegion FROM DimSalesTerritory GROUP BY SalesTerritoryRegion ORDER BY SUM(SalesAmount) DESC]
+(Background on this error at: https://sqlalche.me/e/20/f405)
+[FAIL] (51/52) followup_top_territories_then_order_counts turn=1 [real_world/follow_up] 'Which sales territories have the highest total sales?' -- status=failed rows=None time=89.7s
+         failure_category=generation_failed -- never reached a successful execution (last outcome='missing_reference')
+         sql='SELECT TOP 10 SalesTerritoryRegion FROM DimSalesTerritory GROUP BY SalesTerritoryRegion ORDER BY SUM(SalesAmount) DESC'
+[FAIL] (51/52) followup_top_territories_then_order_counts turn=2 [real_world/follow_up] 'And how many orders came from each?' -- status=needs_clarification rows=None time=0.0s
+         failure_category=unexpected_clarification -- agent asked for clarification instead of answering
+20:44:40 | INFO     | agent.llm_client | [timing] stage=prompt_assembly duration_ms=0.09 prompt_chars=5610
+20:44:58 | INFO     | agent.llm_client | [timing] stage=llm_call total_ms=14828.2 load_ms=2.7 prompt_eval_ms=10192.9 generation_ms=4387.8 prompt_tokens=2010 output_tokens=33
+20:44:58 | INFO     | agent.llm_client | [timing] stage=prompt_assembly duration_ms=0.02 prompt_chars=9635
+20:45:33 | INFO     | agent.llm_client | [timing] stage=llm_call total_ms=32242.7 load_ms=8.9 prompt_eval_ms=22827.3 generation_ms=9386.1 prompt_tokens=3027 output_tokens=58
+[FAIL] (52/52) followup_reseller_sales_by_year_then_category turn=1 [real_world/follow_up] 'Show total reseller sales by year' -- status=succeeded rows=4 time=17.6s
+         failure_category=retrieval_miss -- only 50% of expected tables were retrieved (retrieved=['FactResellerSales', 'FactCurrencyRate', 'NewFactCurrencyRate', 'DimReseller', 'DimCurrency'])
+         sql='SELECT TOP 1000 SUM(SalesAmount) AS TotalResellerSales, YEAR(OrderDate) AS SalesYear FROM FactResellerSales GROUP BY YEAR(OrderDate)'
+[FAIL] (52/52) followup_reseller_sales_by_year_then_category turn=2 [real_world/follow_up] 'Now split that by product category instead' -- status=succeeded rows=10 time=35.0s
+         failure_category=retrieval_miss -- only 50% of expected tables were retrieved (retrieved=['FactResellerSales', 'DimReseller', 'DimSalesReason', 'FactInternetSales', 'DimPromotion', 'FactInternetSalesReason'])
+         sql='SELECT TOP 1000 SUM(SalesAmount) AS TotalResellerSales, YEAR(OrderDate) AS SalesYear, ProductLine FROM FactResellerSales JOIN DimReseller ON FactResellerSales.ResellerKey = DimReseller.ResellerKey GROUP BY YEAR(OrderDate), ProductLine'
+
+## Text-to-SQL Evaluation
+
+Total questions: 57
+First-attempt (first-pass) accuracy: 100.0%
+Final accuracy: 35.0%
+Schema retrieval recall: 82.2%
+Join correctness: 87.5%
+Aggregation correctness: 100.0%
+Follow-up question accuracy: 40.0%
+Security rejection accuracy: 100.0%
+Average latency: 33.26 sec
+P95 latency: 79.52 sec
+
+**Run:** `run_20260901T151533Z` | **Model:** `llama3.1:8b` | **Database:** `AdventureWorksDW2025` | **Timestamp:** 2026-09-01T15:15:33.125519+00:00
+
+### All metrics
+
+| Metric | Value |
+|---|---|
+| SQL execution accuracy | 92.3% |
+| Result-set accuracy | 29.6% |
+| Exact SQL match (diagnostic only) | 0.0% |
+| Final accuracy | 35.0% |
+| Schema retrieval recall | 82.2% |
+| Relevant-table precision | 25.0% |
+| Column selection accuracy | 76.7% |
+| Join correctness | 87.5% |
+| Aggregation correctness | 100.0% |
+| Filter correctness | 100.0% |
+| Date/time reasoning accuracy | 100.0% |
+| GROUP BY correctness | 100.0% |
+| ORDER BY correctness | 100.0% |
+| NULL handling accuracy | 100.0% |
+| Nested-query correctness | 100.0% |
+| Window-function correctness | 0.0% |
+| Ambiguous-question handling accuracy | 0.0% |
+| Follow-up question accuracy | 40.0% |
+| Retry success rate | 66.7% |
+| First-attempt (first-pass) accuracy | 100.0% |
+| Average latency | 33.26 sec |
+| P95 latency | 79.52 sec |
+| Avg. LLM calls per question | 1.12 |
+| Total LLM calls | 64.00 |
+| Avg. prompt tokens | 3994.11 |
+| Avg. completion tokens | 61.43 |
+| Avg. query complexity score | 2.46 |
+| Avg. estimated query cost (rows) | 304933.89 |
+| Security rejection accuracy | 100.0% |
+
+### By difficulty
+
+| Difficulty | Count | Pass rate | Avg latency (s) |
+|---|---|---|---|
+| adversarial | 17 | 100.0% | 9.3 |
+| easy | 6 | 66.7% | 25.9 |
+| hard | 8 | 25.0% | 57.3 |
+| medium | 10 | 40.0% | 52.9 |
+| real_world | 16 | 25.0% | 37.2 |
+
+### By category
+
+| Category | Count | Pass rate | Avg latency (s) |
+|---|---|---|---|
+| aggregation | 2 | 50.0% | 27.6 |
+| ambiguous_wording | 2 | 0.0% | 43.3 |
+| business_questions | 2 | 0.0% | 31.1 |
+| conditional_aggregation | 1 | 0.0% | 34.8 |
+| cost_estimation | 2 | 100.0% | 43.7 |
+| ctes | 2 | 0.0% | 83.6 |
+| date_filtering | 2 | 50.0% | 45.6 |
+| follow_up | 10 | 40.0% | 39.1 |
+| group_by_having | 2 | 0.0% | 50.6 |
+| incomplete_questions | 2 | 0.0% | 28.1 |
+| joins | 2 | 50.0% | 36.2 |
+| malicious_sql | 4 | 100.0% | 26.3 |
+| multi_table_analysis | 2 | 0.0% | 99.4 |
+| nested_queries | 2 | 0.0% | 60.0 |
+| null_handling | 2 | 100.0% | 32.5 |
+| prompt_injection | 9 | 100.0% | 0.0 |
+| schema_manipulation | 2 | 100.0% | 26.0 |
+| simple_filtering | 2 | 100.0% | 20.3 |
+| sorting | 2 | 50.0% | 29.9 |
+| unauthorized_data | 2 | 100.0% | 0.0 |
+| window_functions | 1 | 0.0% | 49.0 |
+
+### Failed questions (26)
+
+- **[easy_sort_top5_expensive]** 'What are the 5 most expensive products?'
+  - difficulty=easy category=sorting status=succeeded
+  - likely failure category: `wrong_result` -- result set didn't match gold (gold_source='expected_sql'): got 5 row(s)
+  - generated SQL: `SELECT TOP 5 ProductKey, EnglishProductName, ListPrice FROM DimProduct ORDER BY ListPrice DESC`
+- **[easy_agg_avg_list_price]** 'What is the average list price across all products?'
+  - difficulty=easy category=aggregation status=succeeded
+  - likely failure category: `retrieval_miss` -- only 0% of expected tables were retrieved (retrieved=['NewFactCurrencyRate', 'DimPromotion', 'FactInternetSales', 'FactResellerSales'])
+  - generated SQL: `SELECT TOP 1000 AVG(UnitPrice) FROM FactInternetSales`
+- **[hard_nested_above_avg_price]** 'Which products have a list price higher than the average list price of all products?'
+  - difficulty=hard category=nested_queries status=succeeded
+  - likely failure category: `wrong_result` -- result set didn't match gold (gold_source='expected_sql'): got 142 row(s)
+  - generated SQL: `SELECT TOP 1000 ProductKey FROM DimProduct WHERE ListPrice > (SELECT AVG(ListPrice) FROM DimProduct)`
+- **[hard_nested_never_sold_products]** 'Which products have never been sold through internet sales?'
+  - difficulty=hard category=nested_queries status=succeeded
+  - likely failure category: `wrong_result` -- result set didn't match gold (gold_source='expected_sql'): got 448 row(s)
+  - generated SQL: `SELECT TOP 1000 * FROM (SELECT ProductKey FROM DimProduct EXCEPT SELECT ProductKey FROM FactInternetSales) AS _l_0`
+- **[hard_cte_top_category]** 'Using total sales per product category, which category has the single highest total?'
+  - difficulty=hard category=ctes status=succeeded
+  - likely failure category: `wrong_query_structure` -- failed structural check(s): ['cte_present']
+  - generated SQL: `SELECT TOP 1 EnglishProductCategoryName FROM DimProductCategory ORDER BY (SELECT SUM(SalesAmount) FROM FactResellerSales JOIN DimProduct ON FactResellerSales.ProductKey = DimProduct.ProductKey JOIN DimProductSubcategory ON DimProduct.ProductSubcategoryKey = DimProductSubcategory.ProductSubcategoryKey JOIN DimProductCategory ON DimProductSubcategory.ProductCategoryKey = DimProductCategory.ProductCategoryKey WHERE DimProductCategory.ProductCategoryKey = DimProductCategory.ProductCategoryKey) DESC`
+- **[hard_cte_territory_ranking]** 'Rank sales territories by total internet sales using a CTE'
+  - difficulty=hard category=ctes status=succeeded
+  - likely failure category: `retrieval_miss` -- only 50% of expected tables were retrieved (retrieved=['DimReseller', 'DimSalesTerritory', 'DimOrganization', 'FactResellerSales', 'DimCurrency'])
+  - generated SQL: `WITH RankedTerritories AS (SELECT SalesTerritoryKey AS SalesTerritoryKey, SUM(SalesAmount) AS TotalInternetSales FROM FactResellerSales GROUP BY SalesTerritoryKey) SELECT TOP 1000 RankedTerritories.SalesTerritoryKey, DimSalesTerritory.SalesTerritoryRegion, RankedTerritories.TotalInternetSales, RANK() OVER (ORDER BY RankedTerritories.TotalInternetSales DESC) AS SalesTerritoryRank FROM RankedTerritories JOIN DimSalesTerritory ON RankedTerritories.SalesTerritoryKey = DimSalesTerritory.SalesTerritoryKey`
+- **[hard_window_top3_per_category]** 'For each product category, show the top 3 products by total sales amount'
+  - difficulty=hard category=window_functions status=succeeded
+  - likely failure category: `wrong_query_structure` -- failed structural check(s): ['window_function_present']
+  - generated SQL: `SELECT TOP 3 dc.EnglishProductCategoryName, dp.EnglishProductName, SUM(fs.SalesAmount) AS TotalSales FROM DimProductCategory AS dc JOIN DimProductSubcategory AS dps ON dc.ProductCategoryKey = dps.ProductCategoryKey JOIN DimProduct AS dp ON dps.ProductSubcategoryKey = dp.ProductSubcategoryKey JOIN FactResellerSales AS fs ON dp.ProductKey = fs.ProductKey GROUP BY dc.EnglishProductCategoryName, dp.EnglishProductName ORDER BY TotalSales DESC`
+- **[hard_conditional_agg_promotion]** 'How many internet sales line items had a promotion applied versus had no promotion?'
+  - difficulty=hard category=conditional_aggregation status=succeeded
+  - likely failure category: `wrong_result` -- result set didn't match gold (gold_source='expected_sql'): got 1 row(s)
+  - generated SQL: `SELECT TOP 1000 COUNT(CASE WHEN NOT T2.PromotionKey IS NULL THEN 1 ELSE NULL END) - COUNT(CASE WHEN T2.PromotionKey IS NULL THEN 1 ELSE NULL END) FROM FactInternetSales AS T1 INNER JOIN DimPromotion AS T2 ON T1.PromotionKey = T2.PromotionKey`
+- **[med_join_sales_by_category]** 'Show total internet sales amount by product category'
+  - difficulty=medium category=joins status=succeeded
+  - likely failure category: `retrieval_miss` -- only 75% of expected tables were retrieved (retrieved=['FactCurrencyRate', 'FactInternetSales', 'DimProductSubcategory', 'FactResellerSales', 'DimCurrency', 'DimProduct'])
+  - generated SQL: `SELECT TOP 1000 SUM(fs.SalesAmount) FROM FactInternetSales AS fs JOIN DimProduct AS d ON fs.ProductKey = d.ProductKey JOIN DimProductSubcategory AS dps ON d.ProductSubcategoryKey = dps.ProductSubcategoryKey JOIN DimProductCategory AS dpc ON dps.ProductCategoryKey = dpc.ProductCategoryKey`
+- **[med_date_jan2012_order_count]** 'How many orders were placed in January 2012?'
+  - difficulty=medium category=date_filtering status=succeeded
+  - likely failure category: `wrong_result` -- result set didn't match gold (gold_source='expected_sql'): got 1 row(s)
+  - generated SQL: `SELECT TOP 1000 COUNT(DISTINCT SalesOrderNumber) FROM FactResellerSales WHERE OrderDateKey = (SELECT TOP 1 DateKey FROM DimDate WHERE CalendarYear = 2012 AND MonthNumberOfYear = 1)`
+- **[med_multi_sales_by_country]** 'Show total internet sales by customer country'
+  - difficulty=medium category=multi_table_analysis status=succeeded
+  - likely failure category: `retrieval_miss` -- only 67% of expected tables were retrieved (retrieved=['DimSalesTerritory', 'DimGeography', 'FactInternetSalesReason', 'FactInternetSales', 'DimOrganization', 'FactResellerSales', 'DimCurrency'])
+  - generated SQL: `SELECT TOP 1000 SUM(T1.SalesAmount) AS TotalInternetSales, T2.EnglishCountryRegionName FROM FactInternetSales AS T1 JOIN DimGeography AS T2 ON T1.CustomerKey = T2.GeographyKey GROUP BY T2.EnglishCountryRegionName`
+- **[med_multi_employee_territory]** "Show each employee's name and their assigned sales territory region"
+  - difficulty=medium category=multi_table_analysis status=failed
+  - likely failure category: `generation_failed` -- never reached a successful execution (last outcome='missing_reference')
+  - generated SQL: `SELECT TOP 1000 dce.EmployeeName, dst.SalesTerritoryRegion FROM DimEmployee AS dce INNER JOIN DimSalesTerritory AS dst ON dce.SalesTerritoryKey = dst.SalesTerritoryKey`
+- **[med_having_category_over_1m]** 'Which product categories have total internet sales over 1,000,000?'
+  - difficulty=medium category=group_by_having status=succeeded
+  - likely failure category: `wrong_result` -- result set didn't match gold (gold_source='expected_sql'): got 0 row(s)
+  - generated SQL: `SELECT TOP 1000 dc.EnglishProductCategoryName FROM DimProductCategory AS dc JOIN FactInternetSales AS fis ON dc.ProductCategoryKey = fis.ProductKey GROUP BY dc.EnglishProductCategoryName HAVING SUM(fis.SalesAmount) > 1000000`
+- **[med_having_territory_over_100_orders]** 'Which sales territories had more than 100 distinct orders?'
+  - difficulty=medium category=group_by_having status=succeeded
+  - likely failure category: `wrong_result` -- result set didn't match gold (gold_source='expected_sql'): got 10 row(s)
+  - generated SQL: `SELECT DISTINCT TOP 1000 t2.SalesTerritoryRegion FROM FactResellerSales AS t1 JOIN DimSalesTerritory AS t2 ON t1.SalesTerritoryKey = t2.SalesTerritoryKey GROUP BY t2.SalesTerritoryRegion HAVING COUNT(DISTINCT t1.SalesOrderNumber) > 100`
+- **[rw_top5_customers_by_spend]** 'Who are our top 5 customers by total spending?'
+  - difficulty=real_world category=business_questions status=succeeded
+  - likely failure category: `wrong_result` -- result set didn't match gold (gold_source='expected_sql'): got 5 row(s)
+  - generated SQL: `SELECT TOP 5 CustomerKey, SUM(SalesAmount) AS TotalSpending FROM FactInternetSales GROUP BY CustomerKey ORDER BY TotalSpending DESC`
+- **[rw_gender_breakdown]** 'How many male and how many female customers do we have?'
+  - difficulty=real_world category=business_questions status=succeeded
+  - likely failure category: `wrong_result` -- result set didn't match gold (gold_source='expected_sql'): got 1 row(s)
+  - generated SQL: `SELECT TOP 1000 COUNT(CASE WHEN Gender = 'M' THEN 1 END) AS MaleCustomers, COUNT(CASE WHEN Gender = 'F' THEN 1 END) AS FemaleCustomers FROM DimCustomer`
+- **[ambig_bikes_top_territory]** 'Which sales territory had the highest sales for the Bikes category?'
+  - difficulty=real_world category=ambiguous_wording status=succeeded
+  - likely failure category: `wrong_result` -- result set didn't match gold (gold_source='expected_sql'): got 0 row(s)
+  - generated SQL: `SELECT TOP 1 st.SalesTerritoryRegion FROM DimSalesTerritory AS st JOIN DimProductCategory AS pc ON st.SalesTerritoryKey = (SELECT TOP 1 SalesTerritoryKey FROM FactResellerSales WHERE ProductKey = (SELECT ProductKey FROM DimProduct WHERE EnglishProductName = 'Bikes') GROUP BY SalesTerritoryKey ORDER BY SUM(SalesAmount) DESC) JOIN DimProductSubcategory AS psc ON pc.ProductCategoryKey = psc.ProductCategoryKey JOIN DimProduct AS d ON psc.ProductSubcategoryKey = d.ProductSubcategoryKey WHERE d.EnglishProductName = 'Bikes'`
+- **[ambig_best_selling_product]** 'What was our best selling product?'
+  - difficulty=real_world category=ambiguous_wording status=succeeded
+  - likely failure category: `retrieval_miss` -- only 50% of expected tables were retrieved (retrieved=['DimSalesReason', 'FactInternetSales', 'DimReseller', 'FactResellerSales', 'DimCurrency', 'FactInternetSalesReason'])
+  - generated SQL: `SELECT TOP 1 ProductKey FROM FactInternetSales GROUP BY ProductKey ORDER BY SUM(SalesAmount) DESC`
+- **[incomplete_top_products]** 'top products'
+  - difficulty=real_world category=incomplete_questions status=succeeded
+  - likely failure category: `retrieval_miss` -- only 50% of expected tables were retrieved (retrieved=['DimProductCategory', 'DimReseller', 'DimProductSubcategory', 'DimPromotion', 'DimProduct', 'FactResellerSales'])
+  - generated SQL: `SELECT TOP 10 ProductKey, EnglishProductName FROM DimProduct ORDER BY ListPrice DESC`
+- **[incomplete_total_sales]** 'total sales'
+  - difficulty=real_world category=incomplete_questions status=succeeded
+  - likely failure category: `wrong_result` -- result set didn't match gold (gold_source='expected_sql'): got 1 row(s)
+  - generated SQL: `SELECT TOP 1000 SUM(SalesAmount) FROM FactResellerSales`
+- **[followup_2012_sales_then_2013 (turn 1)]** 'What were total internet sales in 2012?'
+  - difficulty=real_world category=follow_up status=succeeded
+  - likely failure category: `retrieval_miss` -- only 50% of expected tables were retrieved (retrieved=['FactResellerSales', 'FactInternetSales', 'FactCurrencyRate', 'NewFactCurrencyRate', 'DimCurrency'])
+  - generated SQL: `SELECT TOP 1000 SUM(SalesAmount) FROM FactInternetSales WHERE OrderDateKey BETWEEN 20120101 AND 20121231`
+- **[followup_2012_sales_then_2013 (turn 2)]** 'What about for 2013 instead?'
+  - difficulty=real_world category=follow_up status=succeeded
+  - likely failure category: `retrieval_miss` -- only 50% of expected tables were retrieved (retrieved=['FactCurrencyRate', 'NewFactCurrencyRate', 'FactInternetSales', 'FactResellerSales', 'DimSalesReason', 'DimCurrency', 'FactInternetSalesReason'])
+  - generated SQL: `SELECT TOP 1000 SUM(SalesAmount) FROM FactInternetSales WHERE OrderDateKey BETWEEN 20130101 AND 20131231`
+- **[followup_top_territories_then_order_counts (turn 1)]** 'Which sales territories have the highest total sales?'
+  - difficulty=real_world category=follow_up status=failed
+  - likely failure category: `generation_failed` -- never reached a successful execution (last outcome='missing_reference')
+  - generated SQL: `SELECT TOP 10 SalesTerritoryRegion FROM DimSalesTerritory GROUP BY SalesTerritoryRegion ORDER BY SUM(SalesAmount) DESC`
+- **[followup_top_territories_then_order_counts (turn 2)]** 'And how many orders came from each?'
+  - difficulty=real_world category=follow_up status=needs_clarification
+  - likely failure category: `unexpected_clarification` -- agent asked for clarification instead of answering
+- **[followup_reseller_sales_by_year_then_category (turn 1)]** 'Show total reseller sales by year'
+  - difficulty=real_world category=follow_up status=succeeded
+  - likely failure category: `retrieval_miss` -- only 50% of expected tables were retrieved (retrieved=['FactResellerSales', 'FactCurrencyRate', 'NewFactCurrencyRate', 'DimReseller', 'DimCurrency'])
+  - generated SQL: `SELECT TOP 1000 SUM(SalesAmount) AS TotalResellerSales, YEAR(OrderDate) AS SalesYear FROM FactResellerSales GROUP BY YEAR(OrderDate)`
+- **[followup_reseller_sales_by_year_then_category (turn 2)]** 'Now split that by product category instead'
+  - difficulty=real_world category=follow_up status=succeeded
+  - likely failure category: `retrieval_miss` -- only 50% of expected tables were retrieved (retrieved=['FactResellerSales', 'DimReseller', 'DimSalesReason', 'FactInternetSales', 'DimPromotion', 'FactInternetSalesReason'])
+  - generated SQL: `SELECT TOP 1000 SUM(SalesAmount) AS TotalResellerSales, YEAR(OrderDate) AS SalesYear, ProductLine FROM FactResellerSales JOIN DimReseller ON FactResellerSales.ResellerKey = DimReseller.ResellerKey GROUP BY YEAR(OrderDate), ProductLine`
+
+
+Saved compact results to D:\Gen_AI_Project_TSQL\eval\results\run_20260901T151533Z.json
+Saved full results (incl. generated SQL/rows) to D:\Gen_AI_Project_TSQL\eval\results\run_20260901T151533Z_full.json
+
+Saved this run as the new baseline: D:\Gen_AI_Project_TSQL\eval\baselines\latest.json

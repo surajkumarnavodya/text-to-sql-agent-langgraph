@@ -106,7 +106,7 @@ def _build_case_run_result(
         turn_index=turn_index,
         final_status=state.get("status", "unknown"),
         retry_count=state.get("retry_count", 0),
-        attempt_history=list(state.get("attempt_history") or []),
+        attempt_history=[dict(a) for a in state.get("attempt_history") or []],
         generated_sql=sql,
         rejection_reason=state.get("rejection_reason"),
         followup_classification=state.get("followup_classification"),
@@ -274,16 +274,16 @@ def run_benchmark(
         if progress_callback:
             progress_callback(unit_index, total_units, run)
 
-    for case in followups:
+    for followup_case in followups:
         unit_index += 1
         logger.info(
             "[benchmark] (%d/%d) %s: %d-turn follow-up sequence",
             unit_index,
             total_units,
-            case.id,
-            len(case.turns),
+            followup_case.id,
+            len(followup_case.turns),
         )
-        turn_results = run_followup_case(case, engine, settings, dialect)
+        turn_results = run_followup_case(followup_case, engine, settings, dialect)
         results.extend(turn_results)
         if progress_callback:
             for turn_result in turn_results:

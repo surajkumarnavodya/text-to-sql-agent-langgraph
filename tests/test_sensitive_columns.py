@@ -7,7 +7,7 @@ from pathlib import Path
 
 from sqlalchemy.engine.default import DefaultDialect
 
-from config.sensitive_columns import is_restricted, load_sensitive_columns
+from config.sensitive_columns import SensitivityTier, is_restricted, load_sensitive_columns
 from db.schema_introspection import ColumnInfo, TableSchemaInfo
 from db.value_sampling import attach_sample_values
 
@@ -71,7 +71,9 @@ class TestLoadSensitiveColumns:
 
 class TestIsRestricted:
     def test_classified_restricted_column_is_restricted(self):
-        classifications = {("DimCustomer", "EmailAddress"): "restricted"}
+        classifications: dict[tuple[str, str], SensitivityTier] = {
+            ("DimCustomer", "EmailAddress"): "restricted"
+        }
         assert is_restricted("DimCustomer", "EmailAddress", classifications) is True
 
     def test_unclassified_column_defaults_to_not_restricted(self):
@@ -81,7 +83,9 @@ class TestIsRestricted:
         """ "internal" is a real, distinct tier -- it must not be treated the
         same as "restricted" by this check (see docs/GOVERNANCE.md's tier
         definitions)."""
-        classifications = {("DimReseller", "BusinessName"): "internal"}
+        classifications: dict[tuple[str, str], SensitivityTier] = {
+            ("DimReseller", "BusinessName"): "internal"
+        }
         assert is_restricted("DimReseller", "BusinessName", classifications) is False
 
 
@@ -132,7 +136,9 @@ class TestAttachSampleValuesRespectsRestriction:
             ddl="CREATE TABLE DimCustomer (\n    MaritalStatus VARCHAR(1)\n);",
         )
         engine = _StubEngine([("M",), ("S",)])
-        classifications = {("DimCustomer", "MaritalStatus"): "restricted"}
+        classifications: dict[tuple[str, str], SensitivityTier] = {
+            ("DimCustomer", "MaritalStatus"): "restricted"
+        }
 
         result = attach_sample_values(engine, [table], sensitive_columns=classifications)
 

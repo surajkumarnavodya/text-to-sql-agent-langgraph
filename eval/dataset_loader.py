@@ -176,14 +176,14 @@ def load_benchmark(directory: Path | None = None) -> BenchmarkDataset:
             seen_ids[case.id] = path
             standalone.append(case)
         for raw_case in raw.get("followup_cases") or []:
-            case = _parse_followup_case(raw_case, path)
-            if case.id in seen_ids:
+            followup_case = _parse_followup_case(raw_case, path)
+            if followup_case.id in seen_ids:
                 raise DatasetValidationError(
-                    f"Duplicate case id {case.id!r} in {path.name} "
-                    f"(first seen in {seen_ids[case.id].name})"
+                    f"Duplicate case id {followup_case.id!r} in {path.name} "
+                    f"(first seen in {seen_ids[followup_case.id].name})"
                 )
-            seen_ids[case.id] = path
-            followups.append(case)
+            seen_ids[followup_case.id] = path
+            followups.append(followup_case)
 
     logger.info(
         "[dataset_loader] loaded %d standalone case(s) and %d follow-up sequence(s) "

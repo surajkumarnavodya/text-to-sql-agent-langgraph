@@ -44,6 +44,28 @@ logger = logging.getLogger("security.audit")
 # stays unset and `log_security_event` omits the field, exactly as before.
 _correlation_id: ContextVar[str | None] = ContextVar("correlation_id", default=None)
 
+
+def set_correlation_id(value: str | None) -> Token[str | None]:
+    """Binds `value` as the current context's correlation ID.
+
+    Returns the `Token` needed to restore the previous value via
+    `reset_correlation_id` -- callers (in practice, just `api/middleware.py`)
+    must reset in a `finally` block so the ID doesn't leak into whatever
+    reuses this thread/task next (e.g. a worker thread pool).
+    """
+    return _correlation_id.set(value)
+
+
+def reset_correlation_id(token: Token[str | None]) -> None:
+    """Restores the correlation ID to what it was before `set_correlation_id`."""
+    _correlation_id.reset(token)
+
+
+def get_correlation_id() -> str | None:
+    """Returns the current request's correlation ID, or None outside a request."""
+    return _correlation_id.get()
+
+
 Severity = Literal["info", "warning", "critical"]
 
 _LEVEL_MAP: dict[Severity, int] = {
@@ -97,6 +119,9 @@ def log_security_event(
             for key, value in context.items()
         )
         message = f"event={event_type} severity={severity} detail={detail!r}"
+        correlation_id = _correlation_id.get()
+        if correlation_id is not None:
+            message = f"{message} correlation_id={correlation_id}"
         if rendered_context:
             message = f"{message} {rendered_context}"
         logger.log(_LEVEL_MAP[severity], message)

@@ -469,7 +469,10 @@ class TestValidateSqlNode:
 class TestEstimateQueryCostNode:
     def _state(self, **overrides) -> AgentState:
         state: AgentState = {"sql": "SELECT * FROM FactInternetSales", "retry_count": 0}
-        state.update(overrides)
+        # AgentState.update() wants another AgentState-shaped mapping, not an
+        # arbitrary dict -- too strict for this helper's intentional "merge
+        # in whatever partial overrides this test needs" contract.
+        state.update(overrides)  # type: ignore[typeddict-item]
         return state
 
     def test_low_severity_proceeds_silently(self, monkeypatch):
@@ -641,7 +644,8 @@ class TestGenerateInsightNode:
             "result_rows": [("Australia", 2300000.0), ("Southwest", 1100000.0)],
             "retry_count": 0,
         }
-        state.update(overrides)
+        # See TestEstimateQueryCostNode._state's comment above.
+        state.update(overrides)  # type: ignore[typeddict-item]
         return state
 
     def test_disabled_via_toggle_skips_llm_call(self, monkeypatch):

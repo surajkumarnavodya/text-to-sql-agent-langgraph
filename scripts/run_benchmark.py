@@ -25,6 +25,7 @@ coverage was dropped.
 from __future__ import annotations
 
 import argparse
+import io
 import sys
 from datetime import UTC, datetime
 from pathlib import Path
@@ -39,8 +40,15 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 # log file for a long background run) -- without this, printing such a
 # question crashes the entire run with an UnicodeEncodeError partway
 # through, rather than completing and reporting real results.
-sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+# `.reconfigure()` is only declared on the concrete `TextIOWrapper` (not the
+# `TextIO` protocol `sys.stdout` is typed as), and isn't guaranteed to exist
+# if stdout/stderr have been replaced by something else (e.g. under a test
+# runner's capture) -- guarded rather than assumed, consistent with this
+# project's general fail-open-on-non-critical-path approach.
+if isinstance(sys.stdout, io.TextIOWrapper):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if isinstance(sys.stderr, io.TextIOWrapper):
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 from config.settings import configure_logging, get_settings  # noqa: E402
 from eval.dataset_loader import load_benchmark  # noqa: E402

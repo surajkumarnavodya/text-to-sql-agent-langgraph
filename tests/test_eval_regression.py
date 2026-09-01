@@ -2,14 +2,19 @@
 
 from __future__ import annotations
 
+import dataclasses
+
 from eval.metrics import build_report
 from eval.regression import detect_regression
 from eval.reporting import report_to_dict
 from eval.schema import CaseRunResult
 
 
-def _case(case_id: str, overall_pass: bool, **overrides) -> CaseRunResult:
-    defaults = dict(
+def _case(case_id: str, overall_pass: bool, **overrides: object) -> CaseRunResult:
+    """See `tests/test_connection.py::_settings` for why `dataclasses.replace`
+    is used here instead of spreading a dict into `CaseRunResult(**...)`
+    directly."""
+    base = CaseRunResult(
         case_id=case_id,
         question="q",
         difficulty="easy",
@@ -17,8 +22,7 @@ def _case(case_id: str, overall_pass: bool, **overrides) -> CaseRunResult:
         security_classification="benign",
         final_status="succeeded" if overall_pass else "failed",
     )
-    defaults.update(overrides)
-    run = CaseRunResult(**defaults)
+    run = dataclasses.replace(base, **overrides)  # type: ignore[arg-type]
     run.overall_pass = overall_pass
     return run
 

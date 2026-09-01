@@ -4,6 +4,8 @@ offline (a fake SQLAlchemy engine stands in for the live database used by
 
 from __future__ import annotations
 
+import dataclasses
+
 from eval.evaluators import (
     classify_failure,
     compare_result_sets,
@@ -18,23 +20,27 @@ from eval.evaluators import (
 )
 from eval.schema import BenchmarkCase, CaseRunResult
 
+_BASE_CASE = BenchmarkCase(
+    id="c1", question="q", database="d", difficulty="easy", category="aggregation"
+)
+_BASE_RUN = CaseRunResult(
+    case_id="c1",
+    question="q",
+    difficulty="easy",
+    category="aggregation",
+    security_classification="benign",
+)
 
-def _case(**overrides) -> BenchmarkCase:
-    defaults = dict(id="c1", question="q", database="d", difficulty="easy", category="aggregation")
-    defaults.update(overrides)
-    return BenchmarkCase(**defaults)
+
+def _case(**overrides: object) -> BenchmarkCase:
+    """See `tests/test_connection.py::_settings` for why `dataclasses.replace`
+    is used here instead of spreading a dict into `BenchmarkCase(**...)`
+    directly."""
+    return dataclasses.replace(_BASE_CASE, **overrides)  # type: ignore[arg-type]
 
 
-def _run(**overrides) -> CaseRunResult:
-    defaults = dict(
-        case_id="c1",
-        question="q",
-        difficulty="easy",
-        category="aggregation",
-        security_classification="benign",
-    )
-    defaults.update(overrides)
-    return CaseRunResult(**defaults)
+def _run(**overrides: object) -> CaseRunResult:
+    return dataclasses.replace(_BASE_RUN, **overrides)  # type: ignore[arg-type]
 
 
 class _FakeCursorResult:
@@ -217,6 +223,8 @@ class TestComputeComplexityScore:
         complex_ = compute_complexity_score(
             "WITH x AS (SELECT 1 a) SELECT RANK() OVER (ORDER BY a) FROM x", None
         )
+        assert simple is not None
+        assert complex_ is not None
         assert complex_ > simple
 
 

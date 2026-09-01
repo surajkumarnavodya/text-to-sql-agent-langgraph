@@ -8,47 +8,52 @@ drivers/failure modes.
 
 from __future__ import annotations
 
+import dataclasses
 from pathlib import Path
 
 from config.settings import Settings
 from security.redaction import redact_secrets
+from security.secrets import SecretStr
+
+_BASE_SETTINGS = Settings(
+    ollama_host="http://localhost:11434",
+    ollama_model="llama3.1:8b",
+    ollama_request_timeout_seconds=60,
+    db_type="postgresql",
+    db_host="db.example.com",
+    db_port=5432,
+    db_name="mydb",
+    db_user="reader",
+    db_password=SecretStr("S3cr3t!"),
+    db_connection_string=None,
+    db_schema=None,
+    db_odbc_driver="x",
+    chroma_persist_dir=Path("/tmp/chroma"),
+    chroma_collection_name="x",
+    embedding_model_name="x",
+    schema_top_k=4,
+    max_retries=3,
+    max_result_rows=1000,
+    query_timeout_seconds=15,
+    llm_max_tokens=1024,
+    insight_max_tokens=120,
+    max_question_length=500,
+    question_rate_limit_per_minute=10,
+    llm_call_rate_limit_per_minute=20,
+    cost_estimation_enabled=True,
+    cost_estimation_timeout_seconds=3,
+    cost_moderate_row_threshold=50_000,
+    cost_high_row_threshold=1_000_000,
+    log_level="INFO",
+    log_redaction_level="standard",
+)
 
 
-def _settings(**overrides) -> Settings:
-    defaults = dict(
-        ollama_host="http://localhost:11434",
-        ollama_model="llama3.1:8b",
-        ollama_request_timeout_seconds=60,
-        db_type="postgresql",
-        db_host="db.example.com",
-        db_port=5432,
-        db_name="mydb",
-        db_user="reader",
-        db_password="S3cr3t!",
-        db_connection_string=None,
-        db_schema=None,
-        db_odbc_driver="x",
-        chroma_persist_dir=Path("/tmp/chroma"),
-        chroma_collection_name="x",
-        embedding_model_name="x",
-        schema_top_k=4,
-        max_retries=3,
-        max_result_rows=1000,
-        query_timeout_seconds=15,
-        llm_max_tokens=1024,
-        insight_max_tokens=120,
-        max_question_length=500,
-        question_rate_limit_per_minute=10,
-        llm_call_rate_limit_per_minute=20,
-        cost_estimation_enabled=True,
-        cost_estimation_timeout_seconds=3,
-        cost_moderate_row_threshold=50_000,
-        cost_high_row_threshold=1_000_000,
-        log_level="INFO",
-        log_redaction_level="standard",
-    )
-    defaults.update(overrides)
-    return Settings(**defaults)
+def _settings(**overrides: object) -> Settings:
+    """A `_BASE_SETTINGS` copy with `overrides` applied -- see
+    `tests/test_connection.py::_settings` for why `dataclasses.replace` is
+    used here instead of spreading a dict into `Settings(**...)` directly."""
+    return dataclasses.replace(_BASE_SETTINGS, **overrides)  # type: ignore[arg-type]
 
 
 class TestRedactSecrets:

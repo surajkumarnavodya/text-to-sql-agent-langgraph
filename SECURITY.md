@@ -127,6 +127,18 @@ that pass, not a separate "what's new" list bolted on top.
   ever runs. An estimate far outside normal bounds is treated as a
   retryable mistake (same budget as a syntax error) instead of being
   run and only caught by the existing timeout after the fact.
+- The optional AI-generated insight sentence (`agent/insight.py`, shown
+  after a successful query if enabled) is checked for **output-side
+  groundedness** before it's ever shown, not just trusted because it's
+  short: `agent.insight.is_insight_grounded` requires every number in the
+  generated sentence to trace back to the actual result data (a derived
+  stat like a sum/min/max/top-value share, or a literal already present in
+  the question/SQL) within a small rounding tolerance. A sentence that
+  fails this check is dropped and never reaches the UI — a real, tested
+  hallucination guard (`tests/test_insight.py`), not a prompt instruction
+  alone. This is a narrower claim than "prompt injection is prevented" or
+  "the LLM cannot hallucinate" — it only covers this one specific,
+  numbers-only output surface, checked mechanically after generation.
 
 ## What is explicitly **not** guaranteed
 
@@ -322,6 +334,18 @@ enforced" above; none of this replaces those).
   "normal" looks like for your actual schema and data can be tuned from
   real numbers over time rather than guessed once and left alone.
 
+## The REST API (`api/`) shares this posture, not a separate one
+
+`api/main.py`'s `POST /ask` calls the same `agent.graph.run_agent` the UI
+calls — every control described above (validator, rate limits, row cap,
+timeout, sensitive-column blocking) applies identically, there is no
+parallel, weaker code path. The API adds exactly one new control, an
+optional shared-bearer-token check (`API_AUTH_TOKEN`) — explicitly **not**
+real per-user authentication; see `docs/API.md`'s "Auth" section and
+`docs/RISK_REGISTER.md`'s R-001. Anything reachable beyond a trusted local
+network, UI or API, needs a real authenticating reverse proxy in front of
+it — see `docs/DEPLOYMENT.md`.
+
 ## Bottom line
 
 **Do not point this at a production database, or a database containing
@@ -330,6 +354,15 @@ your own risk assessment first.** For local exploration, portfolio
 demos, or a sandboxed/synthetic dataset, the read-only validator plus a
 genuinely-read-only DB account is a reasonable posture. For anything more
 sensitive, treat this as a starting point, not a finished answer.
+
+See also: [`docs/GOVERNANCE.md`](docs/GOVERNANCE.md) (ownership, change
+control), [`docs/COMPLIANCE.md`](docs/COMPLIANCE.md) (OWASP/NIST AI RMF/
+ISO 42001/EU AI Act self-assessment), [`docs/RESPONSIBLE_AI.md`](docs/RESPONSIBLE_AI.md)
+(design choices through a responsible-AI lens), and
+[`docs/RISK_REGISTER.md`](docs/RISK_REGISTER.md) (every open risk named in
+this document, tracked with severity and a review date) — together these
+five documents describe this project's full risk posture, each linking
+back to the others.
 
 ## Reporting a vulnerability
 

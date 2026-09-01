@@ -3,25 +3,31 @@
 
 from __future__ import annotations
 
+import dataclasses
+
 from eval.metrics import build_report, compute_breakdown, compute_metrics
 from eval.schema import CaseRunResult
 
+_BASE_CASE = CaseRunResult(
+    case_id="c1",
+    question="q",
+    difficulty="easy",
+    category="aggregation",
+    security_classification="benign",
+    final_status="succeeded",
+    row_count=1,
+    retry_count=0,
+    llm_call_count=1,
+    wall_time_seconds=10.0,
+)
 
-def _passing_case(**overrides) -> CaseRunResult:
-    defaults = dict(
-        case_id="c1",
-        question="q",
-        difficulty="easy",
-        category="aggregation",
-        security_classification="benign",
-        final_status="succeeded",
-        row_count=1,
-        retry_count=0,
-        llm_call_count=1,
-        wall_time_seconds=10.0,
-    )
-    defaults.update(overrides)
-    run = CaseRunResult(**defaults)
+
+def _passing_case(**overrides: object) -> CaseRunResult:
+    """A `_BASE_CASE` copy with `overrides` applied -- see
+    `tests/test_connection.py::_settings` for why `dataclasses.replace` is
+    used here instead of spreading a dict into `CaseRunResult(**...)`
+    directly."""
+    run = dataclasses.replace(_BASE_CASE, **overrides)  # type: ignore[arg-type]
     run.overall_pass = True
     run.result_set_correct = True
     return run
