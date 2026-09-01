@@ -15,6 +15,7 @@ owned by `db/schema_introspection.py`, not this module.)
 
 from __future__ import annotations
 
+from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
@@ -71,3 +72,141 @@ class TestRetrieveRelevantSchema:
 
         with pytest.raises(SchemaRetrievalError):
             retrieve_relevant_schema("any question", settings=self._mock_settings())
+
+
+class TestKeywordMatchExpansion:
+    """Regression coverage for a real, reproduced failure: DimProduct ranked
+    outside the top 15 of 31 tables (pure vector similarity) for a question
+    containing the word "product," because its embedded DDL is dominated by
+    nine language-variant description columns -- causing the agent to
+    invent wrong column names for a table it was never shown. See
+    `embeddings/retriever.py::_expand_with_keyword_matches`.
+    """
+
+    def _mock_settings(self, schema_top_k=2):
+        settings = MagicMock()
+        settings.schema_top_k = schema_top_k
+        return settings
+
+    def _mock_collection(self, top_k_result, all_metadatas, documents_by_id):
+        collection = MagicMock()
+        collection.count.return_value = len(all_metadatas)
+        collection.query.return_value = top_k_result
+
+        def _get(ids=None, include=None):
+            if ids is not None:
+                return {
+                    "ids": ids,
+                    "documents": [documents_by_id[i] for i in ids],
+                }
+            return {"metadatas": all_metadatas}
+
+        collection.get.side_effect = _get
+        return collection
+
+    def test_table_matching_a_distinctive_keyword_is_added(self, monkeypatch):
+        # Vector similarity only returns FactInternetSales -- DimProduct
+        # never makes it into the top_k despite "product" being a literal
+        # substring of its name.
+        top_k_result = {
+            "documents": [["CREATE TABLE FactInternetSales (...)"]],
+            "metadatas": [[{"table_name": "FactInternetSales", "fk_targets": ""}]],
+            "distances": [[0.2]],
+        }
+        all_metadatas = [
+            {"table_name": "FactInternetSales", "fk_targets": ""},
+            {"table_name": "DimProduct", "fk_targets": ""},
+            {"table_name": "DimCurrency", "fk_targets": ""},
+        ]
+        documents_by_id = {"DimProduct": "CREATE TABLE DimProduct (...)"}
+        mock_collection = self._mock_collection(top_k_result, all_metadatas, documents_by_id)
+        monkeypatch.setattr("embeddings.retriever.get_chroma_client", lambda settings: MagicMock())
+        monkeypatch.setattr(
+            "embeddings.retriever.get_collection", lambda client, settings: mock_collection
+        )
+
+        tables = retrieve_relevant_schema(
+            "Show total sales by year and product name.", settings=self._mock_settings()
+        )
+
+        names = [t["table_name"] for t in tables]
+        assert "DimProduct" in names
+        assert "DimCurrency" not in names  # no keyword match, no vector match -- must not appear
+
+    def test_no_keyword_match_leaves_result_unchanged(self, monkeypatch):
+        top_k_result = {
+            "documents": [["CREATE TABLE FactInternetSales (...)"]],
+            "metadatas": [[{"table_name": "FactInternetSales", "fk_targets": ""}]],
+            "distances": [[0.2]],
+        }
+        all_metadatas = [
+            {"table_name": "FactInternetSales", "fk_targets": ""},
+            {"table_name": "DimProduct", "fk_targets": ""},
+        ]
+        mock_collection = self._mock_collection(top_k_result, all_metadatas, {})
+        monkeypatch.setattr("embeddings.retriever.get_chroma_client", lambda settings: MagicMock())
+        monkeypatch.setattr(
+            "embeddings.retriever.get_collection", lambda client, settings: mock_collection
+        )
+
+        tables = retrieve_relevant_schema(
+            "What is the average order value?", settings=self._mock_settings()
+        )
+
+        assert [t["table_name"] for t in tables] == ["FactInternetSales"]
+
+    def test_matches_are_capped_at_the_budget(self, monkeypatch):
+        top_k_result: dict[str, list[list[Any]]] = {
+            "documents": [[]],
+            "metadatas": [[]],
+            "distances": [[]],
+        }
+        # Five tables all contain "product" -- only _MAX_KEYWORD_MATCHES (3)
+        # should be added, picked deterministically (alphabetical).
+        table_names = [
+            "DimProduct",
+            "DimProductCategory",
+            "DimProductSubcategory",
+            "FactProductInventory",
+            "FactAdditionalInternationalProductDescription",
+        ]
+        all_metadatas = [{"table_name": name, "fk_targets": ""} for name in table_names]
+        documents_by_id = {name: f"CREATE TABLE {name} (...)" for name in table_names}
+        mock_collection = self._mock_collection(top_k_result, all_metadatas, documents_by_id)
+        monkeypatch.setattr("embeddings.retriever.get_chroma_client", lambda settings: MagicMock())
+        monkeypatch.setattr(
+            "embeddings.retriever.get_collection", lambda client, settings: mock_collection
+        )
+
+        tables = retrieve_relevant_schema("product name", settings=self._mock_settings())
+
+        assert len(tables) == 3
+        assert [t["table_name"] for t in tables] == [
+            "DimProduct",
+            "DimProductCategory",
+            "DimProductSubcategory",
+        ]
+
+    def test_short_and_stopword_terms_never_trigger_a_match(self, monkeypatch):
+        top_k_result: dict[str, list[list[Any]]] = {
+            "documents": [[]],
+            "metadatas": [[]],
+            "distances": [[]],
+        }
+        all_metadatas = [
+            {"table_name": "FactSales", "fk_targets": ""},
+            {"table_name": "DimDate", "fk_targets": ""},
+        ]
+        mock_collection = self._mock_collection(top_k_result, all_metadatas, {})
+        monkeypatch.setattr("embeddings.retriever.get_chroma_client", lambda settings: MagicMock())
+        monkeypatch.setattr(
+            "embeddings.retriever.get_collection", lambda client, settings: mock_collection
+        )
+
+        # "sales", "date", "total" are all stopwords for this fallback
+        # (vector similarity already handles these broad terms well).
+        tables = retrieve_relevant_schema(
+            "What was the total sales by date?", settings=self._mock_settings()
+        )
+
+        assert tables == []

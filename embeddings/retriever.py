@@ -26,11 +26,26 @@ DimProduct and the fact table missing at once -- which a single-hop
 "adjacent to 2+ selected tables" heuristic can't bootstrap into, since
 neither missing table has 2 selected neighbors until the other is already
 present.
+
+Keyword-match fallback (`_expand_with_keyword_matches`, runs before the
+FK-bridge step): FK-bridging only helps when a needed table is a
+*structural gap* between tables that already were retrieved -- it does
+nothing if the needed table simply never made it into the retrieved set at
+all and isn't required to connect anything else. A table whose *embedded*
+DDL is dominated by long, low-signal columns (free-text descriptions in
+several languages, binary blobs, coded fields) can rank far outside top_k
+even when its own table name is a direct, obvious match for the question
+-- observed concretely with `DimProduct` ranking outside the top 15 of 31
+tables for a question containing the word "product." A cheap, bounded,
+deterministic substring match of distinctive question words against table
+*names* (not columns, not DDL content) catches this specific class of miss
+without turning into a second, redundant retrieval strategy.
 """
 
 from __future__ import annotations
 
 import logging
+import re
 from collections import deque
 from typing import Any
 
@@ -58,6 +73,132 @@ _MAX_BRIDGE_TABLES = 5
 # force-bridged -- without this, two coincidentally-retrieved but unrelated
 # tables could drag in a long, irrelevant chain of connector tables.
 _MAX_BRIDGE_PATH_HOPS = 3
+
+# Keyword-match fallback is bounded the same way the FK-bridge budget is
+# (see _MAX_BRIDGE_TABLES) -- a schema with many similarly-named tables
+# (DimProduct, DimProductCategory, DimProductSubcategory, ...) must not
+# have all of them dragged in just because one word matched.
+_MAX_KEYWORD_MATCHES = 3
+
+# A word shorter than this is too generic to safely substring-match a table
+# name on its own (e.g. "id", "key", "by").
+_MIN_KEYWORD_LENGTH = 4
+
+# Common question words, and terms generic enough that pure vector
+# similarity already handles them well (broad concepts like "sales" or
+# "date" match many tables' embeddings directly), excluded so the fallback
+# only fires for genuinely distinctive terms it's actually needed for.
+_KEYWORD_STOPWORDS = frozenset(
+    {
+        "show",
+        "list",
+        "find",
+        "give",
+        "many",
+        "much",
+        "what",
+        "which",
+        "when",
+        "where",
+        "were",
+        "have",
+        "does",
+        "with",
+        "that",
+        "this",
+        "from",
+        "total",
+        "totals",
+        "table",
+        "tables",
+        "data",
+        "value",
+        "values",
+        "count",
+        "counts",
+        "number",
+        "amount",
+        "amounts",
+        "sales",
+        "date",
+        "dates",
+        "year",
+        "years",
+    }
+)
+
+_WORD_RE = re.compile(r"[a-zA-Z]+")
+
+
+def _extract_keywords(question: str) -> set[str]:
+    """Distinctive, lowercased words from `question` worth substring-matching
+    against table names -- see `_expand_with_keyword_matches`."""
+    words = _WORD_RE.findall(question.lower())
+    return {w for w in words if len(w) >= _MIN_KEYWORD_LENGTH and w not in _KEYWORD_STOPWORDS}
+
+
+def _expand_with_keyword_matches(
+    selected: list[TableSchema], question: str, collection: Collection
+) -> list[TableSchema]:
+    """Adds tables whose own name plainly contains a distinctive question word.
+
+    A cheap, deterministic fallback underneath pure vector similarity. A
+    table's *embedded* DDL can be dominated by long, semantically-noisy
+    columns (free-text descriptions in several languages, binary blobs,
+    coded measurement fields) that dilute its embedding far more than its
+    short, on-topic table name alone would suggest -- concretely observed:
+    `DimProduct` (whose DDL includes nine language-variant description
+    columns plus size/weight/measurement-code fields) ranked outside the
+    top 15 of 31 tables for a question containing the word "product",
+    despite "product" being a literal substring of the table's own name.
+    That caused the agent to invent plausible-but-wrong column names for a
+    table it was never actually shown, rather than admit it didn't know.
+
+    Table-name-only (not column names) and budget-capped (see
+    `_MAX_KEYWORD_MATCHES`), to stay precise -- this is a narrow, deliberate
+    fallback for the specific failure mode above, not a second retrieval
+    strategy. Runs before FK-bridge expansion so a structural gap introduced
+    by a keyword match (e.g. matching a dimension but not the fact table
+    that joins it) can still be closed afterward.
+    """
+    keywords = _extract_keywords(question)
+    if not keywords:
+        return selected
+
+    selected_names = {t["table_name"] for t in selected}
+    try:
+        # Untyped as `Any`, matching `_build_fk_adjacency`'s own treatment of
+        # this same Chroma metadata elsewhere in this module -- Chroma's
+        # `Metadata` value type is a broad union (str/int/float/bool/...) at
+        # the stub level, but this app only ever writes `table_name` as a
+        # plain str (`schema_indexer.py`), so treating it as one here is a
+        # deliberate, established simplification, not a real type hazard.
+        all_metadatas: list[Any] = collection.get(include=["metadatas"]).get("metadatas") or []
+    except Exception as exc:  # noqa: BLE001 - best-effort enrichment, never fatal
+        logger.warning("Keyword-match expansion skipped (could not read metadata): %s", exc)
+        return selected
+
+    candidates = sorted(
+        {
+            meta["table_name"]
+            for meta in all_metadatas
+            if meta.get("table_name")
+            and meta["table_name"] not in selected_names
+            and any(keyword in meta["table_name"].lower() for keyword in keywords)
+        }
+    )
+    added = candidates[:_MAX_KEYWORD_MATCHES]
+    if not added:
+        return selected
+
+    logger.info("[retrieve_schema] Keyword-match expansion added: %s", added)
+    fetched = collection.get(ids=added, include=["documents"])
+    fetched_documents = fetched.get("documents") or []
+    keyword_tables = [
+        TableSchema(table_name=table_name, ddl=document, similarity_score=0.0)
+        for table_name, document in zip(fetched["ids"], fetched_documents, strict=True)
+    ]
+    return selected + keyword_tables
 
 
 def _build_fk_adjacency(all_metadatas: list[Any]) -> dict[str, set[str]]:
@@ -231,6 +372,7 @@ def retrieve_relevant_schema(
         table_name = raw_table_name if isinstance(raw_table_name, str) else "unknown"
         tables.append(TableSchema(table_name=table_name, ddl=doc, similarity_score=similarity))
 
+    tables = _expand_with_keyword_matches(tables, question, collection)
     tables = _expand_with_fk_bridges(tables, collection)
 
     logger.debug(
