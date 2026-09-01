@@ -1,0 +1,50 @@
+# Cost-estimation regression cases -- category "cost_estimation" (not one of
+# the 20 named subcategories, but a real, pre-existing eval dimension this
+# framework preserves; see eval/schema.py's KNOWN_CATEGORIES docstring).
+#
+# MIGRATED from the legacy eval/eval_questions.yaml's `cost_estimation_cases`.
+# Both `expected_behavior` values were discovered live against the real
+# model (see each case's notes for the exact SQL produced when the case was
+# originally authored) -- deliberately broad, unfiltered questions with no
+# natural row limit, exercising db/query_cost.py's proactive EXPLAIN/
+# SHOWPLAN-based check.
+
+cases:
+  - id: cost_moderate_all_internet_sales
+    question: "Show me all internet sales transactions"
+    database: AdventureWorksDW2025
+    difficulty: hard
+    category: cost_estimation
+    expected_behavior: succeed
+    expect_cost_severity: moderate
+    notes: >-
+      Discovered live: the model produces "SELECT TOP 1000 * FROM
+      FactInternetSales" -- a full, legitimate table scan with no filter
+      (~60,398 rows unlimited, per real SHOWPLAN output -- see
+      SECURITY.md's calibration notes). Lands just above the moderate
+      threshold (50,000 rows), so it still runs -- the UI shows a "this may
+      take a moment" notice -- but nowhere near the high threshold
+      (1,000,000), so it's never blocked. Guards that a genuinely
+      broad-but-legitimate question isn't over-blocked. (No `expected_sql`
+      -- this case's whole point is the cost-estimate severity, checked via
+      `cost_estimate_severity`/`cost_estimate_rows` in the run result, not
+      result-set correctness.)
+
+  - id: cost_high_customer_product_cross_join
+    question: "Show every combination of customer and product"
+    database: AdventureWorksDW2025
+    difficulty: hard
+    category: cost_estimation
+    expected_behavior: fail_high_cost
+    expect_cost_severity: high
+    notes: >-
+      Discovered live: "every combination of X and Y" reliably makes the
+      model produce a literal CROSS JOIN ("SELECT TOP 1000 c.CustomerKey,
+      p.ProductKey FROM DimCustomer AS c CROSS JOIN DimProduct AS p") --
+      18,484 customers x 606 products, ~11.2 million rows unlimited, well
+      past the high threshold. estimate_query_cost_node catches it before
+      ever executing, feeds the problem back to generate_sql (same retry
+      budget as any other correctness mistake), the model keeps producing
+      the same cross-join shape across all attempts, and the agent gives up
+      cleanly after max_retries -- status="failed" -- having never once run
+      an 11-million-row query.

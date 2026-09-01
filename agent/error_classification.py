@@ -72,7 +72,7 @@ def classify_execution_error(exc: BaseException) -> ExecutionErrorCategory:
     """Best-effort classification of an execution failure.
 
     Args:
-        exc: The exception raised by `agent.nodes.execute_readonly_sql`
+        exc: The exception raised by `db.execution.execute_readonly_sql`
             (a `sqlalchemy.exc.SQLAlchemyError` or a `TimeoutError`).
 
     Returns:

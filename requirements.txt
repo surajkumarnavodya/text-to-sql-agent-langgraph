@@ -30,6 +30,13 @@ streamlit==1.41.1
 plotly==5.24.1
 pandas==2.2.3
 
+# REST API layer (api/) -- pydantic and uvicorn were already present as
+# transitive deps of langgraph/chromadb; fastapi (and its one real new
+# transitive dep, starlette) is the only genuinely new addition. httpx
+# (already present, transitive) powers fastapi.testclient.TestClient, used
+# by tests/test_api_*.py -- no separate test-only HTTP client needed.
+fastapi==0.141.1
+
 # Config
 python-dotenv==1.0.1
 pyyaml==6.0.3   # config/table_descriptions.py -- was only a transitive dep before

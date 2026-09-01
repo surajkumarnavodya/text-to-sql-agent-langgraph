@@ -20,9 +20,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from config.settings import ConfigurationError, configure_logging, get_settings  # noqa: E402
 from db.connection import get_read_only_engine, test_connection  # noqa: E402
-from db.schema_introspection import introspect_schema  # noqa: E402
-from db.value_sampling import attach_sample_values  # noqa: E402
-from embeddings.schema_indexer import build_index  # noqa: E402
+from embeddings.schema_indexer import refresh_schema_index  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
@@ -50,12 +48,8 @@ def main() -> None:
         logger.error("Cannot build embeddings -- database connection failed: %s", check.message)
         sys.exit(1)
 
-    tables = introspect_schema(engine, schema=settings.db_schema)
-    sampled_tables = attach_sample_values(engine, tables)
-    count = build_index(
-        sampled_tables, settings=settings, force=args.force, fingerprint_tables=tables
-    )
-    logger.info("Schema index ready: %d table(s) available for retrieval.", count)
+    sampled_tables = refresh_schema_index(engine, settings=settings, force=args.force)
+    logger.info("Schema index ready: %d table(s) available for retrieval.", len(sampled_tables))
 
 
 if __name__ == "__main__":

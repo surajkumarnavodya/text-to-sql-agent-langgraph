@@ -1,0 +1,149 @@
+# Hard-tier benchmark cases: nested_queries, ctes, window_functions,
+# complex_joins, conditional_aggregation, null_handling. See easy.yaml's
+# header for the gold-SQL verification note.
+#
+# These are expected to have a materially lower pass rate than easy/medium
+# on a local 8B model -- that's the point of including them (see the
+# benchmark report's per-difficulty breakdown and failure analysis).
+
+cases:
+  - id: hard_nested_above_avg_price
+    question: "Which products have a list price higher than the average list price of all products?"
+    database: AdventureWorksDW2025
+    difficulty: hard
+    category: nested_queries
+    expected_tables: [DimProduct]
+    expected_columns: [EnglishProductName, ListPrice]
+    expected_sql: "SELECT EnglishProductName FROM DimProduct WHERE ListPrice > (SELECT AVG(ListPrice) FROM DimProduct)"
+    notes: "A scalar subquery in the WHERE clause -- the simplest nested-query shape."
+
+  - id: hard_nested_never_sold_products
+    question: "Which products have never been sold through internet sales?"
+    database: AdventureWorksDW2025
+    difficulty: hard
+    category: nested_queries
+    expected_tables: [DimProduct, FactInternetSales]
+    expected_columns: [EnglishProductName]
+    expected_sql: >-
+      SELECT EnglishProductName FROM DimProduct
+      WHERE ProductKey NOT IN (SELECT DISTINCT ProductKey FROM FactInternetSales WHERE ProductKey IS NOT NULL)
+    alternative_sql:
+      - >-
+        SELECT p.EnglishProductName FROM DimProduct p
+        LEFT JOIN FactInternetSales f ON p.ProductKey = f.ProductKey
+        WHERE f.ProductKey IS NULL
+    notes: >-
+      NOT IN / anti-join shape -- `alternative_sql` accepts the equally
+      correct LEFT JOIN ... IS NULL rewrite, since both are legitimate ways
+      to answer "never sold" and this benchmark grades the *answer*, not
+      the specific SQL shape (see the module-level "don't optimize for SQL
+      string similarity" instruction this whole framework is built around).
+
+  - id: hard_cte_top_category
+    question: "Using total sales per product category, which category has the single highest total?"
+    database: AdventureWorksDW2025
+    difficulty: hard
+    category: ctes
+    expected_tables: [FactInternetSales, DimProduct, DimProductSubcategory, DimProductCategory]
+    expected_columns: [EnglishProductCategoryName, SalesAmount]
+    expected_sql: >-
+      WITH cat_totals AS (
+        SELECT pc.EnglishProductCategoryName AS cat, SUM(f.SalesAmount) AS total FROM FactInternetSales f
+        JOIN DimProduct p ON f.ProductKey = p.ProductKey
+        JOIN DimProductSubcategory ps ON p.ProductSubcategoryKey = ps.ProductSubcategoryKey
+        JOIN DimProductCategory pc ON ps.ProductCategoryKey = pc.ProductCategoryKey
+        GROUP BY pc.EnglishProductCategoryName)
+      SELECT TOP 1 cat, total FROM cat_totals ORDER BY total DESC
+    alternative_sql:
+      - >-
+        SELECT TOP 1 pc.EnglishProductCategoryName, SUM(f.SalesAmount) AS total FROM FactInternetSales f
+        JOIN DimProduct p ON f.ProductKey = p.ProductKey
+        JOIN DimProductSubcategory ps ON p.ProductSubcategoryKey = ps.ProductSubcategoryKey
+        JOIN DimProductCategory pc ON ps.ProductCategoryKey = pc.ProductCategoryKey
+        GROUP BY pc.EnglishProductCategoryName ORDER BY total DESC
+    notes: >-
+      The question's wording explicitly invites a CTE ("using total sales
+      per category, which..."), but a plain GROUP BY + ORDER BY + TOP 1
+      (no CTE) answers it exactly as correctly -- accepted via
+      alternative_sql. `cte_correctness` (the structural, diagnostic
+      metric) will separately show whether the model actually reached for
+      a CTE when invited to, independent of whether the *answer* was right.
+
+  - id: hard_cte_territory_ranking
+    question: "Rank sales territories by total internet sales using a CTE"
+    database: AdventureWorksDW2025
+    difficulty: hard
+    category: ctes
+    expected_tables: [FactInternetSales, DimSalesTerritory]
+    expected_columns: [SalesTerritoryRegion, SalesAmount]
+    expected_sql: >-
+      WITH territory_totals AS (
+        SELECT t.SalesTerritoryRegion AS region, SUM(f.SalesAmount) AS total FROM FactInternetSales f
+        JOIN DimSalesTerritory t ON f.SalesTerritoryKey = t.SalesTerritoryKey GROUP BY t.SalesTerritoryRegion)
+      SELECT region, total FROM territory_totals ORDER BY total DESC
+    notes: "Explicitly asks for a CTE by name -- the more direct cte_correctness test."
+
+  - id: hard_window_top3_per_category
+    question: "For each product category, show the top 3 products by total sales amount"
+    database: AdventureWorksDW2025
+    difficulty: hard
+    category: window_functions
+    expected_tables: [FactInternetSales, DimProduct, DimProductSubcategory, DimProductCategory]
+    expected_columns: [EnglishProductCategoryName, EnglishProductName, SalesAmount]
+    expected_sql: >-
+      WITH ranked AS (
+        SELECT pc.EnglishProductCategoryName AS cat, p.EnglishProductName AS product, SUM(f.SalesAmount) AS total,
+        ROW_NUMBER() OVER (PARTITION BY pc.EnglishProductCategoryName ORDER BY SUM(f.SalesAmount) DESC) AS rn
+        FROM FactInternetSales f
+        JOIN DimProduct p ON f.ProductKey = p.ProductKey
+        JOIN DimProductSubcategory ps ON p.ProductSubcategoryKey = ps.ProductSubcategoryKey
+        JOIN DimProductCategory pc ON ps.ProductCategoryKey = pc.ProductCategoryKey
+        GROUP BY pc.EnglishProductCategoryName, p.EnglishProductName)
+      SELECT cat, product, total FROM ranked WHERE rn <= 3 ORDER BY cat, rn
+    notes: >-
+      The canonical "top N per group" window-function question -- also used
+      as a hard case in scripts/profile_pipeline.py's latency profile. No
+      non-window alternative is offered (unlike the CTE cases above): "top
+      3 *per category*" genuinely has no correct non-window/non-correlated-
+      subquery answer at this row count, so this case is a fair, specific
+      test of window_function_correctness.
+
+  - id: hard_conditional_agg_promotion
+    question: "How many internet sales line items had a promotion applied versus had no promotion?"
+    database: AdventureWorksDW2025
+    difficulty: hard
+    category: conditional_aggregation
+    expected_tables: [FactInternetSales]
+    expected_columns: [PromotionKey]
+    expected_sql: >-
+      SELECT
+        SUM(CASE WHEN PromotionKey <> 1 THEN 1 ELSE 0 END) AS with_promo,
+        SUM(CASE WHEN PromotionKey = 1 THEN 1 ELSE 0 END) AS without_promo
+      FROM FactInternetSales
+    notes: >-
+      PromotionKey=1 is AdventureWorks' "No Discount" placeholder row, not
+      a real promotion -- verified live (2,151 with vs. 58,247 without).
+      Requires the model to know/infer that a promotion *key* still being
+      present doesn't mean a real promotion was applied, which a from-
+      scratch local model reasonably might not get right -- a genuine,
+      fair hard case rather than a trick question.
+
+  - id: null_handling_no_manager
+    question: "Which employees have no manager assigned?"
+    database: AdventureWorksDW2025
+    difficulty: medium
+    category: null_handling
+    expected_tables: [DimEmployee]
+    expected_columns: [ParentEmployeeKey]
+    expected_sql: "SELECT FirstName, LastName FROM DimEmployee WHERE ParentEmployeeKey IS NULL"
+    notes: "IS NULL, not = NULL -- the classic SQL NULL-comparison pitfall."
+
+  - id: null_handling_missing_weight
+    question: "How many products have no weight recorded?"
+    database: AdventureWorksDW2025
+    difficulty: medium
+    category: null_handling
+    expected_tables: [DimProduct]
+    expected_columns: [Weight]
+    expected_sql: "SELECT COUNT(*) FROM DimProduct WHERE Weight IS NULL"
+    notes: "A second, independent IS NULL case on a different table/column, for a less noisy null_handling_accuracy signal."

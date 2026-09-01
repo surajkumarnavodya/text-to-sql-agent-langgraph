@@ -1,0 +1,37 @@
+# Column data-sensitivity classification -- the enforced version of the
+# policy docs/GOVERNANCE.md's "Data classification policy" section already
+# describes. See that document for what each tier means (public / internal
+# / restricted) and the change-control process for editing this file.
+#
+# *** EMPTY TEMPLATE -- nothing is classified yet ***
+# Same bootstrap posture as config/table_descriptions.yaml: this file is
+# deliberately incomplete until a human reviews and classifies each column
+# that matters for the connected database. An unlisted column defaults to
+# "public" (no restriction) -- never an error, and never treated as
+# restricted by omission.
+#
+# Classifying a column here is what gives it real effect:
+#   - db/value_sampling.py never samples a "restricted" column into the
+#     schema prompt, regardless of how few distinct values it has.
+#   - agent/nodes.py rejects (retryable, not a hard failure -- the model
+#     gets a chance to self-correct by dropping the column and answering
+#     with what remains) any generated SQL that directly SELECTs a
+#     "restricted" column.
+# "internal" columns are recorded for documentation/future-authorization
+# purposes but are not currently blocked from sampling or selection --
+# see docs/GOVERNANCE.md's tier definitions for why.
+#
+# Only the maintainer may change a column's classification tier (see
+# docs/GOVERNANCE.md's "Data classification policy" -- ownership).
+# Loosening a classification (restricted -> internal/public) should go
+# through the exception process described there, not a silent edit, and
+# any change here belongs in docs/security-changelog.md per
+# docs/GOVERNANCE.md's change-control section.
+#
+# Format:
+#   - table_name: exact DB table name (must match schema introspection)
+#     columns:
+#       - column: exact column name
+#         tier: restricted | internal | public
+
+tables: []

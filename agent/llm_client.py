@@ -124,6 +124,12 @@ _ERROR_CATEGORY_HINTS: dict[str, str] = {
         "clause filter (a date range, a specific ID, a status flag) or otherwise "
         "narrow the query so it returns a smaller, more targeted result."
     ),
+    "restricted_column": (
+        "The previous SQL directly selected a column this application never allows "
+        "in a result, regardless of the question. Rewrite the query without that "
+        "column -- answer using only the other columns available, or omit that part "
+        "of the question if no substitute exists."
+    ),
 }
 
 

@@ -57,6 +57,7 @@ def _settings(**overrides) -> Settings:
         cost_moderate_row_threshold=50_000,
         cost_high_row_threshold=1_000_000,
         log_level="INFO",
+        log_redaction_level="standard",
     )
     defaults.update(overrides)
     return Settings(**defaults)

@@ -21,7 +21,11 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from config.settings import ConfigurationError, get_settings  # noqa: E402
-from db.connection import get_read_only_engine, test_connection  # noqa: E402
+from db.connection import (  # noqa: E402
+    check_write_privileges,
+    get_read_only_engine,
+    test_connection,
+)
 from db.schema_introspection import introspect_schema  # noqa: E402
 
 
@@ -59,6 +63,14 @@ def main() -> int:
         preview = ", ".join(t.table_name for t in tables[:10])
         suffix = ", ..." if len(tables) > 10 else ""
         print(f"  ({preview}{suffix})")
+
+    # Best-effort, warning-only least-privilege check (see
+    # db.connection.check_write_privileges' docstring) -- never a reason
+    # this script exits non-zero; the connection itself already passed.
+    privilege_check = check_write_privileges(engine, settings)
+    if privilege_check.checked and privilege_check.has_write_privileges:
+        print()
+        print(f"  WARNING: {privilege_check.message}")
 
     return 0
 

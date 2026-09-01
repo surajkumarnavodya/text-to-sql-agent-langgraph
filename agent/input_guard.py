@@ -51,6 +51,7 @@ import re
 from dataclasses import dataclass
 from typing import Literal
 
+from security.injection_patterns import INJECTION_PATTERNS
 from security.sanitization import normalize_text, truncate_for_log
 
 logger = logging.getLogger(__name__)
@@ -58,45 +59,11 @@ logger = logging.getLogger(__name__)
 RejectionReason = Literal["too_long", "empty", "injection_detected", "off_topic"]
 
 # Phrases that attempt to redirect the model's behavior rather than ask a
-# database question. See module docstring: a fast, cheap first layer, not
-# the security boundary itself.
-_INJECTION_PATTERNS: dict[str, re.Pattern[str]] = {
-    "ignore_instructions": re.compile(
-        # Either word order: "ignore previous instructions" (qualifier
-        # before the noun) and "disregard the rules above" (qualifier
-        # after) are both natural English and both attempts at the same
-        # thing -- matching only one order left the other undetected.
-        r"\b(ignore|disregard|forget)\b(?:\s+\w+){0,3}\s+"
-        r"\b(previous|prior|above|earlier|all|these|those)\b(?:\s+\w+){0,2}\s+"
-        r"\b(instructions?|rules?|prompt|directives?)\b"
-        r"|"
-        r"\b(ignore|disregard|forget)\b(?:\s+\w+){0,3}\s+"
-        r"\b(instructions?|rules?|prompt|directives?)\b(?:\s+\w+){0,3}\s+"
-        r"\b(previous|prior|above|earlier|all|these|those)\b",
-        re.IGNORECASE,
-    ),
-    "role_override": re.compile(
-        r"\b(you are now|act as|pretend (to be|you are)|from now on you are|"
-        r"switch to|enable)\b(?:\s+\w+){0,4}\s+\b(developer|debug|admin|god|dan|"
-        r"unrestricted|jailbreak)\b(?:\s+mode)?|"
-        r"\b(developer|debug|admin|god)\s+mode\b",
-        re.IGNORECASE,
-    ),
-    "reveal_prompt": re.compile(
-        r"\b(print|show|reveal|repeat|output|display|leak)\b(?:\s+\w+){0,3}\s+"
-        r"\b(your\s+)?(system\s+prompt|instructions|configuration|"
-        r"initial\s+prompt|prompt\s+above)\b",
-        re.IGNORECASE,
-    ),
-    "reveal_internal_files": re.compile(
-        r"\b(table_descriptions?\.ya?ml|\.env\b|source\s+code|api\s+key|" r"connection\s+string)\b",
-        re.IGNORECASE,
-    ),
-    "fake_role_marker": re.compile(r"^\s*(system|assistant)\s*:", re.IGNORECASE | re.MULTILINE),
-    "new_instructions_marker": re.compile(
-        r"\bnew\s+instructions?\s*:|^\s*###|\[/?(system|inst)\]", re.IGNORECASE
-    ),
-}
+# database question. Sourced from `security.injection_patterns` -- the
+# single shared pattern set also used by `agent.nodes.retrieve_schema_node`'s
+# RAG-poisoning scan, so both consumers stay in sync. See module docstring: a
+# fast, cheap first layer, not the security boundary itself.
+_INJECTION_PATTERNS = INJECTION_PATTERNS
 
 # Positive signals that this is a request to do something other than
 # generate SQL against the connected database. Intentionally scoped to

@@ -62,10 +62,13 @@ internals).
 - **Human-readable output formatting** — surrogate/ID columns are hidden
   from the default results view, and column labels are expanded from
   common abbreviations, without ever touching the underlying query.
-- **Eval harness with pass/fail accuracy checks** — a small, growable set of
-  real natural-language questions with machine-checkable expectations
-  (`scripts/run_eval.py`), so a join/filter regression shows up as a
-  failing check instead of shipping silently.
+- **Text-to-SQL benchmark harness** — a growable, categorized dataset (easy/
+  medium/hard/real-world/adversarial, 20+ subcategories) graded by real
+  execution-accuracy (comparing the agent's actual result set against gold
+  SQL run live, not SQL-text similarity), covering retrieval recall, join/
+  aggregation/date/GROUP BY/window-function correctness, follow-up and
+  security-rejection accuracy, retry/latency/cost metrics, and regression
+  detection against a stored baseline (`scripts/run_benchmark.py`, `eval/`).
 
 ## Tech stack
 
@@ -148,11 +151,13 @@ Run the app:
 streamlit run ui/app.py
 ```
 
-Run the eval harness (a live-DB + live-Ollama check, separate from the
-mocked `pytest` suite — see [`CONTRIBUTING.md`](CONTRIBUTING.md) for how to
-add questions to it):
+Run the Text-to-SQL benchmark (a live-DB + live-Ollama check, separate from
+the mocked `pytest` suite — see [`CONTRIBUTING.md`](CONTRIBUTING.md) for how
+to add cases to it):
 ```bash
-python scripts/run_eval.py
+python scripts/run_benchmark.py                   # full dataset
+python scripts/run_benchmark.py --limit 20         # a quick, smaller run
+python scripts/run_benchmark.py --check-regression # compare against the stored baseline
 ```
 
 Run the mocked unit test suite + linters:

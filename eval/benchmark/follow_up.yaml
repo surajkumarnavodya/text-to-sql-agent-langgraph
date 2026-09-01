@@ -1,0 +1,120 @@
+# Follow-up (multi-turn) benchmark cases -- category "follow_up".
+#
+# MIGRATED from the legacy eval/eval_questions.yaml's `two_turn_sequences`
+# (see scripts/run_eval.py, superseded by scripts/run_benchmark.py) so that
+# dataset's follow-up regression coverage carries forward unchanged, just in
+# the new schema/runner. Each sequence is run turn by turn through the real
+# `build_conversation_history`/`run_agent` path -- see `eval/runner.py`'s
+# `run_followup_case` -- not a hand-scripted shortcut.
+#
+# expected_sql on turn 2+ is deliberately omitted for cases where the "right"
+# follow-up SQL has many equally-valid shapes (e.g. "top 3 of those" can
+# reasonably re-select from many different base queries) -- those turns
+# fall back to the same min_rows/max_rows/expect_readable_result/
+# expected_tables checks the legacy harness used, preserved exactly via
+# eval.evaluators.compute_overall_pass's fallback path.
+
+followup_cases:
+  - id: followup_sales_by_year_then_quarter
+    database: AdventureWorksDW2025
+    difficulty: real_world
+    category: follow_up
+    turns:
+      - question: "Show total sales by year"
+        expected_tables: [DimDate]
+        min_rows: 1
+        expect_readable_result: true
+        expect_grounded_insight: true
+      - question: "Now break that down by quarter"
+        expected_tables: [DimDate]
+        min_rows: 1
+        expect_readable_result: true
+        expect_followup: true
+        expect_grounded_insight: true
+    notes: >-
+      Baseline two-turn regression: turn 2 has no subject of its own
+      ("that") and only makes sense resolved against turn 1's "sales by
+      year." Both turns are plain GROUP BY aggregations with no TOP/LIMIT,
+      so they're guaranteed multi-row -- a safe, deterministic shape for
+      expect_grounded_insight.
+
+  - id: followup_top_subcategories_then_top3
+    database: AdventureWorksDW2025
+    difficulty: real_world
+    category: follow_up
+    turns:
+      - question: "Which product subcategories have the highest total sales?"
+        expected_tables: [DimProductSubcategory]
+        min_rows: 1
+        expect_readable_result: true
+        expect_grounded_insight: true
+      - question: "Just show the top 3 of those"
+        min_rows: 1
+        max_rows: 3
+        expect_readable_result: true
+        expect_followup: true
+    notes: >-
+      Refinement follow-up (narrows the previous result rather than
+      changing its shape). "those" has no antecedent without turn 1's
+      result, and "top 3" has no meaning without knowing what turn 1 was
+      already sorted by.
+
+  - id: followup_2012_sales_then_2013
+    database: AdventureWorksDW2025
+    difficulty: real_world
+    category: follow_up
+    turns:
+      - question: "What were total internet sales in 2012?"
+        expected_tables: [FactInternetSales, DimDate]
+        min_rows: 1
+        expect_readable_result: true
+      - question: "What about for 2013 instead?"
+        expected_tables: [FactInternetSales, DimDate]
+        min_rows: 1
+        expect_readable_result: true
+        expect_followup: true
+    notes: >-
+      Value-substitution follow-up: turn 2 supplies a new literal (2013)
+      but no subject of its own, and must resolve "instead" against turn
+      1's question to know it's still asking about internet sales, just
+      for a different year -- not a comparison of both years together.
+
+  - id: followup_top_territories_then_order_counts
+    database: AdventureWorksDW2025
+    difficulty: real_world
+    category: follow_up
+    turns:
+      - question: "Which sales territories have the highest total sales?"
+        expected_tables: [DimSalesTerritory]
+        min_rows: 1
+        expect_readable_result: true
+      - question: "And how many orders came from each?"
+        expected_tables: [DimSalesTerritory]
+        min_rows: 1
+        expect_readable_result: true
+        expect_followup: true
+    notes: >-
+      Follow-up that both refers back (leading "And") and introduces new
+      content ("how many orders") -- checks that a follow-up carrying its
+      own subject is still classified as a follow-up (not standalone) and
+      still correctly scoped to sales territory, per turn 1.
+
+  - id: followup_reseller_sales_by_year_then_category
+    database: AdventureWorksDW2025
+    difficulty: real_world
+    category: follow_up
+    turns:
+      - question: "Show total reseller sales by year"
+        expected_tables: [FactResellerSales, DimDate]
+        min_rows: 1
+        expect_readable_result: true
+      - question: "Now split that by product category instead"
+        expected_tables: [FactResellerSales, DimProductCategory]
+        min_rows: 1
+        expect_readable_result: true
+        expect_followup: true
+    notes: >-
+      NEW case (not in the legacy set): a dimension-swap follow-up on the
+      reseller-channel fact table specifically (the legacy set's follow-ups
+      were all internet-channel) -- exercises the same classifier/
+      retrieval-folding path against FactResellerSales instead.

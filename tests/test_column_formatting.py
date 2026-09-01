@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from db.schema_introspection import ColumnInfo, ForeignKeyInfo, TableSchemaInfo
 from ui.column_formatting import (
+    escape_markdown,
     format_column_label,
     get_display_columns,
     get_key_column_names,
@@ -135,3 +136,36 @@ class TestGetDisplayColumns:
 
         assert display == columns
         assert used_fallback is False
+
+
+class TestEscapeMarkdown:
+    """Regression coverage for a confirmed audit finding: raw (database-
+    sourced, therefore untrusted) table/column names were interpolated
+    directly into `st.markdown` calls in ui/app.py without escaping."""
+
+    def test_ordinary_table_name_is_unchanged(self):
+        assert escape_markdown("DimCustomer") == "DimCustomer"
+
+    def test_bold_markup_is_escaped(self):
+        malicious = "Products** DELETED **"
+        escaped = escape_markdown(malicious)
+        assert "**" not in escaped
+        assert escaped == "Products\\*\\* DELETED \\*\\*"
+
+    def test_markdown_link_syntax_is_escaped(self):
+        malicious = "Click [here](javascript:alert(1))"
+        escaped = escape_markdown(malicious)
+        assert "[" not in escaped.replace("\\[", "")
+        assert "\\[here\\]" in escaped
+
+    def test_heading_syntax_is_escaped(self):
+        malicious = "# Fake Heading"
+        assert escape_markdown(malicious) == "\\# Fake Heading"
+
+    def test_backtick_code_fence_is_escaped(self):
+        malicious = "`; DROP TABLE x; --`"
+        escaped = escape_markdown(malicious)
+        assert "`" not in escaped.replace("\\`", "")
+
+    def test_underscores_used_for_italics_are_escaped(self):
+        assert escape_markdown("_italic_") == "\\_italic\\_"

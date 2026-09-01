@@ -31,11 +31,17 @@ context: reviewed by one person, not independently verified by another
 
 ## Data classification policy
 
-**Current status: not yet implemented as an enforced control.** This
-section states the intended policy so classification decisions have a
-named place to live once the mechanism exists, and so the gap is tracked
-deliberately rather than discovered by surprise. See
-[`RISK_REGISTER.md`](RISK_REGISTER.md) for this tracked as an open item.
+**Current status (as of 2026-09-01): implemented as an enforced control.**
+`config/sensitive_columns.yaml` (loaded by `config/sensitive_columns.py`)
+exists and is wired into two enforcement points: `db/value_sampling.py`
+never samples a column classified "restricted" into the schema prompt
+regardless of cardinality, and `agent/nodes.py::validate_sql_node` rejects
+(retryable) generated SQL that directly selects a "restricted" column. The
+file ships empty — the mechanism exists, but no column has been reviewed
+and classified yet, so this has no effect on any real question until that
+happens. See `tests/test_sensitive_columns.py` and
+`tests/test_nodes_security_wiring.py` for the enforcement's regression
+coverage.
 
 ### The three tiers
 
@@ -56,38 +62,41 @@ into exactly one of three tiers:
   (e.g. customer PII — name, email, phone — if this were ever pointed at a
   schema that carried it in the clear).
 
-### What exists today instead
+### What exists today
 
-There is no `config/sensitive_columns.yaml` and no code that reads a
-per-column classification and enforces it at query-generation, execution,
-or display time. Two things partially and *incidentally* reduce this
-risk, but neither is a classification system and neither should be
-mistaken for one:
+`config/sensitive_columns.yaml` + `config/sensitive_columns.py`, mirroring
+`config/table_descriptions.yaml`'s own pattern exactly: hand-authored,
+read fresh on every call (no caching, so a hand-edit takes effect on the
+very next question, no rebuild step), deliberately incomplete until a
+human reviews and classifies each column that matters for the connected
+database. Two independent enforcement points read it:
 
-- `db/value_sampling.py`'s 20-distinct-value cap on which columns get
-  sampled into the schema prompt (see `CLAUDE.md`) means high-cardinality
-  columns — which is what most real PII columns are — structurally never
-  get sampled. This is a side effect of a cardinality heuristic built for
-  a different reason (disambiguating coded columns like `ProductLine`),
-  not a deliberate sensitivity control, and it provides no protection for
-  a low-cardinality sensitive column (e.g. a small, closed set of medical
-  or demographic categories) or for a column's *values* once a query
-  actually selects and returns it.
-- `config/table_descriptions.yaml` documents table and column *meaning*
-  (`ProductLine` is a manufacturing code, not a category) — it says
-  nothing about sensitivity and isn't read as a classification source
-  anywhere.
+- `db/value_sampling.py::attach_sample_values` never samples a "restricted"
+  column, regardless of how well it would otherwise qualify by the
+  existing 20-distinct-value cardinality cap (see `CLAUDE.md`) — that cap
+  is a side effect of a heuristic built for a different reason
+  (disambiguating coded columns like `ProductLine`), not a deliberate
+  sensitivity control, and provides no protection on its own for a
+  low-cardinality sensitive column (e.g. a small, closed set of medical or
+  demographic categories).
+- `agent/nodes.py::validate_sql_node` rejects (retryable, not a hard
+  safety-violation failure — the model can drop the column and answer
+  with what remains) any validated SQL that directly selects a
+  "restricted" column, via
+  `agent.sql_validator.find_restricted_column_references`.
 
-Neither of these results in a restricted column being blocked, redacted,
-or flagged at any point in the pipeline. A question that asks for a
-sensitive column by name today is answered exactly like any other
-question, subject only to the general controls in SECURITY.md (read-only
-validator, row cap, timeout) — none of which are sensitivity-aware.
+`config/table_descriptions.yaml` still documents table/column *meaning*,
+not sensitivity — it remains a separate file with a separate purpose, not
+read as a classification source.
 
-### The policy, once implemented
+A restricted column's *values*, once a query is allowed to select it, are
+not separately redacted in the results table — the block happens at
+query-generation time, not as output filtering. Nothing here is
+authorization-aware (there's no per-user identity in this app's
+single-user model to authorize against) — see "Restricted" tier's own note
+below on what a future multi-user deployment would still need to add.
 
-When `config/sensitive_columns.yaml` (or equivalent) exists, the following
-applies:
+### The policy tiers, as enforced
 
 - Every table/column's classification is recorded in that file, not in
   code, comments, or tribal knowledge — the same "config, not scattered
@@ -113,8 +122,11 @@ Any change to one of the following is deliberate and documented, not an
 incidental side effect of an unrelated commit:
 
 - The SQL validator's allowlist (`agent/sql_validator.py`) — what
-  statement shapes are permitted to execute.
-- The sensitivity/classification config, once it exists (see above).
+  statement shapes are permitted to execute, including the
+  `_DISALLOWED_NESTED_TYPES` full-tree write/DDL check and the
+  `_DANGEROUS_FUNCTION_NAMES` denylist added 2026-09-01.
+- The sensitivity/classification config (`config/sensitive_columns.yaml`
+  — see above).
 - Rate limits (`QUESTION_RATE_LIMIT_PER_MINUTE`,
   `LLM_CALL_RATE_LIMIT_PER_MINUTE` — `agent/rate_limit.py`,
   `config/settings.py`).
@@ -172,12 +184,14 @@ that's effectively been abandoned — surface it, don't let it sit.
 Proportionate to a solo-maintainer project actively being developed, not
 an enterprise SOC schedule:
 
-- **Re-run the eval harness** (`python scripts/run_eval.py`, or
-  `scripts/scheduled_eval_check.py` for the baseline-comparison version —
-  see [`COMPLIANCE.md`](COMPLIANCE.md)'s MEASURE section) **after any
-  change to the system prompt, `agent/input_guard.py`'s patterns, a config
-  default, or the Ollama model** — this is the accuracy + adversarial
-  regression check, and it's cheap enough that "after every relevant
+- **Re-run the benchmark** (`python scripts/run_benchmark.py
+  --check-regression`, comparing against the stored baseline at
+  `eval/baselines/latest.json`; exits non-zero if accuracy, retrieval,
+  security-rejection, or latency/cost regressed beyond tolerance — see
+  `eval/regression.py`) **after any change to the system prompt,
+  `agent/input_guard.py`'s patterns, a config default, or the Ollama
+  model** — this is the accuracy + adversarial regression check, and it's
+  cheap enough that "after every relevant
   change" is the realistic bar, not "periodically."
 - **Review `scripts/monitoring_summary.py`'s output weekly** during active
   development (and before/after any change to rate limits, cost

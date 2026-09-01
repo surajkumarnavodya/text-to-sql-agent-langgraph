@@ -28,6 +28,20 @@ fetched value through `security.sanitization.normalize_text` (which
 collapses embedded newlines/control characters to a single space,
 preventing exactly that line-injection) and caps its length before it's
 ever stored, let alone rendered into a prompt.
+
+A second, independent risk this module guards against: `table_name`/
+`column_name` here come from live schema introspection, not a literal in
+this codebase -- ordinarily safe (an engine's own identifier rules
+constrain what can even be introspected), but if the connected database
+ever contains a maliciously-named table/column (creatable via
+quoted-identifier DDL by anyone with CREATE privileges on that schema --
+e.g. `CREATE TABLE "Products; DROP TABLE Orders;--"`), naively interpolating
+that name into a raw SQL string would be a second-order SQL injection
+point. `_sample_column` quotes both identifiers via the connected engine's
+own `identifier_preparer` (the same dialect-aware quoting/escaping
+SQLAlchemy's own reflection code uses internally) before building the
+`SELECT DISTINCT` text, rather than trusting they're already safe to
+interpolate bare.
 """
 
 from __future__ import annotations
@@ -38,6 +52,7 @@ import re
 from sqlalchemy import Engine, text
 from sqlalchemy.exc import SQLAlchemyError
 
+from config.sensitive_columns import SensitivityTier, is_restricted, load_sensitive_columns
 from db.schema_introspection import TableSchemaInfo, render_ddl
 from security.sanitization import normalize_text
 
@@ -85,11 +100,20 @@ def _is_sampling_candidate(column_name: str, column_type: str, is_primary_key: b
 
 
 def _sample_column(engine: Engine, table_name: str, column_name: str) -> tuple[str, ...] | None:
-    """Returns up to `_MAX_DISTINCT_VALUES` distinct values, or None if too many/failed."""
+    """Returns up to `_MAX_DISTINCT_VALUES` distinct values, or None if too many/failed.
+
+    `table_name`/`column_name` are quoted via the connected engine's own
+    `identifier_preparer` before being interpolated into the query text --
+    see this module's docstring for why a malicious identifier (not just a
+    malicious *value*) is a real, if second-order, risk here.
+    """
+    quote = engine.dialect.identifier_preparer.quote
+    quoted_table = quote(table_name)
+    quoted_column = quote(column_name)
     try:
         with engine.connect() as connection:
             cursor_result = connection.execute(
-                text(f"SELECT DISTINCT {column_name} FROM {table_name}")
+                text(f"SELECT DISTINCT {quoted_column} FROM {quoted_table}")
             )
             rows = cursor_result.fetchmany(_MAX_DISTINCT_VALUES + 1)
     except SQLAlchemyError as exc:
@@ -119,7 +143,11 @@ def _sample_column(engine: Engine, table_name: str, column_name: str) -> tuple[s
     return tuple(values) if values else None
 
 
-def attach_sample_values(engine: Engine, tables: list[TableSchemaInfo]) -> list[TableSchemaInfo]:
+def attach_sample_values(
+    engine: Engine,
+    tables: list[TableSchemaInfo],
+    sensitive_columns: dict[tuple[str, str], SensitivityTier] | None = None,
+) -> list[TableSchemaInfo]:
     """Re-renders each table's DDL with real sample values for qualifying columns.
 
     Qualifying = a string-typed (VARCHAR/CHAR family), non-key, declared-
@@ -129,21 +157,43 @@ def attach_sample_values(engine: Engine, tables: list[TableSchemaInfo]) -> list[
     low-cardinality descriptive columns (EnglishProductCategoryName) alike,
     anywhere in the schema -- not a hardcoded list of column names.
 
+    A column classified "restricted" in `config/sensitive_columns.yaml` (see
+    `config.sensitive_columns`) is never sampled, regardless of cardinality
+    or how well it would otherwise qualify -- this is a hard exclusion, not
+    another heuristic, since the 20-distinct-value cardinality cap above is
+    a side effect of a check built for a different reason (disambiguating
+    coded columns) and provides no protection for a low-cardinality
+    sensitive column (e.g. a small, closed set of medical/demographic
+    categories) -- see `docs/GOVERNANCE.md`'s "Data classification policy."
+
     Args:
         engine: A read-only SQLAlchemy engine.
         tables: Already-introspected tables (from `introspect_schema()`).
+        sensitive_columns: Optional pre-loaded classification map (mainly
+            for tests / callers that already loaded it for another reason).
+            Defaults to `config.sensitive_columns.load_sensitive_columns()`.
 
     Returns:
         A new list of `TableSchemaInfo`, same columns/foreign_keys, with
         `ddl` re-rendered to include sample values where found. Tables/
-        columns where sampling fails or doesn't qualify are left exactly as
-        `introspect_schema()` produced them.
+        columns where sampling fails, doesn't qualify, or is restricted are
+        left exactly as `introspect_schema()` produced them.
     """
+    classifications = (
+        sensitive_columns if sensitive_columns is not None else load_sensitive_columns()
+    )
     enriched: list[TableSchemaInfo] = []
     for table in tables:
         sample_values: dict[str, tuple[str, ...]] = {}
         for column in table.columns:
             if not _is_sampling_candidate(column.name, column.type, column.is_primary_key):
+                continue
+            if is_restricted(table.table_name, column.name, classifications):
+                logger.info(
+                    "Skipping value sampling for restricted column %s.%s",
+                    table.table_name,
+                    column.name,
+                )
                 continue
             values = _sample_column(engine, table.table_name, column.name)
             if values:

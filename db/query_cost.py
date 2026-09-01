@@ -2,7 +2,7 @@
 
 Catches an expensive query *before* running it -- an earlier, additional
 layer in front of the existing timeout-based protection
-(`agent.nodes._execute_with_timeout`), not a replacement for it. The
+(`db.execution._execute_with_timeout`), not a replacement for it. The
 timeout still catches anything this layer misses (a plan that
 under-estimates, a dialect this module doesn't support, ...); this layer
 exists purely to catch the common, avoidable case (a missing filter, an
@@ -273,7 +273,7 @@ def _run_with_timeout(strategy, engine: Engine, sql: str, timeout_seconds: float
 
     A plan-only compile is normally fast (milliseconds), so this is a pure
     safety net for a pathological edge case, not the primary defense --
-    unlike `agent.nodes._execute_with_timeout`, an abandoned worker thread
+    unlike `db.execution._execute_with_timeout`, an abandoned worker thread
     here is simply left to finish and clean up its own connection on its
     own schedule (daemon thread; never blocks process exit). That's an
     acceptable simplification for a rare-timeout, estimation-only path

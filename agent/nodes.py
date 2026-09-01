@@ -16,15 +16,12 @@ terminal "rejected"/"needs_clarification"/"rate_limited" shapes.
 
 from __future__ import annotations
 
-import contextlib
 import functools
 import logging
-import threading
 import time
 from collections.abc import Callable
 from typing import Any
 
-from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 
 from agent.error_classification import ExecutionErrorCategory, classify_execution_error
@@ -42,16 +39,28 @@ from agent.rate_limit import LLM_CALL_LIMIT_MESSAGE, get_llm_call_limiter
 from agent.sql_validator import (
     SAFETY_VIOLATION_TYPES,
     enforce_row_limit,
+    find_restricted_column_references,
     find_unexpected_table_references,
     strip_row_limit,
     validate_sql,
 )
 from agent.state import AgentState, AttemptRecord, ConversationExchange, StageTiming, TableSchema
+from config.sensitive_columns import load_sensitive_columns
 from config.settings import get_settings
 from config.table_descriptions import apply_table_description, load_table_descriptions
 from db.connection import get_read_only_engine, get_sqlglot_dialect
+from db.execution import execute_readonly_sql
 from db.query_cost import MODERATE_COST_NOTICE, estimate_query_cost, high_cost_error_message
 from embeddings.retriever import retrieve_relevant_schema
+from security.audit_log import log_security_event
+from security.injection_patterns import INJECTION_PATTERNS
+
+# Re-exported for `tests/test_agent_nodes.py`'s
+# `monkeypatch.setattr("agent.nodes.execute_readonly_sql", ...)` seam -- the
+# actual implementation (and its own tests) lives in `db/execution.py`, a
+# pure database-execution concern with no LangGraph/state dependency. Kept as
+# a plain re-import (not re-implemented) so there is exactly one definition.
+__all__ = ["execute_readonly_sql"]
 
 logger = logging.getLogger(__name__)
 
@@ -90,18 +99,6 @@ def _timed_node(stage: str) -> Callable[[Callable[[AgentState], dict[str, Any]]]
         return wrapper
 
     return decorator
-
-
-# DB_TYPE -> a one-line SET statement that caps execution time at the
-# database itself, for engines where that's a cheap, well-known statement.
-# Applied best-effort right after opening the connection, before running the
-# actual query -- this is the "enforced at the driver level" half of the
-# timeout story (see `_execute_with_timeout` for the other half, which
-# covers every dialect including the two without a simple SET form below).
-_STATEMENT_TIMEOUT_SQL: dict[str, str] = {
-    "postgresql": "SET statement_timeout = {timeout_ms}",
-    "mysql": "SET SESSION MAX_EXECUTION_TIME = {timeout_ms}",
-}
 
 
 def _give_up_explanation(state: AgentState, detailed_message: str) -> str:
@@ -152,6 +149,13 @@ def sanitize_input_node(state: AgentState) -> dict[str, Any]:
         logger.info(
             "[sanitize_input] rejected reason=%s -- see agent.input_guard logs for detail",
             result.reason,
+        )
+        log_security_event(
+            "input_rejected",
+            "warning" if result.reason == "injection_detected" else "info",
+            "A question was rejected at the input-sanitization gate before any "
+            "schema retrieval or LLM call.",
+            reason=result.reason,
         )
         return {
             "status": "rejected",
@@ -328,6 +332,37 @@ def retrieve_schema_node(state: AgentState) -> dict[str, Any]:
         len(tables),
         [t["table_name"] for t in tables],
     )
+
+    # Detection-only, never blocks: the same normalize-and-frame-as-data
+    # defenses already applied to sampled values (security.sanitization,
+    # the system prompt's untrusted-data framing) are what actually bound
+    # the consequences if this ever fires for real -- this is purely an
+    # operator-visibility signal that the *content itself* looked
+    # injection-shaped, reusing the exact same pattern set
+    # agent.input_guard applies to typed questions (security.
+    # injection_patterns) rather than a second, drifting copy. Blocking
+    # here instead would risk refusing a legitimate question just because
+    # real business data (a promo name, a free-text comment) happened to
+    # contain an ordinary phrase this cheap regex layer also fires on --
+    # see SECURITY.md's "database content is untrusted input too" section.
+    matched_patterns = [
+        name for name, pattern in INJECTION_PATTERNS.items() if pattern.search(context_text)
+    ]
+    if matched_patterns:
+        logger.warning(
+            "[retrieve_schema] [rag_poisoning] retrieved schema context matched "
+            "injection-style pattern(s): %s -- proceeding (detection only)",
+            matched_patterns,
+        )
+        log_security_event(
+            "possible_rag_poisoning",
+            "warning",
+            "Retrieved schema/sampled-value content matched an injection-style "
+            "pattern before being included in the generation prompt.",
+            matched_patterns=matched_patterns,
+            tables=[t["table_name"] for t in tables],
+        )
+
     return {
         "schema_tables": tables,
         "schema_context_text": context_text,
@@ -372,6 +407,13 @@ def generate_sql_node(state: AgentState) -> dict[str, Any]:
             "[generate_sql] attempt %d: LLM call rate limit exceeded, retry_after=%.1fs",
             attempt_number,
             rate_limit_result.retry_after_seconds,
+        )
+        log_security_event(
+            "rate_limit_tripped",
+            "info",
+            "The process-wide LLM-call rate limiter denied a generation attempt.",
+            attempt=attempt_number,
+            retry_after_seconds=round(rate_limit_result.retry_after_seconds, 1),
         )
         record: AttemptRecord = {
             "attempt": attempt_number,
@@ -485,6 +527,14 @@ def validate_sql_node(state: AgentState) -> dict[str, Any]:
                 attempt_number,
                 result.error,
             )
+            log_security_event(
+                "sql_safety_violation",
+                "warning",
+                "Generated SQL failed the validator's SELECT-only allowlist -- "
+                "failing closed, never retried.",
+                violation_type=result.violation_type,
+                attempt=attempt_number,
+            )
             record: AttemptRecord = {
                 "attempt": attempt_number,
                 "sql": sql,
@@ -554,6 +604,67 @@ def validate_sql_node(state: AgentState) -> dict[str, Any]:
             "the retrieved schema context: %s",
             anomaly_tables,
         )
+
+    # Enforces config/sensitive_columns.yaml's classification (see
+    # config.sensitive_columns, docs/GOVERNANCE.md's "Data classification
+    # policy") -- unlike the schema-anomaly check just above, this IS a new
+    # gate: a "restricted" column reference is rejected here, not merely
+    # logged. Treated exactly like an ordinary validation failure (retryable,
+    # same budget, same error-feedback loop) rather than a
+    # SAFETY_VIOLATION_TYPES failure, since the model can plausibly
+    # self-correct by dropping the column and answering with what remains --
+    # this is a data-governance policy, not a security-gate failure the
+    # model has no way to recover from. Empty by default (the classification
+    # file ships with no entries), so this has zero effect until a column is
+    # deliberately classified.
+    classifications = load_sensitive_columns()
+    restricted_pairs = {pair for pair, tier in classifications.items() if tier == "restricted"}
+    if restricted_pairs:
+        restricted_hits = find_restricted_column_references(
+            safe_sql, restricted_pairs, known_tables, dialect=dialect
+        )
+        if restricted_hits:
+            logger.warning(
+                "[validate_sql] rejected -- references restricted column(s): %s",
+                restricted_hits,
+            )
+            log_security_event(
+                "sensitive_column_blocked",
+                "warning",
+                "Generated SQL directly selected a column classified 'restricted' "
+                "in config/sensitive_columns.yaml.",
+                columns=restricted_hits,
+                attempt=attempt_number,
+            )
+            retry_count = state.get("retry_count", 0)
+            can_retry = retry_count < settings.max_retries
+            restricted_record: AttemptRecord = {
+                "attempt": attempt_number,
+                "sql": safe_sql,
+                "outcome": "restricted_column",
+                "error": f"References restricted column(s): {restricted_hits}",
+                "will_retry": can_retry,
+            }
+            restricted_update: dict[str, Any] = {
+                "sql": safe_sql,
+                "validation_error": f"References restricted column(s): {restricted_hits}",
+                "error_history": [
+                    f"SQL references restricted column(s) {restricted_hits} -- "
+                    "these may never be selected; choose different columns."
+                ],
+                "attempt_history": [restricted_record],
+                "last_error_category": "restricted_column",
+                "retry_count": retry_count + 1,
+                "status": "generating" if can_retry else "failed",
+                "schema_anomaly_tables": anomaly_tables,
+            }
+            if not can_retry:
+                restricted_update["failure_explanation"] = _give_up_explanation(
+                    state,
+                    f"Gave up after {attempt_number} attempts. The generated SQL kept "
+                    f"referencing restricted column(s): {restricted_hits}.",
+                )
+            return restricted_update
 
     return {
         "sql": safe_sql,
@@ -664,106 +775,6 @@ def estimate_query_cost_node(state: AgentState) -> dict[str, Any]:
             state, f"Gave up after {attempt_number} attempts. {message}"
         )
     return update
-
-
-def _apply_statement_timeout(connection, dialect_name: str, timeout_seconds: int) -> None:
-    """Best-effort driver-level statement timeout, where a simple SET exists.
-
-    Not every engine has a one-line session-level timeout (MSSQL/Oracle
-    don't), which is why this is "best effort" and paired with the
-    thread-based cancellation fallback in `_execute_with_timeout` that
-    covers every dialect uniformly.
-    """
-    template = _STATEMENT_TIMEOUT_SQL.get(dialect_name)
-    if not template:
-        return
-    timeout_ms = int(timeout_seconds * 1000)
-    try:
-        connection.execute(text(template.format(timeout_ms=timeout_ms)))
-    except SQLAlchemyError as exc:
-        # Non-fatal: the thread-based fallback below still enforces the
-        # wall-clock cutoff even if this driver-level SET isn't permitted
-        # for this user/role.
-        logger.debug("[execute_sql] could not set driver-level statement timeout: %s", exc)
-
-
-def _execute_with_timeout(
-    sql: str, query_timeout_seconds: int, max_result_rows: int
-) -> tuple[list[str], list[tuple]]:
-    """Runs `sql` on a worker thread and force-aborts it past `query_timeout_seconds`.
-
-    SQLAlchemy has no universal, cross-dialect "cancel this query" call, so
-    the fallback that works for every one of the four supported engines is:
-    run the query on a background thread, and if it hasn't finished by the
-    deadline, close the underlying connection from the *calling* thread.
-    Closing the socket out from under an in-flight query forces the
-    database server to notice and kill it -- a real, driver-level
-    cancellation, not just "stop waiting for the response" on our side.
-
-    Row cap is enforced with `fetchmany(max_result_rows)` rather than
-    `fetchall()` -- a defense-in-depth measure independent of the `LIMIT`
-    clause already added by `agent.sql_validator.enforce_row_limit`, so a
-    malformed or dialect-mistranslated query that ignores/lacks a LIMIT
-    still can't pull an unbounded result set into memory.
-    """
-    engine = get_read_only_engine()
-    result: dict[str, Any] = {}
-    error: dict[str, BaseException] = {}
-    connection_holder: dict[str, Any] = {}
-
-    def _run() -> None:
-        try:
-            with engine.connect() as connection:
-                connection_holder["connection"] = connection
-                _apply_statement_timeout(connection, engine.dialect.name, query_timeout_seconds)
-                cursor_result = connection.execute(text(sql))
-                result["columns"] = list(cursor_result.keys())
-                result["rows"] = cursor_result.fetchmany(max_result_rows)
-        except BaseException as exc:  # noqa: BLE001 - re-raised on the caller's thread below
-            error["error"] = exc
-        finally:
-            connection_holder.pop("connection", None)
-
-    worker = threading.Thread(target=_run, daemon=True)
-    worker.start()
-    worker.join(query_timeout_seconds)
-
-    if worker.is_alive():
-        connection = connection_holder.get("connection")
-        if connection is not None:
-            # Best-effort abort; must not mask the TimeoutError raised below.
-            with contextlib.suppress(Exception):
-                connection.close()
-        worker.join(query_timeout_seconds)
-        raise TimeoutError(f"Query exceeded the {query_timeout_seconds}s timeout and was aborted.")
-
-    if "error" in error:
-        raise error["error"]
-
-    return result["columns"], result["rows"]
-
-
-def execute_readonly_sql(
-    sql: str, query_timeout_seconds: int, max_result_rows: int | None = None
-) -> tuple[list[str], list[tuple]]:
-    """Executes already-validated, already row-limited SQL read-only.
-
-    Shared by `execute_sql_node` (the agent's internal self-correction loop)
-    and `ui/app.py`'s manual "Confirm and Run" path, so both go through the
-    exact same connection reuse, timeout, and read-only enforcement -- the
-    UI does not get its own, separately-maintained execution logic.
-
-    Returns:
-        (columns, rows).
-
-    Raises:
-        SQLAlchemyError: on a SQL execution error (e.g. unknown column).
-        TimeoutError: if execution exceeds `query_timeout_seconds`.
-    """
-    resolved_max_rows = (
-        max_result_rows if max_result_rows is not None else get_settings().max_result_rows
-    )
-    return _execute_with_timeout(sql, query_timeout_seconds, resolved_max_rows)
 
 
 @_timed_node("execute_sql")

@@ -128,6 +128,26 @@ def is_probable_surrogate_key(
     return tokens[-1].lower() in suffixes
 
 
+_MARKDOWN_SPECIAL_CHARS_RE = re.compile(r"([\\`*_{}\[\]()#+\-.!|>~])")
+
+
+def escape_markdown(text: str) -> str:
+    """Escapes CommonMark special characters for safe inclusion in `st.markdown`/`st.caption`.
+
+    Table/column names are database-sourced, therefore untrusted input per
+    this project's own stated model (see SECURITY.md's "Database content is
+    untrusted input too") -- most engines' quoted-identifier rules are
+    permissive enough that a malicious table/column name could otherwise
+    inject markdown formatting (fake bold text, a spoofed link, a bogus
+    heading) into `ui/app.py`'s sidebar table list or "Retrieved schema
+    context" panel. Neither of those call sites sets `unsafe_allow_html`, so
+    this is about markdown-*syntax* spoofing, not script execution -- but
+    database-sourced text reaching a rendering surface unescaped is worth
+    closing regardless of severity.
+    """
+    return _MARKDOWN_SPECIAL_CHARS_RE.sub(r"\\\1", text)
+
+
 def get_display_columns(columns: list[str], key_columns: set[str]) -> tuple[list[str], bool]:
     """Filters surrogate key columns out of the default results view.
 

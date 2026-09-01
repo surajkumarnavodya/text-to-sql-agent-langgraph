@@ -23,6 +23,7 @@ from __future__ import annotations
 import html
 import logging
 import sys
+import uuid
 from pathlib import Path
 
 import pandas as pd
@@ -38,15 +39,25 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from agent.exceptions import SchemaRetrievalError
 from agent.graph import run_agent
-from agent.nodes import execute_readonly_sql
 from agent.rate_limit import QUESTION_LIMIT_MESSAGE, SlidingWindowRateLimiter
 from agent.sql_validator import enforce_row_limit, validate_sql
 from config.settings import configure_logging, get_settings
-from db.connection import get_read_only_engine, get_sqlglot_dialect, test_connection
-from db.schema_introspection import TableSchemaInfo, introspect_schema
-from db.value_sampling import attach_sample_values
-from embeddings.schema_indexer import build_index
-from ui.column_formatting import format_column_label, get_display_columns, get_key_column_names
+from db.connection import (
+    check_write_privileges,
+    get_read_only_engine,
+    get_sqlglot_dialect,
+    test_connection,
+)
+from db.execution import execute_readonly_sql
+from db.schema_introspection import TableSchemaInfo
+from embeddings.schema_indexer import refresh_schema_index
+from security.redaction import redact_secrets
+from ui.column_formatting import (
+    escape_markdown,
+    format_column_label,
+    get_display_columns,
+    get_key_column_names,
+)
 from ui.session_history import (
     QueryHistoryEntry,
     append_entry,
@@ -281,6 +292,21 @@ if not _startup_check.success:
 
 
 # --------------------------------------------------------------------------
+# Write-privilege check (once per process) -- best-effort, warning-only, see
+# db.connection.check_write_privileges' docstring (item A: least-privilege
+# design). Never blocks startup, unlike the connection check above.
+# --------------------------------------------------------------------------
+
+
+@st.cache_resource(show_spinner=False)
+def _startup_write_privilege_check():
+    return check_write_privileges(get_read_only_engine(settings), settings)
+
+
+_write_privilege_check = _startup_write_privilege_check()
+
+
+# --------------------------------------------------------------------------
 # Schema introspection + embedding index (once per process; "Refresh Schema"
 # button below clears and re-runs this)
 # --------------------------------------------------------------------------
@@ -289,10 +315,7 @@ if not _startup_check.success:
 @st.cache_resource(show_spinner=False)
 def _initialize_schema() -> list[TableSchemaInfo]:
     engine = get_read_only_engine(settings)
-    tables = introspect_schema(engine, schema=settings.db_schema)
-    sampled_tables = attach_sample_values(engine, tables)
-    build_index(sampled_tables, settings=settings, fingerprint_tables=tables)
-    return sampled_tables
+    return refresh_schema_index(engine, settings=settings)
 
 
 discovered_tables = _initialize_schema()
@@ -300,12 +323,24 @@ discovered_tables = _initialize_schema()
 
 @st.cache_data(show_spinner=False)
 def _run_readonly_query(
-    sql: str, query_timeout_seconds: int, max_result_rows: int
+    sql: str, query_timeout_seconds: int, max_result_rows: int, session_token: str
 ) -> tuple[list[str], list[tuple]]:
     """Executes already-validated, row-limited SQL, cached by exact SQL text.
 
     Caching here means asking to re-run the identical SQL (e.g. re-clicking
     Confirm and Run without edits) doesn't hit the database again.
+
+    `session_token` (see the `session_token` session-state entry below) is
+    part of the cache key but never used inside the function body --
+    `st.cache_data` is a **process-wide** cache in Streamlit, not
+    per-session, despite every other piece of state in this file being
+    session-scoped. Without a session-scoped component in the key, a future
+    multi-user deployment would let User B, submitting/editing SQL that
+    happens to match User A's exact SQL text, receive User A's cached
+    *result rows* without their own query ever executing -- a real
+    cross-user data leak this app's actual single-user target never
+    surfaced, but the fix costs nothing today and closes it structurally
+    for whenever that target changes.
     """
     return execute_readonly_sql(sql, query_timeout_seconds, max_result_rows)
 
@@ -328,6 +363,9 @@ def _run_readonly_query(
 #   display_sql: str | None                            the exact SQL text that produced display_result, if any
 #   enable_insight: bool                                whether to generate a plain-English insight (sidebar toggle)
 #   question_rate_limiter: SlidingWindowRateLimiter     per-session cap on question submissions (see agent/rate_limit.py)
+#   session_token: str                                  random per-session id, scopes _run_readonly_query's cache (see its docstring)
+if "session_token" not in st.session_state:
+    st.session_state.session_token = uuid.uuid4().hex
 if "chat_history" not in st.session_state:
     st.session_state.chat_history = []
 if "nl_question_cache" not in st.session_state:
@@ -380,6 +418,8 @@ with st.sidebar:
         st.markdown(f"**Schema:** `{settings.db_schema}`")
     if _startup_check.db_version:
         st.caption(_startup_check.db_version)
+    if _write_privilege_check.checked and _write_privilege_check.has_write_privileges:
+        st.warning(f"⚠️ {_write_privilege_check.message}")
 
     if st.button("🔌 Test Connection", use_container_width=True):
         with st.spinner("Testing connection..."):
@@ -398,8 +438,10 @@ with st.sidebar:
 
     with st.expander(f"📋 Discovered tables ({len(discovered_tables)})", expanded=False):
         for table in discovered_tables:
-            st.markdown(f"**{table.table_name}**")
-            column_summary = ", ".join(f"{c.name} ({c.type})" for c in table.columns)
+            st.markdown(f"**{escape_markdown(table.table_name)}**")
+            column_summary = ", ".join(
+                f"{escape_markdown(c.name)} ({escape_markdown(c.type)})" for c in table.columns
+            )
             st.caption(column_summary)
 
     st.divider()
@@ -723,7 +765,10 @@ if state and state.get("status") not in (
         if not tables:
             st.write("No schema context retrieved.")
         for table in tables:
-            st.markdown(f"**{table['table_name']}** (similarity: {table['similarity_score']:.3f})")
+            st.markdown(
+                f"**{escape_markdown(table['table_name'])}** "
+                f"(similarity: {table['similarity_score']:.3f})"
+            )
             st.code(table["ddl"], language="sql")
 
     st.subheader("🛠️ Generated SQL")
@@ -769,7 +814,10 @@ if state and state.get("status") not in (
             try:
                 with st.spinner("Running query..."):
                     columns, rows = _run_readonly_query(
-                        safe_sql, settings.query_timeout_seconds, settings.max_result_rows
+                        safe_sql,
+                        settings.query_timeout_seconds,
+                        settings.max_result_rows,
+                        st.session_state.session_token,
                     )
                 st.session_state.display_result = (columns, rows)
                 st.session_state.display_error = None
@@ -780,11 +828,16 @@ if state and state.get("status") not in (
                         st.session_state.query_history, active_id, updated_entry
                     )
             except (SQLAlchemyError, TimeoutError) as exc:
+                # Redacted before display/storage: on some drivers/failure
+                # modes a mid-query connection failure can surface the full
+                # connection string (including the password) verbatim in
+                # the exception text -- see security.redaction's docstring.
+                safe_detail = redact_secrets(str(exc), settings)
                 st.session_state.display_result = None
-                st.session_state.display_error = f"Execution failed: {exc}"
+                st.session_state.display_error = f"Execution failed: {safe_detail}"
                 st.session_state.display_sql = None
                 if active_entry is not None:
-                    updated_entry = with_confirmed_error(active_entry, str(exc))
+                    updated_entry = with_confirmed_error(active_entry, safe_detail)
                     st.session_state.query_history = replace_entry(
                         st.session_state.query_history, active_id, updated_entry
                     )

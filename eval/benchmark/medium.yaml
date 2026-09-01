@@ -1,0 +1,117 @@
+# Medium-tier benchmark cases: joins, date_filtering, multi_table_analysis,
+# group_by_having. See easy.yaml's header for the gold-SQL verification note.
+
+cases:
+  - id: med_join_sales_by_category
+    question: "Show total internet sales amount by product category"
+    database: AdventureWorksDW2025
+    difficulty: medium
+    category: joins
+    expected_tables: [FactInternetSales, DimProduct, DimProductSubcategory, DimProductCategory]
+    expected_columns: [EnglishProductCategoryName, SalesAmount]
+    expected_sql: >-
+      SELECT pc.EnglishProductCategoryName, SUM(f.SalesAmount)
+      FROM FactInternetSales f
+      JOIN DimProduct p ON f.ProductKey = p.ProductKey
+      JOIN DimProductSubcategory ps ON p.ProductSubcategoryKey = ps.ProductSubcategoryKey
+      JOIN DimProductCategory pc ON ps.ProductCategoryKey = pc.ProductCategoryKey
+      GROUP BY pc.EnglishProductCategoryName
+    notes: >-
+      A 3-hop join chain (fact -> product -> subcategory -> category) --
+      the classic regression case for join correctness in this schema (see
+      the migrated legacy case in real_world.yaml for the historical
+      version of this exact join chain going wrong).
+
+  - id: med_join_reseller_by_business_type
+    question: "Show total reseller sales amount by reseller business type"
+    database: AdventureWorksDW2025
+    difficulty: medium
+    category: joins
+    expected_tables: [FactResellerSales, DimReseller]
+    expected_columns: [BusinessType, SalesAmount]
+    expected_sql: >-
+      SELECT r.BusinessType, SUM(f.SalesAmount) FROM FactResellerSales f
+      JOIN DimReseller r ON f.ResellerKey = r.ResellerKey GROUP BY r.BusinessType
+    notes: "A single-hop join on the reseller (not internet) sales fact table."
+
+  - id: med_date_2013_internet_sales
+    question: "What were total internet sales in 2013?"
+    database: AdventureWorksDW2025
+    difficulty: medium
+    category: date_filtering
+    expected_tables: [FactInternetSales, DimDate]
+    expected_columns: [CalendarYear, SalesAmount]
+    expected_sql: >-
+      SELECT SUM(f.SalesAmount) FROM FactInternetSales f
+      JOIN DimDate d ON f.OrderDateKey = d.DateKey WHERE d.CalendarYear = 2013
+    notes: "Date filtering via the DimDate join (a surrogate DateKey, not a native date column)."
+
+  - id: med_date_jan2012_order_count
+    question: "How many orders were placed in January 2012?"
+    database: AdventureWorksDW2025
+    difficulty: medium
+    category: date_filtering
+    expected_tables: [FactInternetSales, DimDate]
+    expected_columns: [CalendarYear, MonthNumberOfYear]
+    expected_sql: >-
+      SELECT COUNT(DISTINCT f.SalesOrderNumber) FROM FactInternetSales f
+      JOIN DimDate d ON f.OrderDateKey = d.DateKey
+      WHERE d.CalendarYear = 2012 AND d.MonthNumberOfYear = 1
+    notes: >-
+      Two-part date filter (year AND month) plus COUNT DISTINCT on the
+      order number -- FactInternetSales is one row per *line item*, so a
+      naive COUNT(*) would overcount orders with multiple line items.
+
+  - id: med_multi_sales_by_country
+    question: "Show total internet sales by customer country"
+    database: AdventureWorksDW2025
+    difficulty: medium
+    category: multi_table_analysis
+    expected_tables: [FactInternetSales, DimCustomer, DimGeography]
+    expected_columns: [EnglishCountryRegionName, SalesAmount]
+    expected_sql: >-
+      SELECT g.EnglishCountryRegionName, SUM(f.SalesAmount) FROM FactInternetSales f
+      JOIN DimCustomer c ON f.CustomerKey = c.CustomerKey
+      JOIN DimGeography g ON c.GeographyKey = g.GeographyKey
+      GROUP BY g.EnglishCountryRegionName
+    notes: "3-table analysis: fact -> customer -> geography."
+
+  - id: med_multi_employee_territory
+    question: "Show each employee's name and their assigned sales territory region"
+    database: AdventureWorksDW2025
+    difficulty: medium
+    category: multi_table_analysis
+    expected_tables: [DimEmployee, DimSalesTerritory]
+    expected_columns: [FirstName, LastName, SalesTerritoryRegion]
+    expected_sql: >-
+      SELECT e.FirstName, e.LastName, t.SalesTerritoryRegion FROM DimEmployee e
+      JOIN DimSalesTerritory t ON e.SalesTerritoryKey = t.SalesTerritoryKey
+    notes: "No fact table involved -- a pure two-dimension join, checking the model doesn't force in an unrelated fact table."
+
+  - id: med_having_category_over_1m
+    question: "Which product categories have total internet sales over 1,000,000?"
+    database: AdventureWorksDW2025
+    difficulty: medium
+    category: group_by_having
+    expected_tables: [FactInternetSales, DimProduct, DimProductSubcategory, DimProductCategory]
+    expected_columns: [EnglishProductCategoryName, SalesAmount]
+    expected_sql: >-
+      SELECT pc.EnglishProductCategoryName, SUM(f.SalesAmount) AS total FROM FactInternetSales f
+      JOIN DimProduct p ON f.ProductKey = p.ProductKey
+      JOIN DimProductSubcategory ps ON p.ProductSubcategoryKey = ps.ProductSubcategoryKey
+      JOIN DimProductCategory pc ON ps.ProductCategoryKey = pc.ProductCategoryKey
+      GROUP BY pc.EnglishProductCategoryName HAVING SUM(f.SalesAmount) > 1000000
+    notes: "Only 'Bikes' clears this bar in the real data -- a genuine, non-trivial HAVING filter, not a vacuous one."
+
+  - id: med_having_territory_over_100_orders
+    question: "Which sales territories had more than 100 distinct orders?"
+    database: AdventureWorksDW2025
+    difficulty: medium
+    category: group_by_having
+    expected_tables: [FactInternetSales, DimSalesTerritory]
+    expected_columns: [SalesTerritoryRegion]
+    expected_sql: >-
+      SELECT t.SalesTerritoryRegion, COUNT(DISTINCT f.SalesOrderNumber) AS n FROM FactInternetSales f
+      JOIN DimSalesTerritory t ON f.SalesTerritoryKey = t.SalesTerritoryKey
+      GROUP BY t.SalesTerritoryRegion HAVING COUNT(DISTINCT f.SalesOrderNumber) > 100
+    notes: "HAVING on a COUNT DISTINCT, not a plain COUNT/SUM -- a slightly sharper correctness bar."

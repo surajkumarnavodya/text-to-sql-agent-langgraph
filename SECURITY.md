@@ -3,18 +3,76 @@
 This is a **demo/portfolio project**, not a production-hardened product.
 Please read this before pointing it at anything real.
 
+**2026-09-01 update:** this document reflects an enterprise-oriented
+security audit (22 attack-surface categories, tested against the running
+code, not just reasoned about from the design). It found and closed two
+real gaps in the SQL validator — see "What's actually enforced" below and
+`docs/security-changelog.md`'s dated entry for the full detail — plus added
+several defense-in-depth layers (identifier quoting, secret redaction, a
+`SecretStr` wrapper, a best-effort write-privilege check, enforced column
+sensitivity classification, structured security-event logging, a
+RAG-poisoning detection scan, and closing a process-wide result-cache
+cross-session risk). Everything below is written to still be accurate after
+that pass, not a separate "what's new" list bolted on top.
+
 ## What's actually enforced
 
 - Generated SQL is restricted to a single read-only `SELECT` (or
   `UNION`/`EXCEPT`/`INTERSECT`) statement via an AST-based allowlist
   (`agent/sql_validator.py`, parsed with `sqlglot` — not a regex
   blocklist). This check runs on every attempt, including retries and SQL
-  you hand-edit in the UI before clicking **Confirm and Run**.
+  you hand-edit in the UI before clicking **Confirm and Run**. Two
+  additional AST-based checks close bypass classes a root-type-only check
+  misses: a **write/DDL operation embedded anywhere in the parsed tree**
+  (not just the root) — e.g. Postgres's data-modifying-CTE syntax,
+  `WITH x AS (DELETE FROM t RETURNING *) SELECT * FROM x`, whose *root*
+  node is an ordinary `SELECT` even though it deletes real rows — and a
+  **denylist of known-dangerous functions/table-valued-functions**
+  callable from inside an otherwise ordinary SELECT (`pg_sleep`,
+  `pg_read_file`, MySQL `SLEEP`/`BENCHMARK`/`LOAD_FILE`, Oracle
+  `UTL_HTTP.REQUEST`, MSSQL `OPENQUERY`/`OPENROWSET`/`OPENDATASOURCE`/
+  `xp_cmdshell`, and others — see `agent/sql_validator.py`'s
+  `_DANGEROUS_FUNCTION_NAMES` for the full, documented list). The dangerous-
+  function check is a genuine denylist, not an allowlist like the rest of
+  this validator, and is documented as such: it can only ever be as
+  complete as what's enumerated there.
 - Query execution goes through a read-only-by-convention SQLAlchemy
   engine, a row cap enforced two independent ways, and a query timeout —
   see `CLAUDE.md`'s "SQL is untrusted output, always" section for the
-  full detail.
+  full detail. A best-effort, warning-only check
+  (`db.connection.check_write_privileges`, surfaced in the UI sidebar and
+  `scripts/test_db_connection.py`) queries the connected database's own
+  privilege catalog and flags — never blocks — a `DB_USER` that appears to
+  hold INSERT/UPDATE/DELETE grants, since the database role actually being
+  read-only is the real guarantee behind the validator, not something this
+  app can enforce by itself (see "What is explicitly not guaranteed" below).
+- `db/value_sampling.py` quotes table/column identifiers via the connected
+  engine's own dialect-aware `identifier_preparer` before building the
+  `SELECT DISTINCT` text it uses to sample values, rather than
+  interpolating them raw — closes a second-order SQL-injection path if the
+  database ever contains a maliciously-named table/column (creatable via
+  quoted-identifier DDL by anyone with CREATE privileges on that schema).
+- Optional column-level data governance: `config/sensitive_columns.yaml`
+  (loaded by `config/sensitive_columns.py`, same hand-authored,
+  read-fresh-every-call pattern as `config/table_descriptions.yaml`) lets
+  you classify a column "restricted." A restricted column is never sampled
+  into the schema prompt regardless of cardinality, and generated SQL that
+  directly selects one is rejected (retryable — the model can drop the
+  column and answer with what remains). Ships empty, so this has no effect
+  until you classify something — see `docs/GOVERNANCE.md`'s "Data
+  classification policy."
 - The app never logs a connection string, password, or full result row.
+  Where driver/library exception text is shown or logged (a connection
+  failure, a mid-query execution error), it's passed through
+  `security/redaction.py` first — some drivers render the full attempted
+  connection string, including the password, into their own error text on
+  failure, which this app doesn't control the format of. `Settings.
+  db_password`/`db_connection_string` are also wrapped in
+  `security.secrets.SecretStr`, a string that behaves normally everywhere
+  the real value is needed but whose `repr()`/`%r` output is redacted —
+  protection against an accidental `logger.debug("%r", settings)` or a
+  traceback's local-variable dump, not just against call sites this
+  codebase controls the wording of.
 - Every typed question passes through `agent/input_guard.py` before
   anything else touches it: a length cap, Unicode normalization (NFKC
   *plus* an explicit Cyrillic/Greek confusables map — plain NFKC alone
@@ -36,7 +94,28 @@ Please read this before pointing it at anything real.
   and especially sampled distinct column *values* — is normalized the
   same way (`security/sanitization.py`) before it's ever concatenated
   into a prompt or persisted into the embedding index. See "Database
-  content is untrusted input too" below.
+  content is untrusted input too" below. The same regex patterns
+  `agent/input_guard.py` applies to typed questions (shared from
+  `security/injection_patterns.py`, one definition, not two) are also run
+  against the fully-assembled retrieved schema context right before
+  generation, in `agent.nodes.retrieve_schema_node` — detection-only,
+  never blocking (blocking real business data on a false positive would be
+  worse than the risk it's guarding against), but it gives an operator
+  visibility into whether the *content itself* is actively being used to
+  try to prompt-inject the model, not just whether a typed question was.
+  Database identifiers rendered in the Streamlit UI (the sidebar's table
+  list, the "Retrieved schema context" panel) are markdown-escaped
+  (`ui/column_formatting.py::escape_markdown`) for the same
+  untrusted-content reason, even though neither call site sets
+  `unsafe_allow_html` (so this is about markdown-syntax spoofing, not
+  script execution).
+- Every rejection, validator safety violation, rate-limit trip, and
+  RAG-poisoning-scan hit is additionally logged as one structured event
+  (`security/audit_log.py`, on a dedicated `security.audit` logger) — not a
+  replacement for each module's own existing prose log line, but a single,
+  consistently-shaped stream a real deployment could point a SIEM/alerting
+  pipeline at without having to know which of a dozen module loggers a
+  given kind of event happens to live under.
 - Two basic, in-memory rate limits guard against both accidental and
   deliberate resource exhaustion: a cap on question submissions per
   minute (per session) and a stricter, separate cap on LLM *generation*
@@ -74,13 +153,39 @@ Please read this before pointing it at anything real.
   prompt-injection testing against the SQL generation path by someone
   other than the author). It has been reasoned about carefully, but "the
   author thought about it" is not the same as "someone tried to break it."
+- **The dangerous-function check is a denylist, not the AST allowlist the
+  rest of the validator is.** It can only ever be as complete as
+  `agent/sql_validator.py`'s `_DANGEROUS_FUNCTION_NAMES` list — an
+  engine-specific dangerous function not enumerated there is a real,
+  standing residual risk, the same honesty this document already applies
+  to `agent/input_guard.py`'s own regex layer above. This is exactly why
+  it exists *underneath* the statement-type allowlist, not instead of it:
+  the allowlist alone already blocks every non-SELECT statement shape
+  regardless of what this list does or doesn't know about.
+- **Secret redaction (`security/redaction.py`, `security.secrets.SecretStr`)
+  is a best-effort second layer, not a guarantee.** It catches the
+  configured password's exact value plus common
+  `password=`/`://user:pass@`-shaped patterns in driver error text — a
+  driver that renders a secret in some other shape neither layer
+  recognizes would still leak it. `SecretStr` only redacts `repr()`/`%r`
+  output; `str()`/f-string interpolation of the wrapped value still yields
+  the real secret, since call sites that legitimately need it (building the
+  actual connection) still have to get it.
 - **Not designed for multi-tenant or production deployment.** No
-  authentication, no per-user authorization, no audit log beyond
-  application logging. Rate limiting exists (see below) but is a basic,
-  in-memory, single-process safeguard sized for one local user, not a
-  substitute for real multi-tenant rate limiting (a distributed store,
-  per-user identity, coordinated limits across processes) if this were
-  ever deployed for more than one person at a time.
+  authentication, no per-user authorization. `security/audit_log.py` gives
+  every rejection/violation a structured log line a real deployment could
+  ship to a SIEM, but it's still just structured *application* logging, not
+  a tamper-evident audit trail with per-user identity behind it. Rate
+  limiting exists (see below) but is a basic, in-memory, single-process
+  safeguard sized for one local user, not a substitute for real
+  multi-tenant rate limiting (a distributed store, per-user identity,
+  coordinated limits across processes) if this were ever deployed for more
+  than one person at a time. `ui/app.py`'s query-result cache (`st.
+  cache_data`, which is process-wide in Streamlit, not per-session by
+  default) is scoped with a per-session token specifically so this
+  single-user posture doesn't quietly become a cross-user data leak the
+  moment more than one person points a browser at the same running
+  process — see that function's own docstring.
 - **The LLM-call rate limiter is process-wide, not per-session**, unlike
   the question-submission limiter, which genuinely is per-session (see
   "Resource exhaustion / abuse protections" below for why). For this

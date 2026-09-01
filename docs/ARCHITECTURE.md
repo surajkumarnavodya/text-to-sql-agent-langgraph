@@ -91,9 +91,10 @@ that happens in a log file.
 
 ### Execution safety
 
-`execute_sql_node` runs SQL on a background thread
-(`_execute_with_timeout`) and force-closes the connection from the calling
-thread if it's still running past `QUERY_TIMEOUT_SECONDS` — SQLAlchemy has
+`execute_sql_node` calls `db.execution.execute_readonly_sql`, which runs SQL
+on a background thread (`_execute_with_timeout`) and force-closes the
+connection from the calling thread if it's still running past
+`QUERY_TIMEOUT_SECONDS` — SQLAlchemy has
 no universal cross-dialect "cancel this query" call, so closing the socket
 out from under an in-flight query is the mechanism that works identically
 across all four supported engines. A cheap session-level `SET` statement

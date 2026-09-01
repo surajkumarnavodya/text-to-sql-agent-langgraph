@@ -56,14 +56,22 @@ wrong, not as a parallel supported mode.
   to pull real tables/columns/types/FKs and synthesizes a compact
   `CREATE TABLE`-style DDL string per table (for LLM prompt consistency,
   not necessarily valid executable DDL). `get_schema_fingerprint()` hashes
-  that output for Chroma cache invalidation.
+  that output for Chroma cache invalidation. `execution.py` owns read-only
+  SQL execution mechanics (`execute_readonly_sql` — background-thread
+  timeout enforcement plus a `fetchmany()` row cap), shared by
+  `agent.nodes.execute_sql_node` and `ui/app.py`'s "Confirm and Run" path —
+  a pure database-execution concern with no LangGraph dependency, so it
+  lives here rather than in `agent/`.
 - `embeddings/` — `schema_indexer.py`'s `build_index(tables, ...)` takes
   already-introspected `TableSchemaInfo` objects (not a file, not an
   engine) and embeds them into Chroma, keyed by a hash of the introspected
   schema so re-embedding only happens when the schema actually changed.
-  `retriever.py` does top-k similarity search over those table-level DDL
-  chunks given a question — unchanged in shape from before, just fed by
-  live data now.
+  `refresh_schema_index(engine, settings, force)` is the single
+  introspect → sample → embed pipeline shared by `scripts/build_embeddings.py`
+  and `ui/app.py`'s schema initialization, so that three-step sequence is
+  defined exactly once. `retriever.py` does top-k similarity search over
+  those table-level DDL chunks given a question — unchanged in shape from
+  before, just fed by live data now.
 - `agent/` — LangGraph nodes live in `nodes.py`, one function per node, each
   taking and returning `AgentState` (defined in `state.py`). `graph.py`
   wires them together and compiles the graph. `sql_validator.py` is the
@@ -82,11 +90,28 @@ wrong, not as a parallel supported mode.
   `.env` before booting anything else — prints pass/fail, DB version, table
   count, or a classified readable error), `build_embeddings.py`
   (introspect + embed, with `--force`), `integration_test.py` (manual,
-  requires a real DB, not part of the pytest suite — see `tests/` below).
+  requires a real DB, not part of the pytest suite — see `tests/` below),
+  `run_benchmark.py` (the Text-to-SQL benchmark runner — see `eval/` below;
+  also manual/real-DB-required, not part of the pytest suite).
+- `eval/` — the Text-to-SQL benchmark: `schema.py` (dataset + result data
+  model), `dataset_loader.py` (loads `eval/benchmark/*.yaml`),
+  `evaluators.py` (grades one case — **execution-accuracy first**: gold
+  SQL is executed live and the agent's actual result set is compared
+  against it, never SQL-text similarity alone), `metrics.py` (reduces
+  graded results into the named benchmark metrics), `runner.py` (drives
+  `agent.graph.run_agent` for every case), `reporting.py` (markdown report
+  + JSON baseline serialization), `regression.py` (compares a run against
+  `eval/baselines/latest.json`). `eval/benchmark/*.yaml` holds the actual
+  cases, split by difficulty/category; `eval/eval_questions.yaml` and
+  `scripts/run_eval.py` are the superseded predecessor, kept unmodified —
+  see both files' deprecation notes.
 - `tests/` — pytest, all fully mocked, no real DB or Ollama required.
   Mirrors package names (`test_sql_validator.py`, `test_connection.py`,
   `test_schema_introspection.py`, `test_schema_retriever.py`,
-  `test_agent_nodes.py`).
+  `test_agent_nodes.py`), plus `test_eval_*.py` for the benchmark
+  framework's own logic (dataset loading, grading, metrics, regression
+  detection — not a live run, which stays manual like `run_benchmark.py`
+  itself).
 
 ## Key design decisions
 
@@ -123,7 +148,7 @@ enforced *both* via `LIMIT` in the SQL text and independently via
 bypass it just by lacking a working `LIMIT`) and a query timeout enforced at
 the driver level where a cheap session-level `SET` exists (Postgres, MySQL)
 and via forced connection-abort otherwise (SQL Server, Oracle — see
-`agent/nodes.py::_execute_with_timeout`). This validation step runs
+`db/execution.py::_execute_with_timeout`). This validation step runs
 **every** time SQL is about to be displayed or executed for the user,
 including after the user hand-edits the SQL box in the UI — an edit is
 exactly as untrusted as an LLM generation.

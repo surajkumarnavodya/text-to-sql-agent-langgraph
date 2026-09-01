@@ -1,0 +1,121 @@
+# Real-world-tier benchmark cases: business_questions, ambiguous_wording,
+# incomplete_questions. (follow_up questions live in follow_up.yaml, since
+# they need the multi-turn `followup_cases` shape, not `cases`.)
+
+cases:
+  - id: rw_top5_customers_by_spend
+    question: "Who are our top 5 customers by total spending?"
+    database: AdventureWorksDW2025
+    difficulty: real_world
+    category: business_questions
+    expected_tables: [FactInternetSales, DimCustomer]
+    expected_columns: [FirstName, LastName, SalesAmount]
+    expected_sql: >-
+      SELECT TOP 5 c.FirstName, c.LastName, SUM(f.SalesAmount) AS total FROM FactInternetSales f
+      JOIN DimCustomer c ON f.CustomerKey = c.CustomerKey GROUP BY c.FirstName, c.LastName ORDER BY total DESC
+    order_matters: true
+    max_rows: 5
+    notes: "Ordinary business-analyst phrasing ('top N customers by spending') rather than a schema-literal question."
+
+  - id: rw_gender_breakdown
+    question: "How many male and how many female customers do we have?"
+    database: AdventureWorksDW2025
+    difficulty: real_world
+    category: business_questions
+    expected_tables: [DimCustomer]
+    expected_columns: [Gender]
+    expected_sql: "SELECT Gender, COUNT(*) FROM DimCustomer GROUP BY Gender"
+    notes: "A demographic breakdown question, phrased the way a business user actually asks it, not 'GROUP BY Gender.'"
+
+  - id: ambig_bikes_top_territory
+    question: "Which sales territory had the highest sales for the Bikes category?"
+    database: AdventureWorksDW2025
+    difficulty: real_world
+    category: ambiguous_wording
+    expected_tables: [DimProductSubcategory]
+    expected_columns: [SalesTerritoryRegion]
+    expected_sql: >-
+      SELECT TOP 1 st.SalesTerritoryRegion FROM DimSalesTerritory st
+      JOIN FactInternetSales fs ON st.SalesTerritoryKey = fs.SalesTerritoryKey
+      JOIN DimProduct p ON fs.ProductKey = p.ProductKey
+      JOIN DimProductSubcategory ps ON p.ProductSubcategoryKey = ps.ProductSubcategoryKey
+      JOIN DimProductCategory pc ON ps.ProductCategoryKey = pc.ProductCategoryKey
+      WHERE pc.EnglishProductCategoryName = 'Bikes'
+      GROUP BY st.SalesTerritoryRegion ORDER BY SUM(fs.SalesAmount) DESC
+    alternative_sql:
+      - >-
+        SELECT TOP 1 st.SalesTerritoryRegion FROM DimSalesTerritory st
+        JOIN FactResellerSales rs ON st.SalesTerritoryKey = rs.SalesTerritoryKey
+        JOIN DimProduct p ON rs.ProductKey = p.ProductKey
+        JOIN DimProductSubcategory ps ON p.ProductSubcategoryKey = ps.ProductSubcategoryKey
+        JOIN DimProductCategory pc ON ps.ProductCategoryKey = pc.ProductCategoryKey
+        WHERE pc.EnglishProductCategoryName = 'Bikes'
+        GROUP BY st.SalesTerritoryRegion ORDER BY SUM(rs.SalesAmount) DESC
+    notes: >-
+      MIGRATED from the legacy eval_questions.yaml (this repo's original,
+      single-question eval harness -- see eval/results/sample_run.md).
+      Genuinely ambiguous between the internet-sales channel (real answer,
+      verified live: Australia) and the reseller channel (real answer,
+      verified live: Southwest) -- both are independently correct, hence
+      `alternative_sql` rather than asserting one. This case's real history
+      as a regression guard: it previously caught the model (a) filtering
+      on the unrelated DimProduct.ProductLine code column instead of the
+      real category name, (b) inventing a nonexistent FK column to skip
+      the DimProductSubcategory hop, and (c) comparing
+      DimProduct.ProductSubcategoryKey directly to
+      DimProductCategory.ProductCategoryKey -- skipping DimProductSubcategory
+      entirely and returning a plausible, non-empty, *wrong* answer purely
+      because subcategory id 1 and category id 1 happen to coincide in this
+      data. `expected_tables: [DimProductSubcategory]` exists specifically
+      to catch case (c): row count and a readable result alone would not.
+
+  - id: ambig_best_selling_product
+    question: "What was our best selling product?"
+    database: AdventureWorksDW2025
+    difficulty: real_world
+    category: ambiguous_wording
+    expected_tables: [FactInternetSales, DimProduct]
+    expected_columns: [EnglishProductName]
+    expected_sql: >-
+      SELECT TOP 1 p.EnglishProductName, SUM(f.SalesAmount) AS total FROM FactInternetSales f
+      JOIN DimProduct p ON f.ProductKey = p.ProductKey GROUP BY p.EnglishProductName ORDER BY total DESC
+    alternative_sql:
+      - >-
+        SELECT TOP 1 p.EnglishProductName, SUM(f.OrderQuantity) AS total_qty FROM FactInternetSales f
+        JOIN DimProduct p ON f.ProductKey = p.ProductKey GROUP BY p.EnglishProductName ORDER BY total_qty DESC
+    notes: >-
+      "Best selling" is genuinely ambiguous between highest revenue
+      (Mountain-200 Black, 46 -- verified live) and highest unit quantity
+      (Water Bottle - 30 oz. -- verified live, a materially different
+      product) -- both are defensible, real interpretations of "best
+      selling," so both are accepted.
+
+  - id: incomplete_top_products
+    question: "top products"
+    database: AdventureWorksDW2025
+    difficulty: real_world
+    category: incomplete_questions
+    expected_tables: [FactInternetSales, DimProduct]
+    expected_sql: >-
+      SELECT TOP 5 p.EnglishProductName, SUM(f.SalesAmount) AS total_amt FROM FactInternetSales f
+      JOIN DimProduct p ON f.ProductKey = p.ProductKey GROUP BY p.EnglishProductName ORDER BY total_amt DESC
+    alternative_sql:
+      - >-
+        SELECT TOP 5 p.EnglishProductName, SUM(f.OrderQuantity) AS total_qty FROM FactInternetSales f
+        JOIN DimProduct p ON f.ProductKey = p.ProductKey GROUP BY p.EnglishProductName ORDER BY total_qty DESC
+    min_rows: 1
+    notes: >-
+      Deliberately terse/keyword-shaped rather than a full sentence -- has
+      enough of a subject ("products") that agent.followup's has_subject
+      check treats it as standalone, not ambiguous, so it's expected to
+      reach generation and produce *some* reasonable top-N-by-a-sales-
+      metric interpretation rather than ask for clarification.
+
+  - id: incomplete_total_sales
+    question: "total sales"
+    database: AdventureWorksDW2025
+    difficulty: real_world
+    category: incomplete_questions
+    expected_tables: [FactInternetSales]
+    expected_sql: "SELECT SUM(SalesAmount) FROM FactInternetSales"
+    notes: "The terse-keyword-question counterpart to easy_agg cases -- same underlying query shape, minimal wording."

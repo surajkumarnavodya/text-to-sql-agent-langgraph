@@ -32,9 +32,11 @@ import logging
 import chromadb
 from chromadb.api.models.Collection import Collection
 from chromadb.utils import embedding_functions
+from sqlalchemy import Engine
 
 from config.settings import Settings, get_settings
-from db.schema_introspection import TableSchemaInfo, get_schema_fingerprint
+from db.schema_introspection import TableSchemaInfo, get_schema_fingerprint, introspect_schema
+from db.value_sampling import attach_sample_values
 
 logger = logging.getLogger(__name__)
 
@@ -173,3 +175,35 @@ def build_index(
         settings.chroma_collection_name,
     )
     return len(tables)
+
+
+def refresh_schema_index(
+    engine: Engine, settings: Settings | None = None, force: bool = False
+) -> list[TableSchemaInfo]:
+    """Introspects, samples, and (re)indexes the schema in one call.
+
+    Single source of truth for the introspect -> sample -> embed pipeline --
+    previously duplicated between `scripts/build_embeddings.py` and
+    `ui/app.py`'s schema initialization. The fingerprint used for cache
+    invalidation is computed from the pre-value-sampling tables (see
+    `build_index`'s `fingerprint_tables` parameter), so incidental data
+    changes in a sampled column don't force a re-embed on their own.
+
+    Args:
+        engine: A read-only SQLAlchemy engine.
+        settings: Optional `Settings` override (mainly for tests).
+        force: If True, re-embeds even if the schema fingerprint hasn't
+            changed since the last build.
+
+    Returns:
+        The sample-value-enriched tables (same shape `ui/app.py`'s "Discovered
+        tables" panel and `_build_chart`'s key-column lookup expect).
+
+    Raises:
+        ValueError: if the database has no tables to index (see `build_index`).
+    """
+    settings = settings or get_settings()
+    tables = introspect_schema(engine, schema=settings.db_schema)
+    sampled_tables = attach_sample_values(engine, tables)
+    build_index(sampled_tables, settings=settings, force=force, fingerprint_tables=tables)
+    return sampled_tables

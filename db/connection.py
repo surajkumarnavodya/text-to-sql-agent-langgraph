@@ -31,6 +31,7 @@ from sqlalchemy.engine import URL
 from sqlalchemy.exc import NoSuchModuleError
 
 from config.settings import ConfigurationError, Settings, get_settings
+from security.redaction import redact_secrets
 
 logger = logging.getLogger(__name__)
 
@@ -316,10 +317,11 @@ def test_connection(settings: Settings | None = None) -> ConnectionTestResult:
     try:
         engine = get_engine(settings)
     except ConfigurationError as exc:
-        logger.warning("Connection test failed (configuration): %s", exc)
+        safe_detail = redact_secrets(str(exc), settings)
+        logger.warning("Connection test failed (configuration): %s", safe_detail)
         return ConnectionTestResult(
             success=False,
-            message=f"{_CATEGORY_GUIDANCE[ConnectionErrorCategory.CONFIGURATION]} ({exc})",
+            message=f"{_CATEGORY_GUIDANCE[ConnectionErrorCategory.CONFIGURATION]} ({safe_detail})",
             category=ConnectionErrorCategory.CONFIGURATION,
         )
 
@@ -333,12 +335,153 @@ def test_connection(settings: Settings | None = None) -> ConnectionTestResult:
         )
     except Exception as exc:  # noqa: BLE001 - deliberately broad; classified below, never re-raised
         category = _classify_error(exc)
+        # Redacted before it's ever logged or returned: some drivers/failure
+        # modes render the full attempted connection string -- including
+        # the password -- verbatim into the exception text. See
+        # `security.redaction`'s module docstring for why this can't be
+        # prevented at the source (the driver's error-message format isn't
+        # this codebase's to control).
+        safe_detail = redact_secrets(str(exc), settings)
         logger.warning(
-            "Connection test failed for %s (category=%s): %s", target, category.value, exc
+            "Connection test failed for %s (category=%s): %s", target, category.value, safe_detail
         )
         guidance = _CATEGORY_GUIDANCE[category]
         return ConnectionTestResult(
             success=False,
-            message=f"{guidance} ({exc.__class__.__name__}: {exc})",
+            message=f"{guidance} ({exc.__class__.__name__}: {safe_detail})",
             category=category,
         )
+
+
+@dataclass(frozen=True)
+class WritePrivilegeCheckResult:
+    """Outcome of `check_write_privileges()`.
+
+    Attributes:
+        checked: Whether the check actually ran and produced a real answer.
+            False means it failed open for any reason -- unsupported
+            `DB_TYPE`, a query/driver error, insufficient privilege to even
+            read the privilege catalog -- and `has_write_privileges` should
+            be ignored in that case.
+        has_write_privileges: True if the connected role appears to hold at
+            least one INSERT/UPDATE/DELETE-shaped grant, False if it
+            doesn't, None if `checked` is False.
+        message: Human-readable summary, always set -- either the finding
+            or why the check couldn't run.
+    """
+
+    checked: bool
+    has_write_privileges: bool | None
+    message: str
+
+
+# Per-DB_TYPE best-effort query against that engine's own privilege catalog.
+# postgresql and mssql are checked against real catalog documentation and
+# match the confidence level `db/query_cost.py` already established for its
+# own MSSQL strategy; mysql and oracle are, like `db/query_cost.py`'s own
+# admission for those same two engines, not verified against a live
+# instance -- an incorrect result here fails open (see the broad `except`
+# below), never blocks, so the worst case is a missed warning, not a false
+# block.
+#   - postgresql: `information_schema.role_table_grants`, scoped to the
+#     current session's own grantee.
+#   - mysql: `information_schema.user_privileges` is documented by MySQL to
+#     show rows for the connected user only (MySQL does not allow querying
+#     another user's privileges this way), so no explicit grantee filter is
+#     needed or even possible to express reliably (the GRANTEE column's
+#     `'user'@'host'` quoting is awkward to reconstruct from `CURRENT_USER()`
+#     in SQL text).
+#   - mssql: `fn_my_permissions(NULL, 'DATABASE')`, the same mechanism
+#     SQL Server itself recommends for "what can I do" checks.
+#   - oracle: combines `session_privs` (system-wide privileges, e.g. from an
+#     admin-ish role) with `all_tab_privs` (object-level grants on specific
+#     tables owned by others) -- a real least-privilege reporting role is
+#     more likely to have the latter than the former, so checking only one
+#     would under-detect.
+_WRITE_PRIVILEGE_QUERIES: dict[str, str] = {
+    "postgresql": (
+        "SELECT COUNT(*) FROM information_schema.role_table_grants "
+        "WHERE grantee = current_user "
+        "AND privilege_type IN ('INSERT', 'UPDATE', 'DELETE', 'TRUNCATE')"
+    ),
+    "mysql": (
+        "SELECT COUNT(*) FROM information_schema.user_privileges "
+        "WHERE privilege_type IN ('INSERT', 'UPDATE', 'DELETE')"
+    ),
+    "mssql": (
+        "SELECT COUNT(*) FROM fn_my_permissions(NULL, 'DATABASE') "
+        "WHERE permission_name IN ('INSERT', 'UPDATE', 'DELETE')"
+    ),
+    "oracle": (
+        "SELECT COUNT(*) FROM ("
+        "SELECT privilege FROM session_privs "
+        "WHERE privilege IN ('INSERT ANY TABLE', 'UPDATE ANY TABLE', 'DELETE ANY TABLE') "
+        "UNION ALL "
+        "SELECT privilege FROM all_tab_privs "
+        "WHERE grantee = USER AND privilege IN ('INSERT', 'UPDATE', 'DELETE')"
+        ")"
+    ),
+}
+
+_WRITE_PRIVILEGE_WARNING = (
+    "The connected database role appears to have write privileges "
+    "(INSERT/UPDATE/DELETE) -- this app only ever validates and executes "
+    "read-only SELECT statements, but the database role is your real "
+    "safety boundary if that validation were ever bypassed. Point DB_USER "
+    "at a genuinely read-only role (see SECURITY.md's least-privilege "
+    "guidance)."
+)
+
+
+def check_write_privileges(
+    engine: Engine, settings: Settings | None = None
+) -> WritePrivilegeCheckResult:
+    """Best-effort check for whether the connected role has any write privilege.
+
+    This is a **warning-only, defense-in-depth signal, never a hard gate**:
+    connectivity and every other feature must keep working even if this
+    check itself fails, the DB_TYPE isn't one of the four with a strategy
+    above, or the connected role lacks permission to read the privilege
+    catalog at all. The primary safety guarantee is, and always has been,
+    `agent/sql_validator.py`'s SELECT-only allowlist plus the DB role
+    actually being read-only -- this check exists to catch the case where
+    the second half of that pair isn't true, proactively, rather than only
+    finding out the hard way. See `_WRITE_PRIVILEGE_QUERIES`'s docstring
+    for per-engine confidence/coverage caveats.
+
+    Args:
+        engine: A SQLAlchemy engine for the configured database.
+        settings: Optional `Settings` override (mainly for tests) -- used
+            only to resolve `db_type`.
+
+    Returns:
+        A `WritePrivilegeCheckResult`. Never raises.
+    """
+    settings = settings or get_settings()
+    query = _WRITE_PRIVILEGE_QUERIES.get(settings.db_type)
+    if query is None:
+        return WritePrivilegeCheckResult(
+            checked=False,
+            has_write_privileges=None,
+            message=f"Write-privilege check not available for DB_TYPE={settings.db_type!r}.",
+        )
+
+    try:
+        with engine.connect() as connection:
+            row = connection.execute(text(query)).fetchone()
+        count = int(row[0]) if row and row[0] is not None else 0
+    except Exception as exc:  # noqa: BLE001 - best-effort, fails open regardless of cause
+        logger.debug("[write_privilege_check] failed, failing open: %s", exc)
+        return WritePrivilegeCheckResult(
+            checked=False,
+            has_write_privileges=None,
+            message="Could not determine write privileges for the connected role.",
+        )
+
+    has_write = count > 0
+    if has_write:
+        logger.warning("[write_privilege_check] %s", _WRITE_PRIVILEGE_WARNING)
+        message = _WRITE_PRIVILEGE_WARNING
+    else:
+        message = "The connected database role does not appear to have write privileges."
+    return WritePrivilegeCheckResult(checked=True, has_write_privileges=has_write, message=message)

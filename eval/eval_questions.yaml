@@ -1,5 +1,11 @@
 # Regression questions for the Text-to-SQL agent, run via scripts/run_eval.py.
 #
+# ** Superseded by eval/benchmark/*.yaml, run via scripts/run_benchmark.py. **
+# Every case below was migrated there (see adversarial.yaml, follow_up.yaml,
+# cost_estimation.yaml, and real_world.yaml's ambig_bikes_top_territory) --
+# kept here unmodified for anyone with a workflow still pointed at the old
+# script directly.
+#
 # Each entry is a real natural-language question with a machine-checkable
 # expectation, so a join/filter/output regression shows up as a failing eval
 # run instead of shipping silently. Requires a live DB + Ollama, like

@@ -38,6 +38,7 @@ from agent.nodes import (
 from agent.state import AgentState, ConversationExchange
 from config.settings import Settings
 from db.query_cost import MODERATE_COST_NOTICE, CostEstimate
+from security.secrets import SecretStr
 
 
 @pytest.fixture(autouse=True)
@@ -51,7 +52,7 @@ def _mock_settings(monkeypatch):
         db_port=None,
         db_name="mydb",
         db_user="reader",
-        db_password="secret",
+        db_password=SecretStr("secret"),
         db_connection_string=None,
         db_schema=None,
         db_odbc_driver="ODBC Driver 17 for SQL Server",
@@ -72,6 +73,7 @@ def _mock_settings(monkeypatch):
         cost_moderate_row_threshold=50_000,
         cost_high_row_threshold=1_000_000,
         log_level="INFO",
+        log_redaction_level="standard",
     )
     monkeypatch.setattr("agent.nodes.get_settings", lambda: settings)
     return settings

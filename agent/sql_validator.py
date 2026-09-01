@@ -13,12 +13,13 @@ to construct an INSERT/DROP/ATTACH/etc. statement that parses to an
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass
 from typing import Literal
 
 import sqlglot
 from sqlglot import exp
-from sqlglot.errors import ParseError
+from sqlglot.errors import SqlglotError
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +32,99 @@ _ALLOWED_ROOT_TYPES: tuple[type[exp.Expression], ...] = (
     exp.Intersect,
 )
 
+# Write/DDL-shaped node types, checked *anywhere* in the parsed tree -- not
+# just at the root (see _ALLOWED_ROOT_TYPES above). This closes a real
+# bypass class: several engines (Postgres chief among them) support
+# data-modifying CTEs -- `WITH x AS (DELETE FROM t RETURNING *) SELECT * FROM
+# x` -- whose *root* node is an ordinary exp.Select even though it deletes
+# real rows. A root-type-only check accepts that statement; this full-tree
+# walk does not, regardless of how deeply the write is nested (a CTE, a
+# subquery, ...). exp.Command is included because it's sqlglot's fallback
+# for a fragment it couldn't parse into anything more specific (e.g. an
+# engine-specific EXEC/CALL form) -- a legitimate read-only query never
+# produces one anywhere in its tree, so its presence is only ever a sign the
+# statement isn't what it appears to be.
+_DISALLOWED_NESTED_TYPES: tuple[type[exp.Expression], ...] = (
+    exp.Insert,
+    exp.Update,
+    exp.Delete,
+    exp.Merge,
+    exp.Drop,
+    exp.Create,
+    exp.Alter,
+    exp.TruncateTable,
+    exp.Command,
+)
+
+# Known-dangerous function/procedure/table-valued-function names, callable
+# from inside an otherwise ordinary, single-statement SELECT -- so the
+# statement-type allowlist above (by design) never sees them as anything
+# other than "a SELECT." Unlike that allowlist, this list is a **denylist**:
+# it can only ever be as complete as what's enumerated here, and an
+# engine-specific dangerous function not on this list is a real, standing
+# residual risk (documented in SECURITY.md, the same honesty this project
+# already applies to `agent/input_guard.py`'s own regex layer).
+#   - postgresql: pg_sleep/pg_read_file/pg_read_binary_file/pg_ls_dir/
+#     pg_stat_file (DoS / local file & directory disclosure); lo_import/
+#     lo_export (large-object file I/O); dblink* (cross-database/network
+#     connections).
+#   - mysql: sleep/benchmark (DoS); load_file (local file disclosure).
+#   - mssql: openrowset/openquery/opendatasource (remote/linked-server
+#     query execution -- SSRF/lateral-pivot capable); xp_cmdshell/
+#     xp_dirtree/xp_fileexist (OS command execution / filesystem probing);
+#     sp_configure/sp_oacreate (server reconfiguration / OLE automation).
+#   - oracle: utl_http/utl_tcp/utl_smtp (SSRF / network egress); utl_file
+#     (filesystem I/O); utl_inaddr (DNS/hostname resolution, exfiltration-
+#     capable); dbms_lock (sleep-based DoS); dbms_scheduler/dbms_java
+#     (arbitrary job/code execution).
+_DANGEROUS_FUNCTION_NAMES: frozenset[str] = frozenset(
+    {
+        "pg_sleep",
+        "pg_read_file",
+        "pg_read_binary_file",
+        "pg_ls_dir",
+        "pg_stat_file",
+        "lo_import",
+        "lo_export",
+        "dblink",
+        "dblink_connect",
+        "dblink_exec",
+        "sleep",
+        "benchmark",
+        "load_file",
+        "openrowset",
+        "openquery",
+        "opendatasource",
+        "xp_cmdshell",
+        "xp_dirtree",
+        "xp_fileexist",
+        "sp_configure",
+        "sp_oacreate",
+        "utl_http",
+        "utl_tcp",
+        "utl_smtp",
+        "utl_file",
+        "utl_inaddr",
+        "dbms_lock",
+        "dbms_scheduler",
+        "dbms_java",
+    }
+)
+
+# Raw-text fallback for the same names, requiring the name (as a whole word)
+# to be immediately followed by either `(` or a `.qualifier(` chain -- e.g.
+# `pg_sleep(` and `UTL_HTTP.REQUEST(` both match, but a column merely *named*
+# "sleep_duration" or "utl_http_helper" cannot (no word boundary lands there).
+# This exists only to catch a dialect-qualified call where sqlglot's AST
+# stores the package qualifier (e.g. "UTL_HTTP") on a different node than the
+# immediate call name ("REQUEST") the tree walk below inspects directly.
+_DANGEROUS_FUNCTION_RE = re.compile(
+    r"\b("
+    + "|".join(re.escape(name) for name in sorted(_DANGEROUS_FUNCTION_NAMES))
+    + r")\b(?:\.\w+)*\s*\(",
+    re.IGNORECASE,
+)
+
 # None is sqlglot's own "generic/standard SQL" dialect -- used as the default
 # here so this module has no dependency on which real database is configured.
 # Callers on the actual query path (agent/nodes.py, ui/app.py) resolve and
@@ -41,17 +135,31 @@ DEFAULT_DIALECT: str | None = None
 # Distinguishes *why* validation failed, so callers (agent/nodes.py) can
 # react differently: a violation type in `SAFETY_VIOLATION_TYPES` means the
 # LLM produced a statement this app must never execute (a non-SELECT, a
-# stacked query, or a SELECT that creates a table as a side effect) -- that
-# is a security-gate failure, not a mistake worth coaching the model through,
-# so the agent fails closed immediately rather than retrying. "empty" and
-# "parse_error" are ordinary correctness mistakes (the LLM produced
-# malformed or no text) and are safe to retry with error feedback.
+# stacked query, a SELECT that creates a table as a side effect, a write
+# operation embedded inside an otherwise read-only query, or a call to a
+# known-dangerous function) -- that is a security-gate failure, not a
+# mistake worth coaching the model through, so the agent fails closed
+# immediately rather than retrying. "empty" and "parse_error" are ordinary
+# correctness mistakes (the LLM produced malformed or no text) and are safe
+# to retry with error feedback.
 ViolationType = Literal[
-    "empty", "parse_error", "multiple_statements", "disallowed_statement", "select_into"
+    "empty",
+    "parse_error",
+    "multiple_statements",
+    "disallowed_statement",
+    "select_into",
+    "embedded_write",
+    "dangerous_function",
 ]
 
 SAFETY_VIOLATION_TYPES: frozenset[str] = frozenset(
-    {"multiple_statements", "disallowed_statement", "select_into"}
+    {
+        "multiple_statements",
+        "disallowed_statement",
+        "select_into",
+        "embedded_write",
+        "dangerous_function",
+    }
 )
 
 
@@ -91,6 +199,15 @@ def validate_sql(sql: str, dialect: str | None = DEFAULT_DIALECT) -> ValidationR
           (blocks INSERT/UPDATE/DELETE/DROP/ALTER/TRUNCATE/ATTACH/COPY/etc.).
         - `SELECT ... INTO <table>`, which would create a table as a
           side effect despite being SELECT-shaped.
+        - A write/DDL operation embedded *anywhere* in the tree, not just at
+          the root -- e.g. a data-modifying CTE
+          (`WITH x AS (DELETE FROM t RETURNING *) SELECT * FROM x`), whose
+          root is an ordinary SELECT even though it deletes real rows.
+        - A call to a known-dangerous function/procedure (e.g. `pg_sleep`,
+          `xp_cmdshell`, `OPENQUERY`, `UTL_HTTP.REQUEST`) -- see
+          `_DANGEROUS_FUNCTION_NAMES` for the full list and why each is
+          there. This is a denylist, not an allowlist, and is documented as
+          such (not exhaustive) in SECURITY.md.
 
     Args:
         sql: Raw SQL text, as produced by the LLM (already stripped of any
@@ -111,8 +228,20 @@ def validate_sql(sql: str, dialect: str | None = DEFAULT_DIALECT) -> ValidationR
 
     try:
         statements = [s for s in sqlglot.parse(stripped, read=dialect) if s is not None]
-    except ParseError as exc:
-        logger.debug("SQL failed to parse: %s", exc)
+    except SqlglotError as exc:
+        # Deliberately the broad `SqlglotError` base, not just `ParseError`:
+        # sqlglot's *tokenizer* can fail before parsing even starts (e.g. an
+        # unterminated quoted string in malformed LLM output), raising a
+        # sibling `TokenError` that a narrower `except ParseError` would not
+        # catch -- confirmed live during benchmark authoring, where a
+        # malformed model response crashed the whole agent run with an
+        # unhandled `TokenError` instead of failing closed here as an
+        # ordinary "parse_error" (retryable, see SAFETY_VIOLATION_TYPES).
+        # Untrusted LLM output failing to tokenize is exactly the same kind
+        # of "ordinary correctness mistake" as failing to parse -- it must
+        # never be the reason the whole request crashes instead of
+        # retrying/failing cleanly.
+        logger.debug("SQL failed to tokenize/parse: %s", exc)
         return ValidationResult(
             is_valid=False, error=f"SQL failed to parse: {exc}", violation_type="parse_error"
         )
@@ -144,6 +273,44 @@ def validate_sql(sql: str, dialect: str | None = DEFAULT_DIALECT) -> ValidationR
             is_valid=False,
             error="'SELECT ... INTO <table>' is not allowed (it creates a table).",
             violation_type="select_into",
+        )
+
+    nested_write = next(
+        (node for node in statement.walk() if isinstance(node, _DISALLOWED_NESTED_TYPES)), None
+    )
+    if nested_write is not None:
+        return ValidationResult(
+            is_valid=False,
+            error=(
+                f"The statement contains a {type(nested_write).__name__} operation "
+                "embedded inside an otherwise read-only query (e.g. a data-modifying "
+                "CTE). Write and DDL operations are never allowed, regardless of the "
+                "outer statement shape."
+            ),
+            violation_type="embedded_write",
+        )
+
+    dangerous_name: str | None = next(
+        (
+            node.name.lower()
+            for node in statement.walk()
+            if isinstance(node, exp.Func) and (node.name or "").lower() in _DANGEROUS_FUNCTION_NAMES
+        ),
+        None,
+    )
+    if dangerous_name is None:
+        text_match = _DANGEROUS_FUNCTION_RE.search(stripped)
+        if text_match:
+            dangerous_name = text_match.group(1).lower()
+    if dangerous_name is not None:
+        return ValidationResult(
+            is_valid=False,
+            error=(
+                f"The function/procedure '{dangerous_name}' is not allowed -- it can "
+                "access the filesystem, network, or server configuration rather than "
+                "just querying data."
+            ),
+            violation_type="dangerous_function",
         )
 
     return ValidationResult(
@@ -187,12 +354,72 @@ def find_unexpected_table_references(
     """
     try:
         statement = sqlglot.parse_one(sql, read=dialect)
-    except ParseError:
+    except SqlglotError:
         return []
 
     referenced = {table.name for table in statement.find_all(exp.Table) if table.name}
     known_lower = {name.lower() for name in known_tables}
     return sorted(name for name in referenced if name.lower() not in known_lower)
+
+
+def find_restricted_column_references(
+    sql: str,
+    restricted_columns: set[tuple[str, str]],
+    known_tables: set[str],
+    dialect: str | None = DEFAULT_DIALECT,
+) -> list[tuple[str, str]]:
+    """Flags (table, column) pairs `sql` selects that are classified "restricted".
+
+    Enforces `config/sensitive_columns.yaml`'s policy (see
+    `config.sensitive_columns`, and `docs/GOVERNANCE.md`'s "Data
+    classification policy") -- unlike `find_unexpected_table_references`
+    above (a detection signal only), a hit here **is** a new gate: the
+    caller (`agent.nodes.validate_sql_node`) treats it exactly like a
+    validation failure and does not let the query execute.
+
+    Args:
+        sql: Already-validated SQL.
+        restricted_columns: (table_name, column_name) pairs classified
+            "restricted" -- pre-filtered by the caller from
+            `config.sensitive_columns.load_sensitive_columns()`'s full
+            tier map (this function doesn't know about "internal", only
+            "restricted").
+        known_tables: Table names actually part of this attempt's
+            retrieved schema context, compared case-insensitively -- same
+            convention as `find_unexpected_table_references`.
+        dialect: sqlglot dialect to parse with.
+
+    Returns:
+        Sorted list of (table_name, column_name) pairs referenced in `sql`
+        that are classified restricted -- empty if none (the overwhelming
+        common case while the classification file is unpopulated), or if
+        `sql` doesn't parse.
+
+        Matching is name-based (a restricted column name appearing
+        anywhere in the statement, whose owning table is among
+        `known_tables`), not full table-qualification resolution --
+        deliberately conservative in the safe direction: a false positive
+        only costs a retry (the model gets a chance to drop the column and
+        answer with what remains), while a false negative would let a
+        restricted column through undetected.
+    """
+    try:
+        statement = sqlglot.parse_one(sql, read=dialect)
+    except SqlglotError:
+        return []
+
+    known_tables_lower = {name.lower() for name in known_tables}
+    referenced_columns_lower = {
+        column.name.lower() for column in statement.find_all(exp.Column) if column.name
+    }
+
+    flagged = {
+        (table_name, column_name)
+        for table_name, column_name in restricted_columns
+        if table_name.lower() in known_tables_lower
+        and column_name.lower() in referenced_columns_lower
+    }
+    return sorted(flagged)
 
 
 def enforce_row_limit(sql: str, max_rows: int, dialect: str | None = DEFAULT_DIALECT) -> str:

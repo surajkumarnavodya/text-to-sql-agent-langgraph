@@ -1,5 +1,18 @@
 """Standalone entry point: runs eval/eval_questions.yaml against the real agent.
 
+**Superseded by `scripts/run_benchmark.py`** (a rigorous benchmark
+architecture -- execution-based result-set grading instead of row-count/
+readability heuristics, retrieval/join/aggregation/date/GROUP BY/ORDER BY/
+NULL/nested-query/window-function correctness, latency/retry/token/cost
+metrics, and regression detection against a stored baseline -- see
+`eval/schema.py`, `eval/runner.py`, `eval/metrics.py`). Every case this
+file's `eval/eval_questions.yaml` had was migrated into
+`eval/benchmark/*.yaml` (see `adversarial.yaml`, `follow_up.yaml`,
+`cost_estimation.yaml`, and `real_world.yaml`'s `ambig_bikes_top_territory`
+for the ProductLine regression case specifically) -- nothing here is losing
+coverage by going unused. Kept, unmodified, for anyone with a workflow
+still pointed at it directly; not recommended for new work.
+
 Requires a live DB connection + Ollama, like scripts/integration_test.py --
 not part of the pytest suite, never run by CI. Each question gets a
 pass/fail from machine-checkable expectations (minimum row count, whether

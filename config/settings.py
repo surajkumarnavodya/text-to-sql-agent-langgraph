@@ -21,6 +21,8 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
+from security.secrets import SecretStr, as_secret
+
 # Project root is the parent of this file's parent (config/settings.py -> repo root).
 PROJECT_ROOT: Path = Path(__file__).resolve().parent.parent
 
@@ -112,10 +114,17 @@ class Settings:
         db_name: Database (catalog) name.
         db_user: Database login username. Should be a dedicated read-only
             account -- see README's "Security" section.
-        db_password: Database login password. Never logged.
+        db_password: Database login password. Never logged. Stored as a
+            `security.secrets.SecretStr` (coerced in `__post_init__` below,
+            regardless of whether the caller passed a plain `str` or an
+            already-wrapped value) -- a real `str` for every purpose that
+            needs the actual value, but its `repr()`/`%r` output is
+            redacted, so an accidental `logger.debug("%r", settings)` or a
+            traceback's local-variable dump can't leak it.
         db_connection_string: Optional full SQLAlchemy connection string,
             used as-is instead of building one from the discrete db_* fields
-            above if set.
+            above if set. Also coerced to `SecretStr` -- it may itself embed
+            a password.
         db_schema: Optional schema name to restrict introspection to (so
             only that schema's tables are exposed to the LLM). None means
             "use the database's default schema".
@@ -163,6 +172,15 @@ class Settings:
             not run at all -- treated as a retryable error fed back to
             `generate_sql`, same as any other correctable mistake.
         log_level: Root logging level, e.g. "INFO", "DEBUG".
+        log_redaction_level: How much result-set shape `observability.
+            redaction.summarize_result_for_log` includes when logging a
+            query result -- "standard" (default) logs row/column counts and
+            column *names* (never cell values, which are never logged at
+            any level); "strict" drops column names too, leaving only the
+            counts. Column names can themselves be sensitive in some
+            schemas (e.g. `ssn`, `salary`) even though the data isn't
+            logged, hence the stricter option rather than treating
+            "no cell values" as sufficient on its own.
         project_root: Absolute path to the repository root.
     """
 
@@ -175,8 +193,8 @@ class Settings:
     db_port: int | None
     db_name: str | None
     db_user: str | None
-    db_password: str | None
-    db_connection_string: str | None
+    db_password: SecretStr | None
+    db_connection_string: SecretStr | None
     db_schema: str | None
     db_odbc_driver: str
 
@@ -197,7 +215,72 @@ class Settings:
     cost_moderate_row_threshold: int
     cost_high_row_threshold: int
     log_level: str
+    log_redaction_level: str
     project_root: Path = PROJECT_ROOT
+
+    def __post_init__(self) -> None:
+        """Coerces secret fields and validates security-relevant values.
+
+        Runs on *every* construction of `Settings` -- not just the one path
+        through `get_settings()` below -- so both protections apply
+        uniformly, including to every test in this codebase that builds a
+        `Settings(...)` directly.
+
+        `object.__setattr__` is required because `Settings` is a frozen
+        dataclass (immutable after construction is the point -- see the
+        class docstring); `__post_init__` is the one place frozen dataclass
+        fields may still be set, exactly for this kind of post-construction
+        normalization.
+        """
+        object.__setattr__(self, "db_password", as_secret(self.db_password))
+        object.__setattr__(self, "db_connection_string", as_secret(self.db_connection_string))
+        self._validate_security_settings()
+
+    def _validate_security_settings(self) -> None:
+        """Fails fast on a nonsensical security-relevant value.
+
+        Mirrors the existing "malformed value fails fast" philosophy this
+        module already applies to `DB_PORT` (see
+        `_env_optional_int_strict`) -- a *present* value that's negative,
+        zero, or internally inconsistent (e.g. the "run a query without
+        blocking" threshold set higher than the "block this query"
+        threshold) is a real misconfiguration, not a style choice, and
+        should raise here rather than silently produce a security control
+        that doesn't actually do what its name says.
+        """
+        positive_fields = (
+            ("MAX_RETRIES", self.max_retries),
+            ("MAX_RESULT_ROWS", self.max_result_rows),
+            ("QUERY_TIMEOUT_SECONDS", self.query_timeout_seconds),
+            ("LLM_MAX_TOKENS", self.llm_max_tokens),
+            ("INSIGHT_MAX_TOKENS", self.insight_max_tokens),
+            ("MAX_QUESTION_LENGTH", self.max_question_length),
+            ("QUESTION_RATE_LIMIT_PER_MINUTE", self.question_rate_limit_per_minute),
+            ("LLM_CALL_RATE_LIMIT_PER_MINUTE", self.llm_call_rate_limit_per_minute),
+            ("COST_ESTIMATION_TIMEOUT_SECONDS", self.cost_estimation_timeout_seconds),
+            ("COST_MODERATE_ROW_THRESHOLD", self.cost_moderate_row_threshold),
+            ("COST_HIGH_ROW_THRESHOLD", self.cost_high_row_threshold),
+        )
+        for name, value in positive_fields:
+            if value <= 0:
+                raise ConfigurationError(
+                    f"{name}={value} is not valid -- it must be a positive number. "
+                    f"Fix it in .env (or remove it to use the default)."
+                )
+
+        if self.cost_moderate_row_threshold >= self.cost_high_row_threshold:
+            raise ConfigurationError(
+                f"COST_MODERATE_ROW_THRESHOLD ({self.cost_moderate_row_threshold}) must be "
+                f"strictly less than COST_HIGH_ROW_THRESHOLD ({self.cost_high_row_threshold}) "
+                f"-- otherwise a query is never classified 'moderate', only 'low' or 'high'. "
+                f"Fix both in .env."
+            )
+
+        if self.log_redaction_level not in ("standard", "strict"):
+            raise ConfigurationError(
+                f"LOG_REDACTION_LEVEL={self.log_redaction_level!r} is not valid -- it must be "
+                f"'standard' or 'strict'. Fix it in .env (or remove it to use the default)."
+            )
 
 
 @lru_cache(maxsize=1)
@@ -227,8 +310,8 @@ def get_settings() -> Settings:
         db_port=_env_optional_int_strict("DB_PORT"),
         db_name=_env_optional_str("DB_NAME"),
         db_user=_env_optional_str("DB_USER"),
-        db_password=_env_optional_str("DB_PASSWORD"),
-        db_connection_string=_env_optional_str("DB_CONNECTION_STRING"),
+        db_password=as_secret(_env_optional_str("DB_PASSWORD")),
+        db_connection_string=as_secret(_env_optional_str("DB_CONNECTION_STRING")),
         db_schema=_env_optional_str("DB_SCHEMA"),
         db_odbc_driver=_env_str("DB_ODBC_DRIVER", "ODBC Driver 17 for SQL Server"),
         chroma_persist_dir=_resolve_path(_env_str("CHROMA_PERSIST_DIR", "./embeddings/.chroma")),
@@ -248,6 +331,7 @@ def get_settings() -> Settings:
         cost_moderate_row_threshold=_env_int("COST_MODERATE_ROW_THRESHOLD", 50_000),
         cost_high_row_threshold=_env_int("COST_HIGH_ROW_THRESHOLD", 1_000_000),
         log_level=_env_str("LOG_LEVEL", "INFO"),
+        log_redaction_level=_env_str("LOG_REDACTION_LEVEL", "standard").strip().lower(),
     )
     return settings
 

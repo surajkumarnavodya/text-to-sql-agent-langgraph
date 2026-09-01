@@ -1,6 +1,6 @@
 """ChromaDB-backed schema indexing and retrieval, for prompt-size schema scoping."""
 
 from embeddings.retriever import retrieve_relevant_schema
-from embeddings.schema_indexer import build_index
+from embeddings.schema_indexer import build_index, refresh_schema_index
 
-__all__ = ["build_index", "retrieve_relevant_schema"]
+__all__ = ["build_index", "refresh_schema_index", "retrieve_relevant_schema"]

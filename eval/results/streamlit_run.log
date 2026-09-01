@@ -1,0 +1,127 @@
+
+Collecting usage statistics. To deactivate, set browser.gatherUsageStats to false.
+
+
+  You can now view your Streamlit app in your browser.
+
+  Local URL: http://localhost:8501
+  Network URL: http://192.168.0.104:8501
+  External URL: http://27.96.88.95:8501
+
+D:\Gen_AI_Project_TSQL\.venv\Lib\site-packages\langgraph\checkpoint\base\__init__.py:18: LangChainPendingDeprecationWarning: The default value of `allowed_objects` will change in a future version. Pass an explicit value (e.g., allowed_objects='messages' or allowed_objects='core') to suppress this warning.
+  from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
+D:\Gen_AI_Project_TSQL\db\connection.py:329: SAWarning: Unrecognized server version info '17.0.4025.3'.  Some SQL Server features may not function properly.
+  with engine.connect() as connection:
+20:20:42 | INFO     | db.connection | Connection test succeeded for <DB_CONNECTION_STRING override>
+20:20:42 | WARNING  | db.connection | [write_privilege_check] The connected database role appears to have write privileges (INSERT/UPDATE/DELETE) -- this app only ever validates and executes read-only SELECT statements, but the database role is your real safety boundary if that validation were ever bypassed. Point DB_USER at a genuinely read-only role (see SECURITY.md's least-privilege guidance).
+20:20:42 | INFO     | db.schema_introspection | Introspected 31 table(s) in schema=None
+20:20:44 | INFO     | db.value_sampling | Sampled values for AdventureWorksDWBuildVersion: {'DBVersion': 1}
+20:20:44 | INFO     | db.value_sampling | Sampled values for DimAccount: {'AccountType': 8, 'Operator': 3, 'ValueType': 2}
+20:20:44 | INFO     | db.value_sampling | Sampled values for DimCustomer: {'Title': 6, 'MaritalStatus': 2, 'Suffix': 2, 'Gender': 2, 'EnglishEducation': 5, 'SpanishEducation': 5, 'FrenchEducation': 5, 'HouseOwnerFlag': 2, 'CommuteDistance': 5}
+20:20:44 | INFO     | db.value_sampling | Sampled values for DimDate: {'EnglishDayNameOfWeek': 7, 'SpanishDayNameOfWeek': 7, 'FrenchDayNameOfWeek': 7, 'EnglishMonthName': 12, 'SpanishMonthName': 12, 'FrenchMonthName': 12}
+20:20:44 | INFO     | db.value_sampling | Sampled values for DimDepartmentGroup: {'DepartmentGroupName': 7}
+20:20:44 | INFO     | db.value_sampling | Sampled values for DimEmployee: {'MaritalStatus': 2, 'Gender': 2, 'DepartmentName': 16, 'Status': 2}
+20:20:44 | INFO     | db.value_sampling | Sampled values for DimGeography: {'CountryRegionCode': 6, 'EnglishCountryRegionName': 6, 'SpanishCountryRegionName': 6, 'FrenchCountryRegionName': 6}
+20:20:44 | INFO     | db.value_sampling | Sampled values for DimOrganization: {'PercentageOfOwnership': 4, 'OrganizationName': 14}
+20:20:44 | INFO     | db.value_sampling | Sampled values for DimProduct: {'WeightUnitMeasureCode': 3, 'SizeUnitMeasureCode': 2, 'Color': 10, 'Size': 19, 'SizeRange': 11, 'ProductLine': 5, 'Class': 4, 'Style': 4, 'Status': 2}
+20:20:44 | INFO     | db.value_sampling | Sampled values for DimProductCategory: {'EnglishProductCategoryName': 4, 'SpanishProductCategoryName': 4, 'FrenchProductCategoryName': 4}
+20:20:44 | INFO     | db.value_sampling | Sampled values for DimPromotion: {'EnglishPromotionType': 6, 'SpanishPromotionType': 6, 'FrenchPromotionType': 6, 'EnglishPromotionCategory': 3, 'SpanishPromotionCategory': 3, 'FrenchPromotionCategory': 3}
+20:20:44 | INFO     | db.value_sampling | Sampled values for DimReseller: {'BusinessType': 3, 'OrderFrequency': 3, 'ProductLine': 3, 'BankName': 7}
+20:20:44 | INFO     | db.value_sampling | Sampled values for DimSalesReason: {'SalesReasonName': 10, 'SalesReasonReasonType': 3}
+20:20:44 | INFO     | db.value_sampling | Sampled values for DimSalesTerritory: {'SalesTerritoryRegion': 11, 'SalesTerritoryCountry': 7, 'SalesTerritoryGroup': 4}
+20:20:44 | INFO     | db.value_sampling | Sampled values for DimScenario: {'ScenarioName': 3}
+20:20:44 | INFO     | db.value_sampling | Sampled values for FactCallCenter: {'WageType': 2, 'Shift': 4}
+20:20:44 | INFO     | db.value_sampling | Sampled values for FactInternetSales: {'CarrierTrackingNumber': 1, 'CustomerPONumber': 1}
+20:20:44 | INFO     | db.value_sampling | Sampled values for FactSurveyResponse: {'EnglishProductCategoryName': 2, 'EnglishProductSubcategoryName': 20}
+20:20:44 | INFO     | db.value_sampling | Sampled values for ProspectiveBuyer: {'MaritalStatus': 2, 'Gender': 2, 'Education': 5, 'HouseOwnerFlag': 2, 'Salutation': 2}
+20:20:44 | INFO     | embeddings.schema_indexer | Schema unchanged since last index build (31 tables); skipping re-embedding.
+20:21:06 | INFO     | agent.graph | Starting agent run for question='Show total sales by year and product name.' conversation_history_len=0 enable_insight=True
+20:21:06 | INFO     | agent.nodes | [timing] stage=sanitize_input attempt=1 duration_ms=0.1
+20:21:06 | INFO     | agent.nodes | [classify_followup] question='Show total sales by year and product name.' classification=standalone referring_signal=False has_subject=True matched_patterns=()
+20:21:06 | INFO     | agent.nodes | [timing] stage=classify_followup attempt=1 duration_ms=0.1
+20:21:06 | INFO     | agent.nodes | [retrieve_schema] question='Show total sales by year and product name.'
+20:21:07 | INFO     | embeddings.retriever | [retrieve_schema] FK-bridge expansion added: ['DimDate', 'FactInternetSales', 'FactInternetSalesReason']
+20:21:07 | INFO     | agent.nodes | [retrieve_schema] retrieved 7 table(s): ['FactProductInventory', 'DimSalesReason', 'FactCurrencyRate', 'FactResellerSales', 'DimDate', 'FactInternetSales', 'FactInternetSalesReason']
+20:21:07 | INFO     | agent.nodes | [timing] stage=retrieve_schema attempt=1 duration_ms=751.7
+20:21:07 | INFO     | agent.nodes | [generate_sql] attempt=1/4 last_error_category=None last_error=None followup=False
+20:21:07 | INFO     | agent.llm_client | [timing] stage=prompt_assembly duration_ms=0.01 prompt_chars=9215
+20:22:03 | INFO     | httpx | HTTP Request: POST http://localhost:11434/api/chat "HTTP/1.1 200 OK"
+20:22:03 | INFO     | agent.llm_client | [timing] stage=llm_call total_ms=53919.6 load_ms=1.6 prompt_eval_ms=26688.9 generation_ms=10057.7 prompt_tokens=2890 output_tokens=63
+20:22:03 | INFO     | agent.nodes | [generate_sql] attempt 1: generated SQL: SELECT 
+    D.ProductName, 
+    F.CalendarYear, 
+    SUM(F.SalesAmount) AS TotalSales
+FROM 
+    FactInternetSales F
+INNER JOIN 
+    DimProduct D ON F.ProductKey = D.ProductKey
+GROUP BY 
+    D.ProductName, 
+    F.CalendarYear
+20:22:03 | INFO     | agent.nodes | [timing] stage=generate_sql attempt=1 duration_ms=56390.6
+20:22:03 | INFO     | agent.nodes | [validate_sql] accepted, row-limited SQL: SELECT TOP 1000 D.ProductName, F.CalendarYear, SUM(F.SalesAmount) AS TotalSales FROM FactInternetSales AS F INNER JOIN DimProduct AS D ON F.ProductKey = D.ProductKey GROUP BY D.ProductName, F.CalendarYear
+20:22:03 | WARNING  | agent.nodes | [validate_sql] [schema_anomaly] SQL references table(s) never part of the retrieved schema context: ['DimProduct']
+20:22:03 | INFO     | agent.nodes | [timing] stage=validate_sql attempt=1 duration_ms=57.6
+20:22:03 | INFO     | agent.nodes | [timing] stage=estimate_query_cost attempt=1 duration_ms=8.3
+20:22:03 | WARNING  | agent.nodes | [execute_sql] attempt 1 failed (category=missing_reference): (pyodbc.ProgrammingError) ('42S22', "[42S22] [Microsoft][ODBC Driver 17 for SQL Server][SQL Server]Invalid column name 'ProductName'. (207) (SQLExecDirectW); [42S22] [Microsoft][ODBC Driver 17 for SQL Server][SQL Server]Invalid column name 'CalendarYear'. (207); [42S22] [Microsoft][ODBC Driver 17 for SQL Server][SQL Server]Invalid column name 'ProductName'. (207); [42S22] [Microsoft][ODBC Driver 17 for SQL Server][SQL Server]Invalid column name 'CalendarYear'. (207)")
+[SQL: SELECT TOP 1000 D.ProductName, F.CalendarYear, SUM(F.SalesAmount) AS TotalSales FROM FactInternetSales AS F INNER JOIN DimProduct AS D ON F.ProductKey = D.ProductKey GROUP BY D.ProductName, F.CalendarYear]
+(Background on this error at: https://sqlalche.me/e/20/f405)
+20:22:03 | INFO     | agent.nodes | [timing] stage=execute_sql attempt=1 duration_ms=3.1
+20:22:03 | INFO     | agent.nodes | [retrieve_schema] retry after missing-reference failure: broadening top_k 4 -> 6 with error context
+20:22:03 | INFO     | agent.nodes | [retrieve_schema] question='Show total sales by year and product name.'
+20:22:04 | INFO     | embeddings.retriever | [retrieve_schema] FK-bridge expansion added: ['FactInternetSalesReason', 'DimDate']
+20:22:04 | INFO     | agent.nodes | [retrieve_schema] retrieved 8 table(s): ['FactResellerSales', 'DimSalesReason', 'FactInternetSales', 'DimPromotion', 'FactProductInventory', 'DimReseller', 'DimDate', 'FactInternetSalesReason']
+20:22:04 | INFO     | agent.nodes | [timing] stage=retrieve_schema attempt=2 duration_ms=616.4
+20:22:04 | INFO     | agent.nodes | [generate_sql] attempt=2/4 last_error_category=missing_reference last_error='SQL execution error: (pyodbc.ProgrammingError) (\'42S22\', "[42S22] [Microsoft][ODBC Driver 17 for SQL Server][SQL Server]Invalid column name \'ProductName\'. (207) (SQLExecDirectW); [42S22] [Microsoft][ODBC Driver 17 for SQL Server][SQL Server]Invalid column name \'CalendarYear\'. (207); [42S22] [Microsoft][ODBC Driver 17 for SQL Server][SQL Server]Invalid column name \'ProductName\'. (207); [42S22] [Microsoft][ODBC Driver 17 for SQL Server][SQL Server]Invalid column name \'CalendarYear\'. (207)")\n[SQL: SELECT TOP 1000 D.ProductName, F.CalendarYear, SUM(F.SalesAmount) AS TotalSales FROM FactInternetSales AS F INNER JOIN DimProduct AS D ON F.ProductKey = D.ProductKey GROUP BY D.ProductName, F.CalendarYear]\n(Background on this error at: https://sqlalche.me/e/20/f405)' followup=False
+20:22:04 | INFO     | agent.llm_client | [timing] stage=prompt_assembly duration_ms=0.02 prompt_chars=13098
+20:23:13 | INFO     | httpx | HTTP Request: POST http://localhost:11434/api/chat "HTTP/1.1 200 OK"
+20:23:13 | INFO     | agent.llm_client | [timing] stage=llm_call total_ms=66803.0 load_ms=4.1 prompt_eval_ms=35086.1 generation_ms=9067.9 prompt_tokens=3956 output_tokens=52
+20:23:13 | INFO     | agent.nodes | [generate_sql] attempt 2: generated SQL: SELECT TOP 1000 D.ProductName, F.CalendarYear, SUM(F.SalesAmount) AS TotalSales FROM FactInternetSales AS F INNER JOIN DimProduct AS D ON F.ProductKey = D.ProductKey GROUP BY D.ProductName, F.CalendarYear
+20:23:13 | INFO     | agent.nodes | [timing] stage=generate_sql attempt=2 duration_ms=69229.3
+20:23:13 | INFO     | agent.nodes | [validate_sql] accepted, row-limited SQL: SELECT TOP 1000 D.ProductName, F.CalendarYear, SUM(F.SalesAmount) AS TotalSales FROM FactInternetSales AS F INNER JOIN DimProduct AS D ON F.ProductKey = D.ProductKey GROUP BY D.ProductName, F.CalendarYear
+20:23:13 | WARNING  | agent.nodes | [validate_sql] [schema_anomaly] SQL references table(s) never part of the retrieved schema context: ['DimProduct']
+20:23:13 | INFO     | agent.nodes | [timing] stage=validate_sql attempt=2 duration_ms=10.0
+20:23:13 | INFO     | agent.nodes | [timing] stage=estimate_query_cost attempt=2 duration_ms=7.1
+20:23:13 | WARNING  | agent.nodes | [execute_sql] attempt 2 failed (category=missing_reference): (pyodbc.ProgrammingError) ('42S22', "[42S22] [Microsoft][ODBC Driver 17 for SQL Server][SQL Server]Invalid column name 'ProductName'. (207) (SQLExecDirectW); [42S22] [Microsoft][ODBC Driver 17 for SQL Server][SQL Server]Invalid column name 'CalendarYear'. (207); [42S22] [Microsoft][ODBC Driver 17 for SQL Server][SQL Server]Invalid column name 'ProductName'. (207); [42S22] [Microsoft][ODBC Driver 17 for SQL Server][SQL Server]Invalid column name 'CalendarYear'. (207)")
+[SQL: SELECT TOP 1000 D.ProductName, F.CalendarYear, SUM(F.SalesAmount) AS TotalSales FROM FactInternetSales AS F INNER JOIN DimProduct AS D ON F.ProductKey = D.ProductKey GROUP BY D.ProductName, F.CalendarYear]
+(Background on this error at: https://sqlalche.me/e/20/f405)
+20:23:13 | INFO     | agent.nodes | [timing] stage=execute_sql attempt=2 duration_ms=2.7
+20:23:13 | INFO     | agent.nodes | [retrieve_schema] retry after missing-reference failure: broadening top_k 4 -> 6 with error context
+20:23:13 | INFO     | agent.nodes | [retrieve_schema] question='Show total sales by year and product name.'
+20:23:14 | INFO     | embeddings.retriever | [retrieve_schema] FK-bridge expansion added: ['FactInternetSalesReason', 'DimDate']
+20:23:14 | INFO     | agent.nodes | [retrieve_schema] retrieved 8 table(s): ['FactResellerSales', 'DimSalesReason', 'FactInternetSales', 'DimPromotion', 'FactProductInventory', 'DimReseller', 'DimDate', 'FactInternetSalesReason']
+20:23:14 | INFO     | agent.nodes | [timing] stage=retrieve_schema attempt=3 duration_ms=706.6
+20:23:14 | INFO     | agent.nodes | [generate_sql] attempt=3/4 last_error_category=missing_reference last_error='SQL execution error: (pyodbc.ProgrammingError) (\'42S22\', "[42S22] [Microsoft][ODBC Driver 17 for SQL Server][SQL Server]Invalid column name \'ProductName\'. (207) (SQLExecDirectW); [42S22] [Microsoft][ODBC Driver 17 for SQL Server][SQL Server]Invalid column name \'CalendarYear\'. (207); [42S22] [Microsoft][ODBC Driver 17 for SQL Server][SQL Server]Invalid column name \'ProductName\'. (207); [42S22] [Microsoft][ODBC Driver 17 for SQL Server][SQL Server]Invalid column name \'CalendarYear\'. (207)")\n[SQL: SELECT TOP 1000 D.ProductName, F.CalendarYear, SUM(F.SalesAmount) AS TotalSales FROM FactInternetSales AS F INNER JOIN DimProduct AS D ON F.ProductKey = D.ProductKey GROUP BY D.ProductName, F.CalendarYear]\n(Background on this error at: https://sqlalche.me/e/20/f405)' followup=False
+20:23:14 | INFO     | agent.llm_client | [timing] stage=prompt_assembly duration_ms=0.02 prompt_chars=13098
+20:24:15 | INFO     | httpx | HTTP Request: POST http://localhost:11434/api/chat "HTTP/1.1 200 OK"
+20:24:15 | INFO     | agent.llm_client | [timing] stage=llm_call total_ms=58531.4 load_ms=1.6 prompt_eval_ms=224.9 generation_ms=10693.6 prompt_tokens=3956 output_tokens=52
+20:24:15 | INFO     | agent.nodes | [generate_sql] attempt 3: generated SQL: SELECT TOP 1000 D.ProductName, F.CalendarYear, SUM(F.SalesAmount) AS TotalSales FROM FactInternetSales AS F INNER JOIN DimProduct AS D ON F.ProductKey = D.ProductKey GROUP BY D.ProductName, F.CalendarYear
+20:24:15 | INFO     | agent.nodes | [timing] stage=generate_sql attempt=3 duration_ms=60959.1
+20:24:15 | INFO     | agent.nodes | [validate_sql] accepted, row-limited SQL: SELECT TOP 1000 D.ProductName, F.CalendarYear, SUM(F.SalesAmount) AS TotalSales FROM FactInternetSales AS F INNER JOIN DimProduct AS D ON F.ProductKey = D.ProductKey GROUP BY D.ProductName, F.CalendarYear
+20:24:15 | WARNING  | agent.nodes | [validate_sql] [schema_anomaly] SQL references table(s) never part of the retrieved schema context: ['DimProduct']
+20:24:15 | INFO     | agent.nodes | [timing] stage=validate_sql attempt=3 duration_ms=13.0
+20:24:15 | INFO     | agent.nodes | [timing] stage=estimate_query_cost attempt=3 duration_ms=8.2
+20:24:15 | WARNING  | agent.nodes | [execute_sql] attempt 3 failed (category=missing_reference): (pyodbc.ProgrammingError) ('42S22', "[42S22] [Microsoft][ODBC Driver 17 for SQL Server][SQL Server]Invalid column name 'ProductName'. (207) (SQLExecDirectW); [42S22] [Microsoft][ODBC Driver 17 for SQL Server][SQL Server]Invalid column name 'CalendarYear'. (207); [42S22] [Microsoft][ODBC Driver 17 for SQL Server][SQL Server]Invalid column name 'ProductName'. (207); [42S22] [Microsoft][ODBC Driver 17 for SQL Server][SQL Server]Invalid column name 'CalendarYear'. (207)")
+[SQL: SELECT TOP 1000 D.ProductName, F.CalendarYear, SUM(F.SalesAmount) AS TotalSales FROM FactInternetSales AS F INNER JOIN DimProduct AS D ON F.ProductKey = D.ProductKey GROUP BY D.ProductName, F.CalendarYear]
+(Background on this error at: https://sqlalche.me/e/20/f405)
+20:24:15 | INFO     | agent.nodes | [timing] stage=execute_sql attempt=3 duration_ms=2.8
+20:24:15 | INFO     | agent.nodes | [retrieve_schema] retry after missing-reference failure: broadening top_k 4 -> 6 with error context
+20:24:15 | INFO     | agent.nodes | [retrieve_schema] question='Show total sales by year and product name.'
+20:24:15 | INFO     | embeddings.retriever | [retrieve_schema] FK-bridge expansion added: ['FactInternetSalesReason', 'DimDate']
+20:24:15 | INFO     | agent.nodes | [retrieve_schema] retrieved 8 table(s): ['FactResellerSales', 'DimSalesReason', 'FactInternetSales', 'DimPromotion', 'FactProductInventory', 'DimReseller', 'DimDate', 'FactInternetSalesReason']
+20:24:15 | INFO     | agent.nodes | [timing] stage=retrieve_schema attempt=4 duration_ms=460.8
+20:24:15 | INFO     | agent.nodes | [generate_sql] attempt=4/4 last_error_category=missing_reference last_error='SQL execution error: (pyodbc.ProgrammingError) (\'42S22\', "[42S22] [Microsoft][ODBC Driver 17 for SQL Server][SQL Server]Invalid column name \'ProductName\'. (207) (SQLExecDirectW); [42S22] [Microsoft][ODBC Driver 17 for SQL Server][SQL Server]Invalid column name \'CalendarYear\'. (207); [42S22] [Microsoft][ODBC Driver 17 for SQL Server][SQL Server]Invalid column name \'ProductName\'. (207); [42S22] [Microsoft][ODBC Driver 17 for SQL Server][SQL Server]Invalid column name \'CalendarYear\'. (207)")\n[SQL: SELECT TOP 1000 D.ProductName, F.CalendarYear, SUM(F.SalesAmount) AS TotalSales FROM FactInternetSales AS F INNER JOIN DimProduct AS D ON F.ProductKey = D.ProductKey GROUP BY D.ProductName, F.CalendarYear]\n(Background on this error at: https://sqlalche.me/e/20/f405)' followup=False
+20:24:15 | INFO     | agent.llm_client | [timing] stage=prompt_assembly duration_ms=0.02 prompt_chars=13098
+20:25:01 | INFO     | httpx | HTTP Request: POST http://localhost:11434/api/chat "HTTP/1.1 200 OK"
+20:25:01 | INFO     | agent.llm_client | [timing] stage=llm_call total_ms=43811.7 load_ms=1.7 prompt_eval_ms=189.7 generation_ms=10439.7 prompt_tokens=3956 output_tokens=52
+20:25:01 | INFO     | agent.nodes | [generate_sql] attempt 4: generated SQL: SELECT TOP 1000 D.ProductName, F.CalendarYear, SUM(F.SalesAmount) AS TotalSales FROM FactInternetSales AS F INNER JOIN DimProduct AS D ON F.ProductKey = D.ProductKey GROUP BY D.ProductName, F.CalendarYear
+20:25:01 | INFO     | agent.nodes | [timing] stage=generate_sql attempt=4 duration_ms=46307.4
+20:25:01 | INFO     | agent.nodes | [validate_sql] accepted, row-limited SQL: SELECT TOP 1000 D.ProductName, F.CalendarYear, SUM(F.SalesAmount) AS TotalSales FROM FactInternetSales AS F INNER JOIN DimProduct AS D ON F.ProductKey = D.ProductKey GROUP BY D.ProductName, F.CalendarYear
+20:25:01 | WARNING  | agent.nodes | [validate_sql] [schema_anomaly] SQL references table(s) never part of the retrieved schema context: ['DimProduct']
+20:25:01 | INFO     | agent.nodes | [timing] stage=validate_sql attempt=4 duration_ms=12.4
+20:25:01 | INFO     | agent.nodes | [timing] stage=estimate_query_cost attempt=4 duration_ms=10.1
+20:25:01 | WARNING  | agent.nodes | [execute_sql] attempt 4 failed (category=missing_reference): (pyodbc.ProgrammingError) ('42S22', "[42S22] [Microsoft][ODBC Driver 17 for SQL Server][SQL Server]Invalid column name 'ProductName'. (207) (SQLExecDirectW); [42S22] [Microsoft][ODBC Driver 17 for SQL Server][SQL Server]Invalid column name 'CalendarYear'. (207); [42S22] [Microsoft][ODBC Driver 17 for SQL Server][SQL Server]Invalid column name 'ProductName'. (207); [42S22] [Microsoft][ODBC Driver 17 for SQL Server][SQL Server]Invalid column name 'CalendarYear'. (207)")
+[SQL: SELECT TOP 1000 D.ProductName, F.CalendarYear, SUM(F.SalesAmount) AS TotalSales FROM FactInternetSales AS F INNER JOIN DimProduct AS D ON F.ProductKey = D.ProductKey GROUP BY D.ProductName, F.CalendarYear]
+(Background on this error at: https://sqlalche.me/e/20/f405)
+20:25:01 | INFO     | agent.nodes | [timing] stage=execute_sql attempt=4 duration_ms=2.4
+20:25:01 | INFO     | agent.graph | Agent run finished: status=failed retries=4 followup_classification=standalone has_insight=False rejection_reason=None

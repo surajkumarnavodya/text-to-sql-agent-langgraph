@@ -1,0 +1,84 @@
+# Easy-tier benchmark cases: simple_filtering, sorting, aggregation.
+#
+# Every `expected_sql` below was executed against the live, configured
+# database (AdventureWorksDW2025) during dataset authoring and confirmed to
+# return a real, sensible result -- see eval/dataset_loader.py's docstring
+# and eval/evaluators.py's `fetch_gold_result` for how this gold SQL is used
+# at eval time: it's re-executed fresh on every run (not a frozen row
+# snapshot), and the agent's actual result is compared against *that*, not
+# against the SQL text itself.
+
+cases:
+  - id: easy_filter_red_products
+    question: "Which products are the color red?"
+    database: AdventureWorksDW2025
+    difficulty: easy
+    category: simple_filtering
+    expected_tables: [DimProduct]
+    expected_columns: [EnglishProductName, Color]
+    expected_sql: "SELECT EnglishProductName FROM DimProduct WHERE Color = 'Red'"
+    notes: >-
+      Single-table WHERE filter -- the baseline case for filter_correctness.
+
+  - id: easy_filter_red_count
+    question: "How many products are the color red?"
+    database: AdventureWorksDW2025
+    difficulty: easy
+    category: simple_filtering
+    expected_tables: [DimProduct]
+    expected_columns: [Color]
+    expected_sql: "SELECT COUNT(*) FROM DimProduct WHERE Color = 'Red'"
+    notes: >-
+      Same filter as easy_filter_red_products, phrased as a count -- checks
+      the model applies the same WHERE regardless of whether the question
+      asks to list or to count.
+
+  - id: easy_sort_top5_expensive
+    question: "What are the 5 most expensive products?"
+    database: AdventureWorksDW2025
+    difficulty: easy
+    category: sorting
+    expected_tables: [DimProduct]
+    expected_columns: [EnglishProductName, ListPrice]
+    expected_sql: "SELECT TOP 5 EnglishProductName, ListPrice FROM DimProduct ORDER BY ListPrice DESC"
+    order_matters: true
+    max_rows: 5
+    notes: >-
+      order_matters=true -- this specifically tests ORDER BY correctness,
+      not just "returned 5 plausible rows in any order." Several products
+      tie on ListPrice in this dataset, so the comparator's numeric-
+      tolerance canonicalization (not exact float equality) matters here.
+
+  - id: easy_sort_territories_alpha
+    question: "List all sales territory regions in alphabetical order"
+    database: AdventureWorksDW2025
+    difficulty: easy
+    category: sorting
+    expected_tables: [DimSalesTerritory]
+    expected_columns: [SalesTerritoryRegion]
+    expected_sql: "SELECT SalesTerritoryRegion FROM DimSalesTerritory ORDER BY SalesTerritoryRegion ASC"
+    order_matters: true
+    notes: >-
+      A small (10-row), fully-deterministic ORDER BY case -- low risk of a
+      false failure from an unrelated tie, isolating whether ORDER BY
+      direction/column choice itself was correct.
+
+  - id: easy_agg_count_products
+    question: "How many products are there in total?"
+    database: AdventureWorksDW2025
+    difficulty: easy
+    category: aggregation
+    expected_tables: [DimProduct]
+    expected_sql: "SELECT COUNT(*) FROM DimProduct"
+    expect_readable_result: false
+    notes: "Baseline single-value aggregation, no grouping/filtering."
+
+  - id: easy_agg_avg_list_price
+    question: "What is the average list price across all products?"
+    database: AdventureWorksDW2025
+    difficulty: easy
+    category: aggregation
+    expected_tables: [DimProduct]
+    expected_columns: [ListPrice]
+    expected_sql: "SELECT AVG(ListPrice) FROM DimProduct"
+    notes: "AVG rather than COUNT/SUM -- a different aggregate function, same shape."
