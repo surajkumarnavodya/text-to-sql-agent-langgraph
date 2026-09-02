@@ -40,6 +40,52 @@ tables for a question containing the word "product." A cheap, bounded,
 deterministic substring match of distinctive question words against table
 *names* (not columns, not DDL content) catches this specific class of miss
 without turning into a second, redundant retrieval strategy.
+
+Candidate scoring + adaptive selection (`_lexical_bonus`/
+`_select_by_relevance`, the primary top-k step below): pure vector top-k
+was previously a *fixed* count (`Settings.schema_top_k`, default 4)
+regardless of how many tables a question actually needs. Measured against
+this project's own benchmark, that's a dominant driver of low
+relevant-table precision (24.2%, while recall was already 94.6%): the
+benchmark's average question needs roughly 1.2 tables, so a fixed count of
+4 mechanically pads every simple question with ~3 near-guaranteed-irrelevant
+tables. Two changes address this *within the same top_k candidate window
+the primary vector query already returns* -- deliberately not a wider pool
+(see below for why that was tried and reverted):
+(1) each candidate's vector similarity gets a small deterministic lexical
+    bonus when a distinctive question word substring-matches the table's
+    own name or a column name (same keyword extraction as the fallback
+    above) -- this can only *re-rank within* the existing top_k window,
+    never add a table that wasn't already a primary vector match, since
+    it's additive to (not a replacement for) the vector score and the
+    candidate pool itself isn't widened;
+(2) the final count is only trimmed below `top_k` when the top-ranked
+    candidate is *decisively* ahead of the runner-up (a large score gap)
+    AND fewer than two candidates independently earned a lexical match
+    (two independent literal name matches is itself strong evidence of a
+    genuine multi-table question, even if one still leads the other by a
+    wide margin -- see `_select_by_relevance`'s docstring for the concrete
+    regression this guards against). Deliberately conservative, checked
+    against this project's own retrieved score distributions (real
+    fact-table pairs like FactInternetSales vs. FactResellerSales routinely
+    score within ~0.02-0.05 of each other, too close to safely separate by
+    any threshold). When there's no decisive winner, behavior is unchanged
+    from before this rework: the full `top_k` candidates are kept.
+
+Tried and reverted: widening the primary Chroma query to a pool larger than
+`top_k` (so the lexical bonus could promote a table that wasn't even in the
+raw top-k) and embedding `table_descriptions.yaml` business-term text
+directly into each table's vector (see `embeddings/schema_indexer.py`'s
+docstring for the concrete regression that caused). Measured live against
+this project's own benchmark, the combination increased -- not decreased --
+the average number of retrieved tables: a wider, noisier primary pool put
+more, weakly-related candidates into the selected set, which then triggered
+FK-bridge expansion far more often than intended (that mechanism is meant
+for closing a rare structural gap between two already-good picks, not
+stitching together several loosely-related ones). Recall, column-selection
+accuracy, and latency all measurably regressed. Reverted to the bounded
+version above, where the primary step can only return the same or fewer
+tables than before, never more.
 """
 
 from __future__ import annotations
@@ -83,6 +129,30 @@ _MAX_KEYWORD_MATCHES = 3
 # A word shorter than this is too generic to safely substring-match a table
 # name on its own (e.g. "id", "key", "by").
 _MIN_KEYWORD_LENGTH = 4
+
+# Additive bonus (not a replacement for vector similarity) when a
+# distinctive question keyword substring-matches the candidate's own table
+# name, or one of its column names -- both are literal-identifier matches
+# and treated as comparably strong evidence (a column name like
+# "DiscountPct" matching "discount" is just as specific a signal as a table
+# name match), applied flatly on presence of at least one match rather than
+# scaled by how many of the question's *other* keywords (often generic
+# quantitative language like "average" or "total", not schema terms) don't
+# also match -- fraction-scaling was tried and under-rewarded a single
+# strong, distinctive match.
+_LEXICAL_TABLE_NAME_BONUS = 0.25
+_LEXICAL_COLUMN_BONUS = 0.20
+
+# The final selected count is trimmed below top_k only when the top-ranked
+# candidate's (vector + lexical) score leads the runner-up by at least this
+# much -- calibrated against this project's own retrieved score
+# distributions (see this module's docstring): genuinely competing
+# candidates (e.g. two structurally-similar fact tables) are routinely
+# within ~0.05 of each other, so a materially larger gap is a real signal
+# of a decisively single-table question, not noise.
+_DOMINANT_GAP_THRESHOLD = 0.18
+
+_COLUMN_LINE_RE = re.compile(r"^\s{4}(\w+)\s", re.MULTILINE)
 
 # Common question words, and terms generic enough that pure vector
 # similarity already handles them well (broad concepts like "sales" or
@@ -135,6 +205,70 @@ def _extract_keywords(question: str) -> set[str]:
     against table names -- see `_expand_with_keyword_matches`."""
     words = _WORD_RE.findall(question.lower())
     return {w for w in words if len(w) >= _MIN_KEYWORD_LENGTH and w not in _KEYWORD_STOPWORDS}
+
+
+def _column_names_from_ddl(ddl: str) -> list[str]:
+    """Extracts column identifiers from a `render_ddl`-shaped text block.
+
+    Matches only 4-space-indented lines (every real column line, per
+    `db.schema_introspection.render_ddl`) starting with a bare identifier --
+    this naturally skips the `CREATE TABLE (` / `);` bookend lines and
+    `FOREIGN KEY (...) REFERENCES ...` lines (those start with `FOREIGN`,
+    which still matches the regex as a "column name" token, so it's
+    filtered explicitly below rather than relying on indentation alone).
+    """
+    return [
+        match.group(1)
+        for match in _COLUMN_LINE_RE.finditer(ddl)
+        if match.group(1).upper() != "FOREIGN"
+    ]
+
+
+def _lexical_bonus(table_name: str, ddl: str, keywords: set[str]) -> float:
+    """Additive relevance bonus from distinctive question keywords matching
+    this table's own name or its column names -- see this module's
+    docstring ("Candidate scoring + adaptive selection")."""
+    if not keywords:
+        return 0.0
+
+    bonus = 0.0
+    if any(keyword in table_name.lower() for keyword in keywords):
+        bonus += _LEXICAL_TABLE_NAME_BONUS
+
+    columns_lower = [c.lower() for c in _column_names_from_ddl(ddl)]
+    if any(keyword in column for keyword in keywords for column in columns_lower):
+        bonus += _LEXICAL_COLUMN_BONUS
+
+    return bonus
+
+
+def _select_by_relevance(
+    candidates: list[TableSchema], top_k: int, lexically_matched_count: int
+) -> list[TableSchema]:
+    """Trims a combined-score-sorted candidate list to its adaptively-sized subset.
+
+    `candidates` must already be sorted by `similarity_score` descending.
+    Returns just the top candidate when it decisively outscores the
+    runner-up (see `_DOMINANT_GAP_THRESHOLD`'s docstring note above);
+    otherwise returns the first `top_k` unchanged from prior behavior.
+
+    Never trims when 2+ candidates independently earned their own lexical
+    match (`lexically_matched_count`), even if one still leads the other by
+    a decisive margin -- e.g. "each employee's ... sales territory region"
+    matches both DimEmployee ("employee") and DimSalesTerritory
+    ("territory") by table name, but DimSalesTerritory's raw vector score
+    happens to lead DimEmployee's by more than `_DOMINANT_GAP_THRESHOLD`
+    regardless (a flat bonus added to both doesn't close a large
+    pre-existing vector gap). Two independent, literal name matches is
+    itself strong evidence of a genuine multi-table question -- trimming to
+    one in that situation would be exactly the kind of recall regression
+    this adaptive selection is meant to avoid.
+    """
+    if len(candidates) >= 2 and lexically_matched_count < 2:
+        gap = candidates[0]["similarity_score"] - candidates[1]["similarity_score"]
+        if gap >= _DOMINANT_GAP_THRESHOLD:
+            return candidates[:1]
+    return candidates[:top_k]
 
 
 def _expand_with_keyword_matches(
@@ -321,11 +455,17 @@ def retrieve_relevant_schema(
     top_k: int | None = None,
     settings: Settings | None = None,
 ) -> list[TableSchema]:
-    """Returns the `top_k` most relevant tables' DDL for `question`.
+    """Returns up to `top_k` most relevant tables' DDL for `question`.
 
     Args:
         question: The user's natural-language question.
-        top_k: Number of tables to retrieve; defaults to `Settings.schema_top_k`.
+        top_k: Upper bound on tables to retrieve from the primary
+            vector+lexical scoring step; defaults to `Settings.schema_top_k`.
+            The actual count may be fewer than this (see
+            `_select_by_relevance`) when one candidate decisively
+            outscores the rest, and may end up higher after the
+            keyword-match/FK-bridge expansion steps below add
+            structurally- or lexically-necessary tables on top.
         settings: Optional `Settings` override (mainly for tests).
 
     Returns:
@@ -347,6 +487,16 @@ def retrieve_relevant_schema(
             raise SchemaRetrievalError(
                 "The schema index is empty. Run `python scripts/build_embeddings.py` first."
             )
+        # Deliberately queries exactly resolved_top_k candidates, not a
+        # wider pool -- tried and reverted (see this module's docstring):
+        # widening the pool so the lexical bonus could promote a weakly-
+        # embedded table into contention also let more, noisier candidates
+        # into the primary selection, which then triggered FK-bridge
+        # expansion far more often than intended and measurably increased
+        # (not decreased) the average retrieved-table count. Scoring and
+        # adaptively trimming *within* the original top_k window is a
+        # provably bounded change: the primary step can now only return the
+        # same or fewer tables than before, never more.
         result = collection.query(
             query_texts=[question],
             n_results=min(resolved_top_k, collection.count()),
@@ -364,13 +514,24 @@ def retrieve_relevant_schema(
     metadatas_row = metadatas[0] if metadatas else []
     distances_row = distances[0] if distances else []
 
-    tables: list[TableSchema] = []
+    keywords = _extract_keywords(question)
+    candidates: list[TableSchema] = []
+    lexically_matched_count = 0
     for index, (doc, meta) in enumerate(zip(documents_row, metadatas_row, strict=True)):
         distance: float | None = distances_row[index] if index < len(distances_row) else None
-        similarity = round(1.0 - distance, 4) if distance is not None else 0.0
+        vector_similarity = round(1.0 - distance, 4) if distance is not None else 0.0
         raw_table_name = (meta or {}).get("table_name", "unknown")
         table_name = raw_table_name if isinstance(raw_table_name, str) else "unknown"
-        tables.append(TableSchema(table_name=table_name, ddl=doc, similarity_score=similarity))
+        bonus = _lexical_bonus(table_name, doc, keywords)
+        if bonus > 0:
+            lexically_matched_count += 1
+        combined_score = round(vector_similarity + bonus, 4)
+        candidates.append(
+            TableSchema(table_name=table_name, ddl=doc, similarity_score=combined_score)
+        )
+
+    candidates.sort(key=lambda t: t["similarity_score"], reverse=True)
+    tables = _select_by_relevance(candidates, resolved_top_k, lexically_matched_count)
 
     tables = _expand_with_keyword_matches(tables, question, collection)
     tables = _expand_with_fk_bridges(tables, collection)

@@ -16,6 +16,20 @@ notes (via `config.table_descriptions.apply_table_description()`) on top of
 whatever DDL comes back from retrieval, fresh on every question. This
 module only ever embeds the structural DDL (+ sampled values).
 
+Tried and reverted: embedding the description text directly (so a
+business-term question like "which territory sold the most Bikes?" could
+vector-match a table whose columns say nothing about "Bikes" but whose
+purpose note does). Measured live against this project's own benchmark,
+this did more harm than good: hand-written prose from one table's note can
+coincidentally share vocabulary with an unrelated question -- concretely,
+`FactCallCenter`'s purpose text includes the phrase "orders placed" (part
+of its own, unrelated call-center-metrics description), which caused it to
+vector-match "How many orders were placed in January 2012?" ahead of the
+actually-relevant `FactInternetSales`/`DimDate`, a straight-up retrieval
+miss. Business terminology is better handled at the *lexical* level (see
+`embeddings/retriever.py`'s table/column-name bonus) than by folding
+free-form prose into the embedding text.
+
 Cache invalidation: `db.schema_introspection.get_schema_fingerprint()`
 hashes the introspected schema; that hash is stored alongside the Chroma
 persist directory (`.schema_hash`). Re-embedding is skipped whenever the
@@ -72,10 +86,29 @@ def get_chroma_client(settings: Settings | None = None) -> chromadb.ClientAPI:
 
 
 def get_collection(client: chromadb.ClientAPI, settings: Settings) -> Collection:
-    """Gets or creates the schema-DDL collection with the configured embedding function."""
+    """Gets or creates the schema-DDL collection with the configured embedding function.
+
+    Explicitly configured for cosine distance (`hnsw:space`) rather than
+    accepting Chroma's default (squared L2). `embeddings/retriever.py`
+    computes `similarity_score = 1 - distance`, which is only a correct,
+    boundedly-interpretable similarity value if `distance` actually is
+    cosine distance -- under the default L2 metric that expression silently
+    produced a number that *looked* like a similarity score but wasn't one
+    (e.g. deeply negative for every candidate), which is harmless for
+    relative top-k ordering with unit-normalized embeddings (both metrics
+    are monotonic in that case) but breaks any threshold/margin logic that
+    needs the score's absolute value to mean something -- exactly what
+    `retrieve_relevant_schema`'s adaptive candidate selection now needs.
+    Note: `hnsw:space` is fixed at collection-creation time, so this only
+    takes effect for a freshly created collection (a schema/config change
+    already forces `build_index` to delete + recreate the collection; an
+    existing collection built before this change needs one
+    `python scripts/build_embeddings.py --force` to pick it up).
+    """
     return client.get_or_create_collection(
         name=settings.chroma_collection_name,
         embedding_function=_get_embedding_function(settings),
+        metadata={"hnsw:space": "cosine"},
     )
 
 
