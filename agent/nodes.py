@@ -43,6 +43,7 @@ from agent.sql_validator import (
     enforce_row_limit,
     find_restricted_column_references,
     find_unexpected_table_references,
+    references_multiple_tables,
     strip_row_limit,
     validate_sql,
 )
@@ -50,10 +51,10 @@ from agent.state import AgentState, AttemptRecord, ConversationExchange, StageTi
 from config.sensitive_columns import load_sensitive_columns
 from config.settings import get_settings
 from config.table_descriptions import apply_table_description, load_table_descriptions
-from db.connection import get_read_only_engine, get_sqlglot_dialect
+from db.connection import get_connection, get_read_only_engine, get_sqlglot_dialect
 from db.execution import execute_readonly_sql
 from db.query_cost import MODERATE_COST_NOTICE, estimate_query_cost, high_cost_error_message
-from embeddings.retriever import retrieve_relevant_schema
+from embeddings.retriever import retrieve_relevant_schema, select_database
 from security.audit_log import log_security_event
 from security.injection_patterns import INJECTION_PATTERNS
 
@@ -118,6 +119,20 @@ def _give_up_explanation(state: AgentState, detailed_message: str) -> str:
     if not state.get("schema_tables"):
         return NO_RELEVANT_DATA_MESSAGE
     return detailed_message
+
+
+def _selected_db_name(state: AgentState) -> str:
+    """Returns `state["selected_database"]`, guaranteed non-None by this point.
+
+    `retrieve_schema_node` always runs (and sets this) before
+    `validate_sql`/`estimate_query_cost`/`execute_sql` -- see `agent/graph.py`
+    -- so a None here is a precondition violation, not a real runtime case.
+    """
+    selected_database = state["selected_database"]
+    assert (
+        selected_database is not None
+    ), "reached with no selected_database; retrieve_schema_node must run first"
+    return selected_database
 
 
 # Patterns for the invalid identifier named in a "missing reference" driver
@@ -384,6 +399,15 @@ def retrieve_schema_node(state: AgentState) -> dict[str, Any]:
     makes a hand-edit to that file -- fixing a wrong column note, adding a
     new disambiguation -- take effect on the very next question, with no
     embeddings rebuild required.
+
+    Also where multi-database auto-routing happens: on the *first* pass
+    (`state["selected_database"]` not yet set), `embeddings.retriever.
+    select_database` picks which configured database this question is
+    about, before any per-table retrieval runs. On the missing_reference
+    retry re-entry described above, the already-selected database is
+    reused rather than re-routed -- a retry must keep targeting the same
+    database it already generated/executed SQL against, not silently jump
+    to a different one mid-attempt.
     """
     settings = get_settings()
     question = state["question"]
@@ -419,7 +443,23 @@ def retrieve_schema_node(state: AgentState) -> dict[str, Any]:
     logger.info("[retrieve_schema] question=%r", question)
 
     try:
-        tables = retrieve_relevant_schema(query_text, top_k=top_k)
+        selected_database = state.get("selected_database")
+        if selected_database is None:
+            db_selection = select_database(query_text, settings)
+            selected_database = db_selection.db_name
+            logger.info(
+                "[retrieve_schema] auto-routed to database %r "
+                "(top_table_score=%.4f, scores_by_db=%s)",
+                selected_database,
+                db_selection.top_table_score,
+                db_selection.scores_by_db,
+            )
+        else:
+            logger.info(
+                "[retrieve_schema] retry: reusing previously selected database %r",
+                selected_database,
+            )
+        tables = retrieve_relevant_schema(query_text, db_name=selected_database, top_k=top_k)
     except SchemaRetrievalError as exc:
         logger.error("[retrieve_schema] failed: %s", exc)
         attempt_number = state.get("retry_count", 0) + 1
@@ -488,6 +528,7 @@ def retrieve_schema_node(state: AgentState) -> dict[str, Any]:
         )
 
     return {
+        "selected_database": selected_database,
         "schema_tables": tables,
         "schema_context_text": context_text,
         "status": "generating",
@@ -621,10 +662,12 @@ def generate_sql_node(state: AgentState) -> dict[str, Any]:
 def validate_sql_node(state: AgentState) -> dict[str, Any]:
     """Runs the generated SQL through the allowlist validator.
 
-    Resolves the sqlglot dialect from `Settings.db_type` (via
-    `db.connection.get_sqlglot_dialect`) so validation actually parses the
-    SQL the way the target database will -- this is not optional now that
-    the target is a real, configurable engine rather than always DuckDB.
+    Resolves the sqlglot dialect from the database `retrieve_schema_node`
+    auto-routed this question to (`state["selected_database"]`, via
+    `db.connection.get_connection` + `get_sqlglot_dialect`) so validation
+    actually parses the SQL the way *that* target database will -- not the
+    global default connection, which may be a different engine entirely
+    once more than one database is configured.
 
     Two different failure shapes are handled differently:
       - `result.violation_type` in `SAFETY_VIOLATION_TYPES` (the LLM
@@ -639,7 +682,8 @@ def validate_sql_node(state: AgentState) -> dict[str, Any]:
         a single place using the freshly-incremented count.
     """
     settings = get_settings()
-    dialect = get_sqlglot_dialect(settings.db_type)
+    db_config = get_connection(settings, _selected_db_name(state))
+    dialect = get_sqlglot_dialect(db_config.db_type)
     sql = state.get("sql") or ""
     attempt_number = state.get("retry_count", 0) + 1
     result = validate_sql(sql, dialect=dialect)
@@ -834,9 +878,10 @@ def estimate_query_cost_node(state: AgentState) -> dict[str, Any]:
     only for this estimate.
     """
     settings = get_settings()
+    db_config = get_connection(settings, _selected_db_name(state))
     sql = state.get("sql") or ""
     attempt_number = state.get("retry_count", 0) + 1
-    dialect = get_sqlglot_dialect(settings.db_type)
+    dialect = get_sqlglot_dialect(db_config.db_type)
 
     try:
         unlimited_sql = strip_row_limit(sql, dialect=dialect)
@@ -847,7 +892,9 @@ def estimate_query_cost_node(state: AgentState) -> dict[str, Any]:
         # whole run: fall back to estimating the capped SQL as-is.
         unlimited_sql = sql
 
-    estimate = estimate_query_cost(get_read_only_engine(), unlimited_sql, settings)
+    estimate = estimate_query_cost(
+        get_read_only_engine(db_config), unlimited_sql, db_config.db_type, settings
+    )
 
     if estimate is None or estimate.severity == "low":
         return {"cost_estimate": estimate, "cost_notice": None, "status": "executing"}
@@ -905,11 +952,14 @@ def estimate_query_cost_node(state: AgentState) -> dict[str, Any]:
 def execute_sql_node(state: AgentState) -> dict[str, Any]:
     """Executes validated SQL against the read-only database connection.
 
-    Deliberately uses `get_read_only_engine()` -- never a writable
-    connection -- as a second layer of defense beyond `sql_validator`: even
-    a validator bug can't cause a mutation against a connection intended to
-    be read-only (see `db/connection.py`'s docstring on how that's enforced
-    in practice: a DB-level read-only user, documented in README).
+    Deliberately resolves and passes the read-only engine for the database
+    this question was auto-routed to (`state["selected_database"]`, via
+    `db.connection.get_connection` + `get_read_only_engine`) -- never a
+    writable connection -- as a second layer of defense beyond
+    `sql_validator`: even a validator bug can't cause a mutation against a
+    connection intended to be read-only (see `db/connection.py`'s docstring
+    on how that's enforced in practice: a DB-level read-only user,
+    documented in README).
 
     A failure here is classified (`agent.error_classification.
     classify_execution_error`) and handled differently by category:
@@ -924,8 +974,14 @@ def execute_sql_node(state: AgentState) -> dict[str, Any]:
       - SYNTAX / UNKNOWN: retried via `generate_sql` with the actual driver
         error fed back, same as before -- the schema context was fine, the
         SQL text wasn't.
+
+    A success with zero rows across a multi-table join also sets
+    `low_confidence_notice` -- a detection-only signal (never a retry, never
+    a gate) for the UI to show alongside an otherwise normal "succeeded"
+    result. See `agent.sql_validator.references_multiple_tables`.
     """
     settings = get_settings()
+    db_config = get_connection(settings, _selected_db_name(state))
     sql = state["sql"]
     assert sql is not None, "execute_sql_node reached with no SQL; validate_sql_node must run first"
     retry_count = state.get("retry_count", 0)
@@ -933,7 +989,10 @@ def execute_sql_node(state: AgentState) -> dict[str, Any]:
 
     try:
         columns, rows = execute_readonly_sql(
-            sql, settings.query_timeout_seconds, settings.max_result_rows
+            sql,
+            settings.query_timeout_seconds,
+            settings.max_result_rows,
+            engine=get_read_only_engine(db_config),
         )
     except (SQLAlchemyError, TimeoutError) as exc:
         category = classify_execution_error(exc)
@@ -1030,6 +1089,31 @@ def execute_sql_node(state: AgentState) -> dict[str, Any]:
         "error": None,
         "will_retry": False,
     }
+
+    # Detection-only, never a new gate (same philosophy as
+    # schema_anomaly_tables): a legitimate zero-row answer to a
+    # multi-table question is common, but this exact shape is also the
+    # observable symptom of a join that matched columns from unrelated
+    # surrogate-key spaces -- see agent.sql_validator.
+    # references_multiple_tables and agent.llm_client._system_prompt's
+    # join-correctness rules, added after a reproduced real case (a
+    # subcategory table joined straight to a fact table, skipping the
+    # intermediate dimension).
+    low_confidence_notice = None
+    if not rows and references_multiple_tables(sql, get_sqlglot_dialect(db_config.db_type)):
+        low_confidence_notice = (
+            "This query joined multiple tables and returned 0 rows. That can be a "
+            "legitimate answer, but it's also a common symptom of a JOIN condition "
+            "matching columns that aren't actually related (e.g. two different "
+            "surrogate key spaces) -- double-check the SQL and the schema's "
+            "declared foreign keys before trusting this as final."
+        )
+        logger.info(
+            "[execute_sql] attempt %d succeeded with 0 rows across a multi-table join "
+            "-- flagging as low-confidence (detection only, not retried)",
+            attempt_number,
+        )
+
     return {
         "result_columns": columns,
         "result_rows": rows,
@@ -1037,6 +1121,7 @@ def execute_sql_node(state: AgentState) -> dict[str, Any]:
         "execution_error": None,
         "attempt_history": [record],
         "status": "succeeded",
+        "low_confidence_notice": low_confidence_notice,
     }
 
 

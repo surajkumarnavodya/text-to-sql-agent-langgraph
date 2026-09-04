@@ -55,6 +55,13 @@ class AskResponse(BaseModel):
     rendering this response shape is kept consistent with."""
 
     status: AgentStatus
+    database: str | None = Field(
+        default=None,
+        description=(
+            "Which configured database (Settings.databases[i].name) this question "
+            "was auto-routed to. 'default' for a plain single-database setup."
+        ),
+    )
     sql: str | None = None
     result_columns: list[str] | None = None
     result_rows: list[list[Any]] | None = None
@@ -63,6 +70,14 @@ class AskResponse(BaseModel):
     attempt_history: list[AttemptRecordOut] = Field(default_factory=list)
     insight: str | None = None
     cost_notice: str | None = None
+    low_confidence_notice: str | None = Field(
+        default=None,
+        description=(
+            "Set when the query joined multiple tables and returned 0 rows -- a "
+            "detection-only signal (see agent.state.AgentState.low_confidence_notice), "
+            "not necessarily an error."
+        ),
+    )
     rejection_reason: str | None = None
     rejection_message: str | None = None
     rate_limit_message: str | None = None
@@ -76,11 +91,20 @@ class ComponentHealth(BaseModel):
     detail: str
 
 
+class DatabaseHealth(BaseModel):
+    """Per-configured-database reachability + schema-index status -- one
+    entry per `Settings.databases[i]` ('default' for a plain
+    single-database setup)."""
+
+    name: str
+    connection: ComponentHealth
+    schema_index: ComponentHealth
+
+
 class HealthResponse(BaseModel):
     status: Literal["ok", "degraded"]
-    database: ComponentHealth
+    databases: list[DatabaseHealth]
     ollama: ComponentHealth
-    schema_index: ComponentHealth
 
 
 class ColumnOut(BaseModel):
@@ -91,6 +115,7 @@ class ColumnOut(BaseModel):
 
 
 class TableOut(BaseModel):
+    database: str
     table_name: str
     columns: list[ColumnOut]
 

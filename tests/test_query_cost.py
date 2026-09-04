@@ -116,14 +116,18 @@ class TestEstimateQueryCost:
         _mock_mssql_strategy(monkeypatch, lambda *a: called.append(1))
         settings = _settings(cost_estimation_enabled=False)
 
-        result = estimate_query_cost(engine=_UNUSED_ENGINE, sql="SELECT 1", settings=settings)
+        result = estimate_query_cost(
+            engine=_UNUSED_ENGINE, sql="SELECT 1", db_type=settings.db_type, settings=settings
+        )
 
         assert result is None
         assert called == []
 
     def test_unsupported_db_type_returns_none(self):
         settings = _settings(db_type="not_a_real_engine")
-        result = estimate_query_cost(engine=_UNUSED_ENGINE, sql="SELECT 1", settings=settings)
+        result = estimate_query_cost(
+            engine=_UNUSED_ENGINE, sql="SELECT 1", db_type=settings.db_type, settings=settings
+        )
         assert result is None
 
     def test_moderate_estimate_from_mocked_strategy(self, monkeypatch):
@@ -140,7 +144,10 @@ class TestEstimateQueryCost:
         settings = _settings()
 
         result = estimate_query_cost(
-            engine=_UNUSED_ENGINE, sql="SELECT * FROM FactInternetSales", settings=settings
+            engine=_UNUSED_ENGINE,
+            sql="SELECT * FROM FactInternetSales",
+            db_type=settings.db_type,
+            settings=settings,
         )
 
         assert result is not None
@@ -160,7 +167,10 @@ class TestEstimateQueryCost:
         settings = _settings()
 
         result = estimate_query_cost(
-            engine=_UNUSED_ENGINE, sql="SELECT * FROM a, b", settings=settings
+            engine=_UNUSED_ENGINE,
+            sql="SELECT * FROM a, b",
+            db_type=settings.db_type,
+            settings=settings,
         )
 
         assert result is not None
@@ -181,7 +191,9 @@ class TestEstimateQueryCost:
         _mock_mssql_strategy(monkeypatch, _raise)
         settings = _settings()
 
-        result = estimate_query_cost(engine=_UNUSED_ENGINE, sql="SELECT 1", settings=settings)
+        result = estimate_query_cost(
+            engine=_UNUSED_ENGINE, sql="SELECT 1", db_type=settings.db_type, settings=settings
+        )
 
         assert result is None
 
@@ -189,7 +201,9 @@ class TestEstimateQueryCost:
         _mock_mssql_strategy(monkeypatch, lambda engine, sql: None)
         settings = _settings()
 
-        result = estimate_query_cost(engine=_UNUSED_ENGINE, sql="SELECT 1", settings=settings)
+        result = estimate_query_cost(
+            engine=_UNUSED_ENGINE, sql="SELECT 1", db_type=settings.db_type, settings=settings
+        )
 
         assert result is None
 

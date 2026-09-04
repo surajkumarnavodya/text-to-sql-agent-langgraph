@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from config.settings import ConfigurationError, Settings
+from config.settings import ConfigurationError, Settings, get_settings
 from security.secrets import SecretStr
 
 _BASE_SETTINGS = Settings(
@@ -119,3 +119,81 @@ class TestLogRedactionLevelValidation:
     def test_unknown_level_raises(self):
         with pytest.raises(ConfigurationError, match="LOG_REDACTION_LEVEL"):
             _settings(log_redaction_level="verbose")
+
+
+class TestMultiDatabaseConfig:
+    """`Settings.databases` -- the named-connection list `db.connection.
+    get_connection` and `embeddings.retriever.select_database` read from.
+    See `config.settings._parse_named_connections` and `Settings.
+    __post_init__`'s fallback."""
+
+    def test_no_db_connections_falls_back_to_one_default_entry_matching_flat_fields(self):
+        settings = _settings()
+
+        assert [c.name for c in settings.databases] == ["default"]
+        default = settings.databases[0]
+        assert default.db_type == settings.db_type
+        assert default.db_host == settings.db_host
+        assert default.db_name == settings.db_name
+        assert default.db_user == settings.db_user
+        assert default.db_password == settings.db_password
+
+    def test_directly_constructed_settings_without_databases_still_gets_a_default(self):
+        """`__post_init__` runs on *every* construction (see its docstring)
+        -- not just `get_settings()` -- so a hand-built `Settings(...)` in a
+        test (or any other caller) never has an empty `.databases`.
+
+        `databases=()` is passed explicitly alongside the overrides: `_BASE_
+        SETTINGS` already has its own (postgresql-flavored) `.databases`
+        baked in from its own construction, and `dataclasses.replace` only
+        overwrites the fields named in **overrides -- without resetting
+        `databases` too, the stale postgresql entry would be copied over
+        unchanged even though `db_type` below is being changed to mysql.
+        """
+        settings = _settings(db_type="mysql", db_host="mysql-host", databases=())
+        assert len(settings.databases) == 1
+        assert settings.databases[0].db_type == "mysql"
+
+    def test_db_connections_env_parses_named_connections(self, monkeypatch):
+        monkeypatch.setenv("DB_CONNECTIONS", "sales,hr")
+        monkeypatch.setenv("DB_SALES_TYPE", "postgresql")
+        monkeypatch.setenv("DB_SALES_HOST", "sales-host")
+        monkeypatch.setenv("DB_SALES_NAME", "salesdb")
+        monkeypatch.setenv("DB_HR_TYPE", "mysql")
+        monkeypatch.setenv("DB_HR_HOST", "hr-host")
+        monkeypatch.setenv("DB_HR_NAME", "hrdb")
+        get_settings.cache_clear()
+        try:
+            settings = get_settings()
+            names = [c.name for c in settings.databases]
+            assert names == ["sales", "hr"]
+            sales = settings.databases[0]
+            assert sales.db_type == "postgresql"
+            assert sales.db_host == "sales-host"
+            assert sales.db_name == "salesdb"
+            hr = settings.databases[1]
+            assert hr.db_type == "mysql"
+            assert hr.db_host == "hr-host"
+        finally:
+            get_settings.cache_clear()
+
+    def test_db_connections_entry_missing_type_raises(self, monkeypatch):
+        monkeypatch.setenv("DB_CONNECTIONS", "sales")
+        monkeypatch.delenv("DB_SALES_TYPE", raising=False)
+        get_settings.cache_clear()
+        try:
+            with pytest.raises(ConfigurationError, match="DB_SALES_TYPE"):
+                get_settings()
+        finally:
+            get_settings.cache_clear()
+
+    def test_db_connections_names_colliding_on_the_same_env_prefix_raises(self, monkeypatch):
+        # "sales-east" and "sales_east" both normalize to DB_SALES_EAST_*.
+        monkeypatch.setenv("DB_CONNECTIONS", "sales-east,sales_east")
+        monkeypatch.setenv("DB_SALES_EAST_TYPE", "postgresql")
+        get_settings.cache_clear()
+        try:
+            with pytest.raises(ConfigurationError, match="same env prefix"):
+                get_settings()
+        finally:
+            get_settings.cache_clear()

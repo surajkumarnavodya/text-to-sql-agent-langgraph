@@ -362,6 +362,35 @@ def find_unexpected_table_references(
     return sorted(name for name in referenced if name.lower() not in known_lower)
 
 
+def references_multiple_tables(sql: str, dialect: str | None = DEFAULT_DIALECT) -> bool:
+    """Whether `sql` references two or more distinct tables (i.e. involves a join).
+
+    Used by `agent.nodes.execute_sql_node` to decide whether a successful
+    but zero-row result is worth flagging as low-confidence: a single-table
+    zero-row result (e.g. "how many orders in 2050") is almost always a
+    legitimate answer, but a multi-table zero-row result is also the
+    observable symptom of a join that matched columns from unrelated key
+    spaces (see `agent.llm_client._system_prompt`'s join-correctness rules)
+    -- a query that runs without error but is silently wrong.
+
+    Args:
+        sql: Already-validated SQL.
+        dialect: sqlglot dialect to parse with.
+
+    Returns:
+        True if 2+ distinct table names are referenced. False if `sql`
+        doesn't parse (diagnosing that is `validate_sql`'s job, not this
+        function's).
+    """
+    try:
+        statement = sqlglot.parse_one(sql, read=dialect)
+    except SqlglotError:
+        return False
+
+    referenced = {table.name.lower() for table in statement.find_all(exp.Table) if table.name}
+    return len(referenced) >= 2
+
+
 def find_restricted_column_references(
     sql: str,
     restricted_columns: set[tuple[str, str]],

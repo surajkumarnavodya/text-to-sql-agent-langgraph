@@ -77,6 +77,7 @@ class TestValidateSqlNodeSensitiveColumnGate:
             "sql": "SELECT EmailAddress FROM DimCustomer",
             "retry_count": 0,
             "schema_tables": self._schema_tables(),
+            "selected_database": "default",
         }
 
         result = validate_sql_node(state)
@@ -96,6 +97,7 @@ class TestValidateSqlNodeSensitiveColumnGate:
             "sql": "SELECT EmailAddress FROM DimCustomer",
             "retry_count": 3,  # == default max_retries
             "schema_tables": self._schema_tables(),
+            "selected_database": "default",
         }
 
         result = validate_sql_node(state)
@@ -116,6 +118,7 @@ class TestValidateSqlNodeSensitiveColumnGate:
             "sql": "SELECT FirstName FROM DimCustomer",
             "retry_count": 0,
             "schema_tables": self._schema_tables(),
+            "selected_database": "default",
         }
 
         result = validate_sql_node(state)
@@ -130,6 +133,7 @@ class TestValidateSqlNodeSensitiveColumnGate:
             "sql": "SELECT EmailAddress FROM DimCustomer",
             "retry_count": 0,
             "schema_tables": self._schema_tables(),
+            "selected_database": "default",
         }
 
         result = validate_sql_node(state)
@@ -151,6 +155,7 @@ class TestValidateSqlNodeSensitiveColumnGate:
             "sql": "SELECT EmailAddress FROM DimCustomer",
             "retry_count": 0,
             "schema_tables": self._schema_tables(),
+            "selected_database": "default",
         }
 
         result = validate_sql_node(state)
@@ -162,7 +167,7 @@ class TestRetrieveSchemaNodeRagPoisoningScan:
     def test_clean_schema_context_logs_nothing_at_warning(self, monkeypatch, caplog):
         monkeypatch.setattr(
             "agent.nodes.retrieve_relevant_schema",
-            lambda question, top_k: [
+            lambda question, db_name, top_k: [
                 {
                     "table_name": "orders",
                     "ddl": "CREATE TABLE orders (...)",
@@ -188,7 +193,7 @@ class TestRetrieveSchemaNodeRagPoisoningScan:
         )
         monkeypatch.setattr(
             "agent.nodes.retrieve_relevant_schema",
-            lambda question, top_k: [
+            lambda question, db_name, top_k: [
                 {"table_name": "DimProduct", "ddl": poisoned_ddl, "similarity_score": 0.8}
             ],
         )

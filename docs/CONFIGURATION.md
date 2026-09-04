@@ -30,6 +30,18 @@ malformed values (not missing ones) fail fast at startup with a
 | `DB_CONNECTION_STRING` | — | Full SQLAlchemy connection string, used as-is instead of the discrete fields above if set. Also `SecretStr`-wrapped. |
 | `DB_ODBC_DRIVER` | `ODBC Driver 17 for SQL Server` | Only used for `DB_TYPE=mssql` — must match a driver actually installed (`odbcinst -j` / Windows ODBC Data Sources). |
 
+### Multiple databases (optional)
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `DB_CONNECTIONS` | *(unset)* | Comma-separated list of connection names, e.g. `sales,hr`. Unset means a plain single-database setup — the `DB_*` block above is used as-is, internally named `"default"`. When set, the agent auto-routes each question to whichever configured database looks relevant (`embeddings/retriever.py::select_database`) — there is no manual database picker. |
+| `DB_<NAME>_TYPE`, `DB_<NAME>_HOST`, `DB_<NAME>_PORT`, `DB_<NAME>_NAME`, `DB_<NAME>_USER`, `DB_<NAME>_PASSWORD`, `DB_<NAME>_SCHEMA`, `DB_<NAME>_CONNECTION_STRING`, `DB_<NAME>_ODBC_DRIVER` | — | Per-connection fields, one full `DB_*` set per name listed in `DB_CONNECTIONS` (`<NAME>` = the name uppercased, non-alphanumeric characters replaced with `_`). Same meaning as the unprefixed fields above. See `.env.example` for a worked two-database example. |
+
+Each configured database gets its own Chroma collection and schema-index
+cache (`embeddings/schema_indexer.py`), so `python scripts/build_embeddings.py`
+builds/refreshes all of them in one run; `python scripts/test_db_connection.py`
+checks all of them too.
+
 ## ChromaDB (schema retrieval index)
 
 | Variable | Default | Purpose |

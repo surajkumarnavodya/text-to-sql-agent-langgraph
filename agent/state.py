@@ -158,6 +158,16 @@ class AgentState(TypedDict, total=False):
     # mirroring failure_explanation's role for the "failed" status.
     clarification_message: str | None
 
+    # Set by retrieve_schema on its first pass through (see that node's
+    # docstring) via embeddings.retriever.select_database -- which
+    # configured database (Settings.databases[i].name) this question was
+    # auto-routed to. Read, never re-selected, on the one retry path that
+    # re-enters retrieve_schema (execute_sql's "missing_reference" retry):
+    # a retry must keep targeting the same database, not silently jump to
+    # a different one mid-attempt. validate_sql/estimate_query_cost/
+    # execute_sql all resolve their dialect/engine from this via
+    # db.connection.get_connection(settings, state["selected_database"]).
+    selected_database: str | None
     # Set by retrieve_schema
     schema_tables: list[TableSchema]
     schema_context_text: str
@@ -195,6 +205,17 @@ class AgentState(TypedDict, total=False):
     result_columns: list[str] | None
     result_rows: list[tuple] | None
     row_count: int | None
+
+    # Set by execute_sql, only on a *successful* multi-table-join execution
+    # that returned zero rows -- detection-only, never a new gate (same
+    # philosophy as schema_anomaly_tables above): a legitimate zero-row
+    # answer to a multi-table question is common, but this shape is also
+    # the observable symptom of a join that matched unrelated surrogate-key
+    # columns (see agent.sql_validator.references_multiple_tables and
+    # agent.llm_client._system_prompt's join-correctness rules). None means
+    # either the result had rows, only one table was involved, or execution
+    # didn't succeed at all.
+    low_confidence_notice: str | None
 
     # Input, set once by the caller -- whether generate_insight_node should
     # even attempt an insight. True (the default) is normally low-risk and

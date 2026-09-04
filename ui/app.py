@@ -12,10 +12,21 @@ the editable box -- including if the user edited it -- rather than trusting
 the agent's last internal result. This is the "SQL is untrusted output,
 always" rule from CLAUDE.md applied at the UI layer.
 
-Design note on startup: the app refuses to render the chat UI at all if the
-configured database can't be reached (see the connection check right after
-page setup below) -- better a clear "fix your .env" screen than a crash or
-a silently broken agent deeper in the flow.
+Design note on startup: the app refuses to render the chat UI at all only if
+*every* configured database (see `Settings.databases` -- a plain
+single-database `.env` has exactly one, named "default") is unreachable
+(see the connection check right after page setup below) -- better a clear
+"fix your .env" screen than a crash or a silently broken agent deeper in
+the flow. With multiple databases configured, one being down doesn't block
+the others.
+
+Design note on multi-database routing: with more than one database
+configured, each question is auto-routed to whichever configured database
+looks like the best match (`embeddings.retriever.select_database`, called
+from `agent.nodes.retrieve_schema_node`) -- there is no manual
+database-picker UI. `state["selected_database"]` records which database a
+given agent run targeted, and "Confirm and Run" below deliberately
+validates/executes against that same database, not a re-guessed one.
 """
 
 from __future__ import annotations
@@ -43,14 +54,16 @@ from agent.rate_limit import QUESTION_LIMIT_MESSAGE, SlidingWindowRateLimiter
 from agent.sql_validator import enforce_row_limit, validate_sql
 from config.settings import configure_logging, get_settings
 from db.connection import (
+    ConnectionTestResult,
     check_write_privileges,
+    get_connection,
     get_read_only_engine,
     get_sqlglot_dialect,
     test_connection,
 )
 from db.execution import execute_readonly_sql
 from db.schema_introspection import TableSchemaInfo
-from embeddings.schema_indexer import refresh_schema_index
+from embeddings.schema_indexer import refresh_all_schema_indexes
 from security.redaction import redact_secrets
 from ui.column_formatting import (
     escape_markdown,
@@ -269,20 +282,27 @@ def _mask_username(user: str) -> str:
 
 
 @st.cache_resource(show_spinner=False)
-def _startup_connection_check():
-    """Runs once per process. The uncached `test_connection()` call is used
+def _startup_connection_checks() -> dict[str, ConnectionTestResult]:
+    """Runs once per process, for every configured database (see
+    `Settings.databases`) -- a plain single-database `.env` has exactly one
+    entry, named "default". The uncached `test_connection()` call is used
     by the sidebar's "Test Connection" button so it always re-checks live."""
-    return test_connection(settings)
+    return {config.name: test_connection(config) for config in settings.databases}
 
 
 # --------------------------------------------------------------------------
-# Startup gate: refuse to render the app at all if the DB is unreachable
+# Startup gate: refuse to render the app at all only if *every* configured
+# database is unreachable -- with multiple databases configured, one being
+# down shouldn't block the others (auto-routing simply won't usefully route
+# to it; the existing execution-error retry path surfaces that if it does).
 # --------------------------------------------------------------------------
 
-_startup_check = _startup_connection_check()
-if not _startup_check.success:
+_startup_checks = _startup_connection_checks()
+if all(not result.success for result in _startup_checks.values()):
     st.title("⚠️ Database Connection Required")
-    st.error(f"Could not reach database: {_startup_check.message}")
+    st.error("Could not reach any configured database:")
+    for name, result in _startup_checks.items():
+        st.error(f"**{name}**: {result.message}")
     st.markdown(
         "Check your `.env` file — see README's **Connecting to your database** "
         "section. You can also run `python scripts\\test_db_connection.py` from "
@@ -292,38 +312,47 @@ if not _startup_check.success:
 
 
 # --------------------------------------------------------------------------
-# Write-privilege check (once per process) -- best-effort, warning-only, see
-# db.connection.check_write_privileges' docstring (item A: least-privilege
-# design). Never blocks startup, unlike the connection check above.
+# Write-privilege check (once per process, per configured database) --
+# best-effort, warning-only, see db.connection.check_write_privileges'
+# docstring (item A: least-privilege design). Never blocks startup, unlike
+# the connection check above.
 # --------------------------------------------------------------------------
 
 
 @st.cache_resource(show_spinner=False)
-def _startup_write_privilege_check():
-    return check_write_privileges(get_read_only_engine(settings), settings)
+def _startup_write_privilege_checks():
+    return {
+        config.name: check_write_privileges(get_read_only_engine(config), config)
+        for config in settings.databases
+    }
 
 
-_write_privilege_check = _startup_write_privilege_check()
+_write_privilege_checks = _startup_write_privilege_checks()
 
 
 # --------------------------------------------------------------------------
 # Schema introspection + embedding index (once per process; "Refresh Schema"
-# button below clears and re-runs this)
+# button below clears and re-runs this) -- one index per configured database.
 # --------------------------------------------------------------------------
 
 
 @st.cache_resource(show_spinner=False)
-def _initialize_schema() -> list[TableSchemaInfo]:
-    engine = get_read_only_engine(settings)
-    return refresh_schema_index(engine, settings=settings)
+def _initialize_schema() -> dict[str, list[TableSchemaInfo]]:
+    return refresh_all_schema_indexes(settings)
 
 
-discovered_tables = _initialize_schema()
+discovered_tables_by_db = _initialize_schema()
+discovered_tables = [table for tables in discovered_tables_by_db.values() for table in tables]
 
 
 @st.cache_data(show_spinner=False)
 def _run_readonly_query(
-    sql: str, query_timeout_seconds: int, max_result_rows: int, session_token: str
+    sql: str,
+    query_timeout_seconds: int,
+    max_result_rows: int,
+    session_token: str,
+    db_name: str,
+    _engine=None,
 ) -> tuple[list[str], list[tuple]]:
     """Executes already-validated, row-limited SQL, cached by exact SQL text.
 
@@ -341,8 +370,15 @@ def _run_readonly_query(
     cross-user data leak this app's actual single-user target never
     surfaced, but the fix costs nothing today and closes it structurally
     for whenever that target changes.
+
+    `db_name` is likewise part of the cache key -- identical SQL text
+    executed against two different configured databases must never share a
+    cached result. `_engine` (leading underscore excludes it from
+    Streamlit's cache-key hashing -- a SQLAlchemy `Engine` isn't a stable
+    hash key) is the actual connection resolved for `db_name`; `db_name`
+    alone carries the cache-identity role `_engine` can't.
     """
-    return execute_readonly_sql(sql, query_timeout_seconds, max_result_rows)
+    return execute_readonly_sql(sql, query_timeout_seconds, max_result_rows, engine=_engine)
 
 
 # --------------------------------------------------------------------------
@@ -408,26 +444,48 @@ if "question_rate_limiter" not in st.session_state:
 # Sidebar: Database Connection
 # --------------------------------------------------------------------------
 
+_multi_db = len(settings.databases) > 1
+
 with st.sidebar:
-    st.subheader("🔌 Database Connection")
-    st.markdown(f"**Type:** `{settings.db_type or 'not set'}`")
-    st.markdown(f"**Database:** `{settings.db_name or 'not set'}`")
-    if settings.db_user:
-        st.markdown(f"**User:** `{_mask_username(settings.db_user)}`")
-    if settings.db_schema:
-        st.markdown(f"**Schema:** `{settings.db_schema}`")
-    if _startup_check.db_version:
-        st.caption(_startup_check.db_version)
-    if _write_privilege_check.checked and _write_privilege_check.has_write_privileges:
-        st.warning(f"⚠️ {_write_privilege_check.message}")
+    st.subheader("🔌 Database Connections" if _multi_db else "🔌 Database Connection")
+    for config in settings.databases:
+        check = _startup_checks.get(config.name)
+        status_icon = "✅" if check and check.success else "❌"
+        write_check = _write_privilege_checks.get(config.name)
+        with st.container(border=_multi_db):
+            if _multi_db:
+                st.markdown(f"{status_icon} **{config.name}**")
+            st.markdown(f"**Type:** `{config.db_type or 'not set'}`")
+            st.markdown(f"**Database:** `{config.db_name or 'not set'}`")
+            if config.db_user:
+                st.markdown(f"**User:** `{_mask_username(config.db_user)}`")
+            if config.db_schema:
+                st.markdown(f"**Schema:** `{config.db_schema}`")
+            if check and check.db_version:
+                st.caption(check.db_version)
+            if check and not check.success:
+                st.caption(f"⚠️ {check.message}")
+            if write_check and write_check.checked and write_check.has_write_privileges:
+                st.warning(f"⚠️ {write_check.message}")
+
+    if _multi_db:
+        last_state = st.session_state.current_agent_state
+        last_routed_db = last_state.get("selected_database") if last_state else None
+        if last_routed_db:
+            st.caption(f"🧭 Last question routed to: **{last_routed_db}**")
 
     if st.button("🔌 Test Connection", use_container_width=True):
-        with st.spinner("Testing connection..."):
-            result = test_connection(settings)  # deliberately uncached -- always a fresh check
-        if result.success:
-            st.success(f"Connected.{f' {result.db_version}' if result.db_version else ''}")
-        else:
-            st.error(result.message)
+        with st.spinner("Testing connection(s)..."):
+            # deliberately uncached -- always a fresh check
+            results = {config.name: test_connection(config) for config in settings.databases}
+        for name, result in results.items():
+            prefix = f"{name}: " if _multi_db else ""
+            if result.success:
+                st.success(
+                    f"{prefix}Connected.{f' {result.db_version}' if result.db_version else ''}"
+                )
+            else:
+                st.error(f"{prefix}{result.message}")
 
     if st.button("🔄 Refresh Schema", use_container_width=True):
         with st.spinner("Re-introspecting schema and refreshing embeddings..."):
@@ -436,18 +494,26 @@ with st.sidebar:
             # function as a plain Callable preserving the wrapped signature,
             # which doesn't declare .clear() -- a stub gap, not an app bug.
             _initialize_schema.clear()  # type: ignore[attr-defined]
-            refreshed_tables = _initialize_schema()
-        st.success(f"Schema refreshed: {len(refreshed_tables)} table(s).")
-        discovered_tables = refreshed_tables
+            refreshed_by_db = _initialize_schema()
+        total_tables = sum(len(tables) for tables in refreshed_by_db.values())
+        st.success(
+            f"Schema refreshed: {total_tables} table(s) across "
+            f"{len(refreshed_by_db)} database(s)."
+        )
+        discovered_tables_by_db = refreshed_by_db
+        discovered_tables = [table for tables in refreshed_by_db.values() for table in tables]
 
     with st.expander(f"📋 Discovered tables ({len(discovered_tables)})", expanded=False):
-        for discovered_table in discovered_tables:
-            st.markdown(f"**{escape_markdown(discovered_table.table_name)}**")
-            column_summary = ", ".join(
-                f"{escape_markdown(c.name)} ({escape_markdown(c.type)})"
-                for c in discovered_table.columns
-            )
-            st.caption(column_summary)
+        for db_name, db_tables in discovered_tables_by_db.items():
+            if _multi_db:
+                st.markdown(f"**Database: {db_name}**")
+            for discovered_table in db_tables:
+                st.markdown(f"**{escape_markdown(discovered_table.table_name)}**")
+                column_summary = ", ".join(
+                    f"{escape_markdown(c.name)} ({escape_markdown(c.type)})"
+                    for c in discovered_table.columns
+                )
+                st.caption(column_summary)
 
     st.divider()
     st.subheader("⚙️ Options")
@@ -590,11 +656,16 @@ st.markdown(
     """,
     unsafe_allow_html=True,
 )
+_db_badge = (
+    f"🗃️ {len(settings.databases)} databases configured"
+    if _multi_db
+    else f"🗃️ {settings.db_type} · {settings.db_name}"
+)
 st.markdown(
     f"""
     <div class="tsql-badges">
         <span class="tsql-badge">🧠 {settings.ollama_model}</span>
-        <span class="tsql-badge">🗃️ {settings.db_type} · {settings.db_name}</span>
+        <span class="tsql-badge">{_db_badge}</span>
         <span class="tsql-badge">📋 {len(discovered_tables)} table(s) discovered</span>
     </div>
     """,
@@ -765,6 +836,9 @@ if state and state.get("status") not in (
     "rejected",
     "rate_limited",
 ):
+    if _multi_db and state.get("selected_database"):
+        st.caption(f"🧭 Routed to database: **{state['selected_database']}**")
+
     with st.expander("🔍 Retrieved schema context", expanded=False):
         tables = state.get("schema_tables", [])
         if not tables:
@@ -800,7 +874,14 @@ if state and state.get("status") not in (
     confirm_clicked = st.button("▶ Confirm and Run", type="primary")
 
     if confirm_clicked:
-        dialect = get_sqlglot_dialect(settings.db_type)
+        # Validate/execute against the *same* database the agent generated
+        # this SQL for -- not a re-guessed one. `state["selected_database"]`
+        # is set once by retrieve_schema_node and carried through the whole
+        # run; falling back to the first configured connection only covers
+        # a pre-migration history entry with no selected_database recorded.
+        selected_db_name = state.get("selected_database") or settings.databases[0].name
+        db_config = get_connection(settings, selected_db_name)
+        dialect = get_sqlglot_dialect(db_config.db_type)
         sql_to_run = st.session_state.editable_sql
         validation = validate_sql(sql_to_run, dialect=dialect)
         if not validation.is_valid:
@@ -823,6 +904,8 @@ if state and state.get("status") not in (
                         settings.query_timeout_seconds,
                         settings.max_result_rows,
                         st.session_state.session_token,
+                        selected_db_name,
+                        _engine=get_read_only_engine(db_config),
                     )
                 st.session_state.display_result = (columns, rows)
                 st.session_state.display_error = None
@@ -837,7 +920,11 @@ if state and state.get("status") not in (
                 # modes a mid-query connection failure can surface the full
                 # connection string (including the password) verbatim in
                 # the exception text -- see security.redaction's docstring.
-                safe_detail = redact_secrets(str(exc), settings)
+                # Passed db_config (not the global settings) so the exact
+                # password redacted is the one actually in play for this
+                # connection, which can differ once multiple databases are
+                # configured -- see redact_secrets' docstring.
+                safe_detail = redact_secrets(str(exc), db_config)
                 st.session_state.display_result = None
                 st.session_state.display_error = f"Execution failed: {safe_detail}"
                 st.session_state.display_sql = None
@@ -855,6 +942,15 @@ if state and state.get("status") not in (
         df = pd.DataFrame(rows, columns=columns)
 
         st.subheader(f"📊 Results ({len(df)} row{'s' if len(df) != 1 else ''})")
+
+        # Detection-only signal from execute_sql_node (see AgentState.
+        # low_confidence_notice's docstring) -- only shown when the
+        # currently displayed (confirmed) result came from running exactly
+        # the SQL the notice was computed for, same staleness guard as the
+        # AI insight below.
+        low_confidence_notice = state.get("low_confidence_notice")
+        if low_confidence_notice and st.session_state.display_sql == state.get("sql"):
+            st.warning(f"⚠️ {low_confidence_notice}")
 
         # Only shown when the currently displayed (confirmed) result was
         # produced by running exactly the SQL the insight was generated

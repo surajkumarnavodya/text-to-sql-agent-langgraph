@@ -12,6 +12,7 @@ import pytest
 from agent.sql_validator import (
     SAFETY_VIOLATION_TYPES,
     enforce_row_limit,
+    references_multiple_tables,
     strip_row_limit,
     validate_sql,
 )
@@ -217,6 +218,44 @@ class TestStripRowLimit:
     def test_removes_mssql_top_clause(self):
         sql = strip_row_limit("SELECT TOP 1000 * FROM customers", dialect="tsql")
         assert "TOP" not in sql.upper()
+
+
+class TestReferencesMultipleTables:
+    """Regression coverage for a real, reproduced failure: SQL joining a
+    subcategory table directly to a fact table (skipping the intermediate
+    DimProduct hop) parses and executes without error, but returns 0 rows
+    because the two surrogate-key columns belong to different key spaces.
+    `agent.nodes.execute_sql_node` uses this to flag that specific shape
+    (multi-table join + zero rows) as low-confidence -- see
+    `agent.llm_client._system_prompt`'s join-correctness rules for the
+    generation-side half of this fix."""
+
+    def test_single_table_query_is_false(self):
+        assert references_multiple_tables("SELECT * FROM customers") is False
+
+    def test_two_table_join_is_true(self):
+        sql = "SELECT * FROM orders o JOIN customers c ON o.customer_id = c.id"
+        assert references_multiple_tables(sql) is True
+
+    def test_three_table_join_is_true(self):
+        sql = (
+            "SELECT * FROM DimProductSubcategory s "
+            "JOIN DimProduct p ON s.ProductSubcategoryKey = p.ProductSubcategoryKey "
+            "JOIN FactResellerSales f ON p.ProductKey = f.ProductKey"
+        )
+        assert references_multiple_tables(sql) is True
+
+    def test_same_table_referenced_twice_is_false(self):
+        """A self-join is still one *distinct* table."""
+        sql = "SELECT * FROM employees e1 JOIN employees e2 ON e1.manager_id = e2.id"
+        assert references_multiple_tables(sql) is False
+
+    def test_subquery_against_a_second_table_counts_as_two(self):
+        sql = "SELECT * FROM orders WHERE customer_id IN (SELECT id FROM customers)"
+        assert references_multiple_tables(sql) is True
+
+    def test_malformed_sql_returns_false_not_raise(self):
+        assert references_multiple_tables("SELEKT * FORM !!!") is False
 
     def test_no_limit_present_is_a_no_op(self):
         sql = strip_row_limit("SELECT * FROM customers WHERE id = 1")

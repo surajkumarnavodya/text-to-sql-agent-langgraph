@@ -43,11 +43,14 @@ class TestRetrieveRelevantSchema:
         }
         monkeypatch.setattr("embeddings.retriever.get_chroma_client", lambda settings: MagicMock())
         monkeypatch.setattr(
-            "embeddings.retriever.get_collection", lambda client, settings: mock_collection
+            "embeddings.retriever.get_collection", lambda client, settings, db_name: mock_collection
         )
 
         tables = retrieve_relevant_schema(
-            "How many orders per customer?", top_k=2, settings=self._mock_settings()
+            "How many orders per customer?",
+            top_k=2,
+            db_name="testdb",
+            settings=self._mock_settings(),
         )
 
         assert [t["table_name"] for t in tables] == ["orders", "customers"]
@@ -68,10 +71,12 @@ class TestRetrieveRelevantSchema:
         }
         monkeypatch.setattr("embeddings.retriever.get_chroma_client", lambda settings: MagicMock())
         monkeypatch.setattr(
-            "embeddings.retriever.get_collection", lambda client, settings: mock_collection
+            "embeddings.retriever.get_collection", lambda client, settings, db_name: mock_collection
         )
 
-        retrieve_relevant_schema("any question", top_k=2, settings=self._mock_settings())
+        retrieve_relevant_schema(
+            "any question", top_k=2, db_name="testdb", settings=self._mock_settings()
+        )
 
         _, kwargs = mock_collection.query.call_args
         assert kwargs["n_results"] == 2
@@ -81,11 +86,13 @@ class TestRetrieveRelevantSchema:
         mock_collection.count.return_value = 0
         monkeypatch.setattr("embeddings.retriever.get_chroma_client", lambda settings: MagicMock())
         monkeypatch.setattr(
-            "embeddings.retriever.get_collection", lambda client, settings: mock_collection
+            "embeddings.retriever.get_collection", lambda client, settings, db_name: mock_collection
         )
 
         with pytest.raises(SchemaRetrievalError):
-            retrieve_relevant_schema("any question", settings=self._mock_settings())
+            retrieve_relevant_schema(
+                "any question", db_name="testdb", settings=self._mock_settings()
+            )
 
     def test_wraps_unexpected_query_errors(self, monkeypatch):
         mock_collection = MagicMock()
@@ -93,11 +100,13 @@ class TestRetrieveRelevantSchema:
         mock_collection.query.side_effect = RuntimeError("embedding backend exploded")
         monkeypatch.setattr("embeddings.retriever.get_chroma_client", lambda settings: MagicMock())
         monkeypatch.setattr(
-            "embeddings.retriever.get_collection", lambda client, settings: mock_collection
+            "embeddings.retriever.get_collection", lambda client, settings, db_name: mock_collection
         )
 
         with pytest.raises(SchemaRetrievalError):
-            retrieve_relevant_schema("any question", settings=self._mock_settings())
+            retrieve_relevant_schema(
+                "any question", db_name="testdb", settings=self._mock_settings()
+            )
 
 
 class TestAdaptiveSelection:
@@ -141,11 +150,11 @@ class TestAdaptiveSelection:
         }
         monkeypatch.setattr("embeddings.retriever.get_chroma_client", lambda settings: MagicMock())
         monkeypatch.setattr(
-            "embeddings.retriever.get_collection", lambda client, settings: mock_collection
+            "embeddings.retriever.get_collection", lambda client, settings, db_name: mock_collection
         )
 
         tables = retrieve_relevant_schema(
-            "What is the total revenue?", settings=self._mock_settings()
+            "What is the total revenue?", db_name="testdb", settings=self._mock_settings()
         )
 
         assert [t["table_name"] for t in tables] == ["FactInternetSales"]
@@ -175,10 +184,12 @@ class TestAdaptiveSelection:
         }
         monkeypatch.setattr("embeddings.retriever.get_chroma_client", lambda settings: MagicMock())
         monkeypatch.setattr(
-            "embeddings.retriever.get_collection", lambda client, settings: mock_collection
+            "embeddings.retriever.get_collection", lambda client, settings, db_name: mock_collection
         )
 
-        tables = retrieve_relevant_schema("total sales", top_k=3, settings=self._mock_settings())
+        tables = retrieve_relevant_schema(
+            "total sales", top_k=3, db_name="testdb", settings=self._mock_settings()
+        )
 
         assert len(tables) == 3
 
@@ -217,11 +228,12 @@ class TestAdaptiveSelection:
         }
         monkeypatch.setattr("embeddings.retriever.get_chroma_client", lambda settings: MagicMock())
         monkeypatch.setattr(
-            "embeddings.retriever.get_collection", lambda client, settings: mock_collection
+            "embeddings.retriever.get_collection", lambda client, settings, db_name: mock_collection
         )
 
         tables = retrieve_relevant_schema(
             "Show each employee's name and their assigned sales territory region",
+            db_name="testdb",
             settings=self._mock_settings(),
         )
 
@@ -262,12 +274,15 @@ class TestLexicalBonus:
         }
         monkeypatch.setattr("embeddings.retriever.get_chroma_client", lambda settings: MagicMock())
         monkeypatch.setattr(
-            "embeddings.retriever.get_collection", lambda client, settings: mock_collection
+            "embeddings.retriever.get_collection", lambda client, settings, db_name: mock_collection
         )
 
         # ...but "discount" is a literal column-name match only DimPromotion has.
         tables = retrieve_relevant_schema(
-            "What was the average discount percentage?", top_k=2, settings=self._mock_settings()
+            "What was the average discount percentage?",
+            top_k=2,
+            db_name="testdb",
+            settings=self._mock_settings(),
         )
 
         names = [t["table_name"] for t in tables]
@@ -323,11 +338,13 @@ class TestKeywordMatchExpansion:
         mock_collection = self._mock_collection(top_k_result, all_metadatas, documents_by_id)
         monkeypatch.setattr("embeddings.retriever.get_chroma_client", lambda settings: MagicMock())
         monkeypatch.setattr(
-            "embeddings.retriever.get_collection", lambda client, settings: mock_collection
+            "embeddings.retriever.get_collection", lambda client, settings, db_name: mock_collection
         )
 
         tables = retrieve_relevant_schema(
-            "Show total sales by year and product name.", settings=self._mock_settings()
+            "Show total sales by year and product name.",
+            db_name="testdb",
+            settings=self._mock_settings(),
         )
 
         names = [t["table_name"] for t in tables]
@@ -347,11 +364,11 @@ class TestKeywordMatchExpansion:
         mock_collection = self._mock_collection(top_k_result, all_metadatas, {})
         monkeypatch.setattr("embeddings.retriever.get_chroma_client", lambda settings: MagicMock())
         monkeypatch.setattr(
-            "embeddings.retriever.get_collection", lambda client, settings: mock_collection
+            "embeddings.retriever.get_collection", lambda client, settings, db_name: mock_collection
         )
 
         tables = retrieve_relevant_schema(
-            "What is the average order value?", settings=self._mock_settings()
+            "What is the average order value?", db_name="testdb", settings=self._mock_settings()
         )
 
         assert [t["table_name"] for t in tables] == ["FactInternetSales"]
@@ -376,10 +393,12 @@ class TestKeywordMatchExpansion:
         mock_collection = self._mock_collection(top_k_result, all_metadatas, documents_by_id)
         monkeypatch.setattr("embeddings.retriever.get_chroma_client", lambda settings: MagicMock())
         monkeypatch.setattr(
-            "embeddings.retriever.get_collection", lambda client, settings: mock_collection
+            "embeddings.retriever.get_collection", lambda client, settings, db_name: mock_collection
         )
 
-        tables = retrieve_relevant_schema("product name", settings=self._mock_settings())
+        tables = retrieve_relevant_schema(
+            "product name", db_name="testdb", settings=self._mock_settings()
+        )
 
         assert len(tables) == 3
         assert [t["table_name"] for t in tables] == [
@@ -401,13 +420,13 @@ class TestKeywordMatchExpansion:
         mock_collection = self._mock_collection(top_k_result, all_metadatas, {})
         monkeypatch.setattr("embeddings.retriever.get_chroma_client", lambda settings: MagicMock())
         monkeypatch.setattr(
-            "embeddings.retriever.get_collection", lambda client, settings: mock_collection
+            "embeddings.retriever.get_collection", lambda client, settings, db_name: mock_collection
         )
 
         # "sales", "date", "total" are all stopwords for this fallback
         # (vector similarity already handles these broad terms well).
         tables = retrieve_relevant_schema(
-            "What was the total sales by date?", settings=self._mock_settings()
+            "What was the total sales by date?", db_name="testdb", settings=self._mock_settings()
         )
 
         assert tables == []

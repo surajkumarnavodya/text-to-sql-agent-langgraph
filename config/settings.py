@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
@@ -95,6 +96,114 @@ def _resolve_path(raw: str) -> Path:
     """Resolve a possibly-relative path from .env against the project root."""
     path = Path(raw)
     return path if path.is_absolute() else (PROJECT_ROOT / path).resolve()
+
+
+def _connection_env_prefix(name: str) -> str:
+    """Maps a connection name (from `DB_CONNECTIONS`) to its `DB_<PREFIX>_*` env prefix.
+
+    E.g. "sales" -> "SALES", "us-east 1" -> "US_EAST_1" -- any character
+    that isn't alphanumeric becomes `_`, uppercased, so a human-friendly
+    connection name always has a well-formed env var prefix.
+    """
+    return re.sub(r"[^A-Za-z0-9]", "_", name).upper()
+
+
+@dataclass(frozen=True)
+class DatabaseConnectionConfig:
+    """One named database connection's worth of `DB_*`-shaped fields.
+
+    Mirrors `Settings`' own `db_*` fields exactly (same names, same
+    meanings) so both types satisfy `db.connection.DbConnectionLike` and
+    every connection-building function there (`build_connection_url`,
+    `get_engine`, `test_connection`, ...) works identically whether it's
+    handed the legacy single global `Settings` or one entry from
+    `Settings.databases`.
+
+    See `config/settings.py`'s module docstring and `Settings.databases`
+    for how these are parsed from `.env` (`DB_CONNECTIONS` + per-name
+    `DB_<NAME>_*` vars).
+    """
+
+    name: str
+    db_type: str
+    db_host: str | None
+    db_port: int | None
+    db_name: str | None
+    db_user: str | None
+    db_password: SecretStr | None
+    db_connection_string: SecretStr | None
+    db_schema: str | None
+    db_odbc_driver: str
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "db_password", as_secret(self.db_password))
+        object.__setattr__(self, "db_connection_string", as_secret(self.db_connection_string))
+
+
+def _parse_named_connections() -> tuple[DatabaseConnectionConfig, ...]:
+    """Parses `DB_CONNECTIONS` + per-name `DB_<NAME>_*` vars into named connections.
+
+    `DB_CONNECTIONS` is a comma-separated list of connection names, e.g.
+    `DB_CONNECTIONS=sales,hr,inventory`. Each name `X` then reads
+    `DB_<PREFIX>_TYPE`, `DB_<PREFIX>_HOST`, `DB_<PREFIX>_PORT`,
+    `DB_<PREFIX>_NAME`, `DB_<PREFIX>_USER`, `DB_<PREFIX>_PASSWORD`,
+    `DB_<PREFIX>_CONNECTION_STRING`, `DB_<PREFIX>_SCHEMA`,
+    `DB_<PREFIX>_ODBC_DRIVER` (see `_connection_env_prefix` for how `X`
+    becomes `<PREFIX>`) -- the exact same field set as the legacy flat
+    `DB_*` vars, just namespaced per connection.
+
+    Returns an empty tuple if `DB_CONNECTIONS` is unset/blank -- the
+    caller (`Settings.__post_init__`) falls back to a single "default"
+    connection built from the legacy flat `DB_*` vars in that case, so an
+    existing single-database `.env` needs zero changes.
+
+    Raises:
+        ConfigurationError: on a blank name, a duplicate name (or two
+            names colliding on the same env prefix), or a listed name with
+            no matching `DB_<PREFIX>_TYPE` set.
+    """
+    raw_names = _env_str("DB_CONNECTIONS", "")
+    names = [n.strip() for n in raw_names.split(",") if n.strip()]
+    if not names:
+        return ()
+
+    seen_prefixes: dict[str, str] = {}
+    connections: list[DatabaseConnectionConfig] = []
+    for name in names:
+        prefix = _connection_env_prefix(name)
+        if prefix in seen_prefixes:
+            raise ConfigurationError(
+                f"DB_CONNECTIONS names {seen_prefixes[prefix]!r} and {name!r} both map to "
+                f"the same env prefix DB_{prefix}_* -- use more distinct connection names."
+            )
+        seen_prefixes[prefix] = name
+
+        db_type = _env_str(f"DB_{prefix}_TYPE", "").strip().lower()
+        if not db_type:
+            raise ConfigurationError(
+                f"DB_CONNECTIONS includes {name!r} but DB_{prefix}_TYPE is not set in .env. "
+                f"Every name listed in DB_CONNECTIONS needs its own DB_<NAME>_TYPE (and the "
+                f"other DB_<NAME>_* fields)."
+            )
+
+        connections.append(
+            DatabaseConnectionConfig(
+                name=name,
+                db_type=db_type,
+                db_host=_env_optional_str(f"DB_{prefix}_HOST"),
+                db_port=_env_optional_int_strict(f"DB_{prefix}_PORT"),
+                db_name=_env_optional_str(f"DB_{prefix}_NAME"),
+                db_user=_env_optional_str(f"DB_{prefix}_USER"),
+                db_password=as_secret(_env_optional_str(f"DB_{prefix}_PASSWORD")),
+                db_connection_string=as_secret(_env_optional_str(f"DB_{prefix}_CONNECTION_STRING")),
+                db_schema=_env_optional_str(f"DB_{prefix}_SCHEMA"),
+                db_odbc_driver=_env_str(
+                    f"DB_{prefix}_ODBC_DRIVER", "ODBC Driver 17 for SQL Server"
+                ),
+            )
+        )
+
+    return tuple(connections)
 
 
 @dataclass(frozen=True)
@@ -190,6 +299,17 @@ class Settings:
             authenticating reverse proxy regardless of whether this is set.
             Stored as `SecretStr` for the same reason `db_password` is.
         project_root: Absolute path to the repository root.
+        databases: Every configured database connection, parsed from
+            `DB_CONNECTIONS` + per-name `DB_<NAME>_*` vars (see
+            `_parse_named_connections`). Always has at least one entry:
+            when `DB_CONNECTIONS` is unset, `__post_init__` synthesizes a
+            single connection named `"default"` from this same instance's
+            flat `db_*` fields below, so `db_type`/`db_host`/... above stay
+            the single source of truth for a plain single-database setup,
+            and `databases` is the one multi-database-aware code
+            (`embeddings.retriever.select_database`, the Streamlit sidebar,
+            the scripts) should read instead. `db.connection.
+            get_connection(settings, name)` looks one up by name.
     """
 
     ollama_host: str
@@ -226,9 +346,10 @@ class Settings:
     log_redaction_level: str
     api_auth_token: SecretStr | None = None
     project_root: Path = PROJECT_ROOT
+    databases: tuple[DatabaseConnectionConfig, ...] = ()
 
     def __post_init__(self) -> None:
-        """Coerces secret fields and validates security-relevant values.
+        """Coerces secret fields, fills in `databases`, and validates security-relevant values.
 
         Runs on *every* construction of `Settings` -- not just the one path
         through `get_settings()` below -- so both protections apply
@@ -244,6 +365,30 @@ class Settings:
         object.__setattr__(self, "db_password", as_secret(self.db_password))
         object.__setattr__(self, "db_connection_string", as_secret(self.db_connection_string))
         object.__setattr__(self, "api_auth_token", as_secret(self.api_auth_token))
+        if not self.databases:
+            # No DB_CONNECTIONS configured (or a Settings(...) built directly,
+            # e.g. by a test, without passing databases=) -- fall back to a
+            # single "default" connection mirroring this instance's own flat
+            # db_* fields, so `settings.databases` always has >=1 entry and
+            # multi-database-aware code never needs a special single-DB case.
+            object.__setattr__(
+                self,
+                "databases",
+                (
+                    DatabaseConnectionConfig(
+                        name="default",
+                        db_type=self.db_type,
+                        db_host=self.db_host,
+                        db_port=self.db_port,
+                        db_name=self.db_name,
+                        db_user=self.db_user,
+                        db_password=self.db_password,
+                        db_connection_string=self.db_connection_string,
+                        db_schema=self.db_schema,
+                        db_odbc_driver=self.db_odbc_driver,
+                    ),
+                ),
+            )
         self._validate_security_settings()
 
     def _validate_security_settings(self) -> None:
@@ -343,6 +488,7 @@ def get_settings() -> Settings:
         log_level=_env_str("LOG_LEVEL", "INFO"),
         log_redaction_level=_env_str("LOG_REDACTION_LEVEL", "standard").strip().lower(),
         api_auth_token=as_secret(_env_optional_str("API_AUTH_TOKEN")),
+        databases=_parse_named_connections(),
     )
     return settings
 

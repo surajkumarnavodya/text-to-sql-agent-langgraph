@@ -17,7 +17,7 @@ import logging
 import threading
 from typing import Any
 
-from sqlalchemy import text
+from sqlalchemy import Engine, text
 from sqlalchemy.exc import SQLAlchemyError
 
 from config.settings import get_settings
@@ -59,7 +59,7 @@ def _apply_statement_timeout(connection, dialect_name: str, timeout_seconds: int
 
 
 def _execute_with_timeout(
-    sql: str, query_timeout_seconds: int, max_result_rows: int
+    sql: str, query_timeout_seconds: int, max_result_rows: int, engine: Engine | None = None
 ) -> tuple[list[str], list[tuple]]:
     """Runs `sql` on a worker thread and force-aborts it past `query_timeout_seconds`.
 
@@ -76,8 +76,15 @@ def _execute_with_timeout(
     clause already added by `agent.sql_validator.enforce_row_limit`, so a
     malformed or dialect-mistranslated query that ignores/lacks a LIMIT
     still can't pull an unbounded result set into memory.
+
+    Args:
+        engine: The specific database to execute against. None falls back
+            to the legacy global default connection (`get_read_only_engine()`
+            with no argument) -- callers that resolved a specific database
+            (e.g. `agent.nodes.execute_sql_node`, once a question has been
+            auto-routed) must pass it explicitly instead.
     """
-    engine = get_read_only_engine()
+    engine = engine or get_read_only_engine()
     result: dict[str, Any] = {}
     error: dict[str, BaseException] = {}
     connection_holder: dict[str, Any] = {}
@@ -115,7 +122,10 @@ def _execute_with_timeout(
 
 
 def execute_readonly_sql(
-    sql: str, query_timeout_seconds: int, max_result_rows: int | None = None
+    sql: str,
+    query_timeout_seconds: int,
+    max_result_rows: int | None = None,
+    engine: Engine | None = None,
 ) -> tuple[list[str], list[tuple]]:
     """Executes already-validated, already row-limited SQL read-only.
 
@@ -124,6 +134,14 @@ def execute_readonly_sql(
     both go through the exact same connection reuse, timeout, and read-only
     enforcement -- the UI does not get its own, separately-maintained
     execution logic.
+
+    Args:
+        sql: Already-validated, row-limited SQL text.
+        query_timeout_seconds: Wall-clock execution timeout.
+        max_result_rows: Row cap; defaults to `Settings.max_result_rows`.
+        engine: The specific database to execute against -- see
+            `_execute_with_timeout`'s docstring. None (the default) keeps
+            this function's original single-database behavior.
 
     Returns:
         (columns, rows).
@@ -135,4 +153,4 @@ def execute_readonly_sql(
     resolved_max_rows = (
         max_result_rows if max_result_rows is not None else get_settings().max_result_rows
     )
-    return _execute_with_timeout(sql, query_timeout_seconds, resolved_max_rows)
+    return _execute_with_timeout(sql, query_timeout_seconds, resolved_max_rows, engine=engine)

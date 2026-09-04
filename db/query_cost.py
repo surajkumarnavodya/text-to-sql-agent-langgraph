@@ -299,21 +299,31 @@ def _run_with_timeout(strategy, engine: Engine, sql: str, timeout_seconds: float
     return result.get("value")
 
 
-def estimate_query_cost(engine: Engine, sql: str, settings: Settings) -> CostEstimate | None:
+def estimate_query_cost(
+    engine: Engine, sql: str, db_type: str, settings: Settings
+) -> CostEstimate | None:
     """Estimates `sql`'s cost/row count without executing it, failing open on any problem.
 
     Args:
-        engine: A read-only SQLAlchemy engine.
+        engine: A read-only SQLAlchemy engine for the same database `sql`
+            targets.
         sql: Already-validated, row-limited SQL (see `agent.sql_validator`).
-        settings: For `db_type` (selects the per-engine strategy),
-            `cost_estimation_enabled`, `cost_estimation_timeout_seconds`,
-            and the two row thresholds.
+        db_type: The *target* database's engine family (selects the
+            per-engine strategy below) -- the caller resolves this from
+            whichever database the question was actually routed to (see
+            `agent.nodes.estimate_query_cost_node`), not necessarily
+            `settings.db_type` (the legacy default connection), since more
+            than one database -- each potentially a different engine -- may
+            be configured.
+        settings: For `cost_estimation_enabled`, `cost_estimation_timeout_seconds`,
+            and the two row thresholds -- global tuning knobs, not
+            per-database.
 
     Returns:
         A `CostEstimate`, or None if estimation is disabled, unsupported
-        for `settings.db_type`, or failed/timed out for any reason (logged
-        at debug level either way -- never raises). The exception catch
-        here is deliberately broad (`Exception`, not a specific list): this
+        for `db_type`, or failed/timed out for any reason (logged at debug
+        level either way -- never raises). The exception catch here is
+        deliberately broad (`Exception`, not a specific list): this
         function's entire contract is "never the reason a legitimate query
         can't run" (see module docstring), so an unexpected driver-specific
         error must fail open exactly the same way an anticipated one
@@ -326,11 +336,9 @@ def estimate_query_cost(engine: Engine, sql: str, settings: Settings) -> CostEst
     if not settings.cost_estimation_enabled:
         return None
 
-    strategy = _STRATEGIES.get(settings.db_type)
+    strategy = _STRATEGIES.get(db_type)
     if strategy is None:
-        logger.debug(
-            "[query_cost] no cost-estimation strategy for db_type=%r, skipping", settings.db_type
-        )
+        logger.debug("[query_cost] no cost-estimation strategy for db_type=%r, skipping", db_type)
         return None
 
     try:

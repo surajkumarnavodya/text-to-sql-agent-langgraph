@@ -77,7 +77,9 @@ class TestHealth:
             lambda settings: ConnectionTestResult(success=True, message="Connection successful."),
         )
         monkeypatch.setattr("api.main.get_chroma_client", lambda settings: object.__new__(object))
-        monkeypatch.setattr("api.main.get_collection", lambda client, settings: _FakeCollection(31))
+        monkeypatch.setattr(
+            "api.main.get_collection", lambda client, settings, db_name: _FakeCollection(31)
+        )
 
         class _FakeOllamaClient:
             def __init__(self, host: str) -> None:
@@ -93,9 +95,10 @@ class TestHealth:
         assert response.status_code == 200
         body = response.json()
         assert body["status"] == "ok"
-        assert body["database"]["ok"] is True
+        assert body["databases"][0]["name"] == "default"
+        assert body["databases"][0]["connection"]["ok"] is True
         assert body["ollama"]["ok"] is True
-        assert body["schema_index"]["ok"] is True
+        assert body["databases"][0]["schema_index"]["ok"] is True
 
     def test_database_unreachable_returns_503_degraded(self, monkeypatch, client):
         monkeypatch.setattr(
@@ -105,7 +108,9 @@ class TestHealth:
             ),
         )
         monkeypatch.setattr("api.main.get_chroma_client", lambda settings: object.__new__(object))
-        monkeypatch.setattr("api.main.get_collection", lambda client, settings: _FakeCollection(31))
+        monkeypatch.setattr(
+            "api.main.get_collection", lambda client, settings, db_name: _FakeCollection(31)
+        )
 
         class _FakeOllamaClient:
             def __init__(self, host: str) -> None:
@@ -121,7 +126,7 @@ class TestHealth:
         assert response.status_code == 503
         body = response.json()
         assert body["status"] == "degraded"
-        assert body["database"]["ok"] is False
+        assert body["databases"][0]["connection"]["ok"] is False
 
     def test_empty_schema_index_is_unhealthy_not_a_crash(self, monkeypatch, client):
         monkeypatch.setattr(
@@ -129,7 +134,9 @@ class TestHealth:
             lambda settings: ConnectionTestResult(success=True, message="Connection successful."),
         )
         monkeypatch.setattr("api.main.get_chroma_client", lambda settings: object.__new__(object))
-        monkeypatch.setattr("api.main.get_collection", lambda client, settings: _FakeCollection(0))
+        monkeypatch.setattr(
+            "api.main.get_collection", lambda client, settings, db_name: _FakeCollection(0)
+        )
 
         class _FakeOllamaClient:
             def __init__(self, host: str) -> None:
@@ -143,7 +150,7 @@ class TestHealth:
         response = client.get("/health")
 
         assert response.status_code == 503
-        assert response.json()["schema_index"]["ok"] is False
+        assert response.json()["databases"][0]["schema_index"]["ok"] is False
 
     def test_ollama_unreachable_is_caught_not_raised(self, monkeypatch, client):
         """A health check must never itself crash -- an unreachable
@@ -154,7 +161,9 @@ class TestHealth:
             lambda settings: ConnectionTestResult(success=True, message="Connection successful."),
         )
         monkeypatch.setattr("api.main.get_chroma_client", lambda settings: object.__new__(object))
-        monkeypatch.setattr("api.main.get_collection", lambda client, settings: _FakeCollection(31))
+        monkeypatch.setattr(
+            "api.main.get_collection", lambda client, settings, db_name: _FakeCollection(31)
+        )
 
         class _RaisingOllamaClient:
             def __init__(self, host: str) -> None:

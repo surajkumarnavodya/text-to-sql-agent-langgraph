@@ -86,12 +86,19 @@ exchange, or ambiguous — before any schema retrieval or LLM call. On
 `"ambiguous"`, the graph ends immediately with `status="needs_clarification"`
 rather than guessing.
 
-**`retrieve_schema_node`** — embeds the question, retrieves the top-k most
-relevant tables from ChromaDB, expands that set with FK-adjacency bridge
-tables (§3), overlays the current `config/table_descriptions.yaml` content
-on each table's DDL, and concatenates the result into
-`schema_context_text`. This is also the re-entry point on a
-`missing_reference` execution failure — see §2.
+**`retrieve_schema_node`** — on the first pass, if more than one database is
+configured (`Settings.databases`, via `DB_CONNECTIONS`), calls
+`embeddings.retriever.select_database` to auto-route the question to one
+configured database and stores the result in `state["selected_database"]`
+(a single-database setup short-circuits this immediately). Then embeds the
+question, retrieves the top-k most relevant tables from that database's own
+ChromaDB collection, expands that set with FK-adjacency bridge tables (§3),
+overlays the current `config/table_descriptions.yaml` content on each
+table's DDL, and concatenates the result into `schema_context_text`. This
+is also the re-entry point on a `missing_reference` execution failure — see
+§2 — in which case the already-selected database is **reused**, not
+re-routed, since a retry must keep targeting the same database the failed
+attempt did.
 
 **`generate_sql_node`** — checks the process-wide LLM-call rate limiter
 (`agent.rate_limit.get_llm_call_limiter`) before every attempt, including
@@ -111,29 +118,32 @@ cheaper regex pre-filter missed, which this node turns into the same
 
 **`validate_sql_node`** — runs the candidate through
 `agent/sql_validator.py`'s allowlist (§ below) in the dialect matching
-`DB_TYPE`. A safety violation fails closed immediately. An ordinary parse
-mistake increments `retry_count` and routes back to `generate_sql` if
-budget remains. A pass gets a `LIMIT` clause applied
+`state["selected_database"]`'s own `DB_TYPE` (`db.connection.get_connection`
++ `get_sqlglot_dialect` — not a single global `DB_TYPE` once more than one
+database is configured). A safety violation fails closed immediately. An
+ordinary parse mistake increments `retry_count` and routes back to
+`generate_sql` if budget remains. A pass gets a `LIMIT` clause applied
 (`enforce_row_limit`) and moves to `estimate_cost`.
 
 **`estimate_query_cost_node`** — runs a non-executing `EXPLAIN`/`SHOWPLAN`
-estimate on the validated SQL (`db/query_cost.py`) — an earlier, additional
-layer in front of `execute_sql`'s existing timeout, not a replacement for
-it. Always fails open: any estimation problem (unsupported dialect,
-timeout, driver error) is logged and treated exactly like "low cost,
-proceed." **Low** severity (or estimation unavailable) proceeds silently;
-**moderate** proceeds but sets `cost_notice` so the UI can show a
-"this may take a moment" caption before execution; **high** does not
-execute at all — treated exactly like any other retryable correctness
-mistake, sharing the same `max_retries` budget as a parse error, so the
-model gets a chance to add a filter on its own before the agent gives up.
+estimate on the validated SQL (`db/query_cost.py`), against the selected
+database's own engine and dialect — an earlier, additional layer in front
+of `execute_sql`'s existing timeout, not a replacement for it. Always fails
+open: any estimation problem (unsupported dialect, timeout, driver error)
+is logged and treated exactly like "low cost, proceed." **Low** severity
+(or estimation unavailable) proceeds silently; **moderate** proceeds but
+sets `cost_notice` so the UI can show a "this may take a moment" caption
+before execution; **high** does not execute at all — treated exactly like
+any other retryable correctness mistake, sharing the same `max_retries`
+budget as a parse error, so the model gets a chance to add a filter on its
+own before the agent gives up.
 
-**`execute_sql_node`** — runs the validated SQL against a read-only engine
-with a row cap and timeout (§ "Execution safety" below), classifies any
-failure (`agent/error_classification.py`) into `TIMEOUT` /
-`MISSING_REFERENCE` / `SYNTAX` / `UNKNOWN`, and routes accordingly (§2). On
-success, results and row count go into state and the graph proceeds to
-`generate_insight`.
+**`execute_sql_node`** — runs the validated SQL against the selected
+database's own read-only engine with a row cap and timeout (§ "Execution
+safety" below), classifies any failure (`agent/error_classification.py`)
+into `TIMEOUT` / `MISSING_REFERENCE` / `SYNTAX` / `UNKNOWN`, and routes
+accordingly (§2). On success, results and row count go into state and the
+graph proceeds to `generate_insight`.
 
 **`generate_insight_node`** — only reachable from `execute_sql_node`'s
 *success* path; a failed, needs-clarification, or rejected run never
@@ -223,11 +233,17 @@ embeddings.schema_indexer.build_index()  -- one Chroma chunk per table,
         |                                    (NOT table_descriptions --
         |                                    see below)
         v
-   [ChromaDB persisted index]
+   [one ChromaDB collection per configured database]
         |
         | (per question, in agent.nodes.retrieve_schema_node)
         v
-embeddings.retriever.retrieve_relevant_schema()
+embeddings.retriever.select_database()  -- only when 2+ databases are
+        |                                  configured; short-circuits to
+        |                                  the one database otherwise
+        v
+embeddings.retriever.retrieve_relevant_schema()  -- scoped to the
+        |                                            selected database's
+        |                                            own collection
    1. top-k similarity search
    2. _expand_with_fk_bridges() -- FK-adjacency bridge expansion
         |

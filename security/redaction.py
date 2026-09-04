@@ -40,7 +40,7 @@ import re
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from config.settings import Settings
+    from db.connection import DbConnectionLike
 
 _REDACTED = "***REDACTED***"
 
@@ -66,7 +66,7 @@ def _redact_match(match: re.Match[str]) -> str:
     return f"://{match.group('user')}:{_REDACTED}@"
 
 
-def redact_secrets(text: str, settings: Settings | None = None) -> str:
+def redact_secrets(text: str, settings: DbConnectionLike | None = None) -> str:
     """Returns `text` with any known secret value replaced by a placeholder.
 
     Safe to call on text with no secret in it at all -- returns it
@@ -78,9 +78,15 @@ def redact_secrets(text: str, settings: Settings | None = None) -> str:
     Args:
         text: The text to redact (e.g. `str(exc)` from a connection or
             query-execution failure).
-        settings: Settings to pull the configured secret value(s) from.
-            None skips the exact-value layer and applies only the generic
-            regex fallback (e.g. for a caller with no `Settings` in scope).
+        settings: The `Settings` (or one specific `Settings.databases`
+            entry -- both have a `db_password`) to pull the configured
+            secret value from. Passing the *specific* connection actually
+            being tested/queried matters once multiple databases are
+            configured: their passwords can differ, and only the exact one
+            in play is redacted by this exact-value layer (the generic
+            regex fallback below still catches most other passwords'
+            shape regardless). None skips the exact-value layer and
+            applies only the generic regex fallback.
 
     Returns:
         Redacted text. Never raises -- a redaction bug must not be the

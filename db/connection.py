@@ -24,16 +24,57 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from enum import Enum
-from functools import lru_cache
+from functools import cache
+from typing import Protocol, runtime_checkable
 
 from sqlalchemy import Engine, create_engine, text
 from sqlalchemy.engine import URL
 from sqlalchemy.exc import NoSuchModuleError
 
-from config.settings import ConfigurationError, Settings, get_settings
+from config.settings import ConfigurationError, DatabaseConnectionConfig, Settings, get_settings
 from security.redaction import redact_secrets
+from security.secrets import SecretStr
 
 logger = logging.getLogger(__name__)
+
+
+@runtime_checkable
+class DbConnectionLike(Protocol):
+    """Structural shape shared by `Settings` and `DatabaseConnectionConfig`.
+
+    Every function below that builds a connection/URL/engine from config
+    accepts either type -- both carry the identical `db_*` field set (see
+    `config.settings.DatabaseConnectionConfig`'s docstring) -- so a caller
+    can pass either the legacy single global `Settings` (today's default
+    connection) or one specific `Settings.databases` entry (a named
+    multi-database connection) interchangeably.
+
+    Declared as read-only `@property` members (not plain attributes):
+    both `Settings` and `DatabaseConnectionConfig` are frozen dataclasses,
+    so their fields are read-only from mypy's perspective -- a plain
+    mutable-attribute Protocol member would reject them as non-conforming
+    ("expected settable variable, got read-only attribute") even though
+    they satisfy this structurally in every way that matters here.
+    """
+
+    @property
+    def db_type(self) -> str: ...
+    @property
+    def db_host(self) -> str | None: ...
+    @property
+    def db_port(self) -> int | None: ...
+    @property
+    def db_name(self) -> str | None: ...
+    @property
+    def db_user(self) -> str | None: ...
+    @property
+    def db_password(self) -> SecretStr | None: ...
+    @property
+    def db_connection_string(self) -> SecretStr | None: ...
+    @property
+    def db_schema(self) -> str | None: ...
+    @property
+    def db_odbc_driver(self) -> str: ...
 
 
 @dataclass(frozen=True)
@@ -69,7 +110,7 @@ def get_sqlglot_dialect(db_type: str) -> str | None:
     return info.sqlglot_dialect if info else None
 
 
-def _describe_target(settings: Settings) -> str:
+def _describe_target(settings: DbConnectionLike) -> str:
     """Human-readable, credential-free description of the configured DB, for logging.
 
     Never includes the password or the full connection string -- see
@@ -80,7 +121,7 @@ def _describe_target(settings: Settings) -> str:
     return f"{settings.db_type}://{settings.db_host}:{settings.db_port}/{settings.db_name}"
 
 
-def build_connection_url(settings: Settings) -> URL | str:
+def build_connection_url(settings: DbConnectionLike) -> URL | str:
     """Builds a SQLAlchemy connection URL from config, validating as it goes.
 
     If `DB_CONNECTION_STRING` is set, it's used as-is (full override) --
@@ -88,7 +129,8 @@ def build_connection_url(settings: Settings) -> URL | str:
     `db_*` fields via `DB_TYPE`.
 
     Args:
-        settings: Application settings.
+        settings: Application settings, or one specific
+            `Settings.databases` entry (see `DbConnectionLike`).
 
     Returns:
         A `sqlalchemy.engine.URL` (or the raw override string).
@@ -138,26 +180,38 @@ def build_connection_url(settings: Settings) -> URL | str:
     )
 
 
-@lru_cache(maxsize=1)
+@cache
 def _cached_engine(connection_string: str) -> Engine:
-    """Process-wide singleton engine, keyed by the resolved connection string.
+    """Process-wide engine cache, one entry per distinct resolved connection string.
 
-    `lru_cache` gives connection pooling "for free": every caller within the
-    process shares the same `Engine` (and thus its connection pool) instead
-    of opening a fresh one per query. The cache key lives only in memory for
-    this process -- it is never logged or persisted.
+    `functools.cache` (unbounded `lru_cache`) gives connection pooling "for
+    free": every caller asking for the *same* connection string shares the
+    same `Engine` (and thus its connection pool) instead of opening a fresh
+    one per query. Deliberately unbounded rather than a small bound -- the
+    cache key space is exactly the set of currently-configured database
+    connections (`Settings.databases`, typically a handful), not
+    per-request data, so there's no unbounded-growth risk; a small bound
+    would instead cause a real bug once more than one database is
+    configured: repeatedly switching between two connections would evict
+    and rebuild engines (and their connection pools) on every switch rather
+    than reusing them. The cache key lives only in memory for this process
+    -- it is never logged or persisted.
     """
     return create_engine(connection_string, pool_pre_ping=True, pool_recycle=1800)
 
 
-def get_engine(settings: Settings | None = None) -> Engine:
-    """Builds (or reuses) the SQLAlchemy engine for the configured database.
+def get_engine(settings: DbConnectionLike | None = None) -> Engine:
+    """Builds (or reuses) the SQLAlchemy engine for the given database connection.
 
     Args:
-        settings: Optional `Settings` override (mainly for tests).
+        settings: `Settings` (the legacy default connection), one specific
+            `Settings.databases` entry (`db.connection.get_connection`), or
+            None to use the process-wide `Settings` (`get_settings()`).
 
     Returns:
-        A pooled, reused SQLAlchemy `Engine`.
+        A pooled, reused SQLAlchemy `Engine` -- a distinct one per distinct
+        resolved connection string, so calling this for two different
+        configured databases returns two different engines/pools.
 
     Raises:
         ConfigurationError: see `build_connection_url`.
@@ -168,7 +222,7 @@ def get_engine(settings: Settings | None = None) -> Engine:
     return _cached_engine(str(url))
 
 
-def get_read_only_engine(settings: Settings | None = None) -> Engine:
+def get_read_only_engine(settings: DbConnectionLike | None = None) -> Engine:
     """Returns the engine every query-executing code path must use.
 
     This does not enforce read-only access by itself -- see this module's
@@ -295,7 +349,7 @@ def _fetch_db_version(connection, dialect_name: str) -> str | None:
         return None
 
 
-def test_connection(settings: Settings | None = None) -> ConnectionTestResult:
+def test_connection(settings: DbConnectionLike | None = None) -> ConnectionTestResult:
     """Performs a lightweight round-trip (`SELECT 1`) against the configured database.
 
     This is the single source of truth both `scripts/test_db_connection.py`
@@ -304,7 +358,11 @@ def test_connection(settings: Settings | None = None) -> ConnectionTestResult:
     the classification logic.
 
     Args:
-        settings: Optional `Settings` override (mainly for tests).
+        settings: `Settings` (the legacy default connection), one specific
+            `Settings.databases` entry, or None to use the process-wide
+            `Settings`. Callers testing every configured connection (the
+            multi-database sidebar/scripts) call this once per entry in
+            `Settings.databases`.
 
     Returns:
         A `ConnectionTestResult`. Never raises -- all failure modes are
@@ -434,7 +492,7 @@ _WRITE_PRIVILEGE_WARNING = (
 
 
 def check_write_privileges(
-    engine: Engine, settings: Settings | None = None
+    engine: Engine, settings: DbConnectionLike | None = None
 ) -> WritePrivilegeCheckResult:
     """Best-effort check for whether the connected role has any write privilege.
 
@@ -485,3 +543,31 @@ def check_write_privileges(
     else:
         message = "The connected database role does not appear to have write privileges."
     return WritePrivilegeCheckResult(checked=True, has_write_privileges=has_write, message=message)
+
+
+def list_connection_names(settings: Settings) -> list[str]:
+    """Returns every configured database connection's name, in configured order.
+
+    `Settings.databases` always has at least one entry (see `Settings.
+    __post_init__`) -- a single-database setup returns `["default"]`.
+    """
+    return [config.name for config in settings.databases]
+
+
+def get_connection(settings: Settings, name: str) -> DatabaseConnectionConfig:
+    """Looks up one named database connection from `Settings.databases`.
+
+    This is how multi-database-aware code (the auto-router in `embeddings.
+    retriever`, `agent/nodes.py`, the Streamlit sidebar, the scripts) turns
+    a database *name* (e.g. `state["selected_database"]`) back into the
+    `DatabaseConnectionConfig` needed to build an engine or resolve a
+    dialect.
+
+    Raises:
+        ConfigurationError: if no configured connection has this name.
+    """
+    for config in settings.databases:
+        if config.name == name:
+            return config
+    configured = ", ".join(list_connection_names(settings)) or "(none)"
+    raise ConfigurationError(f"Unknown database connection {name!r}. Configured: {configured}.")

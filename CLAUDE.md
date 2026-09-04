@@ -5,16 +5,28 @@ before making changes.
 
 ## What this project is
 
-A Text-to-SQL dashboard connected to a real, user-configured database. A
-user types a natural-language question in Streamlit, a LangGraph agent turns
-it into SQL against the configured database (schema retrieved via ChromaDB,
-embedded from **live schema introspection** — not a hardcoded sample — so
-only relevant tables are shown to the LLM), the SQL is validated
-(SELECT-only allowlist), executed read-only, and the result is rendered as a
-table + auto-picked Plotly chart. The LLM runs locally via Ollama — no
-network calls for the LLM, no API keys required for that part. Database
-connectivity is fully config-driven via `.env`; there is no hardcoded
-connection string, host, or schema anywhere in the codebase.
+A Text-to-SQL dashboard connected to one or more real, user-configured
+databases. A user types a natural-language question in Streamlit, a
+LangGraph agent turns it into SQL against the configured database (schema
+retrieved via ChromaDB, embedded from **live schema introspection** — not a
+hardcoded sample — so only relevant tables are shown to the LLM), the SQL is
+validated (SELECT-only allowlist), executed read-only, and the result is
+rendered as a table + auto-picked Plotly chart. The LLM runs locally via
+Ollama — no network calls for the LLM, no API keys required for that part.
+Database connectivity is fully config-driven via `.env`; there is no
+hardcoded connection string, host, or schema anywhere in the codebase.
+
+**Multiple databases:** `DB_CONNECTIONS` in `.env` can list more than one
+named connection (`config.settings.DatabaseConnectionConfig`, one full
+`DB_<NAME>_*` field set per name) instead of the single legacy `DB_*` block.
+When more than one is configured, `retrieve_schema_node` auto-routes each
+question to whichever database's schema looks most relevant
+(`embeddings.retriever.select_database`) before generating SQL — there is
+no manual database picker anywhere in the UI/API. A plain single-database
+`.env` (the common case, and everything this file describes elsewhere
+unless multi-database is called out explicitly) still works unchanged: it's
+internally treated as one connection named `"default"`. See "Multi-database
+auto-routing" under Key design decisions below.
 
 **History note:** the project originally shipped with a bundled sample
 DuckDB e-commerce database for demo purposes. That was fully removed (by
@@ -31,7 +43,7 @@ wrong, not as a parallel supported mode.
 | LLM runtime | Ollama, default model `llama3.1:8b` (swap via `.env` / `config/settings.py`, e.g. `sqlcoder`, `duckdb-nsql`) |
 | Orchestration | LangGraph — explicit state machine, not a black-box agent |
 | Schema retrieval | ChromaDB (persisted locally) — embeds table DDL synthesized from live introspection, retrieves top-k relevant tables per question |
-| Database | User's own — PostgreSQL, MySQL, SQL Server, or Oracle, via SQLAlchemy. Config-driven (`DB_TYPE` + connection params in `.env`), pluggable per `db.connection.SUPPORTED_DB_TYPES` |
+| Database | User's own — PostgreSQL, MySQL, SQL Server, or Oracle, via SQLAlchemy. Config-driven (`DB_TYPE` + connection params in `.env`), pluggable per `db.connection.SUPPORTED_DB_TYPES`. One or more named connections (`DB_CONNECTIONS` in `.env`); the agent auto-routes each question to the right one when more than one is configured |
 | SQL parsing/validation | sqlglot — parses generated SQL and checks statement type against an allowlist, in the dialect matching `DB_TYPE` |
 | UI | Streamlit + Plotly |
 | Python | 3.11 is the target per project spec. **This machine only has 3.14 installed** (no 3.11 on PATH via `py -0p`) — the venv was created against 3.14. If a future session hits a wheel-availability issue for a pinned dependency, that's why. Re-run `py -0p` to check if 3.11 has since been installed and consider recreating `.venv` against it if so. |
@@ -50,8 +62,12 @@ wrong, not as a parallel supported mode.
   connection URL from config (`build_connection_url`), exposes a cached
   `get_engine()`/`get_read_only_engine()`, and `test_connection()` (a
   `SELECT 1` round-trip with best-effort failure classification — auth,
-  host-unreachable, db-not-found, driver-missing, timeout, unknown).
-  `schema_introspection.py` is the **sole source of truth** for schema
+  host-unreachable, db-not-found, driver-missing, timeout, unknown). Every
+  one of these accepts either the legacy global `Settings` or one specific
+  `Settings.databases` entry (a named connection — see `DbConnectionLike`),
+  so the same functions serve both a plain single-database setup and a
+  multi-database one; `get_connection(settings, name)` looks one up by
+  name. `schema_introspection.py` is the **sole source of truth** for schema
   shape: `introspect_schema(engine, schema)` uses SQLAlchemy's `Inspector`
   to pull real tables/columns/types/FKs and synthesizes a compact
   `CREATE TABLE`-style DDL string per table (for LLM prompt consistency,
@@ -62,37 +78,55 @@ wrong, not as a parallel supported mode.
   `agent.nodes.execute_sql_node` and `ui/app.py`'s "Confirm and Run" path —
   a pure database-execution concern with no LangGraph dependency, so it
   lives here rather than in `agent/`.
-- `embeddings/` — `schema_indexer.py`'s `build_index(tables, ...)` takes
-  already-introspected `TableSchemaInfo` objects (not a file, not an
-  engine) and embeds them into Chroma, keyed by a hash of the introspected
-  schema so re-embedding only happens when the schema actually changed.
-  `refresh_schema_index(engine, settings, force)` is the single
-  introspect → sample → embed pipeline shared by `scripts/build_embeddings.py`
-  and `ui/app.py`'s schema initialization, so that three-step sequence is
-  defined exactly once. `retriever.py` does top-k similarity search over
-  those table-level DDL chunks given a question — unchanged in shape from
-  before, just fed by live data now.
+- `embeddings/` — `schema_indexer.py`'s `build_index(tables, db_name, ...)`
+  takes already-introspected `TableSchemaInfo` objects (not a file, not an
+  engine) and embeds them into **that database's own Chroma collection**
+  (never a shared one — see `get_collection`'s docstring for why), keyed by
+  a hash of the introspected schema so re-embedding only happens when that
+  database's schema actually changed. `refresh_schema_index(engine, db_name,
+  settings, force)` is the single introspect → sample → embed pipeline for
+  one database; `refresh_all_schema_indexes(settings, force)` runs it for
+  every configured database and is what `scripts/build_embeddings.py` and
+  `ui/app.py`'s schema initialization actually call. `retriever.py`'s
+  `retrieve_relevant_schema(question, db_name, ...)` does top-k similarity
+  search over one database's table-level DDL chunks — unchanged in shape
+  from before, just explicitly scoped to one database's collection now.
+  `retriever.py`'s `select_database(question, settings)` is the
+  auto-router: with one configured database it short-circuits immediately
+  (no behavior change); with several, it compares each database's own
+  best-matching table and picks the winner, before per-table retrieval
+  runs. See "Multi-database auto-routing" below.
 - `agent/` — LangGraph nodes live in `nodes.py`, one function per node, each
   taking and returning `AgentState` (defined in `state.py`). `graph.py`
   wires them together and compiles the graph. `sql_validator.py` is the
-  security boundary — see below. The sqlglot dialect used for validation is
-  resolved from `Settings.db_type` via `db.connection.get_sqlglot_dialect()`
-  — never hardcoded to one engine.
+  security boundary — see below. `AgentState["selected_database"]` records
+  which configured database a question was auto-routed to (set once by
+  `retrieve_schema_node`); the sqlglot dialect used for validation/cost
+  estimation is resolved from *that* database's `db_type`
+  (`db.connection.get_connection(settings, selected_database)` +
+  `get_sqlglot_dialect()`) — never a single hardcoded/global engine.
 - `ui/app.py` — the only file that imports Streamlit. It imports the
   compiled graph from `agent/graph.py` and calls it; it does not contain any
   agent logic itself. Manual "Confirm and Run" button gates *displayed*
   execution — see "SQL is untrusted output, always" below for the nuance
-  around the agent's own internal self-correction executions. On startup,
-  a failed `test_connection()` shows a setup screen and `st.stop()`s rather
-  than letting the app render broken. The sidebar exposes connection status,
-  a manual re-test, a manual schema refresh, and a schema browser.
+  around the agent's own internal self-correction executions; it validates
+  and executes against whichever database the displayed SQL was actually
+  routed to (`state["selected_database"]`), not a re-guessed one. On
+  startup, `test_connection()` is checked for every configured database; a
+  setup screen and `st.stop()` only happen if *all* of them fail (one down
+  database doesn't block the others). The sidebar exposes per-database
+  connection status, a manual re-test, a manual schema refresh (all
+  databases), a schema browser grouped by database, and which database the
+  most recent question was routed to.
 - `scripts/` — standalone entry points: `test_db_connection.py` (verify
   `.env` before booting anything else — prints pass/fail, DB version, table
-  count, or a classified readable error), `build_embeddings.py`
-  (introspect + embed, with `--force`), `integration_test.py` (manual,
-  requires a real DB, not part of the pytest suite — see `tests/` below),
-  `run_benchmark.py` (the Text-to-SQL benchmark runner — see `eval/` below;
-  also manual/real-DB-required, not part of the pytest suite).
+  count, or a classified readable error, per configured database),
+  `build_embeddings.py` (introspect + embed every configured database, with
+  `--force`), `integration_test.py` (manual, requires real database(s), not
+  part of the pytest suite — see `tests/` below; also demonstrates routing
+  when 2+ databases are configured), `run_benchmark.py` (the Text-to-SQL
+  benchmark runner — see `eval/` below; also manual/real-DB-required, not
+  part of the pytest suite).
 - `eval/` — the Text-to-SQL benchmark: `schema.py` (dataset + result data
   model), `dataset_loader.py` (loads `eval/benchmark/*.yaml`),
   `evaluators.py` (grades one case — **execution-accuracy first**: gold
@@ -104,14 +138,22 @@ wrong, not as a parallel supported mode.
   `eval/baselines/latest.json`). `eval/benchmark/*.yaml` holds the actual
   cases, split by difficulty/category; `eval/eval_questions.yaml` and
   `scripts/run_eval.py` are the superseded predecessor, kept unmodified —
-  see both files' deprecation notes.
+  see both files' deprecation notes. Each case's `database:` field is
+  currently an inert descriptive label (e.g. `AdventureWorksDW2025`), not a
+  `Settings.databases` connection name — the benchmark runner resolves one
+  engine/dialect globally, same as before multi-database support existed.
+  Routing the benchmark itself per-case is a known, deliberately
+  out-of-scope follow-up (see the multi-database auto-routing design note
+  below).
 - `tests/` — pytest, all fully mocked, no real DB or Ollama required.
   Mirrors package names (`test_sql_validator.py`, `test_connection.py`,
   `test_schema_introspection.py`, `test_schema_retriever.py`,
-  `test_agent_nodes.py`), plus `test_eval_*.py` for the benchmark
-  framework's own logic (dataset loading, grading, metrics, regression
-  detection — not a live run, which stays manual like `run_benchmark.py`
-  itself).
+  `test_agent_nodes.py`), plus `test_db_router.py` (the multi-database
+  auto-router, `embeddings.retriever.select_database`, and
+  `retrieve_schema_node`'s retry-reuses-the-same-database contract) and
+  `test_eval_*.py` for the benchmark framework's own logic (dataset
+  loading, grading, metrics, regression detection — not a live run, which
+  stays manual like `run_benchmark.py` itself).
 
 ## Key design decisions
 
@@ -140,6 +182,45 @@ and only inject those into the generation prompt. This matters a lot more
 now than it did with the old bundled 5-table sample schema — a real
 production database can easily have hundreds of tables, which is exactly
 the case this code path is written for.
+
+### Multi-database auto-routing
+`DB_CONNECTIONS` in `.env` can name more than one database
+(`config.settings.DatabaseConnectionConfig`, collected into
+`Settings.databases`). Each configured database gets its **own** Chroma
+collection (`embeddings.schema_indexer.get_collection`'s `db_name` param) —
+never a shared one, because FK-bridge/keyword-match expansion in
+`embeddings/retriever.py` only makes sense within one database's own
+foreign-key graph, and a shared collection would also risk table-name
+collisions between two databases that happen to share a table name.
+
+Routing itself (`embeddings.retriever.select_database`) is a cheap,
+separate pre-step: with one configured database it short-circuits
+immediately (no Chroma query, no behavior/latency change for a plain
+single-database setup — the overwhelmingly common case); with several, it
+queries every database's collection for its own single best-matching table
+(`n_results=1`) and picks the database that wins. The existing, unmodified
+top-k/FK-bridge/keyword-fallback retrieval logic then runs exactly as
+before, scoped to that one winning database's collection.
+
+`retrieve_schema_node` calls `select_database` only on the *first* pass
+through a question and stores the result in `AgentState["selected_database"]`.
+The one retry path that re-enters `retrieve_schema` (`execute_sql`'s
+`missing_reference` retry — see the self-correcting retry loop above)
+**reuses** that stored value rather than re-routing: a retry must keep
+targeting the same database attempt 1 already generated/executed SQL
+against. Every downstream dialect/engine resolution
+(`validate_sql_node`, `estimate_query_cost_node`, `execute_sql_node`, and
+`ui/app.py`'s "Confirm and Run") reads `db.connection.get_connection(settings,
+state["selected_database"])` rather than a single global `Settings.db_type`.
+
+Two things deliberately left alone by this design (documented, not
+silently ignored): the eval benchmark's per-case `database:` label (see the
+`eval/` folder note above) and `config/table_descriptions.yaml`/
+`config/sensitive_columns.yaml`, which are keyed by bare table name, not
+`(database, table)` — a note/classification for one configured database's
+table could in principle also apply to a same-named table in another. Both
+are real, narrow limitations worth knowing about if you're extending this
+further, not oversights to silently work around.
 
 ### SQL is untrusted output, always
 The LLM's SQL is never trusted at face value. `agent/sql_validator.py`

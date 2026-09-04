@@ -32,10 +32,20 @@ free-form prose into the embedding text.
 
 Cache invalidation: `db.schema_introspection.get_schema_fingerprint()`
 hashes the introspected schema; that hash is stored alongside the Chroma
-persist directory (`.schema_hash`). Re-embedding is skipped whenever the
+persist directory, one file per configured database (`.schema_hash__
+<db_name>` -- see `_hash_filename`). Re-embedding is skipped whenever the
 hash matches, so refreshing the schema (e.g. the UI's "Refresh Schema"
-button, or every app startup) doesn't redo embedding work unless the real
+button, or every app startup) doesn't redo embedding work unless that
 database's schema actually changed.
+
+Multi-database support: every configured database (`Settings.databases`)
+gets its own Chroma collection (`get_collection`'s `db_name` param -- see
+its docstring for why a shared collection isn't used) and its own
+fingerprint file, so indexing/refreshing one database never touches
+another's index. `refresh_all_schema_indexes()` is the entry point that
+loops every configured database; `embeddings/retriever.py::select_database`
+is what decides, per question, which database's collection to actually
+query.
 """
 
 from __future__ import annotations
@@ -49,12 +59,16 @@ from chromadb.utils import embedding_functions
 from sqlalchemy import Engine
 
 from config.settings import Settings, get_settings
+from db.connection import get_connection, get_read_only_engine
 from db.schema_introspection import TableSchemaInfo, get_schema_fingerprint, introspect_schema
 from db.value_sampling import attach_sample_values
 
 logger = logging.getLogger(__name__)
 
-_HASH_FILENAME = ".schema_hash"
+
+def _hash_filename(db_name: str) -> str:
+    """Per-database schema-fingerprint cache filename -- see `build_index`."""
+    return f".schema_hash__{db_name}"
 
 
 def _get_embedding_function(settings: Settings) -> embedding_functions.EmbeddingFunction:
@@ -85,8 +99,24 @@ def get_chroma_client(settings: Settings | None = None) -> chromadb.ClientAPI:
     return chromadb.PersistentClient(path=str(settings.chroma_persist_dir))
 
 
-def get_collection(client: chromadb.ClientAPI, settings: Settings) -> Collection:
-    """Gets or creates the schema-DDL collection with the configured embedding function.
+def _collection_name(settings: Settings, db_name: str) -> str:
+    """Per-database Chroma collection name -- see `get_collection`'s docstring."""
+    return f"{settings.chroma_collection_name}__{db_name}"
+
+
+def get_collection(client: chromadb.ClientAPI, settings: Settings, db_name: str) -> Collection:
+    """Gets or creates the schema-DDL collection for one configured database.
+
+    Each database gets its **own** Chroma collection (name derived from
+    `db_name` -- see `_collection_name`), never a shared one: this is what
+    keeps `embeddings/retriever.py`'s FK-bridge and keyword-match expansion
+    correct once more than one database is configured -- bridging across
+    two physically unrelated databases' foreign-key graphs would be
+    meaningless, and a shared collection would also risk table-name-as-ID
+    collisions between two databases that happen to have a same-named
+    table. `db_name` must be one of `Settings.databases`' `.name` values
+    (`"default"` for a plain single-database setup -- see `Settings.
+    databases`' docstring).
 
     Explicitly configured for cosine distance (`hnsw:space`) rather than
     accepting Chroma's default (squared L2). `embeddings/retriever.py`
@@ -106,7 +136,7 @@ def get_collection(client: chromadb.ClientAPI, settings: Settings) -> Collection
     `python scripts/build_embeddings.py --force` to pick it up).
     """
     return client.get_or_create_collection(
-        name=settings.chroma_collection_name,
+        name=_collection_name(settings, db_name),
         embedding_function=_get_embedding_function(settings),
         metadata={"hnsw:space": "cosine"},
     )
@@ -114,11 +144,12 @@ def get_collection(client: chromadb.ClientAPI, settings: Settings) -> Collection
 
 def build_index(
     tables: list[TableSchemaInfo],
+    db_name: str,
     settings: Settings | None = None,
     force: bool = False,
     fingerprint_tables: list[TableSchemaInfo] | None = None,
 ) -> int:
-    """Builds (or refreshes) the Chroma collection from already-introspected tables.
+    """Builds (or refreshes) one database's Chroma collection from already-introspected tables.
 
     Takes `tables` rather than a database engine/connection: this function's
     only responsibility is embedding, not introspection -- callers (`scripts
@@ -131,6 +162,11 @@ def build_index(
             `db.value_sampling.attach_sample_values()` (sample-value-enriched
             DDL) rather than raw `introspect_schema()` output, so the LLM
             sees real column values.
+        db_name: Which configured database (`Settings.databases[i].name`)
+            these tables belong to -- determines the target Chroma
+            collection (see `get_collection`) and the cache-hash filename
+            (see `_hash_filename`), so different databases' indexes and
+            invalidation state never collide.
         force: If True, re-embeds even if the schema fingerprint hasn't changed.
         settings: Optional `Settings` override (mainly for tests).
         fingerprint_tables: Tables to compute the cache-invalidation hash
@@ -153,15 +189,15 @@ def build_index(
     """
     if not tables:
         raise ValueError(
-            "No tables to index. Check DB_SCHEMA (if set) and that the "
-            "connected database user can see the expected tables."
+            f"No tables to index for database {db_name!r}. Check its DB_*_SCHEMA (if set) "
+            f"and that the connected database user can see the expected tables."
         )
 
     settings = settings or get_settings()
     current_hash = get_schema_fingerprint(
         fingerprint_tables if fingerprint_tables is not None else tables
     )
-    hash_path = settings.chroma_persist_dir / _HASH_FILENAME
+    hash_path = settings.chroma_persist_dir / _hash_filename(db_name)
 
     if (
         not force
@@ -169,17 +205,20 @@ def build_index(
         and hash_path.read_text(encoding="utf-8").strip() == current_hash
     ):
         logger.info(
-            "Schema unchanged since last index build (%d tables); skipping re-embedding.",
+            "Schema unchanged since last index build for database %r (%d tables); "
+            "skipping re-embedding.",
+            db_name,
             len(tables),
         )
         return len(tables)
 
     client = get_chroma_client(settings)
+    collection_name = _collection_name(settings, db_name)
     # Collection may not exist yet on a first run; exact error type varies by
     # chromadb version, so suppress broadly rather than chasing it.
     with contextlib.suppress(Exception):
-        client.delete_collection(settings.chroma_collection_name)
-    collection = get_collection(client, settings)
+        client.delete_collection(collection_name)
+    collection = get_collection(client, settings, db_name)
 
     collection.add(
         ids=[table.table_name for table in tables],
@@ -187,6 +226,7 @@ def build_index(
         metadatas=[
             {
                 "table_name": table.table_name,
+                "db_name": db_name,
                 # Comma-joined referred-table names -- lets retriever.py do
                 # FK-adjacency bridge expansion (see
                 # `embeddings/retriever.py::_expand_with_fk_bridges`) without
@@ -203,17 +243,18 @@ def build_index(
     settings.chroma_persist_dir.mkdir(parents=True, exist_ok=True)
     hash_path.write_text(current_hash, encoding="utf-8")
     logger.info(
-        "Indexed %d table(s) into Chroma collection '%s'.",
+        "Indexed %d table(s) into Chroma collection '%s' for database %r.",
         len(tables),
-        settings.chroma_collection_name,
+        collection_name,
+        db_name,
     )
     return len(tables)
 
 
 def refresh_schema_index(
-    engine: Engine, settings: Settings | None = None, force: bool = False
+    engine: Engine, db_name: str, settings: Settings | None = None, force: bool = False
 ) -> list[TableSchemaInfo]:
-    """Introspects, samples, and (re)indexes the schema in one call.
+    """Introspects, samples, and (re)indexes one configured database's schema.
 
     Single source of truth for the introspect -> sample -> embed pipeline --
     previously duplicated between `scripts/build_embeddings.py` and
@@ -223,7 +264,13 @@ def refresh_schema_index(
     changes in a sampled column don't force a re-embed on their own.
 
     Args:
-        engine: A read-only SQLAlchemy engine.
+        engine: A read-only SQLAlchemy engine for this specific database
+            (typically `db.connection.get_read_only_engine(config)` for the
+            matching `db.connection.get_connection(settings, db_name)`).
+        db_name: The configured connection's name (`Settings.databases[i].
+            name`) -- also used to resolve that connection's own
+            `db_schema` restriction (each database can restrict
+            introspection to a different schema).
         settings: Optional `Settings` override (mainly for tests).
         force: If True, re-embeds even if the schema fingerprint hasn't
             changed since the last build.
@@ -236,7 +283,39 @@ def refresh_schema_index(
         ValueError: if the database has no tables to index (see `build_index`).
     """
     settings = settings or get_settings()
-    tables = introspect_schema(engine, schema=settings.db_schema)
+    db_schema = get_connection(settings, db_name).db_schema
+    tables = introspect_schema(engine, schema=db_schema)
     sampled_tables = attach_sample_values(engine, tables)
-    build_index(sampled_tables, settings=settings, force=force, fingerprint_tables=tables)
+    build_index(sampled_tables, db_name, settings=settings, force=force, fingerprint_tables=tables)
     return sampled_tables
+
+
+def refresh_all_schema_indexes(
+    settings: Settings | None = None, force: bool = False
+) -> dict[str, list[TableSchemaInfo]]:
+    """Introspects, samples, and (re)indexes every configured database's schema.
+
+    The single shared orchestration point for "refresh everything" --
+    `scripts/build_embeddings.py`, `ui/app.py`'s schema initialization, and
+    `scripts/integration_test.py` all call this rather than looping over
+    `Settings.databases` themselves. A failure introspecting/indexing one
+    database does not stop the others -- it's logged and that database is
+    simply omitted from the returned dict, so a single misconfigured or
+    temporarily-unreachable connection can't block every other configured
+    database from getting a working schema index.
+
+    Returns:
+        `{db_name: sample-value-enriched tables}` for every database that
+        was successfully indexed.
+    """
+    settings = settings or get_settings()
+    results: dict[str, list[TableSchemaInfo]] = {}
+    for config in settings.databases:
+        try:
+            engine = get_read_only_engine(config)
+            results[config.name] = refresh_schema_index(
+                engine, config.name, settings=settings, force=force
+            )
+        except Exception as exc:  # noqa: BLE001 - one bad connection must not block the rest
+            logger.warning("Skipping schema index refresh for database %r: %s", config.name, exc)
+    return results

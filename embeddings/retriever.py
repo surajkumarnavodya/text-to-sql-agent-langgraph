@@ -86,6 +86,18 @@ stitching together several loosely-related ones). Recall, column-selection
 accuracy, and latency all measurably regressed. Reverted to the bounded
 version above, where the primary step can only return the same or fewer
 tables than before, never more.
+
+Multi-database routing (`select_database`): with more than one database
+configured (`Settings.databases`), each database has its own Chroma
+collection (`embeddings.schema_indexer.get_collection`) -- FK-bridging and
+keyword-matching only make sense *within* one database's own foreign-key
+graph, so nothing below ever mixes tables across databases. `select_database`
+is a separate, cheap pre-step that picks *which* database's collection to
+query (by comparing each database's single best-matching table), before
+`retrieve_relevant_schema`'s existing per-table logic runs, unchanged,
+against just that one database's collection. With exactly one configured
+database (the default), `select_database` short-circuits and this whole
+module behaves exactly as it did before multi-database support existed.
 """
 
 from __future__ import annotations
@@ -93,6 +105,7 @@ from __future__ import annotations
 import logging
 import re
 from collections import deque
+from dataclasses import dataclass, field
 from typing import Any
 
 from chromadb.api.models.Collection import Collection
@@ -450,15 +463,115 @@ def _expand_with_fk_bridges(
     return selected + bridge_tables
 
 
-def retrieve_relevant_schema(
-    question: str,
-    top_k: int | None = None,
-    settings: Settings | None = None,
-) -> list[TableSchema]:
-    """Returns up to `top_k` most relevant tables' DDL for `question`.
+@dataclass(frozen=True)
+class DatabaseSelection:
+    """Outcome of `select_database` -- which configured database a question was routed to.
+
+    Attributes:
+        db_name: The winning `Settings.databases[i].name`.
+        top_table_score: That database's winning top-1 vector similarity
+            score (cosine, same convention as `TableSchema.similarity_score`).
+        scores_by_db: Every database that had a usable (non-empty) index,
+            mapped to its own top-1 score -- kept for logging/debugging a
+            routing decision, not needed by callers that just want
+            `db_name`.
+    """
+
+    db_name: str
+    top_table_score: float
+    scores_by_db: dict[str, float] = field(default_factory=dict)
+
+
+def select_database(question: str, settings: Settings | None = None) -> DatabaseSelection:
+    """Auto-routes `question` to the single best-matching configured database.
+
+    With exactly one configured database (`Settings.databases`, the default
+    for a plain single-database setup) this short-circuits to that database
+    with no Chroma query at all -- zero behavior/latency change from before
+    multi-database support existed.
+
+    With two or more configured databases, each one's own Chroma collection
+    (see `embeddings.schema_indexer.get_collection`) is queried for its
+    single best-matching table (`n_results=1`); the database whose top
+    table scores highest wins. This is deliberately a *coarse*, cheap
+    pre-selection step -- the actual per-table retrieval (FK-bridging,
+    keyword fallback, adaptive top-k) still happens exactly as before, via
+    `retrieve_relevant_schema(question, db_name=<the winner>, ...)`, now
+    just scoped to the winning database's collection.
+
+    A database whose index isn't built yet (or is empty) is skipped with a
+    warning rather than failing the whole routing decision -- one
+    unconfigured/not-yet-indexed connection shouldn't prevent routing to
+    the others.
 
     Args:
         question: The user's natural-language question.
+        settings: Optional `Settings` override (mainly for tests).
+
+    Returns:
+        A `DatabaseSelection`.
+
+    Raises:
+        SchemaRetrievalError: if every configured database's index is
+            missing/empty, or every query fails.
+    """
+    settings = settings or get_settings()
+    databases = settings.databases
+
+    if len(databases) == 1:
+        only_name = databases[0].name
+        return DatabaseSelection(
+            db_name=only_name, top_table_score=1.0, scores_by_db={only_name: 1.0}
+        )
+
+    client = get_chroma_client(settings)
+    scores: dict[str, float] = {}
+    for config in databases:
+        try:
+            collection = get_collection(client, settings, config.name)
+            if collection.count() == 0:
+                continue
+            result = collection.query(query_texts=[question], n_results=1)
+        except Exception as exc:  # noqa: BLE001 - one bad database must not block routing
+            logger.warning(
+                "select_database: skipping database %r (query failed): %s", config.name, exc
+            )
+            continue
+
+        distances = result.get("distances") or [[]]
+        distances_row = distances[0] if distances else []
+        if not distances_row:
+            continue
+        scores[config.name] = round(1.0 - distances_row[0], 4)
+
+    if not scores:
+        raise SchemaRetrievalError(
+            "No configured database has a built schema index. Run "
+            "`python scripts/build_embeddings.py` first."
+        )
+
+    best_db_name = max(scores, key=lambda name: scores[name])
+    logger.debug("select_database scores for question=%r: %s", question, scores)
+    return DatabaseSelection(
+        db_name=best_db_name, top_table_score=scores[best_db_name], scores_by_db=scores
+    )
+
+
+def retrieve_relevant_schema(
+    question: str,
+    db_name: str,
+    top_k: int | None = None,
+    settings: Settings | None = None,
+) -> list[TableSchema]:
+    """Returns up to `top_k` most relevant tables' DDL for `question`, from one database.
+
+    Args:
+        question: The user's natural-language question.
+        db_name: Which configured database (`Settings.databases[i].name`)
+            to retrieve from -- see `select_database` for how this is
+            chosen. Every internal step below (vector query, lexical
+            bonus, keyword-match fallback, FK-bridge expansion) is scoped
+            to this one database's own Chroma collection.
         top_k: Upper bound on tables to retrieve from the primary
             vector+lexical scoring step; defaults to `Settings.schema_top_k`.
             The actual count may be fewer than this (see
@@ -482,10 +595,11 @@ def retrieve_relevant_schema(
 
     try:
         client = get_chroma_client(settings)
-        collection = get_collection(client, settings)
+        collection = get_collection(client, settings, db_name)
         if collection.count() == 0:
             raise SchemaRetrievalError(
-                "The schema index is empty. Run `python scripts/build_embeddings.py` first."
+                f"The schema index for database {db_name!r} is empty. Run "
+                f"`python scripts/build_embeddings.py` first."
             )
         # Deliberately queries exactly resolved_top_k candidates, not a
         # wider pool -- tried and reverted (see this module's docstring):

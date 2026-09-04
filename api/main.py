@@ -38,6 +38,7 @@ from api.schemas import (
     AttemptRecordOut,
     ColumnOut,
     ComponentHealth,
+    DatabaseHealth,
     HealthResponse,
     TableOut,
     TablesResponse,
@@ -111,6 +112,7 @@ def _ask_response_from_state(state: AgentState) -> AskResponse:
     result_rows = state.get("result_rows")
     return AskResponse(
         status=state.get("status", "failed"),
+        database=state.get("selected_database"),
         sql=state.get("sql"),
         result_columns=state.get("result_columns"),
         result_rows=jsonable_encoder(result_rows) if result_rows is not None else None,
@@ -119,6 +121,7 @@ def _ask_response_from_state(state: AgentState) -> AskResponse:
         attempt_history=_attempt_records_out(state),
         insight=state.get("insight"),
         cost_notice=state.get("cost_notice"),
+        low_confidence_notice=state.get("low_confidence_notice"),
         rejection_reason=state.get("rejection_reason"),
         rejection_message=state.get("rejection_message"),
         rate_limit_message=state.get("rate_limit_message"),
@@ -131,18 +134,44 @@ def _ask_response_from_state(state: AgentState) -> AskResponse:
 @app.get("/health", response_model=HealthResponse)
 def health(response: Response) -> HealthResponse:
     """Real, non-cached reachability check of every external dependency
-    this app needs -- database, Ollama, and the Chroma schema index.
-    Deliberately cheap: no LLM generation call, no query execution, no
-    schema re-introspection -- just "can we reach it" for each.
+    this app needs -- every configured database (`Settings.databases`) plus
+    its schema index, and Ollama. Deliberately cheap: no LLM generation
+    call, no query execution, no schema re-introspection -- just "can we
+    reach it" for each.
 
-    Returns HTTP 200 when every component is reachable, 503 otherwise (so
-    typical container/orchestrator health-check tooling that checks the
-    status code, not just the body, behaves correctly).
+    Returns HTTP 200 when every component -- Ollama and *every* configured
+    database -- is reachable, 503 otherwise (so typical
+    container/orchestrator health-check tooling that checks the status
+    code, not just the body, behaves correctly). One unreachable database
+    among several still marks the whole response "degraded" rather than
+    being silently dropped, since a caller relying on that database would
+    otherwise have no way to know.
     """
     settings = get_settings()
 
-    db_result = test_connection(settings)
-    database = ComponentHealth(ok=db_result.success, detail=db_result.message)
+    databases: list[DatabaseHealth] = []
+    for config in settings.databases:
+        db_result = test_connection(config)
+        connection = ComponentHealth(ok=db_result.success, detail=db_result.message)
+
+        try:
+            client = get_chroma_client(settings)
+            collection = get_collection(client, settings, config.name)
+            count = collection.count()
+            schema_index = ComponentHealth(
+                ok=count > 0,
+                detail=(
+                    f"{count} table(s) indexed."
+                    if count > 0
+                    else "Index is empty -- run scripts/build_embeddings.py."
+                ),
+            )
+        except Exception as exc:  # noqa: BLE001 - health check must never crash the endpoint
+            schema_index = ComponentHealth(ok=False, detail=f"Unreachable: {exc}")
+
+        databases.append(
+            DatabaseHealth(name=config.name, connection=connection, schema_index=schema_index)
+        )
 
     try:
         import ollama
@@ -152,28 +181,14 @@ def health(response: Response) -> HealthResponse:
     except Exception as exc:  # noqa: BLE001 - health check must never crash the endpoint
         ollama_health = ComponentHealth(ok=False, detail=f"Unreachable: {exc}")
 
-    try:
-        client = get_chroma_client(settings)
-        collection = get_collection(client, settings)
-        count = collection.count()
-        schema_index = ComponentHealth(
-            ok=count > 0,
-            detail=(
-                f"{count} table(s) indexed."
-                if count > 0
-                else "Index is empty -- run scripts/build_embeddings.py."
-            ),
-        )
-    except Exception as exc:  # noqa: BLE001 - health check must never crash the endpoint
-        schema_index = ComponentHealth(ok=False, detail=f"Unreachable: {exc}")
-
-    overall_ok = database.ok and ollama_health.ok and schema_index.ok
+    overall_ok = ollama_health.ok and all(
+        db.connection.ok and db.schema_index.ok for db in databases
+    )
     response.status_code = status.HTTP_200_OK if overall_ok else status.HTTP_503_SERVICE_UNAVAILABLE
     return HealthResponse(
         status="ok" if overall_ok else "degraded",
-        database=database,
+        databases=databases,
         ollama=ollama_health,
-        schema_index=schema_index,
     )
 
 
@@ -215,28 +230,47 @@ def ask(payload: AskRequest, request: Request) -> AskResponse:
 
 
 @app.get("/schema/tables", response_model=TablesResponse, dependencies=[Depends(verify_api_key)])
-def schema_tables() -> TablesResponse:
+def schema_tables(database: str | None = None) -> TablesResponse:
     """Live schema listing (table/column names, types) -- the same
     `db.schema_introspection.introspect_schema` the UI's sidebar schema
     browser and `scripts/build_embeddings.py` use, metadata-only (no data
-    queries), reflecting the database as it is right now."""
+    queries), reflecting the database(s) as they are right now.
+
+    Args:
+        database: Optional `Settings.databases[i].name` filter. Omitted
+            (the default) returns every configured database's tables,
+            each tagged with its `database` name; raises 404 if `database`
+            names a connection that isn't configured.
+    """
     settings = get_settings()
-    engine = get_read_only_engine(settings)
-    tables = introspect_schema(engine, settings.db_schema)
-    return TablesResponse(
-        tables=[
-            TableOut(
-                table_name=table.table_name,
-                columns=[
-                    ColumnOut(
-                        name=column.name,
-                        type=column.type,
-                        nullable=column.nullable,
-                        is_primary_key=column.is_primary_key,
-                    )
-                    for column in table.columns
-                ],
-            )
-            for table in tables
-        ]
+    if database is not None and database not in {config.name for config in settings.databases}:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail=f"Unknown database {database!r}."
+        )
+
+    configs = (
+        [config for config in settings.databases if config.name == database]
+        if database is not None
+        else settings.databases
     )
+
+    tables_out: list[TableOut] = []
+    for config in configs:
+        engine = get_read_only_engine(config)
+        for table in introspect_schema(engine, config.db_schema):
+            tables_out.append(
+                TableOut(
+                    database=config.name,
+                    table_name=table.table_name,
+                    columns=[
+                        ColumnOut(
+                            name=column.name,
+                            type=column.type,
+                            nullable=column.nullable,
+                            is_primary_key=column.is_primary_key,
+                        )
+                        for column in table.columns
+                    ],
+                )
+            )
+    return TablesResponse(tables=tables_out)

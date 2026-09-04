@@ -17,7 +17,13 @@ import pytest
 from sqlalchemy.engine import URL
 
 from config.settings import ConfigurationError, Settings
-from db.connection import ConnectionErrorCategory, build_connection_url, get_sqlglot_dialect
+from db.connection import (
+    ConnectionErrorCategory,
+    build_connection_url,
+    get_connection,
+    get_sqlglot_dialect,
+    list_connection_names,
+)
 
 # Aliased on import: pytest collects any module-level callable named
 # `test_*` as a test case, which would otherwise pick up the real
@@ -140,6 +146,32 @@ class TestGetSqlglotDialect:
 
     def test_empty_db_type_returns_none(self):
         assert get_sqlglot_dialect("") is None
+
+
+class TestGetConnection:
+    """`get_connection`/`list_connection_names` -- how multi-database-aware
+    code (embeddings.retriever.select_database, agent/nodes.py, the
+    Streamlit sidebar) turns a database *name* back into its full
+    `DatabaseConnectionConfig`. See `Settings.databases`'s docstring."""
+
+    def test_single_database_setup_has_one_default_connection(self):
+        settings = _settings()
+        assert list_connection_names(settings) == ["default"]
+        assert get_connection(settings, "default").db_type == settings.db_type
+
+    def test_looks_up_a_named_connection_among_several(self):
+        sales = dataclasses.replace(_BASE_SETTINGS.databases[0], name="sales", db_type="postgresql")
+        hr = dataclasses.replace(_BASE_SETTINGS.databases[0], name="hr", db_type="mysql")
+        settings = _settings(databases=(sales, hr))
+
+        assert list_connection_names(settings) == ["sales", "hr"]
+        assert get_connection(settings, "hr").db_type == "mysql"
+        assert get_connection(settings, "sales").db_type == "postgresql"
+
+    def test_unknown_connection_name_raises(self):
+        settings = _settings()
+        with pytest.raises(ConfigurationError, match="Unknown database connection"):
+            get_connection(settings, "does_not_exist")
 
 
 def _mock_engine(dialect_name: str = "postgresql") -> MagicMock:

@@ -4,12 +4,16 @@ Usage (from repo root, with the venv activated):
 
     python scripts\\test_db_connection.py
 
-Prints a clear pass/fail, the database version, and a table count on
-success; a readable error (auth failure, host unreachable, wrong DB name,
-missing driver, etc. -- not a raw stack trace) on failure. Exits 0 on
-success, 1 on failure, so it's usable in a pre-flight check / CI step too.
+Checks every configured database (`Settings.databases` -- a plain
+single-database `.env` has exactly one, named "default"; a multi-database
+`.env` sets `DB_CONNECTIONS=name1,name2,...`), printing a clear pass/fail,
+the database version, and a table count per connection on success; a
+readable error (auth failure, host unreachable, wrong DB name, missing
+driver, etc. -- not a raw stack trace) on failure. Exits 0 only if every
+configured connection passed, 1 if any failed, so it's usable in a
+pre-flight check / CI step too.
 
-Read-only: this script never writes to the database. Introspection only
+Read-only: this script never writes to any database. Introspection only
 issues metadata queries (information_schema/catalog reads).
 """
 
@@ -29,34 +33,32 @@ from db.connection import (  # noqa: E402
 from db.schema_introspection import introspect_schema  # noqa: E402
 
 
-def main() -> int:
-    settings = get_settings()
-
-    print(f"DB_TYPE: {settings.db_type or '(not set)'}")
-    print(f"DB_HOST: {settings.db_host or '(not set)'}")
-    print(f"DB_NAME: {settings.db_name or '(not set)'}")
-    print(f"DB_SCHEMA: {settings.db_schema or '(default)'}")
+def _check_one(config) -> bool:
+    print(f"DB_TYPE: {config.db_type or '(not set)'}")
+    print(f"DB_HOST: {config.db_host or '(not set)'}")
+    print(f"DB_NAME: {config.db_name or '(not set)'}")
+    print(f"DB_SCHEMA: {config.db_schema or '(default)'}")
     print()
 
-    result = test_connection(settings)
+    result = test_connection(config)
     if not result.success:
         print(f"FAIL: {result.message}")
         if result.category:
             print(f"  category: {result.category.value}")
-        return 1
+        return False
 
     print("PASS: connection successful.")
     if result.db_version:
         print(f"  DB version: {result.db_version}")
 
     try:
-        engine = get_read_only_engine(settings)
-        tables = introspect_schema(engine, schema=settings.db_schema)
+        engine = get_read_only_engine(config)
+        tables = introspect_schema(engine, schema=config.db_schema)
     except ConfigurationError as exc:
         # Shouldn't happen if test_connection() already succeeded, but keep
         # this readable rather than letting a stack trace through regardless.
         print(f"  Connected, but schema introspection failed: {exc}")
-        return 1
+        return False
 
     print(f"  Tables visible: {len(tables)}")
     if tables:
@@ -67,12 +69,28 @@ def main() -> int:
     # Best-effort, warning-only least-privilege check (see
     # db.connection.check_write_privileges' docstring) -- never a reason
     # this script exits non-zero; the connection itself already passed.
-    privilege_check = check_write_privileges(engine, settings)
+    privilege_check = check_write_privileges(engine, config)
     if privilege_check.checked and privilege_check.has_write_privileges:
         print()
         print(f"  WARNING: {privilege_check.message}")
 
-    return 0
+    return True
+
+
+def main() -> int:
+    settings = get_settings()
+    multi = len(settings.databases) > 1
+
+    all_passed = True
+    for index, config in enumerate(settings.databases):
+        if multi:
+            if index:
+                print()
+            print(f"=== {config.name} ===")
+        if not _check_one(config):
+            all_passed = False
+
+    return 0 if all_passed else 1
 
 
 if __name__ == "__main__":

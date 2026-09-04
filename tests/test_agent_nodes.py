@@ -173,7 +173,7 @@ class TestRetrieveSchemaNode:
             },
         ]
         monkeypatch.setattr(
-            "agent.nodes.retrieve_relevant_schema", lambda question, top_k: fake_tables
+            "agent.nodes.retrieve_relevant_schema", lambda question, db_name, top_k: fake_tables
         )
 
         result = retrieve_schema_node({"question": "top customers by orders"})
@@ -184,7 +184,7 @@ class TestRetrieveSchemaNode:
         assert "CREATE TABLE customers" in result["schema_context_text"]
 
     def test_marks_failed_on_schema_retrieval_error(self, monkeypatch):
-        def _raise(question, top_k):
+        def _raise(question, db_name, top_k):
             raise SchemaRetrievalError("index not built")
 
         monkeypatch.setattr("agent.nodes.retrieve_relevant_schema", _raise)
@@ -199,7 +199,7 @@ class TestRetrieveSchemaNode:
     def test_first_call_uses_plain_question_and_default_top_k(self, monkeypatch):
         captured = {}
 
-        def _capture(question, top_k):
+        def _capture(question, db_name, top_k):
             captured["question"] = question
             captured["top_k"] = top_k
             return []
@@ -218,7 +218,7 @@ class TestRetrieveSchemaNode:
         first attempt did, rather than repeating the exact same search."""
         captured = {}
 
-        def _capture(question, top_k):
+        def _capture(question, db_name, top_k):
             captured["question"] = question
             captured["top_k"] = top_k
             return []
@@ -243,7 +243,7 @@ class TestRetrieveSchemaNode:
         similarity search still has something to match tables against."""
         captured = {}
 
-        def _capture(question, top_k):
+        def _capture(question, db_name, top_k):
             captured["question"] = question
             captured["top_k"] = top_k
             return []
@@ -410,7 +410,11 @@ class TestGenerateSqlNode:
 
 class TestValidateSqlNode:
     def test_valid_sql_advances_to_executing(self):
-        state: AgentState = {"sql": "SELECT * FROM customers", "retry_count": 0}
+        state: AgentState = {
+            "sql": "SELECT * FROM customers",
+            "retry_count": 0,
+            "selected_database": "default",
+        }
         result = validate_sql_node(state)
 
         assert result["status"] == "executing"
@@ -421,7 +425,11 @@ class TestValidateSqlNode:
         """An ordinary correctness mistake (malformed SQL) is still retried,
         as opposed to a safety violation -- see the safety-violation tests
         below for the contrasting fail-closed behavior."""
-        state: AgentState = {"sql": "SELEKT * FORM customers !!!", "retry_count": 0}
+        state: AgentState = {
+            "sql": "SELEKT * FORM customers !!!",
+            "retry_count": 0,
+            "selected_database": "default",
+        }
         result = validate_sql_node(state)
 
         assert result["status"] == "generating"
@@ -435,6 +443,7 @@ class TestValidateSqlNode:
         state: AgentState = {
             "sql": "SELEKT * FORM customers !!!",
             "retry_count": 3,
+            "selected_database": "default",
         }  # == default max_retries
         result = validate_sql_node(state)
 
@@ -448,7 +457,11 @@ class TestValidateSqlNode:
         correctness mistake -- it must fail closed on attempt 1 even though
         the retry budget is untouched, per CLAUDE.md's 'SQL is untrusted
         output, always.'"""
-        state: AgentState = {"sql": "DROP TABLE customers", "retry_count": 0}
+        state: AgentState = {
+            "sql": "DROP TABLE customers",
+            "retry_count": 0,
+            "selected_database": "default",
+        }
         result = validate_sql_node(state)
 
         assert result["status"] == "failed"
@@ -459,7 +472,11 @@ class TestValidateSqlNode:
         assert "security gate" in result["failure_explanation"]
 
     def test_stacked_query_is_also_a_safety_violation(self):
-        state: AgentState = {"sql": "SELECT 1; DROP TABLE customers;", "retry_count": 0}
+        state: AgentState = {
+            "sql": "SELECT 1; DROP TABLE customers;",
+            "retry_count": 0,
+            "selected_database": "default",
+        }
         result = validate_sql_node(state)
 
         assert result["status"] == "failed"
@@ -468,7 +485,11 @@ class TestValidateSqlNode:
 
 class TestEstimateQueryCostNode:
     def _state(self, **overrides) -> AgentState:
-        state: AgentState = {"sql": "SELECT * FROM FactInternetSales", "retry_count": 0}
+        state: AgentState = {
+            "sql": "SELECT * FROM FactInternetSales",
+            "retry_count": 0,
+            "selected_database": "default",
+        }
         # AgentState.update() wants another AgentState-shaped mapping, not an
         # arbitrary dict -- too strict for this helper's intentional "merge
         # in whatever partial overrides this test needs" contract.
@@ -561,10 +582,14 @@ class TestExecuteSqlNode:
     def test_success_populates_results(self, monkeypatch):
         monkeypatch.setattr(
             "agent.nodes.execute_readonly_sql",
-            lambda sql, timeout, max_rows: (["id"], [(1,), (2,)]),
+            lambda sql, timeout, max_rows, engine=None: (["id"], [(1,), (2,)]),
         )
 
-        state: AgentState = {"sql": "SELECT id FROM customers", "retry_count": 0}
+        state: AgentState = {
+            "sql": "SELECT id FROM customers",
+            "retry_count": 0,
+            "selected_database": "default",
+        }
         result = execute_sql_node(state)
 
         assert result["status"] == "succeeded"
@@ -572,12 +597,16 @@ class TestExecuteSqlNode:
         assert result["attempt_history"][0]["outcome"] == "succeeded"
 
     def test_missing_reference_routes_back_to_schema_retrieval(self, monkeypatch):
-        def _raise(sql, timeout, max_rows):
+        def _raise(sql, timeout, max_rows, engine=None):
             raise SQLAlchemyError("(pyodbc.ProgrammingError) Invalid column name 'CustName'.")
 
         monkeypatch.setattr("agent.nodes.execute_readonly_sql", _raise)
 
-        state: AgentState = {"sql": "SELECT CustName FROM customers", "retry_count": 0}
+        state: AgentState = {
+            "sql": "SELECT CustName FROM customers",
+            "retry_count": 0,
+            "selected_database": "default",
+        }
         result = execute_sql_node(state)
 
         assert result["status"] == "retrieving_schema"
@@ -587,12 +616,16 @@ class TestExecuteSqlNode:
         assert route_after_execution(result) == "retrieve_schema"
 
     def test_missing_reference_fails_when_retries_exhausted(self, monkeypatch):
-        def _raise(sql, timeout, max_rows):
+        def _raise(sql, timeout, max_rows, engine=None):
             raise SQLAlchemyError("Invalid object name 'Orderss'.")
 
         monkeypatch.setattr("agent.nodes.execute_readonly_sql", _raise)
 
-        state: AgentState = {"sql": "SELECT * FROM Orderss", "retry_count": 3}
+        state: AgentState = {
+            "sql": "SELECT * FROM Orderss",
+            "retry_count": 3,
+            "selected_database": "default",
+        }
         result = execute_sql_node(state)
 
         assert result["status"] == "failed"
@@ -606,7 +639,7 @@ class TestExecuteSqlNode:
         explicit system-prompt instruction not to. See
         `agent.nodes._suggest_correct_column`."""
 
-        def _raise(sql, timeout, max_rows):
+        def _raise(sql, timeout, max_rows, engine=None):
             raise SQLAlchemyError(
                 "(pyodbc.ProgrammingError) ('42S22', \"[42S22] [Microsoft]"
                 "[ODBC Driver 17 for SQL Server][SQL Server]Invalid column "
@@ -652,6 +685,7 @@ class TestExecuteSqlNode:
             "sql": "SELECT ProductSubcategoryName FROM DimProductSubcategory",
             "retry_count": 0,
             "schema_tables": schema_tables,
+            "selected_database": "default",
         }
         result = execute_sql_node(state)
 
@@ -664,7 +698,7 @@ class TestExecuteSqlNode:
         assert "EnglishProductSubcategoryName" in result["attempt_history"][0]["error"]
 
     def test_missing_reference_suggestion_included_in_final_failure_message(self, monkeypatch):
-        def _raise(sql, timeout, max_rows):
+        def _raise(sql, timeout, max_rows, engine=None):
             raise SQLAlchemyError("Invalid column name 'ProductName'.")
 
         monkeypatch.setattr("agent.nodes.execute_readonly_sql", _raise)
@@ -685,6 +719,7 @@ class TestExecuteSqlNode:
             "sql": "SELECT ProductName FROM DimProduct",
             "retry_count": 3,  # already at max_retries (3, TestExecuteSqlNode's default)
             "schema_tables": schema_tables,
+            "selected_database": "default",
         }
         result = execute_sql_node(state)
 
@@ -695,7 +730,7 @@ class TestExecuteSqlNode:
         """Silence, not a wrong guess, when nothing in the retrieved schema
         is actually close to the invalid name."""
 
-        def _raise(sql, timeout, max_rows):
+        def _raise(sql, timeout, max_rows, engine=None):
             raise SQLAlchemyError("Invalid column name 'TotallyUnrelatedThing'.")
 
         monkeypatch.setattr("agent.nodes.execute_readonly_sql", _raise)
@@ -716,6 +751,7 @@ class TestExecuteSqlNode:
             "sql": "SELECT TotallyUnrelatedThing FROM DimProduct",
             "retry_count": 0,
             "schema_tables": schema_tables,
+            "selected_database": "default",
         }
         result = execute_sql_node(state)
 
@@ -724,12 +760,16 @@ class TestExecuteSqlNode:
         )
 
     def test_syntax_error_retries_via_generate_sql(self, monkeypatch):
-        def _raise(sql, timeout, max_rows):
+        def _raise(sql, timeout, max_rows, engine=None):
             raise SQLAlchemyError("Incorrect syntax near 'FROM'.")
 
         monkeypatch.setattr("agent.nodes.execute_readonly_sql", _raise)
 
-        state: AgentState = {"sql": "SELECT * FROM FROM customers", "retry_count": 0}
+        state: AgentState = {
+            "sql": "SELECT * FROM FROM customers",
+            "retry_count": 0,
+            "selected_database": "default",
+        }
         result = execute_sql_node(state)
 
         assert result["status"] == "generating"
@@ -744,12 +784,16 @@ class TestExecuteSqlNode:
         remaining -- retrying the same expensive query rarely helps, so the
         agent should flag it and stop rather than loop."""
 
-        def _raise(sql, timeout, max_rows):
+        def _raise(sql, timeout, max_rows, engine=None):
             raise TimeoutError("Query exceeded the 15s timeout and was aborted.")
 
         monkeypatch.setattr("agent.nodes.execute_readonly_sql", _raise)
 
-        state: AgentState = {"sql": "SELECT * FROM huge_join", "retry_count": 0}
+        state: AgentState = {
+            "sql": "SELECT * FROM huge_join",
+            "retry_count": 0,
+            "selected_database": "default",
+        }
         result = execute_sql_node(state)
 
         assert result["status"] == "failed"
@@ -758,6 +802,67 @@ class TestExecuteSqlNode:
         assert result["attempt_history"][0]["will_retry"] is False
         assert "narrow" in result["failure_explanation"].lower()
         assert route_after_execution(result) == "failed"
+
+    def test_zero_rows_from_a_multi_table_join_is_flagged_low_confidence(self, monkeypatch):
+        """Regression coverage for a real, reproduced failure: a query
+        joining DimProductSubcategory straight to FactResellerSales (skipping
+        the intermediate DimProduct hop) executes without error but matches
+        nothing, because the two surrogate keys belong to different key
+        spaces. Detection-only -- the run still succeeds normally."""
+        monkeypatch.setattr(
+            "agent.nodes.execute_readonly_sql",
+            lambda sql, timeout, max_rows, engine=None: (["TotalSales"], []),
+        )
+        state: AgentState = {
+            "sql": (
+                "SELECT SUM(f.SalesAmount) AS TotalSales FROM DimProductSubcategory s "
+                "JOIN FactResellerSales f ON s.ProductSubcategoryKey = f.ProductKey"
+            ),
+            "retry_count": 0,
+            "selected_database": "default",
+        }
+
+        result = execute_sql_node(state)
+
+        assert result["status"] == "succeeded"
+        assert result["row_count"] == 0
+        assert result["low_confidence_notice"] is not None
+        assert "0 rows" in result["low_confidence_notice"]
+
+    def test_zero_rows_from_a_single_table_query_is_not_flagged(self, monkeypatch):
+        """A single-table zero-row result (e.g. a narrow WHERE filter) is a
+        common, legitimate answer -- must not be flagged."""
+        monkeypatch.setattr(
+            "agent.nodes.execute_readonly_sql",
+            lambda sql, timeout, max_rows, engine=None: (["id"], []),
+        )
+        state: AgentState = {
+            "sql": "SELECT id FROM customers WHERE signup_year = 2050",
+            "retry_count": 0,
+            "selected_database": "default",
+        }
+
+        result = execute_sql_node(state)
+
+        assert result["status"] == "succeeded"
+        assert result["row_count"] == 0
+        assert result["low_confidence_notice"] is None
+
+    def test_multi_table_join_with_rows_is_not_flagged(self, monkeypatch):
+        monkeypatch.setattr(
+            "agent.nodes.execute_readonly_sql",
+            lambda sql, timeout, max_rows, engine=None: (["id"], [(1,)]),
+        )
+        state: AgentState = {
+            "sql": "SELECT o.id FROM orders o JOIN customers c ON o.customer_id = c.id",
+            "retry_count": 0,
+            "selected_database": "default",
+        }
+
+        result = execute_sql_node(state)
+
+        assert result["status"] == "succeeded"
+        assert result["low_confidence_notice"] is None
 
 
 class TestGenerateInsightNode:

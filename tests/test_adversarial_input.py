@@ -446,7 +446,7 @@ class TestPoisonedValueCannotBypassTheValidatorEvenIfModelIsTricked:
         gen_result = generate_sql_node(state)
         assert gen_result["status"] == "validating"
 
-        merged_state = {**state, **gen_result, "schema_tables": []}
+        merged_state = {**state, **gen_result, "schema_tables": [], "selected_database": "default"}
         validate_result = validate_sql_node(merged_state)
         assert validate_result["status"] == "failed"
         assert validate_result["last_error_category"] == "safety_violation"

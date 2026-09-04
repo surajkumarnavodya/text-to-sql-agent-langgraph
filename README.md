@@ -147,6 +147,15 @@ for the single source of truth this table is drawn from, and
 [`docs/CONFIGURATION.md`](docs/CONFIGURATION.md) for every connection
 variable.
 
+**Multiple databases:** set `DB_CONNECTIONS=name1,name2,...` (plus a
+`DB_<NAME>_*` block per name) instead of the single `DB_*` block above to
+connect to more than one database at once — each can be a different
+`DB_TYPE`. Each question is then auto-routed to whichever configured
+database looks relevant (`embeddings/retriever.py::select_database`); there
+is no manual database picker in the UI. See
+[`docs/CONFIGURATION.md`](docs/CONFIGURATION.md) and `.env.example` for the
+exact variable shape.
+
 ## Project structure
 
 ```
