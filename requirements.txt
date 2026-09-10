@@ -25,10 +25,21 @@ oracledb==4.0.2             # DB_TYPE=oracle -- pure-Python "thin mode", no Orac
 # Local vector store for schema retrieval
 chromadb==1.5.9
 
+# PDF text extraction for document/policy RAG ingestion (rag/ingestion.py) --
+# pure-Python, no system dependency (unlike e.g. poppler-based extractors).
+pypdf==6.18.0
+
 # UI
 streamlit==1.41.1
 plotly==5.24.1
-pandas==2.2.3
+# pandas==2.2.3 predates Python 3.14 and segfaults (access violation deep in
+# pandas.core.arrays.datetimes._construct_from_dt64_naive) building a
+# DataFrame from any row data containing a raw datetime.datetime value --
+# i.e. any query result with a datetime/date column, via ui/app.py's
+# pd.DataFrame(rows, columns=columns). Reproduces in two lines outside the
+# app entirely (not caused by anything in ui/app.py's own code), and is
+# fixed by 2.3.3, the first pandas release with real Python 3.14 wheels.
+pandas==2.3.3
 
 # REST API layer (api/) -- pydantic and uvicorn were already present as
 # transitive deps of langgraph/chromadb; fastapi (and its one real new

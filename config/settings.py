@@ -298,6 +298,64 @@ class Settings:
             beyond local/trusted-network use should sit behind a real
             authenticating reverse proxy regardless of whether this is set.
             Stored as `SecretStr` for the same reason `db_password` is.
+        enable_multi_source_router: Whether `ui/app.py`/`api/main.py` route
+            questions through `agent.orchestrator.graph.run_orchestrated`
+            (the multi-source router) instead of calling
+            `agent.graph.run_agent` directly. False by default -- with it
+            off, `run_orchestrated` itself just calls `run_agent` and
+            returns its result unwrapped, so a fresh clone with no other
+            `.env` changes behaves identically to the app before this
+            existed. See `agent/orchestrator/graph.py`'s module docstring
+            (`docs/ARCHITECTURE.md` gets a matching section once the
+            multi-source design lands in full -- see CLAUDE.md's Part 7).
+        rag_store_connection_string: Full SQLAlchemy connection string for
+            the document/policy RAG store (`rag/store.py`) -- a SQL Server
+            2025+/Azure SQL database using the native `VECTOR` column type
+            (see `rag/store.py`'s module docstring for the schema). Deliberately
+            a *separate* connection from `DB_CONNECTIONS`/`Settings.databases`
+            -- chunk/embedding storage is not business data and shouldn't
+            share a schema (or a connection pool) with a configured SQL
+            database. None (default, unset) means document/policy RAG is
+            entirely unavailable regardless of `enable_document_rag`/
+            `enable_policy_rag` below -- `rag/store.py` fails fast with a
+            clear message if either is on but this isn't set.
+        rag_store_odbc_driver: ODBC driver name for the RAG store connection,
+            same meaning as `db_odbc_driver`.
+        enable_document_rag: Whether the general "documents" collection is
+            offered to the orchestrator's router at all. False by default.
+        enable_policy_rag: Whether the separate, more access-sensitive
+            "policies" collection is offered to the router. False by default,
+            and independent of `enable_document_rag` -- either can be on
+            without the other.
+        rag_top_k: Number of most-relevant chunks retrieved per question,
+            per collection (documents/policies each retrieve their own top-k
+            independently).
+        rag_max_retries: Max query-rewrite retries in the agentic RAG
+            subgraph (`rag/graph.py`) before falling back to "insufficient
+            information" -- same bounded-retry philosophy as `max_retries`
+            for the SQL loop, a separate knob since a bad chunk retrieval
+            and a bad SQL parse aren't the same kind of budget.
+        rag_chunk_size: Target chunk length in characters when splitting an
+            ingested PDF's extracted text (`rag/ingestion.py`).
+        rag_chunk_overlap: Character overlap between consecutive chunks, so
+            a sentence spanning a chunk boundary isn't lost to either chunk
+            alone.
+        rag_embedding_model_name: Embedding model for document/policy
+            chunks. Blank (default) reuses `embedding_model_name` (the same
+            model already embedding schema DDL) -- set this only if
+            documents genuinely need a different model than schema
+            retrieval does.
+        enable_web_search: Whether the web_search node is offered to the
+            router at all. False by default, and independent of
+            `web_search_api_key` being set -- both must be true/present for
+            the node to actually run (see `search/web_search.py`).
+        web_search_provider: Which provider `search/web_search.py` calls --
+            see `search.web_search.SUPPORTED_SEARCH_PROVIDERS` for the
+            supported values. Swapping providers is a config change, not a
+            code change, mirroring `DB_TYPE`'s own pattern.
+        web_search_api_key: API key for the configured provider. Stored as
+            `SecretStr` for the same reason `db_password` is.
+        web_search_max_results: Max results requested per web search call.
         project_root: Absolute path to the repository root.
         databases: Every configured database connection, parsed from
             `DB_CONNECTIONS` + per-name `DB_<NAME>_*` vars (see
@@ -344,7 +402,21 @@ class Settings:
     cost_high_row_threshold: int
     log_level: str
     log_redaction_level: str
+    enable_multi_source_router: bool = False
     api_auth_token: SecretStr | None = None
+    rag_store_connection_string: SecretStr | None = None
+    rag_store_odbc_driver: str = "ODBC Driver 17 for SQL Server"
+    enable_document_rag: bool = False
+    enable_policy_rag: bool = False
+    rag_top_k: int = 4
+    rag_max_retries: int = 2
+    rag_chunk_size: int = 1200
+    rag_chunk_overlap: int = 150
+    rag_embedding_model_name: str = ""
+    enable_web_search: bool = False
+    web_search_provider: str = "tavily"
+    web_search_api_key: SecretStr | None = None
+    web_search_max_results: int = 5
     project_root: Path = PROJECT_ROOT
     databases: tuple[DatabaseConnectionConfig, ...] = ()
 
@@ -365,6 +437,10 @@ class Settings:
         object.__setattr__(self, "db_password", as_secret(self.db_password))
         object.__setattr__(self, "db_connection_string", as_secret(self.db_connection_string))
         object.__setattr__(self, "api_auth_token", as_secret(self.api_auth_token))
+        object.__setattr__(
+            self, "rag_store_connection_string", as_secret(self.rag_store_connection_string)
+        )
+        object.__setattr__(self, "web_search_api_key", as_secret(self.web_search_api_key))
         if not self.databases:
             # No DB_CONNECTIONS configured (or a Settings(...) built directly,
             # e.g. by a test, without passing databases=) -- fall back to a
@@ -415,6 +491,10 @@ class Settings:
             ("COST_ESTIMATION_TIMEOUT_SECONDS", self.cost_estimation_timeout_seconds),
             ("COST_MODERATE_ROW_THRESHOLD", self.cost_moderate_row_threshold),
             ("COST_HIGH_ROW_THRESHOLD", self.cost_high_row_threshold),
+            ("RAG_TOP_K", self.rag_top_k),
+            ("RAG_MAX_RETRIES", self.rag_max_retries),
+            ("RAG_CHUNK_SIZE", self.rag_chunk_size),
+            ("WEB_SEARCH_MAX_RESULTS", self.web_search_max_results),
         )
         for name, value in positive_fields:
             if value <= 0:
@@ -487,7 +567,21 @@ def get_settings() -> Settings:
         cost_high_row_threshold=_env_int("COST_HIGH_ROW_THRESHOLD", 1_000_000),
         log_level=_env_str("LOG_LEVEL", "INFO"),
         log_redaction_level=_env_str("LOG_REDACTION_LEVEL", "standard").strip().lower(),
+        enable_multi_source_router=_env_bool("ENABLE_MULTI_SOURCE_ROUTER", False),
         api_auth_token=as_secret(_env_optional_str("API_AUTH_TOKEN")),
+        rag_store_connection_string=as_secret(_env_optional_str("RAG_STORE_CONNECTION_STRING")),
+        rag_store_odbc_driver=_env_str("RAG_STORE_ODBC_DRIVER", "ODBC Driver 17 for SQL Server"),
+        enable_document_rag=_env_bool("ENABLE_DOCUMENT_RAG", False),
+        enable_policy_rag=_env_bool("ENABLE_POLICY_RAG", False),
+        rag_top_k=_env_int("RAG_TOP_K", 4),
+        rag_max_retries=_env_int("RAG_MAX_RETRIES", 2),
+        rag_chunk_size=_env_int("RAG_CHUNK_SIZE", 1200),
+        rag_chunk_overlap=_env_int("RAG_CHUNK_OVERLAP", 150),
+        rag_embedding_model_name=_env_str("RAG_EMBEDDING_MODEL_NAME", ""),
+        enable_web_search=_env_bool("ENABLE_WEB_SEARCH", False),
+        web_search_provider=_env_str("WEB_SEARCH_PROVIDER", "tavily").strip().lower(),
+        web_search_api_key=as_secret(_env_optional_str("WEB_SEARCH_API_KEY")),
+        web_search_max_results=_env_int("WEB_SEARCH_MAX_RESULTS", 5),
         databases=_parse_named_connections(),
     )
     return settings

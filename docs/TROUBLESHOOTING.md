@@ -128,6 +128,52 @@ installed driver name (`"ODBC Driver 17 for SQL Server"`,
   extending the base image with Microsoft's ODBC driver package — it's not
   included by default.
 
+## Streamlit crashes / "Connection error" popup after a query with a date column
+
+A real, observed segfault: `pandas==2.2.3` predates real Python 3.14
+wheels and crashes (`Windows fatal exception: access violation` deep in
+`pandas.core.arrays.datetimes._construct_from_dt64_naive`) building a
+`DataFrame` from *any* row data containing a raw `datetime.datetime`
+value — i.e. any query result with a date/datetime column, via
+`ui/app.py`'s `pd.DataFrame(rows, columns=columns)`. This kills the whole
+Streamlit process (not a catchable Python exception), which is what the
+browser shows as a generic "Connection error / is Streamlit still
+running?" toast. **Fixed** by pinning `pandas==2.3.3` in
+`requirements.txt` (see its own comment) — if you see this exact crash
+shape after touching dependency pins, check that pin hasn't regressed.
+Reproduces in two lines with no app code involved:
+```python
+import datetime, pandas as pd
+pd.DataFrame([(1, datetime.datetime(1990, 1, 1))], columns=["id", "d"])
+```
+
+## "Invalid object name 'X'" for a table that genuinely exists
+
+Happens on a database whose real tables live under a **non-default
+schema** (`DB_<NAME>_SCHEMA` set to something other than `dbo`/`public`) —
+an engine resolves an unqualified table name against the *connecting
+user's own default schema*, not the schema you configured for
+introspection. The model correctly sees and generates `FROM Employee`
+(schema-qualification was never part of the DDL it was shown — see
+`CLAUDE.md`'s multi-database note on why `table_descriptions.yaml`/schema
+DDL stay bare-named), but bare `Employee` then fails to resolve if the
+connection's actual default schema is `dbo` and the table is really
+`employee.Employee`. **Fixed** by `agent.sql_validator.qualify_table_schema`,
+applied only at the execution step, transparently, using
+`DB_<NAME>_SCHEMA` — you shouldn't see this anymore for a correctly
+configured `DB_<NAME>_SCHEMA`. If you do, confirm the configured schema
+name actually matches where the tables live (`SELECT SCHEMA_NAME(schema_id), name FROM sys.tables`
+on SQL Server) rather than assuming the connection's default.
+
+## Multi-source router picked the wrong source, or a source you configured isn't offered
+
+See [`docs/MULTI_SOURCE_GUIDE.md`](MULTI_SOURCE_GUIDE.md#7-troubleshooting)
+— almost always either a missed app restart after a `.env` change
+(`Settings` is a cached singleton, same as every other setting — see
+above), or a genuinely ambiguous/compound question. Check the
+`[router] available=[...] sources=[...] reasoning=...` log line before
+assuming something's broken.
+
 ## "It rejected my question and I don't know why"
 
 By design, a rejection message is deliberately generic

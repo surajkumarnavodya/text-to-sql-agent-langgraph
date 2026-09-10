@@ -43,6 +43,7 @@ from agent.sql_validator import (
     enforce_row_limit,
     find_restricted_column_references,
     find_unexpected_table_references,
+    qualify_table_schema,
     references_multiple_tables,
     strip_row_limit,
     validate_sql,
@@ -987,9 +988,17 @@ def execute_sql_node(state: AgentState) -> dict[str, Any]:
     retry_count = state.get("retry_count", 0)
     attempt_number = retry_count + 1
 
+    # Schema-qualifies unqualified table references for this execution only
+    # -- see qualify_table_schema's docstring. `sql` itself (used below in
+    # every attempt/error record, and still what `state["sql"]` holds) stays
+    # exactly what the model produced and the UI shows.
+    execution_sql = qualify_table_schema(
+        sql, db_config.db_schema, dialect=get_sqlglot_dialect(db_config.db_type)
+    )
+
     try:
         columns, rows = execute_readonly_sql(
-            sql,
+            execution_sql,
             settings.query_timeout_seconds,
             settings.max_result_rows,
             engine=get_read_only_engine(db_config),

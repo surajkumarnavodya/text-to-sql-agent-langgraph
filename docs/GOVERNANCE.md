@@ -96,6 +96,19 @@ authorization-aware (there's no per-user identity in this app's
 single-user model to authorize against) — see "Restricted" tier's own note
 below on what a future multi-user deployment would still need to add.
 
+**Extended to policy documents (2026-09-10, optional feature, off by
+default):** the same three-tier philosophy — hand-authored classification,
+enforced fail-closed, not authorization-aware — now also covers uploaded
+policy PDFs, a different data shape (a whole document/chunk, not a
+`(table, column)` pair). `rag/store.py`'s `SensitivityCategory` implements
+three specific "restricted"-equivalent categories, reviewed and signed off
+on for this project: **compensation & pay**, **disciplinary/HR case
+content**, and **legal/litigation**. A chunk tagged with any of these is
+never summarized into an answer — see `SECURITY.md`'s multi-source section
+and `CLAUDE.md`'s "Document/policy agentic RAG" for the mechanism. Same
+caveat as the column-level "Restricted" tier: this blocks everyone
+equally, it is not per-user access control.
+
 ### The policy tiers, as enforced
 
 - Every table/column's classification is recorded in that file, not in

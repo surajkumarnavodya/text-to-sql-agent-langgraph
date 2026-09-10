@@ -1,6 +1,7 @@
 """FastAPI app: a REST surface over the same LangGraph agent the Streamlit
 UI drives -- see `api/__init__.py`'s module docstring for why `/ask` is a
-thin wrapper around `agent.graph.run_agent`, not a second implementation.
+thin wrapper around `agent.orchestrator.graph.run_orchestrated`, not a
+second implementation.
 
 Run with (see `docs/API.md`/`docs/DEPLOYMENT.md` for the full picture):
 
@@ -28,7 +29,7 @@ from fastapi.encoders import jsonable_encoder
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from agent.exceptions import SchemaRetrievalError
-from agent.graph import run_agent
+from agent.orchestrator.graph import run_orchestrated
 from agent.rate_limit import QUESTION_LIMIT_MESSAGE, SlidingWindowRateLimiter
 from agent.state import AgentState, ConversationExchange
 from api.auth import verify_api_key
@@ -196,10 +197,13 @@ def health(response: Response) -> HealthResponse:
 def ask(payload: AskRequest, request: Request) -> AskResponse:
     """Runs one question through the full agent graph -- schema retrieval,
     SQL generation, validation, cost estimation, execution, self-correction
-    -- exactly as `ui/app.py` does via the same `agent.graph.run_agent`
-    call. Every safety layer that governs the UI (input guard, SQL
-    validator, row cap, timeout, LLM-call rate limit, sensitive-column
-    blocking) applies identically here, since it's the same graph.
+    -- exactly as `ui/app.py` does via the same
+    `agent.orchestrator.graph.run_orchestrated` call (which itself is a
+    pure pass-through to `agent.graph.run_agent` unless
+    `ENABLE_MULTI_SOURCE_ROUTER` is set -- see that module's docstring).
+    Every safety layer that governs the UI (input guard, SQL validator, row
+    cap, timeout, LLM-call rate limit, sensitive-column blocking) applies
+    identically here, since it's the same underlying graph.
     """
     client_ip = request.client.host if request.client else "unknown"
     rate_limit_result = _limiter_for(client_ip).check()
@@ -218,7 +222,7 @@ def ask(payload: AskRequest, request: Request) -> AskResponse:
     ]
 
     try:
-        final_state = run_agent(
+        final_state = run_orchestrated(
             payload.question, conversation_history, enable_insight=payload.enable_insight
         )
     except SchemaRetrievalError as exc:

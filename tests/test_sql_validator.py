@@ -12,6 +12,7 @@ import pytest
 from agent.sql_validator import (
     SAFETY_VIOLATION_TYPES,
     enforce_row_limit,
+    qualify_table_schema,
     references_multiple_tables,
     strip_row_limit,
     validate_sql,
@@ -218,6 +219,43 @@ class TestStripRowLimit:
     def test_removes_mssql_top_clause(self):
         sql = strip_row_limit("SELECT TOP 1000 * FROM customers", dialect="tsql")
         assert "TOP" not in sql.upper()
+
+
+class TestQualifyTableSchema:
+    """Regression coverage for a real failure found configuring a database
+    whose tables all live under a non-default schema (e.g. `employee.Employee`,
+    with the connecting user's actual default schema being `dbo`): every
+    generated query failed with "Invalid object name", even after retries,
+    since the model was never shown (and never taught to produce) a
+    schema-qualified table reference -- see qualify_table_schema's docstring
+    for why that's applied here rather than upstream in the DDL/prompt.
+    """
+
+    def test_none_schema_is_a_no_op(self):
+        sql = "SELECT * FROM Employee"
+        assert qualify_table_schema(sql, None, dialect="tsql") == sql
+
+    def test_qualifies_a_bare_table_reference(self):
+        sql = qualify_table_schema("SELECT * FROM Employee", "employee", dialect="tsql")
+        assert "employee.Employee" in sql or "employee.[Employee]" in sql.replace(" ", "")
+
+    def test_qualifies_every_table_in_a_join(self):
+        sql = qualify_table_schema(
+            "SELECT * FROM Employee e JOIN Department d ON e.DeptId = d.Id",
+            "employee",
+            dialect="tsql",
+        )
+        assert sql.count("employee.") == 2
+
+    def test_leaves_an_already_qualified_reference_alone(self):
+        sql = qualify_table_schema("SELECT * FROM dbo.AlreadyQualified", "employee", dialect="tsql")
+        assert "employee." not in sql
+        assert "dbo.AlreadyQualified" in sql
+
+    def test_is_idempotent(self):
+        once = qualify_table_schema("SELECT * FROM Employee", "employee", dialect="tsql")
+        twice = qualify_table_schema(once, "employee", dialect="tsql")
+        assert once == twice
 
 
 class TestReferencesMultipleTables:

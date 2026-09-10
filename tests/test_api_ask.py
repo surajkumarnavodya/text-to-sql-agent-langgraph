@@ -1,9 +1,12 @@
 """Unit tests for POST /ask and GET /schema/tables (api/main.py).
 
-Fully mocked -- `agent.graph.run_agent` and the DB/Chroma calls are patched
-at the `api.main` module they're looked up from, exactly like
-`tests/test_agent_nodes.py` mocks `agent.nodes`'s own dependencies. No real
-LLM call, database connection, or Chroma index is ever touched.
+Fully mocked -- `agent.orchestrator.graph.run_orchestrated` (what `api.main`
+actually calls -- a pass-through to `agent.graph.run_agent` when
+`ENABLE_MULTI_SOURCE_ROUTER` is unset, its default in these tests) and the
+DB/Chroma calls are patched at the `api.main` module they're looked up from,
+exactly like `tests/test_agent_nodes.py` mocks `agent.nodes`'s own
+dependencies. No real LLM call, database connection, or Chroma index is ever
+touched.
 """
 
 from __future__ import annotations
@@ -103,7 +106,7 @@ class TestAsk:
             "insight": "There are 5 rows.",
             "error_history": [],
         }
-        monkeypatch.setattr("api.main.run_agent", lambda *a, **k: final_state)
+        monkeypatch.setattr("api.main.run_orchestrated", lambda *a, **k: final_state)
 
         response = client.post("/ask", json={"question": "How many rows are there?"})
 
@@ -124,7 +127,7 @@ class TestAsk:
             captured["enable_insight"] = enable_insight
             return {"status": "succeeded", "error_history": []}
 
-        monkeypatch.setattr("api.main.run_agent", _capture)
+        monkeypatch.setattr("api.main.run_orchestrated", _capture)
 
         response = client.post(
             "/ask",
@@ -151,7 +154,7 @@ class TestAsk:
         def _raise(*a, **k):
             raise SchemaRetrievalError("Chroma index is empty -- run scripts/build_embeddings.py.")
 
-        monkeypatch.setattr("api.main.run_agent", _raise)
+        monkeypatch.setattr("api.main.run_orchestrated", _raise)
 
         response = client.post("/ask", json={"question": "How many rows are there?"})
 
@@ -169,7 +172,7 @@ class TestAsk:
             "api.main.get_settings", lambda: _settings(question_rate_limit_per_minute=1)
         )
         monkeypatch.setattr(
-            "api.main.run_agent", lambda *a, **k: {"status": "succeeded", "error_history": []}
+            "api.main.run_orchestrated", lambda *a, **k: {"status": "succeeded", "error_history": []}
         )
 
         first = client.post("/ask", json={"question": "q1"})
@@ -186,7 +189,7 @@ class TestAsk:
         # get_settings, not api.main's -- both must be patched.
         monkeypatch.setattr("api.auth.get_settings", lambda: auth_settings)
         monkeypatch.setattr(
-            "api.main.run_agent", lambda *a, **k: {"status": "succeeded", "error_history": []}
+            "api.main.run_orchestrated", lambda *a, **k: {"status": "succeeded", "error_history": []}
         )
 
         no_header = client.post("/ask", json={"question": "q"})

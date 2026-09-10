@@ -14,7 +14,11 @@ every retry is visible and inspectable, and the schema the model sees
 scales to a database with hundreds of tables instead of assuming a toy
 5-table sample. It's also a fully local stack (Ollama + ChromaDB, no API
 keys, no data leaving the machine), which matters for anyone who can't send
-a real schema or query results to a hosted API.
+a real schema or query results to a hosted API — this holds for the core
+SQL pipeline unconditionally; the optional multi-source router's web
+search feature (off by default) is the one deliberate exception, since a
+live web search inherently needs to leave the machine — see "Multi-source
+knowledge" below.
 
 ## Architecture
 
@@ -50,6 +54,14 @@ to be inspectable, not a black box. See
 walkthrough (all eight LangGraph nodes, retry semantics, schema-retrieval
 internals) and [`USER_GUIDE.md`](USER_GUIDE.md) for what this looks like
 from inside the app.
+
+**Optional: this SQL pipeline is the default destination of a
+multi-source router**, off by default (`ENABLE_MULTI_SOURCE_ROUTER=false`).
+Turned on, a question can also be routed to (or fanned out across) uploaded
+PDF documents, a separate sensitivity-gated company-policy collection, or
+live web search — see "Multi-source knowledge" below. With the router off,
+this diagram is the *entire* app, unchanged from before that feature
+existed.
 
 ## Key features
 
@@ -107,6 +119,14 @@ from inside the app.
   programmatic access — a thin wrapper over the same `agent.graph.run_agent`
   the UI calls, so every safety layer applies identically. See
   [`docs/API.md`](docs/API.md).
+- **Optional multi-source agentic RAG** — a router (off by default,
+  `ENABLE_MULTI_SOURCE_ROUTER`) that can fan a question out across the SQL
+  pipeline above, uploaded PDF documents, a separate sensitivity-gated
+  company-policy collection, and live web search (Tavily), synthesizing an
+  attributed answer when more than one source contributes. Document/policy
+  chunks are stored using SQL Server 2025+/Azure SQL's native `VECTOR`
+  type. See "Multi-source knowledge" below and
+  [`docs/MULTI_SOURCE_GUIDE.md`](docs/MULTI_SOURCE_GUIDE.md).
 
 ## Tech stack
 
@@ -119,6 +139,9 @@ from inside the app.
 | SQL validation | [sqlglot](https://github.com/tobymao/sqlglot) | Parses the AST and allowlists the statement *type* — can't be bypassed by a syntax variant the way a keyword blocklist can. |
 | UI | [Streamlit](https://streamlit.io) + [Plotly](https://plotly.com/python/) | Fast to build a real reviewable UI (editable SQL box, retry timeline, schema browser) without a separate frontend. |
 | API | [FastAPI](https://fastapi.tiangolo.com/) | A thin, optional REST surface (`api/`) over the same agent graph the UI calls — see [`docs/API.md`](docs/API.md). |
+| Multi-source router | LangGraph (a second graph, `agent/orchestrator/`) | Optional, off by default — routes to/fans out across the SQL pipeline, document/policy RAG, and web search. See [`docs/MULTI_SOURCE_GUIDE.md`](docs/MULTI_SOURCE_GUIDE.md). |
+| Document/policy RAG storage | SQL Server 2025+ / Azure SQL native `VECTOR` type | A dedicated connection, separate from `DB_CONNECTIONS` — see `rag/store.py`. |
+| Web search | [Tavily](https://tavily.com) (configurable provider) | The one exception to this project's fully-local posture — only when explicitly enabled. |
 | Deployment | [Docker](https://www.docker.com/) + Compose | Non-root, pinned, health-checked containers for the UI and API — see [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md). |
 
 ### Supported LLM models
@@ -156,23 +179,59 @@ is no manual database picker in the UI. See
 [`docs/CONFIGURATION.md`](docs/CONFIGURATION.md) and `.env.example` for the
 exact variable shape.
 
+## Multi-source knowledge (optional)
+
+Beyond the SQL database(s), a question can also be routed to (or fanned
+out across) three more sources — all off by default:
+
+- **Document RAG** — upload general PDFs on the Streamlit "Knowledge
+  Sources" page; retrieved and answered by an agentic RAG subgraph
+  (retrieve → grade relevance → rewrite query and retry if not relevant,
+  bounded → generate a cited answer, or an honest "couldn't find that"
+  fallback).
+- **Policy RAG** — the same subgraph, pointed at a separate, more
+  access-sensitive collection for internal company policy PDFs. A document
+  tagged `compensation`/`disciplinary`/`legal` at upload time is never
+  summarized into an answer — this app has no per-user authorization
+  system, so it fails closed instead of guessing who's allowed to see it.
+- **Live web search** (Tavily) — for questions about current/external
+  information outside any configured source. Every web-sourced answer is
+  explicitly labeled "According to a live web search:", never presented as
+  if it came from the company's own systems.
+
+When more than one source is relevant to a question, an LLM router picks
+which (a bounded, well-tested single LLM call — see
+[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md#4-multi-source-orchestration)),
+and the answer attributes each source's contribution under its own labeled
+heading rather than blending them together. Document/policy chunks are
+stored using SQL Server 2025+/Azure SQL's native `VECTOR` column type, on a
+connection kept deliberately separate from your business database(s).
+
+**Full setup walkthrough, including exactly where the Tavily API key goes
+and how to upload a policy document:**
+[`docs/MULTI_SOURCE_GUIDE.md`](docs/MULTI_SOURCE_GUIDE.md).
+
 ## Project structure
 
 ```
 Gen_AI_Project_TSQL/
 ├── agent/            # LangGraph nodes, state, SQL validator, LLM client, rate limiting
-├── api/               # Optional FastAPI REST layer (thin wrapper over agent.graph.run_agent)
+│   └── orchestrator/  # Optional multi-source router (off by default) -- sits in front of agent/graph.py
+├── api/               # Optional FastAPI REST layer (thin wrapper over agent.orchestrator.graph.run_orchestrated)
 ├── config/            # Settings (env-driven), table descriptions, sensitive-column classification
 ├── db/                 # SQLAlchemy engine, schema introspection, query execution, cost estimation
-├── docs/              # Architecture, security, deployment, API, evaluation, governance docs
+├── docs/              # Architecture, security, deployment, API, evaluation, governance, multi-source docs
 ├── embeddings/        # Chroma index build + top-k/FK-adjacency schema retrieval
 ├── eval/               # Text-to-SQL benchmark harness: dataset, evaluators, metrics, regression
 │   └── benchmark/      # Benchmark case YAML files (easy/medium/hard/real_world/adversarial/...)
 ├── observability/      # LLM call timing capture, result-log redaction
+├── rag/                # Optional document/policy agentic RAG (SQL Server native VECTOR storage)
 ├── scripts/            # CLI entry points: build_embeddings, test_db_connection, run_benchmark, ...
+├── search/             # Optional live web search (provider-configurable, Tavily implemented)
 ├── security/           # Secret redaction, SecretStr, audit logging, sanitization, injection patterns
 ├── tests/              # Fully mocked pytest suite (no live DB/Ollama required)
 ├── ui/                 # Streamlit app (the primary interface) + session history + column formatting
+│   └── pages/           # Knowledge Sources page -- PDF upload/management for document/policy RAG
 ├── Dockerfile, docker-compose.yml, .dockerignore
 ├── requirements.txt, pyproject.toml
 ├── tasks.ps1, Makefile
@@ -316,6 +375,19 @@ results table with an auto-picked chart._
 - **Single-user, local-dev oriented.** This has not been hardened for
   concurrent multi-tenant use or production deployment — see
   [`SECURITY.md`](SECURITY.md) before pointing it at anything sensitive.
+- **Multi-source questions aren't decomposed per-source (optional feature).**
+  When the multi-source router fans a question out to more than one
+  source, every source receives the same full question text. A
+  single-topic multi-source question retrieves fine on every side (e.g.
+  "compare our leave policy with sales in the database"); a question
+  that's really two unrelated asks mashed into one sentence can retrieve
+  poorly on both sides even though each half would work fine asked
+  separately. See [`docs/MULTI_SOURCE_GUIDE.md`](docs/MULTI_SOURCE_GUIDE.md).
+- **Document/policy RAG requires SQL Server 2025+ or Azure SQL**
+  specifically (native `VECTOR` column type) — not one of the four
+  `DB_TYPE`s the core SQL pipeline supports. Confirmed against a real
+  instance before being built, not assumed; check `SELECT @@VERSION`
+  before configuring `RAG_STORE_CONNECTION_STRING`.
 
 ## More documentation
 
@@ -326,7 +398,11 @@ results table with an auto-picked chart._
   messages mean.
 - [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — detailed technical
   walkthrough of the LangGraph node design, retry/self-correction logic,
-  and schema-retrieval pipeline.
+  schema-retrieval pipeline, and (§4) the optional multi-source router.
+- [`docs/MULTI_SOURCE_GUIDE.md`](docs/MULTI_SOURCE_GUIDE.md) — how to turn
+  on and use document RAG, policy RAG, and live web search: where the
+  Tavily key goes, how to upload a policy PDF, what the sensitivity
+  categories actually do, and troubleshooting.
 - [`docs/User_Guide.pdf`](docs/User_Guide.pdf) — an earlier, PDF-format
   general-audience guide. `USER_GUIDE.md` above is the current,
   markdown-native reference kept in sync with the running app; this PDF

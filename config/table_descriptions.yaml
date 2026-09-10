@@ -16,6 +16,25 @@
 # flow into the LLM prompt as-is, so reviewing the rest for accuracy is
 # worth doing, not just optional cleanup.
 #
+# Added 2026-09-10: the 11 `employee.*` tables from HrAutomationDb
+# (DB_CONNECTIONS name "hr", DB_HR_SCHEMA=employee). Unlike the
+# AdventureWorksDW2025 entries above, these were written directly from live
+# introspection output (real columns + real foreign keys pulled and reviewed
+# for this file, not guessed from names alone) -- see each table's
+# key_relationships for exactly which FKs were confirmed. Several of those
+# FKs point at tables in *other* HrAutomationDb schemas (recruitment, offer,
+# workflow, org, ref, iam) that aren't currently exposed to the agent --
+# DB_HR_SCHEMA only indexes one schema at a time (see .env's own note on
+# this). Those cross-schema references are called out explicitly below so
+# the model doesn't try to join to a table it was never shown.
+#
+# This file (table_descriptions.yaml) is keyed by bare table name across
+# every configured database, not (database, table) -- a real, documented
+# limitation (see CLAUDE.md's multi-database note). None of the 11
+# employee.* names collide with any AdventureWorksDW2025 table name, so
+# that's a non-issue today, but worth remembering if a future database adds
+# a table named e.g. "Employee" too.
+#
 # Going forward, this file -- not code, not a re-run of any generator -- is
 # the single source of truth for table meaning. Code reads it; nothing
 # should regenerate or overwrite it silently. If a table is added or
@@ -339,3 +358,138 @@ tables:
       end users.
     key_relationships: >-
       None. SSMS-internal system table.
+
+  # --- HrAutomationDb, schema `employee` (DB_CONNECTIONS name "hr") ---
+
+  - table_name: Employee
+    purpose: >-
+      One row per person who has actually been converted into an employee
+      (post-hire) -- name, employee code, date of joining, and status/
+      designation/job-grade/employment-type classification. Soft-deleted via
+      IsDeleted/DeletedAtUtc rather than removed.
+    key_relationships: >-
+      EmployeeConversionId links back to the EmployeeConversion row that
+      created this employee (the offer-acceptance -> employee pipeline).
+      CandidateId references recruitment.Candidate (not currently indexed --
+      only the employee schema is exposed). DesignationId/JobGradeId/
+      EmploymentTypeId/EmployeeStatusId reference ref-schema lookup tables
+      (also not currently indexed). Referenced by EmployeeManagerAssignment,
+      EmployeeOrganizationAssignment, EmployeeProvisioningRequest,
+      EmployeeStatusHistory, and EmployeeIntegrationMapping via EmployeeId.
+    column_notes:
+      - column: EmployeeId
+        note: >-
+          A UNIQUEIDENTIFIER (GUID) surrogate key, not an integer -- filter/
+          join on it as a GUID literal, never cast to a number.
+
+  - table_name: EmployeeConversion
+    purpose: >-
+      One row per candidate-to-employee conversion event -- the process
+      that turns an accepted job offer into an actual Employee record.
+      Status (e.g. requested/converted) plus RequestedAtUtc/ConvertedAtUtc
+      timestamps.
+    key_relationships: >-
+      CandidateApplicationId and OfferId reference recruitment/offer-schema
+      tables (not currently indexed). WorkflowInstanceId references the
+      workflow schema (not currently indexed). Referenced by Employee via
+      EmployeeConversionId (the employee this conversion produced), and by
+      EmployeeConversionApproval, EmployeeConversionChecklist, and
+      EmployeeIdRegistry via EmployeeConversionId.
+
+  - table_name: EmployeeConversionApproval
+    purpose: >-
+      One row per approval step required on a specific EmployeeConversion
+      (e.g. HR/manager sign-off before the conversion completes), with
+      Status and RequestedAtUtc/CompletedAtUtc.
+    key_relationships: >-
+      EmployeeConversionId joins back to EmployeeConversion. ApprovalRequestId
+      references the generic workflow-schema approval-request table (not
+      currently indexed).
+
+  - table_name: EmployeeConversionChecklist
+    purpose: >-
+      One row per checklist item (e.g. a required document or verification)
+      that must be satisfied before an EmployeeConversion can complete --
+      IsSatisfied plus when it was checked.
+    key_relationships: >-
+      EmployeeConversionId joins back to EmployeeConversion. Each row
+      belongs to exactly one conversion; a conversion typically has several
+      checklist rows.
+
+  - table_name: EmployeeIdRegistry
+    purpose: >-
+      Registry of issued employee codes (EmployeeCode) -- one row per code
+      issued during a conversion, with IssuedAtUtc. Exists to guarantee
+      employee codes are unique/traceable to the conversion that issued
+      them, separate from the Employee row itself.
+    key_relationships: >-
+      EmployeeConversionId joins back to EmployeeConversion (which
+      conversion issued this code).
+
+  - table_name: EmployeeIntegrationMapping
+    purpose: >-
+      One row per external-system identifier an Employee is mapped to (e.g.
+      payroll or a third-party HRIS), keyed by ExternalSystemCode +
+      ExternalEntityId, with SyncedAtUtc.
+    key_relationships: >-
+      EmployeeId joins back to Employee. A single employee can have several
+      rows here, one per external system they're synced to.
+
+  - table_name: EmployeeManagerAssignment
+    purpose: >-
+      Time-bounded (EffectiveFromUtc/EffectiveToUtc) record of who an
+      employee's manager is -- supports reporting-line history, not just
+      the current manager.
+    key_relationships: >-
+      EmployeeId and ManagerEmployeeId both reference Employee (a
+      self-referencing relationship via two separate FKs, not a single
+      self-join column) -- ManagerEmployeeId is itself an EmployeeId. A
+      NULL/open EffectiveToUtc means the assignment is currently active;
+      filter on that (or "EffectiveToUtc is NULL or > today") for "who does
+      X currently report to" rather than assuming one row per employee.
+
+  - table_name: EmployeeOrganizationAssignment
+    purpose: >-
+      Time-bounded (EffectiveFromUtc/EffectiveToUtc) record of where an
+      employee sits organizationally -- department, business unit,
+      location, and cost center -- supports org-placement history, not just
+      the current placement.
+    key_relationships: >-
+      EmployeeId references Employee. DepartmentId, BusinessUnitId,
+      LocationId, and CostCenterId all reference org-schema lookup tables
+      (not currently indexed). Same "open EffectiveToUtc = current" caveat
+      as EmployeeManagerAssignment applies here.
+
+  - table_name: EmployeeProvisioningRequest
+    purpose: >-
+      One row per request to provision (or deprovision) an employee's
+      access/accounts in some system -- ProvisioningType, Status,
+      RequestedAtUtc/CompletedAtUtc.
+    key_relationships: >-
+      EmployeeId references Employee. Referenced by
+      EmployeeProvisioningStatusHistory via
+      EmployeeProvisioningRequestId (the audit trail of this request's
+      status changes).
+
+  - table_name: EmployeeProvisioningStatusHistory
+    purpose: >-
+      Audit trail of status transitions (FromStatus -> ToStatus, with
+      ChangedAtUtc and free-text Details) for one
+      EmployeeProvisioningRequest.
+    key_relationships: >-
+      EmployeeProvisioningRequestId joins back to
+      EmployeeProvisioningRequest. Multiple rows per request, one per
+      status change -- order by ChangedAtUtc for the timeline.
+
+  - table_name: EmployeeStatusHistory
+    purpose: >-
+      Audit trail of an employee's status changes (e.g. active, on leave,
+      terminated) -- FromEmployeeStatusId -> ToEmployeeStatusId, with
+      ChangedAtUtc, who changed it, and a free-text Reason.
+    key_relationships: >-
+      EmployeeId references Employee. FromEmployeeStatusId and
+      ToEmployeeStatusId both reference the ref-schema EmployeeStatus lookup
+      table (not currently indexed, so its status codes/names aren't
+      resolvable from the exposed schema alone -- flag this to the user
+      rather than guessing a status name). Multiple rows per employee, one
+      per status change -- order by ChangedAtUtc for the timeline.

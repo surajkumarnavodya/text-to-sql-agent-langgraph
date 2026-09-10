@@ -109,6 +109,26 @@ docker compose exec app python scripts/build_embeddings.py
 (Cheap to run when nothing changed — `embeddings.schema_indexer.build_index`
 skips re-embedding if the schema fingerprint hasn't changed.)
 
+## Multi-source RAG / web search (optional)
+
+Nothing Docker-specific here either if you turn these on
+(`docs/MULTI_SOURCE_GUIDE.md`) — same `.env` mechanism:
+
+- **`RAG_STORE_CONNECTION_STRING`** must point at a **SQL Server 2025+/
+  Azure SQL** database reachable from the container (native `VECTOR`
+  column type — `rag/store.py`). If it's a separate host from your
+  `DB_CONNECTIONS` database, it needs the same network reachability as
+  any other external database (see "Connecting to an external database"
+  above); if it's SQL Server, it needs the same `mssql` image-extension
+  note as `DB_TYPE=mssql` above (`pyodbc`'s build requirement is covered,
+  Microsoft's ODBC driver itself is not, by design).
+- **`WEB_SEARCH_API_KEY`** (Tavily by default) means the container makes
+  outbound HTTPS calls to a third-party API carrying question text — the
+  one exception to this project's otherwise fully-local, no-external-calls
+  posture (see `SECURITY.md`'s multi-source section). Confirm your
+  network/firewall policy allows outbound HTTPS from the container before
+  relying on this in a locked-down environment.
+
 ## Health checks
 
 - **`app`** (Streamlit): Docker `HEALTHCHECK` hits Streamlit's own built-in
@@ -179,7 +199,8 @@ solves none of that on its own.
   orchestrator's native secret mechanism. Don't bake secrets into a custom
   image layer (they'd persist in image history even if a later layer
   removes the file).
-- `DB_PASSWORD`/`DB_CONNECTION_STRING`/`API_AUTH_TOKEN` are wrapped in
+- `DB_PASSWORD`/`DB_CONNECTION_STRING`/`API_AUTH_TOKEN`/
+  `RAG_STORE_CONNECTION_STRING`/`WEB_SEARCH_API_KEY` are wrapped in
   `security.secrets.SecretStr` the moment `Settings` is constructed — never
   logged in plaintext by this app's own code (`SECURITY.md`). This does
   not protect against `docker compose config` rendering your `.env` values

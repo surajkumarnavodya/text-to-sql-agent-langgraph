@@ -374,3 +374,200 @@ is deliberately computed from the pre-value-sampling tables: if it were
 computed from the sample-enriched DDL, incidental data changes (a new
 distinct color appearing in a `Color` column, say) would force a full
 re-embed on every build even though nothing schema-*shaped* had changed.
+
+## 4. Multi-source orchestration
+
+Optional, off by default (`ENABLE_MULTI_SOURCE_ROUTER=false`). When off,
+`agent.orchestrator.graph.run_orchestrated` — the one entry point
+`ui/app.py`/`api/main.py` call — is a pure pass-through to
+`agent.graph.run_agent`: the orchestrator graph below is never even
+constructed, so everything in sections 1–3 above is exactly as accurate for
+a plain SQL-only setup with the flag on as with it off. See
+`docs/MULTI_SOURCE_GUIDE.md` for how to turn each source on.
+
+```mermaid
+flowchart TD
+    START(["run_orchestrated(question)"]) --> ROUTER["router_node<br/>get_available_sources() + classify_sources()"]
+    ROUTER -->|"only 1 source configured<br/>(short-circuit, 0 LLM calls)"| SQLSUB
+    ROUTER -->|"2+ sources: 1 LLM call picks<br/>which apply, fans out to all"| FANOUT{route_after_router<br/>returns a list}
+    FANOUT --> SQLSUB["sql_subgraph<br/>agent.graph.run_agent() — UNCHANGED"]
+    FANOUT --> DOCSUB["document_rag<br/>rag.graph.run_rag(collection='documents')"]
+    FANOUT --> POLSUB["policy_rag<br/>rag.graph.run_rag(collection='policies')"]
+    FANOUT --> WEBSUB["web_search<br/>search.web_search.web_search()"]
+    SQLSUB --> SYN
+    DOCSUB --> SYN
+    POLSUB --> SYN
+    WEBSUB --> SYN
+    SYN["synthesis_node<br/>pass-through if 1 source fired;<br/>labeled per-source attribution if 2+"]
+    SYN --> ENDOK(["END — sources_used + synthesized_answer (if 2+)"])
+```
+
+### Router: availability, then classification
+
+`get_available_sources(settings)` (`agent/orchestrator/nodes.py`) always
+includes `"sql"` (`Settings.databases` always has ≥1 entry) and adds
+`"documents"`/`"policy"`/`"web"` only when **both** that source's
+`ENABLE_*` flag **and** the config it actually needs are present (a
+document-store connection string, a web-search API key) — an enabled flag
+alone with nothing configured behind it is not "available," since routing
+to it would just fail.
+
+With ≤1 source available, `router_node` short-circuits: no Chroma-style
+extra query, no LLM call, mirroring `embeddings.retriever.select_database`'s
+own single-database short-circuit for the exact same reason (zero
+behavior/latency change for the common case). With 2+, `classify_sources`
+makes one LLM call — a system prompt listing each available source's
+plain-language description, asking for a comma-separated subset — and
+parses the response, keeping only names actually in the available set and
+falling back to *every* available source (never zero) if the response is
+empty or unparseable, since silently dropping the question is worse than
+one or two extra subgraph calls.
+
+### Fan-out and synthesis
+
+`route_after_router` returns a **list** of destination node names, not a
+single string. LangGraph runs every named destination as its own parallel
+branch within the same graph superstep before the graph proceeds to
+`synthesis` — verified directly against this project's pinned LangGraph
+version (a small throwaway graph, not assumed from documentation) before
+this was built. This is what lets a genuinely multi-source question
+("compare policy X with the database") hit two subgraphs in one step
+rather than sequentially.
+
+`synthesis_node` is a pure pass-through when only one source fired — that
+source's own answer *is* the final answer, unedited, no LLM call spent
+restating something already complete (`state["synthesized_answer"]` stays
+`None`; the UI reads the single source's own result field directly — see
+"UI rendering" below). With 2+, it composes a plain-text answer with one
+labeled section per source (`**Database**: ...`, `**Policy**: ...`, ...) —
+never blended into one unattributed claim.
+
+**Known limitation, found during testing:** every routed subgraph receives
+the same full, un-decomposed question text, not a source-specific
+sub-question. A cleanly single-topic multi-source question retrieves fine
+on every side (verified: a combined leave-policy + sales-database question
+correctly fanned out and both sides retrieved correctly); a question that's
+really two unrelated asks mashed into one sentence can retrieve poorly on
+both sides even though each alone would work. Per-source query
+decomposition would fix this — out of scope for the initial build.
+
+### `OrchestratorState`: additive, not a replacement
+
+`agent/orchestrator/state.py`'s `OrchestratorState` *extends* `AgentState`
+(`class OrchestratorState(AgentState, total=False)`) rather than defining a
+parallel shape. `sql_subgraph_node` merges `run_agent()`'s complete return
+value into it under the exact same keys `AgentState` already uses
+(`status`, `sql`, `result_rows`, `error_history`, `attempt_history`, ...) —
+this is what keeps every existing UI read site working identically whether
+a question went through `run_agent` directly or through the orchestrator.
+The only genuinely new fields are `route_decision`, `sources_used`
+(`operator.add`-accumulated, same reducer pattern as `error_history`),
+`document_result`/`policy_result`/`web_result` (each a `SourceAnswer`:
+`answer`, `citations`, `status`), and `synthesized_answer`.
+
+### UI rendering: gated on whether SQL was actually a source
+
+`ui/app.py`'s SQL-specific rendering (schema context expander, the
+editable SQL box, Confirm and Run, the results table/chart) only renders
+when `"sql" in state.get("sources_used", ["sql"])` — the default
+(`["sql"]`) covers the router-off path, where `sources_used` doesn't exist
+at all and "sql" is implied (it's the only thing that could have produced
+that state). A single non-SQL source's answer (web/documents/policy alone)
+has nowhere else to appear, so `_render_sources_used`/
+`_render_source_answer` render it directly, with its citations, whenever
+`synthesized_answer` is absent (meaning exactly one source fired).
+
+### Document/policy agentic RAG (`rag/`)
+
+One implementation, `rag.graph.build_rag_subgraph(collection)`, serving
+both `"documents"` and `"policies"` — they're structurally identical and
+only differ in `generate_node`'s sensitivity check.
+
+```mermaid
+flowchart LR
+    A["embed query<br/>rag/embedding.py — same model as ingestion"] --> B["retrieve top-k<br/>rag.store.similarity_search<br/>(SQL Server VECTOR_DISTANCE)"]
+    B --> C{"grade relevance<br/>1 LLM call: YES/NO"}
+    C -->|"no, retries left<br/>(RAG_MAX_RETRIES)"| D["rewrite query<br/>1 LLM call"] --> B
+    C -->|"no, retries exhausted"| E(["insufficient-information<br/>fallback"])
+    C -->|yes| F{"any retrieved chunk has a<br/>sensitivity_category?"}
+    F -->|yes| G(["restricted — refuse, cite<br/>category, never call generate LLM<br/>on that content"])
+    F -->|no| H["generate grounded answer<br/>+ cite [filename] per claim"]
+```
+
+**Storage** (`rag/store.py`): SQL Server 2025+/Azure SQL native `VECTOR`
+columns (confirmed against the real target instance, including
+`VECTOR_DISTANCE('cosine', ...)`, before this was built), on a **dedicated
+connection** (`RAG_STORE_CONNECTION_STRING`) — deliberately never one of
+`Settings.databases`, since chunk/embedding storage isn't business data and
+shouldn't share a schema or connection pool with a configured database.
+Two tables in a `rag` schema: `documents` (filename, collection, upload
+date, status, chunk count, and — policies only — a hand-set
+`sensitivity_category`) and `chunks` (text, position, `VECTOR(384)`
+embedding, page number). `EMBEDDING_DIMENSIONS = 384` is fixed to the
+default embedding model's output size; changing
+`EMBEDDING_MODEL_NAME`/`RAG_EMBEDDING_MODEL_NAME` to a different-dimension
+model requires migrating this column's width too — a documented limitation,
+not a dynamic schema.
+
+One real bug found and fixed while building this: a 384-float embedding
+serialized to JSON is long enough (~7,000+ characters) that pyodbc binds it
+as `ntext` (`SQL_WLONGVARCHAR`) rather than `nvarchar`
+(`SQL_WVARCHAR`) — a driver-level length heuristic, not something this code
+controls per-parameter — and SQL Server's `VECTOR` cast rejects `ntext` as
+a source type outright ("Explicit conversion from data type ntext to
+vector is not allowed"). Fixed by casting through `NVARCHAR(MAX)` first
+(`rag.store._VECTOR_CAST`: `CAST(CAST(:embedding AS NVARCHAR(MAX)) AS
+VECTOR(384))`) — confirmed against the real error text and a minimal
+repro before being applied, not guessed.
+
+**Ingestion** (`rag/ingestion.py`): `pypdf`-based per-page text extraction
+→ character-based overlapping chunking (`RAG_CHUNK_SIZE`/
+`RAG_CHUNK_OVERLAP`, tracking which page each chunk starts on for
+citations) → embedding (`rag/embedding.py`, shared with retrieval so both
+live in the same vector space — reuses the exact same Chroma
+`DefaultEmbeddingFunction`/`SentenceTransformerEmbeddingFunction` choice
+`embeddings/schema_indexer.py` uses for schema DDL) → storage. A page whose
+extracted text is under ~20 characters is flagged as a likely
+scanned/image-only page needing OCR, rather than silently indexed as an
+empty chunk. A `rag.documents` row is created with status `"processing"`
+*before* any real work starts, so a mid-ingestion failure still leaves a
+visible, inspectable record (`"failed"` + the real error message) in the
+Knowledge Sources management view instead of vanishing silently.
+
+**Sensitivity gating**: a policy document tagged `compensation`,
+`disciplinary`, or `legal` at upload time (`rag/store.py`'s
+`SensitivityCategory`) is never summarized into an answer —
+`generate_node` checks every retrieved chunk's `sensitivity_category`
+*before* calling the LLM at all, and refuses with a fixed message if any
+are set, rather than relying on a prompt instruction the model might not
+follow. This app has no per-user authorization system to check who's
+allowed to see restricted policy content, so failing closed here is the
+only honest option — the same philosophy as `agent/sql_validator.py`'s
+`SAFETY_VIOLATION_TYPES` (a gate that doesn't open, not a mistake worth
+coaching through), applied to a document/chunk tag instead of a
+`(table, column)` pair.
+
+**Untrusted content**: `_GENERATE_SYSTEM_PROMPT` explicitly instructs the
+model to treat retrieved chunk text as data, never as instructions, even
+if it appears to contain commands — the same principle
+`agent/llm_client.py`'s system prompt already applies to database-sourced
+content, extended to cover a poisoned/malicious uploaded PDF, this
+feature's realistic injection vector.
+
+### Live web search (`search/web_search.py`)
+
+Provider-configurable, shaped exactly like `db/connection.py`'s
+`SUPPORTED_DB_TYPES`: `SUPPORTED_SEARCH_PROVIDERS` maps a provider name to
+its call function, so `WEB_SEARCH_PROVIDER` is a `.env` change, not a code
+change. Only `tavily` is implemented today (a plain `httpx.post` to
+Tavily's REST API — no vendor SDK dependency). Every result is wrapped in
+a fixed `WebResult` (`title`, `url`, `snippet`, `retrieved_at`) before it
+ever reaches a prompt.
+
+`agent.orchestrator.nodes.web_search_node` frames results as external/live/
+untrusted in the generation prompt, and the generated answer text always
+opens with "According to a live web search:" — never presented as if it
+came from the company's own systems. Same "data, not instructions"
+untrusted-content principle as ingested PDF content, since a search
+result's content is exactly as attacker-influenceable as a stored database
+value or an uploaded document.

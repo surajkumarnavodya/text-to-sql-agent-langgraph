@@ -254,6 +254,68 @@ those alone — the SELECT-only allowlist and read-only connection are what
 actually bound the consequences if a poisoned value ever does influence
 what the model generates.
 
+## Multi-source RAG and web search (optional, off by default)
+
+Everything in this section only exists when `ENABLE_MULTI_SOURCE_ROUTER=true`
+**and** the specific source's own flag/config is set — see
+`docs/MULTI_SOURCE_GUIDE.md`. With the router off (the default), none of
+this code path runs at all.
+
+- **Document/policy content is untrusted the moment it's retrieved,** the
+  same principle as "Database content is untrusted input too" above,
+  applied to a PDF instead of a database row. `rag/graph.py`'s
+  `_GENERATE_SYSTEM_PROMPT` explicitly instructs the model to treat every
+  retrieved excerpt as data to reason about, never as instructions to
+  follow, even if the excerpt's text looks like a command — a malicious or
+  poisoned uploaded PDF is this feature's realistic injection vector, and
+  anyone who can upload a PDF (there is no per-user authorization on the
+  Knowledge Sources page — see below) can attempt it.
+- **Live web search results are the least-trusted input source in this
+  whole system**, and are treated accordingly:
+  `agent.orchestrator.nodes.web_search_node`'s generation prompt applies
+  the identical "data, not instructions" framing, and the generated answer
+  always opens with "According to a live web search:" so it can never be
+  mistaken for something from the company's own systems. Nothing from a
+  web result is ever concatenated into SQL, a file path, or anything else
+  executable — only into prompt text, same as every other untrusted-input
+  category in this document.
+- **Policy sensitivity gating fails closed by construction, not by prompt
+  instruction.** A policy document tagged `compensation`/`disciplinary`/
+  `legal` at upload time (`rag/store.py`'s `SensitivityCategory`) has its
+  chunks checked *before* `rag/graph.py`'s `generate_node` ever calls the
+  LLM — if any retrieved chunk is tagged, generation is skipped entirely
+  and a fixed refusal message is returned instead. This exists because the
+  app has **no per-user authorization system** to check who's allowed to
+  see restricted content — the same reasoning as this document's "Not
+  designed for multi-tenant or production deployment" note below, applied
+  to a new data type. **This blocks everyone equally, not just
+  unauthorized users** — it is not real access control, it is "don't show
+  this content through this feature at all."
+- **New secrets, same `SecretStr` treatment.** `RAG_STORE_CONNECTION_STRING`
+  and `WEB_SEARCH_API_KEY` are wrapped in `security.secrets.SecretStr` the
+  moment `Settings` is constructed, identically to `DB_PASSWORD`/
+  `DB_CONNECTION_STRING`/`API_AUTH_TOKEN` — never logged in plaintext by
+  this app's own code, `repr()`/`%r`-redacted as a defense-in-depth layer
+  against an accidental debug dump. The RAG store is a genuinely separate
+  SQL Server connection/database from any `DB_CONNECTIONS` business
+  database (see `CLAUDE.md`'s "Document/policy agentic RAG" section for
+  why) — a compromised RAG-store credential exposes ingested document
+  chunks, not business data, and vice versa.
+- **The Knowledge Sources upload page has no access control of its own** —
+  same posture as the rest of this app (see "Not designed for multi-tenant
+  or production deployment" below): anyone who can reach the Streamlit UI
+  can upload to either collection, including the sensitivity-gated one
+  (they just can't get the LLM to summarize sensitive content back to them
+  afterward). Put this behind the same authenticating reverse proxy you'd
+  use for the rest of the app before exposing it beyond a trusted network.
+- **The web search API key leaves the machine** — the one exception to
+  this project's "fully local, no network calls" posture (see README).
+  `search/web_search.py` makes an outbound HTTPS call to the configured
+  provider (Tavily by default) carrying the question text and the API key;
+  this is inherent to using a hosted search API, not a bug, but worth
+  knowing if "no data leaves the machine" was part of why you chose this
+  project — it's no longer true once `ENABLE_WEB_SEARCH` is on.
+
 ## Resource exhaustion / abuse protections
 
 Two independent, deliberately simple protections guard against both

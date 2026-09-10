@@ -143,6 +143,57 @@ mismatch between what was claimed and what existed.
 
 ---
 
+## 2026-09-10 — Multi-source RAG + web search: new secrets, new sensitivity gate, new untrusted-content surface
+
+**Change:** An optional, off-by-default (`ENABLE_MULTI_SOURCE_ROUTER=false`)
+multi-source router (`agent/orchestrator/`) was added in front of the
+existing SQL pipeline, plus three new sources behind their own independent
+flags — document RAG, policy RAG, and live web search
+(`docs/MULTI_SOURCE_GUIDE.md`). This adds to `docs/security-changelog.md`'s
+scope the same way the REST API entry above did (a new security-relevant
+surface, not a change to an existing threshold value):
+
+1. **Two new secrets**, `RAG_STORE_CONNECTION_STRING` and
+   `WEB_SEARCH_API_KEY`, both `SecretStr`-wrapped identically to
+   `DB_PASSWORD`/`API_AUTH_TOKEN`.
+2. **A new sensitivity-classification mechanism**, `rag/store.py`'s
+   `SensitivityCategory` (`compensation`, `disciplinary`, `legal`),
+   extending `GOVERNANCE.md`'s "Data classification policy" from
+   `(table, column)` pairs to whole policy documents/chunks — a chunk
+   tagged with any of these three categories is never summarized into an
+   answer, checked before generation is ever attempted, not relying on a
+   prompt instruction.
+3. **A new untrusted-content surface**: retrieved PDF chunk text and live
+   web search results are both framed as data, never instructions, in
+   their respective generation prompts (`rag/graph.py`,
+   `agent.orchestrator.nodes.web_search_node`) — the same principle
+   `SECURITY.md` already applies to database-sourced content, extended to
+   two new input channels a malicious upload or a compromised/adversarial
+   search result could exploit.
+4. **One new outbound network call**: web search sends the question text
+   to a third-party API (Tavily by default) — the one exception to this
+   project's otherwise fully-local posture, and only when
+   `ENABLE_WEB_SEARCH` is explicitly turned on.
+
+No change to the SQL validator's allowlist, the existing column-sensitivity
+config, or any existing rate-limit/cost threshold.
+
+**Why:** Requested as part of evolving this project from a single-source
+Text-to-SQL agent into a multi-source agentic RAG system (customer/sales/
+financial/support-ticket data via SQL, PDF documents, sensitive HR/company
+policy documents, and live web search) — each new source was given its own
+safety boundary rather than treated as automatically safe because it's
+read-only, per this project's own stated design principle for the work.
+
+**Status:** Permanent, all four sources off by default. New regression
+coverage: `tests/test_orchestrator.py` (router availability, LLM
+classification + fallback, fan-out, synthesis attribution). `rag/` and
+`search/` themselves were verified against real SQL Server 2025/Tavily/
+Ollama instances during development rather than a mocked unit-test suite
+— see `CLAUDE.md`'s "Known gaps" section for the follow-up this leaves.
+
+---
+
 <!--
 Template for new entries — copy this block:
 

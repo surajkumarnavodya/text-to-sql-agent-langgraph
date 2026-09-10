@@ -523,3 +523,55 @@ def strip_row_limit(sql: str, dialect: str | None = DEFAULT_DIALECT) -> str:
         )
     statement.set("limit", None)
     return statement.sql(dialect=dialect)
+
+
+def qualify_table_schema(
+    sql: str, schema: str | None, dialect: str | None = DEFAULT_DIALECT
+) -> str:
+    """Schema-qualifies every unqualified table reference, for execution only.
+
+    An engine resolves an unqualified table name (`FROM Employee`) against
+    the *connecting user's own default schema* -- which has no guaranteed
+    relationship to `Settings.databases[i].db_schema` (`DB_<NAME>_SCHEMA`),
+    the schema introspection was restricted to. A database whose tables all
+    live under a non-default schema (e.g. `employee.Employee`, with the
+    connection's actual default schema being `dbo`) will otherwise fail
+    every query with "Invalid object name", even though the table genuinely
+    exists -- the model has no way to know to qualify it, because nothing
+    it's shown (the DDL, `table_descriptions.yaml`) ever mentions a schema;
+    both are deliberately keyed by bare table name (see CLAUDE.md's
+    multi-database note on why).
+
+    Applied only to a throwaway copy of the SQL text passed to
+    `db.execution.execute_readonly_sql`, in `execute_sql_node`/`ui/app.py`'s
+    "Confirm and Run" -- `state["sql"]` itself (and everything that reads it:
+    the schema-anomaly and restricted-column checks above, `table_descriptions`
+    lookups, the UI's editable SQL box, insight generation) is never touched,
+    since all of those are keyed by the same bare table names the model was
+    shown and must keep matching them.
+
+    A table reference that's already schema-qualified (by the model, or
+    because it's genuinely in a different schema on purpose) is left alone --
+    this only fills in a *missing* schema, never overrides one.
+
+    Args:
+        sql: Already-validated, row-limited SQL text (the output of
+            `enforce_row_limit`).
+        schema: The selected database's configured schema
+            (`DatabaseConnectionConfig.db_schema`), or None. A no-op when
+            None -- the common case, since most configured databases either
+            have no non-default schema at all or (dialects with a session
+            search path, e.g. Postgres) resolve it without this.
+        dialect: sqlglot dialect to parse/render with.
+
+    Returns:
+        SQL text with every previously-unqualified table reference
+        prefixed with `schema`, or the input unchanged if `schema` is None.
+    """
+    if not schema:
+        return sql
+    statement = sqlglot.parse_one(sql, read=dialect)
+    for table in statement.find_all(exp.Table):
+        if not table.args.get("db"):
+            table.set("db", exp.to_identifier(schema))
+    return statement.sql(dialect=dialect)

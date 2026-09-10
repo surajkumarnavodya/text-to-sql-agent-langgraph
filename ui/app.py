@@ -34,6 +34,7 @@ from __future__ import annotations
 import html
 import logging
 import sys
+import time
 import uuid
 from pathlib import Path
 
@@ -49,9 +50,9 @@ from sqlalchemy.exc import SQLAlchemyError
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from agent.exceptions import SchemaRetrievalError
-from agent.graph import run_agent
+from agent.orchestrator.graph import run_orchestrated
 from agent.rate_limit import QUESTION_LIMIT_MESSAGE, SlidingWindowRateLimiter
-from agent.sql_validator import enforce_row_limit, validate_sql
+from agent.sql_validator import enforce_row_limit, qualify_table_schema, validate_sql
 from config.settings import configure_logging, get_settings
 from db.connection import (
     ConnectionTestResult,
@@ -425,6 +426,12 @@ if "active_entry_id" not in st.session_state:
     st.session_state.active_entry_id = None
 if "display_sql" not in st.session_state:
     st.session_state.display_sql = None
+if "display_duration_seconds" not in st.session_state:
+    # Wall-clock time of the most recent "Confirm and Run" execution -- set
+    # right alongside display_result/display_sql below, cleared the same way
+    # (None means "no confirmed execution yet, or the SQL box no longer
+    # matches what was run" -- same staleness rule as display_sql itself).
+    st.session_state.display_duration_seconds = None
 if "enable_insight" not in st.session_state:
     st.session_state.enable_insight = True  # default ON -- see sidebar toggle
 if "question_rate_limiter" not in st.session_state:
@@ -546,6 +553,11 @@ with st.sidebar:
                         st.session_state.active_entry_id = entry.entry_id
                         st.session_state.current_agent_state = entry.final_state
                         st.session_state.editable_sql = entry.sql or ""
+                        # None in all three branches: this is restoring a past
+                        # history entry's already-confirmed result, not a live
+                        # execution -- no wall-clock duration was recorded for
+                        # it, so showing one here would be fabricated.
+                        st.session_state.display_duration_seconds = None
                         if entry.confirmed_columns is not None:
                             st.session_state.display_result = (
                                 entry.confirmed_columns,
@@ -574,7 +586,7 @@ with st.sidebar:
                         else:
                             with st.spinner("Re-running against the live database..."):
                                 prior_context = build_conversation_history(history)
-                                rerun_state = run_agent(
+                                rerun_state = run_orchestrated(
                                     entry.question,
                                     prior_context,
                                     enable_insight=st.session_state.enable_insight,
@@ -587,6 +599,7 @@ with st.sidebar:
                             st.session_state.display_result = None
                             st.session_state.display_error = None
                             st.session_state.display_sql = None
+                            st.session_state.display_duration_seconds = None
 
         if st.button("🗑️ Clear history", use_container_width=True):
             st.session_state.query_history = clear_history()
@@ -596,6 +609,7 @@ with st.sidebar:
             st.session_state.display_result = None
             st.session_state.display_error = None
             st.session_state.display_sql = None
+            st.session_state.display_duration_seconds = None
 
 
 # --------------------------------------------------------------------------
@@ -717,7 +731,7 @@ if question:
                     with st.spinner(
                         "Retrieving schema, generating SQL, self-correcting if needed..."
                     ):
-                        final_state = run_agent(
+                        final_state = run_orchestrated(
                             question, prior_context, enable_insight=st.session_state.enable_insight
                         )
                     st.session_state.nl_question_cache[cache_key] = final_state
@@ -731,6 +745,7 @@ if question:
             st.session_state.display_result = None
             st.session_state.display_error = None
             st.session_state.display_sql = None
+            st.session_state.display_duration_seconds = None
 
             if final_state.get("status") == "rate_limited":
                 # Distinct from "rejected": a temporary, systemic load
@@ -775,6 +790,19 @@ if question:
                 st.session_state.chat_history.append(
                     {"role": "assistant", "content": f"Failed: {explanation}"}
                 )
+            elif "sql" not in final_state.get("sources_used", ["sql"]):
+                # A non-SQL source (or sources) answered this -- "sql" being
+                # absent from sources_used is only possible via the
+                # multi-source router (agent/orchestrator/nodes.py); the
+                # default router-off path always implies "sql" (see
+                # _is_sql_result's docstring in the "Current turn" section
+                # below, which is where the actual answer text is rendered
+                # -- this is just the lightweight chat-log confirmation,
+                # matching the "Generated SQL." line's role for the SQL path.
+                sources_used = list(dict.fromkeys(final_state.get("sources_used", [])))
+                summary = f"Answered using: {', '.join(sources_used)}."
+                st.markdown(summary)
+                st.session_state.chat_history.append({"role": "assistant", "content": summary})
             else:
                 if final_state.get("followup_classification") == "followup":
                     resolved_against = final_state.get("followup_resolved_against") or {}
@@ -807,6 +835,120 @@ _OUTCOME_ICONS = {
 }
 
 
+def _stage_duration_seconds(stage_timings: list[dict], stage: str) -> float:
+    """Sums `state['stage_timings']` durations for one node/stage, in seconds.
+
+    Summed rather than "just the latest" because a retried question re-enters
+    a stage (e.g. `retrieve_schema` on a missing_reference retry, or
+    `generate_sql`/`validate_sql`/`execute_sql` on any retry) -- see
+    `agent.state.StageTiming`'s own docstring on why one entry per *call* is
+    the point: this is "total time actually spent in this stage across the
+    whole run," not just the last attempt's cost.
+    """
+    return sum(t["duration_ms"] for t in stage_timings if t["stage"] == stage) / 1000.0
+
+
+def _render_stage_timings(stage_timings: list[dict]) -> None:
+    """ "Time taken to get the schema and query" -- a concise per-stage timing
+    line, from the agent's own internal run (not the later, separate
+    "Confirm and Run" wall-clock time -- see display_duration_seconds for
+    that)."""
+    if not stage_timings:
+        return
+    schema_s = _stage_duration_seconds(stage_timings, "retrieve_schema")
+    generate_s = _stage_duration_seconds(stage_timings, "generate_sql")
+    execute_s = _stage_duration_seconds(stage_timings, "execute_sql")
+    st.caption(
+        f"⏱️ Schema retrieval: {schema_s:.2f}s · SQL generation: {generate_s:.2f}s · "
+        f"Query execution: {execute_s:.2f}s"
+    )
+
+
+_SOURCE_CHIP_LABELS = {
+    "sql": "🗄️ Database",
+    "documents": "📄 Documents",
+    "policy": "🔒 Policy",
+    "web": "🌐 Web (external, live)",
+}
+
+
+def _is_sql_result(state: dict) -> bool:
+    """True when this run's SQL-specific fields (schema context, the editable
+    SQL box, Confirm and Run, results table) are meaningful to show.
+
+    `sources_used` is only ever set by the orchestrator (see
+    `agent/orchestrator/nodes.py`) -- a plain `agent.graph.run_agent` result
+    (the default, router-off path) has no such key at all, in which case
+    "sql" is implied (it's the only thing that could have produced this
+    state). When the router *is* on and picked only non-SQL source(s) (a
+    pure web/document/policy question), "sql" is absent from
+    `sources_used`, and none of the SQL-specific UI below applies -- there
+    is no SQL, no schema context, nothing to confirm and run.
+    """
+    return "sql" in state.get("sources_used", ["sql"])
+
+
+_SOURCE_RESULT_LABELS: dict[str, str] = {
+    "document_result": "📄 Documents",
+    "policy_result": "🔒 Policy",
+    "web_result": "🌐 Web (external, live)",
+}
+
+
+def _render_source_answer(label: str, result: dict) -> None:
+    st.markdown(f"**{label}**")
+    # No unsafe_allow_html -- this text can carry content sourced from an
+    # uploaded PDF or a live web result, both untrusted relative to this
+    # app's own UI (rag/graph.py's generate-node prompt treats that content
+    # as data, never instructions; this is the same principle applied to
+    # rendering -- never raw HTML either).
+    st.markdown(result.get("answer") or "(no answer)")
+    citations = result.get("citations") or []
+    if citations:
+        cited = ", ".join(dict.fromkeys(c["filename"] for c in citations))
+        st.caption(f"Sources: {cited}")
+
+
+def _render_sources_used(state: dict) -> None:
+    """ "Sources used" indicator -- only meaningful once ENABLE_MULTI_SOURCE_ROUTER
+    is on (see agent/orchestrator/graph.py); a plain SQL-only run never sets
+    more than `["sql"]`, so this stays a single quiet chip in that case
+    rather than a new thing to explain for the common setup.
+
+    Also where a non-SQL source's actual answer gets rendered: the
+    SQL-specific block below this function's call site only ever fires when
+    `_is_sql_result(state)` is true, so a pure web/document/policy answer
+    has nowhere else to appear.
+    """
+    sources_used = list(dict.fromkeys(state.get("sources_used", [])))
+    if not sources_used:
+        return
+    chips = " ".join(f"`{_SOURCE_CHIP_LABELS.get(s, s)}`" for s in sources_used)
+    st.caption(f"🔗 Sources used: {chips}")
+
+    synthesized = state.get("synthesized_answer")
+    if synthesized:
+        st.markdown("🧩 **Synthesized answer**")
+        # No unsafe_allow_html here (unlike the AI-insight callout above) --
+        # this text can carry content sourced from an uploaded PDF or a live
+        # web result, both untrusted relative to this app's own UI (same
+        # principle as rag/graph.py's generate-node prompt treating that
+        # content as data, never as instructions -- here it's "never as raw
+        # HTML" instead). Plain st.markdown still renders the **bold**
+        # section labels from synthesis_node; it just never interprets a
+        # literal HTML tag if one showed up in retrieved content.
+        st.markdown(synthesized)
+        return
+
+    # No synthesis means 1 source fired (see synthesis_node's docstring) --
+    # if that one source wasn't SQL, its answer is only ever in one of these
+    # three fields, and nothing else in this file renders them.
+    for key, label in _SOURCE_RESULT_LABELS.items():
+        result = state.get(key)
+        if result:
+            _render_source_answer(label, result)
+
+
 def _render_attempt_timeline(attempt_history: list[dict]) -> None:
     if not attempt_history:
         return
@@ -829,15 +971,21 @@ def _render_attempt_timeline(attempt_history: list[dict]) -> None:
 state = st.session_state.current_agent_state
 if state:
     _render_attempt_timeline(state.get("attempt_history", []))
+    # Always rendered, unlike everything below: a pure web/document/policy
+    # answer (no "sql" in sources_used) has no other place to appear -- see
+    # _is_sql_result's docstring for why the rest of this section is gated
+    # on SQL specifically having been one of the sources.
+    _render_sources_used(state)
 
-if state and state.get("status") not in (
-    "failed",
-    "needs_clarification",
-    "rejected",
-    "rate_limited",
+if (
+    state
+    and _is_sql_result(state)
+    and state.get("status") not in ("failed", "needs_clarification", "rejected", "rate_limited")
 ):
     if _multi_db and state.get("selected_database"):
         st.caption(f"🧭 Routed to database: **{state['selected_database']}**")
+
+    _render_stage_timings(state.get("stage_timings", []))
 
     with st.expander("🔍 Retrieved schema context", expanded=False):
         tables = state.get("schema_tables", [])
@@ -887,29 +1035,43 @@ if state and state.get("status") not in (
         if not validation.is_valid:
             st.session_state.display_result = None
             st.session_state.display_error = f"Rejected: {validation.error}"
+            st.session_state.display_duration_seconds = None
         else:
             assert validation.normalized_sql is not None  # guaranteed when is_valid is True
             safe_sql = enforce_row_limit(
                 validation.normalized_sql, settings.max_result_rows, dialect=dialect
             )
             st.session_state.editable_sql = safe_sql
+            # Schema-qualifies unqualified table references for this
+            # execution only -- see qualify_table_schema's docstring.
+            # safe_sql itself (the editable SQL box, display_sql, history)
+            # stays exactly what's shown/editable, bare table names intact.
+            execution_sql = qualify_table_schema(safe_sql, db_config.db_schema, dialect=dialect)
             active_id = st.session_state.active_entry_id
             active_entry = next(
                 (e for e in st.session_state.query_history if e.entry_id == active_id), None
             )
             try:
                 with st.spinner("Running query..."):
+                    # Wall-clock time of this execution as the user actually
+                    # experiences it -- includes a cache hit collapsing to
+                    # ~0s if _run_readonly_query (st.cache_data) has already
+                    # run this exact SQL text before, which is accurate, not
+                    # a bug: it really did take that long this time.
+                    _query_start = time.perf_counter()
                     columns, rows = _run_readonly_query(
-                        safe_sql,
+                        execution_sql,
                         settings.query_timeout_seconds,
                         settings.max_result_rows,
                         st.session_state.session_token,
                         selected_db_name,
                         _engine=get_read_only_engine(db_config),
                     )
+                    query_duration_seconds = time.perf_counter() - _query_start
                 st.session_state.display_result = (columns, rows)
                 st.session_state.display_error = None
                 st.session_state.display_sql = safe_sql
+                st.session_state.display_duration_seconds = query_duration_seconds
                 if active_entry is not None:
                     updated_entry = with_confirmed_result(active_entry, columns, rows)
                     st.session_state.query_history = replace_entry(
@@ -928,6 +1090,7 @@ if state and state.get("status") not in (
                 st.session_state.display_result = None
                 st.session_state.display_error = f"Execution failed: {safe_detail}"
                 st.session_state.display_sql = None
+                st.session_state.display_duration_seconds = None
                 if active_entry is not None:
                     updated_entry = with_confirmed_error(active_entry, safe_detail)
                     st.session_state.query_history = replace_entry(
@@ -942,6 +1105,11 @@ if state and state.get("status") not in (
         df = pd.DataFrame(rows, columns=columns)
 
         st.subheader(f"📊 Results ({len(df)} row{'s' if len(df) != 1 else ''})")
+        # Only shown alongside the run that actually produced it -- same
+        # staleness rule as display_sql/the AI insight below (see
+        # display_duration_seconds's session_state init comment).
+        if st.session_state.display_duration_seconds is not None:
+            st.caption(f"⏱️ Query executed in {st.session_state.display_duration_seconds:.2f}s")
 
         # Detection-only signal from execute_sql_node (see AgentState.
         # low_confidence_notice's docstring) -- only shown when the

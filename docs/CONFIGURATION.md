@@ -95,6 +95,39 @@ distributed multi-tenant rate limiter. See `SECURITY.md`,
 |---|---|---|
 | `API_AUTH_TOKEN` | *(unset)* | Optional shared bearer token required on `/ask`/`/schema/tables`. A lightweight hook, not real auth — see `docs/API.md`. |
 
+## Multi-source router (optional, off by default)
+
+See [`docs/MULTI_SOURCE_GUIDE.md`](MULTI_SOURCE_GUIDE.md) for a walkthrough
+of turning each of these on; [`docs/ARCHITECTURE.md`](ARCHITECTURE.md#4-multi-source-orchestration)
+for how the router/subgraphs work internally.
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `ENABLE_MULTI_SOURCE_ROUTER` | `false` | Routes questions through `agent.orchestrator.graph.run_orchestrated` instead of calling `agent.graph.run_agent` directly. Off means the orchestrator graph is never even constructed — a pure pass-through. |
+
+### Document/policy RAG store
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `RAG_STORE_CONNECTION_STRING` | *(unset)* | SQLAlchemy connection string for a **dedicated** SQL Server 2025+/Azure SQL database (native `VECTOR` column type — `rag/store.py`). Never reuse a `DB_CONNECTIONS` business database. Required for `ENABLE_DOCUMENT_RAG`/`ENABLE_POLICY_RAG` to actually work; `SecretStr`-wrapped. |
+| `RAG_STORE_ODBC_DRIVER` | `ODBC Driver 17 for SQL Server` | Same meaning as `DB_ODBC_DRIVER`, for the RAG store connection. |
+| `ENABLE_DOCUMENT_RAG` | `false` | Offers the general "documents" collection to the router. Needs `RAG_STORE_CONNECTION_STRING` too. |
+| `ENABLE_POLICY_RAG` | `false` | Offers the separate, more access-sensitive "policies" collection. Independent of `ENABLE_DOCUMENT_RAG`. |
+| `RAG_TOP_K` | `4` | Chunks retrieved per question, per collection. |
+| `RAG_MAX_RETRIES` | `2` | Query-rewrite retries in the agentic RAG subgraph before falling back to "insufficient information." |
+| `RAG_CHUNK_SIZE` | `1200` | Target chunk length (characters) when splitting an ingested PDF's text. |
+| `RAG_CHUNK_OVERLAP` | `150` | Character overlap between consecutive chunks. |
+| `RAG_EMBEDDING_MODEL_NAME` | *(blank = reuse `EMBEDDING_MODEL_NAME`)* | Embedding model for document/policy chunks, if it needs to differ from schema retrieval's. |
+
+### Live web search
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `ENABLE_WEB_SEARCH` | `false` | Offers the web_search node to the router. Needs `WEB_SEARCH_API_KEY` too. |
+| `WEB_SEARCH_PROVIDER` | `tavily` | Selects the provider (`search/web_search.py::SUPPORTED_SEARCH_PROVIDERS`). Only `tavily` is implemented today. |
+| `WEB_SEARCH_API_KEY` | *(unset)* | API key for the configured provider. Get a Tavily key at [tavily.com](https://tavily.com). `SecretStr`-wrapped. |
+| `WEB_SEARCH_MAX_RESULTS` | `5` | Max results requested per search call. |
+
 ## Validation behavior worth knowing
 
 - **Missing vs. malformed are treated differently.** A missing `DB_HOST`
@@ -105,6 +138,7 @@ distributed multi-tenant rate limiter. See `SECURITY.md`,
   `Settings` construction — see `config/settings.py::_env_optional_int_strict`.
 - **Security-relevant values are validated for sanity, not just type.**
   `MAX_RETRIES`, `MAX_RESULT_ROWS`, both rate limits, both cost thresholds,
+  `RAG_TOP_K`, `RAG_MAX_RETRIES`, `RAG_CHUNK_SIZE`, `WEB_SEARCH_MAX_RESULTS`,
   etc. must be positive; `COST_MODERATE_ROW_THRESHOLD` must be strictly
   less than `COST_HIGH_ROW_THRESHOLD`; `LOG_REDACTION_LEVEL` must be
   `standard` or `strict` — all enforced in
