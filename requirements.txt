@@ -58,3 +58,11 @@ black==24.10.0
 ruff==0.8.4
 mypy==1.13.0
 types-PyYAML==6.0.12.20260815
+
+# --- Docs build (not required to run the app) ---
+# Pure-Python PDF generation for scripts/build_user_guide_pdf.py, the actual
+# source of docs/User_Guide.pdf -- see that script's docstring. Previously a
+# standalone binary with no checked-in source or build tool (three prior
+# revisions were each hand-authored outside the repo); this replaces that
+# with a reproducible build from USER_GUIDE.md's own content.
+reportlab==5.0.1
