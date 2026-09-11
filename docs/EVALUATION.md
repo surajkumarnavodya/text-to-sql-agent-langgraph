@@ -113,6 +113,24 @@ this audit's hardening pass (see `docs/PRODUCTION_READINESS_REPORT.md`'s
 scope decisions) — flagged here as a concrete, evidenced limitation rather
 than a hypothetical one.
 
+> **Note (2026-09-11, this trace predates the fix):** a separate, since-
+> reproduced case of this same "deterministic retry regenerates the same
+> wrong SQL" pattern was traced to a specific, fixable root cause — a
+> nested-aggregate shape (`AVG(CASE WHEN ... THEN SUM(x) ELSE 0 END)`,
+> used for a "year-over-year growth" question) that the error-feedback
+> prompt gave the model no useful signal to escape. `agent/sql_validator.py`
+> now catches this shape statically with a targeted rewrite hint, and the
+> retry budget quoted above (`MAX_RETRIES`) is no longer always a single
+> flat number — `agent/complexity.py` widens it adaptively for a question
+> matching this kind of "non-trivial" pattern, and a new agentic
+> query-planning + plan-conformance review pass (see
+> `docs/ARCHITECTURE.md`) gives the retry loop a semantic check beyond raw
+> driver error text. None of this has been re-benchmarked against this
+> file's measured numbers as of this note — see
+> `docs/PRODUCTION_READINESS_REPORT.md`'s addendum and
+> `docs/RISK_REGISTER.md`'s R-003 for the same caveat stated in those
+> documents' own words.
+
 ## Running it yourself
 
 ```bash

@@ -16,7 +16,7 @@ The agent is a small, explicit `StateGraph` (`agent/graph.py`), not a
 free-form ReAct-style agent. That's a deliberate choice: every possible
 transition is a named edge in a fixed graph, so the retry/error-feedback
 path is something you can read off the graph definition, not something
-that emerges from a model's own planning. The graph has **eight nodes**,
+that emerges from a model's own planning. The graph has **ten nodes**,
 not just the four covering the "happy path" of retrieval → generation →
 validation → execution — the full picture, straight from
 `agent/graph.py::build_graph()`:
@@ -28,11 +28,15 @@ flowchart TD
     SI --> CF["classify_followup<br/>standalone / follow-up / ambiguous"]
     CF -->|ambiguous| ENDCLAR(["END — needs_clarification"])
     CF --> RS["retrieve_schema<br/>ChromaDB top-k + FK-adjacency bridge"]
-    RS --> GS["generate_sql<br/>Ollama via agent/llm_client.py"]
+    RS --> PQ["plan_query<br/>LLM plan, only for complex questions"]
+    PQ --> GS["generate_sql<br/>Ollama via agent/llm_client.py"]
     GS -->|off-topic sentinel| ENDREJ2(["END — rejected"])
     GS -->|LLM/Ollama error| ENDFAIL1(["END — failed"])
     GS -->|LLM-call rate limit tripped| ENDRATE(["END — rate_limited"])
-    GS --> VS["validate_sql<br/>sqlglot AST allowlist"]
+    GS --> RV["review_sql<br/>plan-conformance check, only if planned"]
+    RV -->|plan not satisfied, retries left| GS
+    RV -->|plan not satisfied, budget exhausted| ENDFAIL6(["END — failed"])
+    RV --> VS["validate_sql<br/>sqlglot AST allowlist"]
     VS -->|safety violation, no retry| ENDFAIL2(["END — failed"])
     VS -->|retryable parse error| GS
     VS --> CE["estimate_cost<br/>non-executing EXPLAIN / SHOWPLAN"]
@@ -56,6 +60,14 @@ query **timeout**. All three are deliberate "don't retry" decisions — see
 process-wide LLM-call limiter tripped) are likewise terminal, but aren't
 failures in the same sense — they're clean, expected stops, not errors.
 
+`plan_query` and `review_sql` are the two newest nodes, and both are a
+**pure pass-through — zero LLM calls — for an ordinary question**: they
+only do real work when `agent/complexity.py::detect_complexity_signals`
+judged the question non-trivial (top-N-per-group phrasing, period-over-
+period growth, a ranking/window-function need, or several metrics
+requested at once). See "Agentic query planning and plan-conformance
+review" below.
+
 State is threaded through every node as an `AgentState` TypedDict
 (`agent/state.py`, `total=False` — each node only sets the fields it owns).
 Every node function has the same shape: take the current state, return a
@@ -66,7 +78,7 @@ lets `generate_sql` see the full trail of prior failures on a retry, and
 what lets the UI render a complete "Attempt 1: ..., Attempt 2: ..." timeline
 instead of just the latest attempt.
 
-### The eight nodes
+### The ten nodes
 
 **`sanitize_input_node`** — the graph's true entry point, before anything
 else (including follow-up classification) touches the question. Runs
@@ -100,21 +112,55 @@ is also the re-entry point on a `missing_reference` execution failure — see
 re-routed, since a retry must keep targeting the same database the failed
 attempt did.
 
+**`plan_query_node`** — the agentic query-decomposition step. Reads
+`state["complexity_signals"]` (computed once, up front, by `run_agent()` —
+see "Agentic query planning and plan-conformance review" below) and, only
+when that list is non-empty *and* `ENABLE_QUERY_PLANNING` is on, makes one
+LLM call asking the model to break the question into a short ordered plan
+(grouping columns, metrics, filters, whether a top-N-per-group ranking or a
+period-over-period comparison needs a window function) **before** any SQL
+is written. The plan is stored in `state["query_plan"]` and injected into
+every subsequent `generate_sql` attempt's prompt for this question. An
+ordinary question — the overwhelming common case — matches no complexity
+signal, so this node returns immediately with `query_plan = None` and adds
+no latency. Fails open on any planning failure (unreachable Ollama, an
+unparseable response): logged, `query_plan` stays `None`, never a reason
+the question can't be answered.
+
 **`generate_sql_node`** — checks the process-wide LLM-call rate limiter
 (`agent.rate_limit.get_llm_call_limiter`) before every attempt, including
 retries; a denial ends the run immediately at `status="rate_limited"`,
 never retried (see `agent/rate_limit.py`'s docstring for why the retry
 loop specifically needs its own, stricter limit, separate from the
 question-submission limiter the UI enforces per session). Otherwise calls
-Ollama (`agent/llm_client.py`) with the schema context and, on a retry,
-the previous SQL plus the specific error that came back (with a
-category-specific hint — e.g. "you referenced a column that doesn't
-exist, use only what's shown in the schema"). Returns raw SQL text, not
-yet validated. The system prompt also instructs the model to refuse (via
-a fixed sentinel) if a question isn't answerable as SQL — a second,
-independent off-topic backstop for anything `sanitize_input_node`'s
-cheaper regex pre-filter missed, which this node turns into the same
-`"rejected"` terminal state.
+Ollama (`agent/llm_client.py`) with the schema context, `state["query_plan"]`
+if `plan_query_node` produced one (rendered as a numbered "implement every
+one of these steps" block, present on every retry for this question, not
+just the first attempt), and, on a retry, the previous SQL plus the
+specific error that came back (with a category-specific hint — e.g. "you
+referenced a column that doesn't exist, use only what's shown in the
+schema", or, on a plan-conformance failure, the reviewer's own critique).
+Returns raw SQL text, not yet validated. The system prompt also instructs
+the model to refuse (via a fixed sentinel) if a question isn't answerable
+as SQL — a second, independent off-topic backstop for anything
+`sanitize_input_node`'s cheaper regex pre-filter missed, which this node
+turns into the same `"rejected"` terminal state.
+
+**`review_sql_node`** — the plan-conformance self-correction step, and the
+`plan_query_node`/`review_sql_node` pair's other half. Only makes an LLM
+call when `state["query_plan"]` is a non-empty list — nothing to check
+against otherwise, so this is a zero-cost pass-through for the overwhelming
+common case, exactly like `plan_query_node`. When there is a plan, one LLM
+call checks whether the just-generated SQL actually implements every step
+and returns a `PASS`/`FAIL: <reason>` verdict. A `FAIL` is treated exactly
+like any other retryable correctness mistake: the critique becomes this
+attempt's error feedback and the graph loops back to `generate_sql`,
+**sharing the same `retry_count`/`state["max_retries"]` budget** as every
+other retryable failure category — not a second, unbounded critique loop
+layered on top of the first. Fails open on any review failure (unreachable
+Ollama, an unparseable verdict): treated as a pass, since the validator and
+execution layers immediately downstream are still the real safety net
+regardless of what this step decides.
 
 **`validate_sql_node`** — runs the candidate through
 `agent/sql_validator.py`'s allowlist (§ below) in the dialect matching
@@ -141,9 +187,9 @@ own before the agent gives up.
 **`execute_sql_node`** — runs the validated SQL against the selected
 database's own read-only engine with a row cap and timeout (§ "Execution
 safety" below), classifies any failure (`agent/error_classification.py`)
-into `TIMEOUT` / `MISSING_REFERENCE` / `SYNTAX` / `UNKNOWN`, and routes
-accordingly (§2). On success, results and row count go into state and the
-graph proceeds to `generate_insight`.
+into `TIMEOUT` / `MISSING_REFERENCE` / `AGGREGATE_NESTING` / `SYNTAX` /
+`UNKNOWN`, and routes accordingly (§2). On success, results and row count
+go into state and the graph proceeds to `generate_insight`.
 
 **`generate_insight_node`** — only reachable from `execute_sql_node`'s
 *success* path; a failed, needs-clarification, or rejected run never
@@ -164,35 +210,93 @@ here can alter the already-final `sql`/`result_rows`/`row_count`.
 
 Not every failure is treated the same way — the routing logic
 (`route_after_sanitization`, `route_after_classification`,
-`route_after_generation`, `route_after_validation`,
+`route_after_generation`, `route_after_review`, `route_after_validation`,
 `route_after_cost_estimate`, `route_after_execution` in `agent/nodes.py`)
 distinguishes failures by *what kind of mistake it was*, because "try
-again" isn't equally useful for all of them:
+again" isn't equally useful for all of them. "Up to `max_retries`" below
+means `state["max_retries"]` specifically — not always the flat
+`Settings.max_retries` value; see "Agentic query planning and
+plan-conformance review" further down for how that per-question budget is
+computed:
 
 | Failure category | Retries? | Where it routes | Why |
 |---|---|---|---|
 | Input rejected (`sanitize_input`: too long, empty, injection-pattern match, off-topic) | **Never** | `END (rejected)` | Not a mistake to coach through — the input itself is the problem. |
 | Follow-up classification ambiguous | **Never** | `END (needs_clarification)` | Fail-closed on "I don't know what you're asking" rather than guessing and possibly answering the wrong question. |
-| Parse error / ordinary validation failure | Yes, up to `MAX_RETRIES` | `generate_sql` | An ordinary correctness mistake — the model has the right context, just wrote bad SQL. |
+| Parse/empty SQL, or a nested-aggregate shape (`AVG(...SUM(...)...)`) caught statically by `agent/sql_validator.py` | Yes, up to `max_retries` | `generate_sql` | An ordinary correctness mistake — the model has the right context, just wrote bad (or structurally invalid) SQL. |
 | Safety violation (non-SELECT, stacked query, `SELECT ... INTO`, embedded write, dangerous function) | **Never** | `END (failed)` | A security-gate failure, not a mistake worth coaching through — the agent fails closed immediately regardless of remaining budget. |
 | `generate_sql` off-topic sentinel | **Never** | `END (rejected)` | The model itself judged the question unanswerable as SQL — a defense-in-depth backstop for `sanitize_input`'s pre-filter, not a correctness mistake. |
 | `generate_sql` LLM/Ollama error | **Never** | `END (failed)` | The LLM call itself never returned usable text — retrying the same call is unlikely to help within this run. |
 | LLM-call rate limit tripped | **Never** | `END (rate_limited)` | A load-shedding stop, not a correctness issue — retrying immediately would just re-trip the same limiter. |
-| Query cost estimate: **high** severity | Yes, up to `MAX_RETRIES` | `generate_sql` | Treated exactly like a correctness mistake — the model may be able to add a filter on its own. |
-| Execution error, category `SYNTAX`/`UNKNOWN` | Yes, up to `MAX_RETRIES` | `generate_sql` | Schema context was fine; the SQL text wasn't. Same retry shape as a validation failure. |
-| Execution error, category `MISSING_REFERENCE` | Yes, up to `MAX_RETRIES` | **`retrieve_schema`**, not `generate_sql` | If the SQL referenced a table/column that doesn't exist, the *wrong tables may have been retrieved* in the first place — re-running generation with the same (possibly wrong) schema context would likely repeat the mistake. This re-entry also folds the DB error text into the retrieval query and widens `top_k` (`settings.schema_top_k + 2`), since the error usually names the missing identifier — a genuinely useful extra signal for similarity search. |
+| `review_sql` plan-conformance `FAIL` verdict (only when `state["query_plan"]` is set) | Yes, up to `max_retries` | `generate_sql` | Treated exactly like a correctness mistake — the reviewer's critique (e.g. "missing the ROW_NUMBER() partition for the per-region ranking") becomes this attempt's error feedback. Shares the same budget as every other retryable category, not a separate loop. |
+| Query cost estimate: **high** severity | Yes, up to `max_retries` | `generate_sql` | Treated exactly like a correctness mistake — the model may be able to add a filter on its own. |
+| Execution error, category `SYNTAX`/`UNKNOWN`/`AGGREGATE_NESTING` | Yes, up to `max_retries` | `generate_sql` | Schema context was fine; the SQL text wasn't. `AGGREGATE_NESTING` is the execution-time backstop for a nested-aggregate shape the static validator check didn't catch (e.g. a dialect-specific aggregate `sqlglot` doesn't recognize) — same retry shape as a validation failure. |
+| Execution error, category `MISSING_REFERENCE` | Yes, up to `max_retries` | **`retrieve_schema`**, not `generate_sql` | If the SQL referenced a table/column that doesn't exist, the *wrong tables may have been retrieved* in the first place — re-running generation with the same (possibly wrong) schema context would likely repeat the mistake. This re-entry also folds the DB error text into the retrieval query and widens `top_k` (`settings.schema_top_k + 2`), since the error usually names the missing identifier — a genuinely useful extra signal for similarity search. Re-entering `retrieve_schema` also re-runs `plan_query` (schema may have changed), reusing the already-selected database. |
 | Execution error, category `TIMEOUT` | **Never** | `END (failed)` | Retrying an expensive query with the same shape wastes the whole retry budget on something a retry can't fix. The failure message suggests narrowing the question instead. |
 
-`retry_count` is incremented in `validate_sql_node`/`estimate_query_cost_node`/
-`execute_sql_node` themselves (not in the routing functions), so "retry
-vs. give up" is decided from a single, freshly-incremented count rather
-than multiple places disagreeing about how many attempts have happened.
+`retry_count` is incremented in `review_sql_node`/`validate_sql_node`/
+`estimate_query_cost_node`/`execute_sql_node` themselves (not in the
+routing functions), so "retry vs. give up" is decided from a single,
+freshly-incremented count rather than multiple places disagreeing about
+how many attempts have happened.
 
 Every attempt — successful or not — gets exactly one `AttemptRecord`
 appended to `attempt_history`: `{attempt, sql, outcome, error, will_retry}`.
 This is what the UI's "Retry timeline" expander renders directly, and
 what makes the self-correction loop demoable rather than just something
 that happens in a log file.
+
+### Agentic query planning and plan-conformance review
+
+Two more layers sit on top of the retry table above, both driven by
+`agent/complexity.py`:
+
+`detect_complexity_signals(question)` is a cheap, regex-only heuristic
+(mirroring `agent.followup.classify_followup`'s own approach — no LLM call,
+negligible cost next to a real Ollama round-trip) that flags a question as
+non-trivial when it matches one or more of four patterns: `top_n_per_group`
+("top 3 products *per region*" — as opposed to a plain "top 10 customers
+*by* revenue", which is ordinary top-N and deliberately **not** flagged),
+`growth_comparison` ("year-over-year", "compared to", "trend", ...),
+`ranking_window` ("running total", "cumulative", "moving average", ...),
+and `multi_metric` (3+ distinct metric keywords — revenue, profit, count,
+distinct, ... — in one question). `compute_max_retries(question,
+base_max_retries, max_bonus)` turns the matched signals into this
+question's effective retry budget: one extra retry per distinct signal,
+capped at `COMPLEX_QUERY_MAX_RETRY_BONUS` (default 2). `run_agent()` calls
+this exactly once, up front, and stores both the signal list
+(`state["complexity_signals"]`, kept purely for observability/logging) and
+the resulting budget (`state["max_retries"]`) — every retry-vs-give-up
+check in the table above reads `state["max_retries"]`, not the raw
+`Settings.max_retries`, via `agent.nodes._effective_max_retries`.
+
+Those same signals gate the two newest nodes (§1's diagram): `plan_query_node`
+only calls the LLM when `state["complexity_signals"]` is non-empty, and
+`review_sql_node` only calls the LLM when `plan_query_node` actually
+produced a plan (`state["query_plan"]` is a non-empty list). This is a
+deliberate design choice, not an accident of implementation: the same
+"non-trivial question" judgment that earns a question a wider retry budget
+is what earns it the extra planning + review LLM calls, so a plain question
+never pays for either — no new Chroma query, no new LLM call, no new
+latency, exactly as if `plan_query`/`review_sql` weren't in the graph at
+all. `ENABLE_QUERY_PLANNING` (default `true`) is a master switch on top of
+the signal gate — off means every question behaves exactly as it did before
+this feature existed, regardless of complexity signals.
+
+The two nodes are a decompose-then-check pair, not two independent
+features: `plan_query_node` produces the plan (a JSON array of step
+strings — the model is asked, e.g., to explicitly call out that a
+top-N-per-group result needs `ROW_NUMBER()`/`RANK()`, never `TOP`/`LIMIT`
+combined with `GROUP BY`, and that a period-over-period comparison needs
+`LAG()`/`LEAD()` on an already-aggregated result, never one aggregate
+nested inside another); `review_sql_node` then checks the *generated* SQL
+against that same plan before it ever reaches `validate_sql`. Reusing the
+existing retry infrastructure (`retry_count`/`state["max_retries"]`,
+`error_history`, `attempt_history` with `outcome="plan_not_satisfied"`) for
+a `FAIL` verdict, rather than introducing a separate critique-loop counter,
+keeps the graph's total worst-case LLM-call count boundable the same way it
+already was for every other retryable category — see `SECURITY.md` for how
+this factors into `LLM_CALL_RATE_LIMIT_PER_MINUTE` sizing.
 
 ### Execution safety
 
@@ -251,7 +355,10 @@ embeddings.retriever.retrieve_relevant_schema()  -- scoped to the
 config.table_descriptions.apply_table_description()  -- fresh from disk,
         |                                                every question
         v
-   schema_context_text  -->  generate_sql_node's prompt
+   schema_context_text  -->  plan_query_node's prompt (if the question is
+                              complex -- see "Agentic query planning and
+                              plan-conformance review" in §2) and, either
+                              way, generate_sql_node's prompt
 ```
 
 ### Live introspection, not a hardcoded schema

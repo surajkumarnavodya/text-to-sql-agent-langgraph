@@ -335,12 +335,31 @@ enforced" above; none of this replaces those).
   - **LLM generation calls** (default 20/minute, stricter,
     `LLM_CALL_RATE_LIMIT_PER_MINUTE`): process-wide, checked inside
     `generate_sql_node` before *every* attempt, including retries within
-    a single question. This is the layer that actually bounds the retry
-    loop's contribution to LLM load — the question-level limit alone
-    can't, since one stuck question can burn up to `MAX_RETRIES + 1`
-    calls on its own. Process-wide (not per-session) is a deliberate
-    simplification appropriate for one local user; see "What is
-    explicitly not guaranteed" above.
+    a single question. This is the layer that actually bounds the
+    `generate_sql` retry loop's contribution to LLM load — the
+    question-level limit alone can't, since one stuck question can burn up
+    to `state["max_retries"] + 1` calls on its own (not always the flat
+    `MAX_RETRIES` — `agent/complexity.py` widens this by up to
+    `COMPLEX_QUERY_MAX_RETRY_BONUS` for a question judged non-trivial; see
+    `docs/ARCHITECTURE.md`'s "Agentic query planning and plan-conformance
+    review"). Process-wide (not per-session) is a deliberate simplification
+    appropriate for one local user; see "What is explicitly not
+    guaranteed" above.
+
+    **Known gap, not currently covered by this limiter:** `plan_query_node`
+    (up to one call per question, or a few more on a `missing_reference`
+    retry that re-enters `retrieve_schema`) and `review_sql_node` (up to
+    one call per `generate_sql` attempt, so up to `state["max_retries"] +
+    1` more) do **not** check `get_llm_call_limiter` themselves — only
+    `generate_sql_node` does. Both are only reachable for a question that
+    already matched an `agent/complexity.py` signal (`ENABLE_QUERY_PLANNING`
+    is a global off-switch), so this doesn't change the limiter's behavior
+    for an ordinary question, but the realistic worst-case LLM-call count
+    for a *complex* question is closer to `2 * (state["max_retries"] + 1) +
+    1` (generation + review, plus one planning call) than the
+    `state["max_retries"] + 1` figure above — worth knowing when sizing
+    `LLM_CALL_RATE_LIMIT_PER_MINUTE`, and a reasonable follow-up to close
+    if this app is ever exposed beyond a single trusted local user.
 
   Both trips produce a calm, standardized message (never a raw error or
   a silent hang) and log through `agent.rate_limit`'s own logger — a

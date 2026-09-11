@@ -141,6 +141,11 @@ below, and `docs/MULTI_SOURCE_GUIDE.md` for how to configure each source.
   estimation is resolved from *that* database's `db_type`
   (`db.connection.get_connection(settings, selected_database)` +
   `get_sqlglot_dialect()`) — never a single hardcoded/global engine.
+  `complexity.py` is the source of the adaptive retry budget and the
+  planning/review gate (`detect_complexity_signals`/`compute_max_retries`,
+  see "Agentic query planning + plan-conformance self-correction" below) —
+  a cheap regex heuristic, no LLM call, computed once by `run_agent()` per
+  question.
 - `agent/orchestrator/` — the multi-source router, one level up from
   `agent/`'s own SQL-only graph, never the other way around: `nodes.py`
   (`router_node`/`classify_sources` — LLM classification only when 2+
@@ -207,7 +212,13 @@ below, and `docs/MULTI_SOURCE_GUIDE.md` for how to configure each source.
   part of the pytest suite — see `tests/` below; also demonstrates routing
   when 2+ databases are configured), `run_benchmark.py` (the Text-to-SQL
   benchmark runner — see `eval/` below; also manual/real-DB-required, not
-  part of the pytest suite).
+  part of the pytest suite), `build_user_guide_pdf.py` (rebuilds
+  `docs/User_Guide.pdf` from `USER_GUIDE.md` via `reportlab` — the actual
+  source of truth for that PDF; re-run after every `USER_GUIDE.md` edit.
+  Previously a standalone binary with no checked-in source at all, three
+  revisions hand-authored outside the repo — this replaced that with a
+  reproducible build, closing a real doc-drift gap
+  `docs/PRODUCTION_READINESS_REPORT.md` had flagged).
 - `eval/` — the Text-to-SQL benchmark: `schema.py` (dataset + result data
   model), `dataset_loader.py` (loads `eval/benchmark/*.yaml`),
   `evaluators.py` (grades one case — **execution-accuracy first**: gold
@@ -229,7 +240,12 @@ below, and `docs/MULTI_SOURCE_GUIDE.md` for how to configure each source.
 - `tests/` — pytest, all fully mocked, no real DB or Ollama required.
   Mirrors package names (`test_sql_validator.py`, `test_connection.py`,
   `test_schema_introspection.py`, `test_schema_retriever.py`,
-  `test_agent_nodes.py`), plus `test_db_router.py` (the multi-database
+  `test_agent_nodes.py` — including `TestPlanQueryNode`/`TestReviewSqlNode`
+  and the nested-aggregate `TestValidateSqlRejectsNestedAggregates` cases,
+  `test_complexity.py` (the adaptive-retry-budget heuristic, including the
+  "top N *by* metric" false-positive regression case), and
+  `test_llm_client_planning.py` (the plan/review response parsers'
+  fail-open contracts) — plus `test_db_router.py` (the multi-database
   auto-router, `embeddings.retriever.select_database`, and
   `retrieve_schema_node`'s retry-reuses-the-same-database contract),
   `test_orchestrator.py` (source availability, LLM classification parsing +
@@ -247,20 +263,71 @@ below, and `docs/MULTI_SOURCE_GUIDE.md` for how to configure each source.
 ## Key design decisions
 
 ### Self-correcting retry loop (LangGraph)
-The full graph (`agent/graph.py`) is eight nodes, not four:
-`sanitize_input → classify_followup → retrieve_schema → generate_sql →
-validate_sql → estimate_cost → execute_sql → generate_insight`. On a
-validation, cost-estimate, or execution failure, a conditional edge routes
-back to `generate_sql` (or, for a "missing reference" execution error,
-back to `retrieve_schema`) with the error message appended to the state's
-history, so the LLM sees what went wrong and can correct itself. Capped at
-`MAX_RETRIES = 3` (`config/settings.py`) — after that, the graph ends in a
-terminal `failed` state and the UI surfaces the last error rather than
-looping forever. This is the interview-relevant piece: it's a small
-explicit state machine, not a ReAct-style free-form agent, specifically so
-the retry/error-feedback path is inspectable and boundable. See
-[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the full per-node
+The full graph (`agent/graph.py`) is ten nodes, not four:
+`sanitize_input → classify_followup → retrieve_schema → plan_query →
+generate_sql → review_sql → validate_sql → estimate_cost → execute_sql →
+generate_insight`. On a review, validation, cost-estimate, or execution
+failure, a conditional edge routes back to `generate_sql` (or, for a
+"missing reference" execution error, back to `retrieve_schema`) with the
+error message appended to the state's history, so the LLM sees what went
+wrong and can correct itself. Capped at `MAX_RETRIES = 3`
+(`config/settings.py`) as a base, but not a single flat number in
+practice — `agent/complexity.py::compute_max_retries` widens it by up to
+`COMPLEX_QUERY_MAX_RETRY_BONUS` (default 2) extra attempts for a question
+whose text matches a "harder than usual" signal (top-N-per-group phrasing,
+year-over-year/period growth, several metrics at once), computed once by
+`run_agent()` and stored in `state["max_retries"]` — every retry-vs-give-up
+check reads that, not the raw setting. After the budget is exhausted, the
+graph ends in a terminal `failed` state and the UI surfaces the last error
+rather than looping forever. This is the interview-relevant piece: it's a
+small explicit state machine, not a ReAct-style free-form agent,
+specifically so the retry/error-feedback path is inspectable and boundable.
+See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the full per-node
 walkthrough and the complete retry-routing table.
+
+### Agentic query planning + plan-conformance self-correction
+`plan_query_node` (between `retrieve_schema` and `generate_sql`) and
+`review_sql_node` (between `generate_sql` and `validate_sql`) are a
+decompose-then-check pair, gated by the exact same complexity signals that
+widen the retry budget above (`state["complexity_signals"]`) and by
+`ENABLE_QUERY_PLANNING` (default `true`). For an ordinary question that
+matches no signal, both nodes are a pure pass-through — zero LLM calls,
+zero added latency, identical behavior to before this feature existed. For
+a question that does match, `plan_query_node` makes one LLM call producing
+a short ordered plan (grouping, metrics, filters, and an explicit call-out
+when a top-N-per-group ranking needs `ROW_NUMBER()`/`RANK()` instead of
+`TOP`/`LIMIT` + `GROUP BY`, or a period-over-period comparison needs
+`LAG()`/`LEAD()` instead of a nested aggregate), which is then injected
+into every `generate_sql` attempt's prompt for that question.
+`review_sql_node` makes a second LLM call checking the *generated* SQL
+against that same plan (`PASS`/`FAIL: <reason>`); a `FAIL` feeds the
+critique back into another `generate_sql` attempt, sharing the same
+`retry_count`/`state["max_retries"]` budget as every other retryable
+failure — not a second, unbounded loop. Both nodes fail open on an
+unreachable Ollama server or an unparseable response (log it, proceed as
+if there were no plan/pass the review) — this feature is an accuracy aid,
+never a reason a question can't be answered. See
+[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md#2-retry--self-correction-semantics)
+for the full reasoning.
+
+### Nested-aggregate detection (validator + execution backstop)
+A real, reproduced failure: a local model asked for something like
+"year-over-year growth" reliably reaches for `AVG(CASE WHEN ... THEN
+SUM(x) ELSE 0 END)` — an aggregate nested inside another aggregate, which
+every supported engine (`mssql`/`postgres`/`mysql`/`oracle`) rejects.
+`agent/sql_validator.py::_find_nested_aggregate` walks the `sqlglot` AST
+and catches this shape statically, before the query ever reaches the
+database (`violation_type="nested_aggregate"`, retryable, not a
+`SAFETY_VIOLATION_TYPES` failure). `agent/error_classification.py`'s
+`ExecutionErrorCategory.AGGREGATE_NESTING` is the execution-time backstop
+for whatever the static check misses (e.g. a dialect-specific aggregate
+`sqlglot` doesn't classify as `exp.AggFunc`). Both retry categories get a
+targeted rewrite hint (`agent.llm_client._ERROR_CATEGORY_HINTS`) pointing
+the model at a pre-aggregating CTE or a window function instead of nesting
+the aggregate calls. The generation system prompt also carries a standing
+rule against this shape plus two few-shot patterns (top-N-per-group via
+`ROW_NUMBER()`, period-over-period via `LAG()`) so the mistake is less
+likely in the first place, not just caught after the fact.
 
 ### Schema scoping (why ChromaDB at all)
 For a large real schema, dumping every table's DDL into the prompt burns

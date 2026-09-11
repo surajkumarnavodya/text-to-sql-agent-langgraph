@@ -20,6 +20,15 @@ open gaps.
   This was a deliberate architectural choice (`docs/ARCHITECTURE.md`'s "§1
   The LangGraph state machine": "a small, explicit `StateGraph`... not a
   free-form ReAct-style agent") specifically so this trail is inspectable.
+- **The agent's own plan, when it makes one, is shown too — not just the
+  final SQL.** For a question judged non-trivial (top-N-per-group,
+  year-over-year growth, several metrics at once), `plan_query_node`'s
+  up-front plan and `review_sql_node`'s plan-conformance check are the same
+  kind of "reasoning step," made visible rather than happening invisibly
+  inside one opaque generation call — the UI's "🧭 Query plan" expander
+  (`ui/app.py`) shows the plan itself, and a plan-conformance retry appears
+  in the same "Retry timeline" as any other self-correction attempt
+  (`outcome="plan_not_satisfied"`), not as a separate, hidden mechanism.
 - **Real accuracy numbers are published, including the unflattering ones.**
   `docs/EVALUATION.md` reports the actual latest benchmark run (35% final
   accuracy) rather than only qualitative feature-list claims. A reader

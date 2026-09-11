@@ -19,11 +19,11 @@ just read off a design doc.
 | LLM01: Prompt Injection | Layered, not eliminated | `agent/input_guard.py` (pre-filter regex), the system prompt's untrusted-data framing (`agent/llm_client.py`), and — the actual backstop — `agent/sql_validator.py`'s SELECT-only allowlist plus a read-only DB role. `SECURITY.md`'s "What is explicitly not guaranteed" is explicit that the regex layer is beatable; the SQL validator is what bounds the consequences. |
 | LLM02: Insecure Output Handling | Addressed | Generated SQL is never executed without passing `agent/sql_validator.py`'s AST-based allowlist first — every time, including hand-edited SQL in the UI (`ui/app.py`'s "Confirm and Run" re-validates). Not treated as trusted output at any point. |
 | LLM03: Training Data Poisoning | Not applicable | No model training/fine-tuning happens in this project; `llama3.1:8b` is used as-shipped via Ollama. |
-| LLM04: Model Denial of Service | Partially addressed | `agent/rate_limit.py` (question + LLM-call limits), `LLM_MAX_TOKENS`/`INSIGHT_MAX_TOKENS` caps, `QUERY_TIMEOUT_SECONDS`, `db/query_cost.py`'s pre-execution cost gate. No circuit breaker on sustained Ollama failure (`docs/RISK_REGISTER.md`'s R-006). |
+| LLM04: Model Denial of Service | Partially addressed | `agent/rate_limit.py` (question + LLM-call limits), `LLM_MAX_TOKENS`/`INSIGHT_MAX_TOKENS`/`QUERY_PLAN_MAX_TOKENS`/`SQL_REVIEW_MAX_TOKENS` caps, `QUERY_TIMEOUT_SECONDS`, `db/query_cost.py`'s pre-execution cost gate. The process-wide LLM-call limiter covers `generate_sql_node` but not the newer `plan_query_node`/`review_sql_node` calls (`docs/RISK_REGISTER.md`'s R-007) or sustained Ollama failure generally (R-006). |
 | LLM05: Supply Chain Vulnerabilities | Addressed | `requirements.txt` fully version-pinned (no unpinned/range deps); dependency-Python-version verification gap tracked as `docs/RISK_REGISTER.md`'s R-004. |
 | LLM06: Sensitive Information Disclosure | Layered | `security/redaction.py` + `security.secrets.SecretStr` for connection secrets; `config/sensitive_columns.py`'s restricted-column blocking (currently unpopulated — R-002); results/errors never logged with cell values (`observability/redaction.py`). |
 | LLM07: Insecure Plugin Design | Not applicable | No plugin/tool-calling architecture — the agent's only "tool" is the SQL execution path, itself gated by the validator. |
-| LLM08: Excessive Agency | Addressed by design | The agent never executes SQL the user hasn't implicitly approved by asking the question, and the UI additionally gates *displayed* execution behind "Confirm and Run" (`CLAUDE.md`'s "SQL is untrusted output, always"). Retries are capped (`MAX_RETRIES`) and every attempt is logged/shown, not silently expanded. |
+| LLM08: Excessive Agency | Addressed by design | The agent never executes SQL the user hasn't implicitly approved by asking the question, and the UI additionally gates *displayed* execution behind "Confirm and Run" (`CLAUDE.md`'s "SQL is untrusted output, always"). Retries are capped by a bounded, per-question budget (`MAX_RETRIES`, adaptively widened up to `COMPLEX_QUERY_MAX_RETRY_BONUS` by `agent/complexity.py` — never unbounded) and every attempt is logged/shown, not silently expanded — this now includes the agentic query-planning + plan-conformance review pass (`plan_query_node`/`review_sql_node`), which shares the same bounded budget rather than adding a second, independent loop. |
 | LLM09: Overreliance | Partially addressed | The UI shows generated SQL, a retry timeline, and (this audit's finding) the real accuracy numbers are now documented (`docs/EVALUATION.md`) rather than only implied by feature-list language — a user reading `docs/EVALUATION.md` before trusting an answer is the actual mitigation; nothing in the UI itself warns per-answer. |
 | LLM10: Model Theft | Not applicable | Fully local model via Ollama; no hosted model API key or proprietary model artifact to steal. |
 
@@ -62,9 +62,12 @@ solo-maintainer project, not a full RMF profile:
   (`eval/regression.py`). `docs/EVALUATION.md` reports the actual latest
   numbers, including the ones that look bad (35% final accuracy), rather
   than only the ones that look good (100% security-rejection accuracy).
-- **Manage:** Retry/error-feedback loop bounded (`MAX_RETRIES`), fail-open
-  design for non-critical checks (cost estimation, write-privilege check)
-  vs. fail-closed for the safety-critical one (SQL validator), rate
+- **Manage:** Retry/error-feedback loop bounded (`MAX_RETRIES`, adaptively
+  widened per question by `agent/complexity.py` but still capped, never
+  unbounded — the agentic query-planning + plan-conformance review pass
+  shares this same bounded budget), fail-open design for non-critical
+  checks (cost estimation, write-privilege check, query planning, plan
+  review) vs. fail-closed for the safety-critical one (SQL validator), rate
   limiting, and a documented risk register with review dates. Residual
   risk (no auth, unclassified sensitive columns, low accuracy) is named,
   not hidden.

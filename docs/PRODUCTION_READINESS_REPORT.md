@@ -12,6 +12,21 @@ This report does not assume anything documented elsewhere in the repo
 found to be inaccurate during this audit and are called out explicitly
 below.
 
+> **Addendum (not re-scored):** since this report's 2026-09-01 audit, the
+> SQL pipeline gained two nodes directly targeting the AI-accuracy gap
+> flagged below (agentic query planning + a plan-conformance
+> self-correction loop — see `docs/ARCHITECTURE.md`'s "Agentic query
+> planning and plan-conformance review"), an adaptive per-question retry
+> budget (`agent/complexity.py`), and static + execution-time detection of
+> a specific nested-aggregate failure mode that was previously exhausting
+> the retry budget outright. The test suite also grew from 503 to 636
+> passing tests. None of these were re-benchmarked against the
+> 35%/30%-accuracy baseline this report's score is built on — the
+> **69/100** figure, and every category score below, is this report's own
+> point-in-time snapshot, not a live number. Re-running
+> `scripts/run_benchmark.py` against the current code is the way to get an
+> updated score; this addendum intentionally doesn't guess one.
+
 ---
 
 ## Score: 69 / 100
@@ -202,20 +217,38 @@ committed.
 15. `docs/User_Guide.pdf` wasn't reviewed as part of this text-focused
     audit (binary format) — worth a pass to confirm it doesn't repeat any
     of the stale/aspirational claims this audit found and corrected
-    elsewhere (the phantom API layer, the missing governance docs).
+    elsewhere (the phantom API layer, the missing governance docs). **Update
+    (2026-09-11):** this item's root cause (no checked-in source, three
+    prior revisions each hand-authored and committed as a raw binary
+    replacement) is fixed — `scripts/build_user_guide_pdf.py` now builds
+    the PDF programmatically from `USER_GUIDE.md`, so "review the PDF"
+    reduces to "review `USER_GUIDE.md` and re-run the script," and the two
+    can no longer drift silently apart the way they previously could.
 
 ## Technical debt
 
-- **Test-coverage gaps** in `agent/llm_client.py` (prompt construction and
-  the injection-resistance framing have no dedicated unit test — only
-  indirect coverage via mocked node tests), `agent/error_classification.py`
-  (no isolated test of the TIMEOUT/MISSING_REFERENCE/SYNTAX/UNKNOWN
-  classification that drives materially different retry routing), and
-  `ui/app.py` (zero automated coverage — common for Streamlit but means
-  the "Confirm and Run" re-validation safeguard has no regression test).
+- **Test-coverage gaps** in `agent/llm_client.py` (the original SQL-
+  generation prompt construction and the injection-resistance framing
+  still have no dedicated unit test — only indirect coverage via mocked
+  node tests; `tests/test_llm_client_planning.py` closes this gap for the
+  newer plan/review prompt-building and response-parsing functions only,
+  not `_system_prompt`/`_build_user_prompt`'s original SQL-generation
+  path), `agent/error_classification.py` (still no isolated test of
+  `classify_execution_error()` itself — the
+  TIMEOUT/MISSING_REFERENCE/SYNTAX/UNKNOWN/AGGREGATE_NESTING
+  classification that drives materially different retry routing is only
+  exercised indirectly, one category at a time, via mocked
+  `execute_sql_node` tests in `tests/test_agent_nodes.py`), and `ui/app.py`
+  (zero automated coverage — common for Streamlit but means the "Confirm
+  and Run" re-validation safeguard, and the newer "Query plan" expander,
+  have no regression test).
 - **`docs/User_Guide.pdf`** exists alongside the now-much-larger markdown
   doc suite — worth deciding whether it stays as a separate general-
-  audience document or gets superseded/merged, so the two don't drift.
+  audience document or gets superseded/merged. The drift risk itself is
+  now mitigated (2026-09-11: `scripts/build_user_guide_pdf.py` builds it
+  from `USER_GUIDE.md`, not hand-authored separately), but nothing enforces
+  that the PDF was actually *rebuilt* after the last `USER_GUIDE.md` edit —
+  that's still a manual step, not a CI check.
 - **The eval framework's own `eval/results/` directory accumulates run
   artifacts** (`live_run_output.log`, timestamped JSON pairs) without a
   retention/cleanup policy — not urgent, but will grow unbounded over time.

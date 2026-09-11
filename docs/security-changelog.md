@@ -194,6 +194,60 @@ Ollama instances during development rather than a mocked unit-test suite
 
 ---
 
+## 2026-09-11 — Nested-aggregate validator check + agentic query planning's rate-limiter gap
+
+**Change:** Two changes, both in this changelog's stated scope:
+
+1. **New validator check, `agent/sql_validator.py`'s allowlist.** A new
+   `violation_type`, `"nested_aggregate"`, rejects one aggregate function
+   called inside another aggregate's own arguments (e.g. `AVG(CASE WHEN
+   ... THEN SUM(x) ELSE 0 END)`) via a `sqlglot` AST walk
+   (`_find_nested_aggregate`) — every supported engine
+   (mssql/postgres/mysql/oracle) rejects this shape at execution time
+   regardless, so this is a static, pre-execution catch, not a new
+   permission being granted or withdrawn. **Not** added to
+   `SAFETY_VIOLATION_TYPES` — this is an ordinary, retryable correctness
+   mistake (the model gets a targeted rewrite hint and another attempt),
+   not a security-gate failure. A matching execution-time backstop,
+   `agent/error_classification.py`'s `ExecutionErrorCategory.
+   AGGREGATE_NESTING`, catches the same failure shape by driver error text
+   if the static check ever misses one (e.g. a dialect-specific aggregate
+   `sqlglot` doesn't classify as `exp.AggFunc`).
+2. **New, currently-uncovered LLM-call surface.** Two new graph nodes,
+   `plan_query_node` and `review_sql_node` (agentic query planning +
+   plan-conformance self-correction — see `docs/ARCHITECTURE.md`), make
+   their own Ollama calls but do **not** check
+   `agent.rate_limit.get_llm_call_limiter` themselves, unlike
+   `generate_sql_node`. Both are gated behind `agent/complexity.py`'s
+   signal detection (so an ordinary question is unaffected) and
+   `ENABLE_QUERY_PLANNING`, but for a question that *does* trigger them,
+   the realistic worst-case LLM-call count is no longer bounded solely by
+   `LLM_CALL_RATE_LIMIT_PER_MINUTE` the way `SECURITY.md` previously
+   described. Logged here as a known gap (see `SECURITY.md`'s "Rate
+   limiting" section for the corrected worst-case math), not fixed in this
+   pass — no rate-limit threshold value changed.
+
+**Why:** The nested-aggregate check closes a reproduced real failure (a
+"top 3 per year/territory with year-over-year growth" question exhausted
+its entire retry budget on this exact shape, never once getting a
+targeted hint that would have let it self-correct). The query-planning
+feature was added to address the same underlying accuracy gap more
+broadly (see `docs/PRODUCTION_READINESS_REPORT.md`'s addendum) — its
+rate-limiter gap is a side effect of that addition, surfaced here rather
+than left undocumented.
+
+**Status:** Permanent (validator check). The rate-limiter gap is an open
+item, not a time-boxed exception — tracked as `docs/RISK_REGISTER.md`'s
+R-007. New regression coverage:
+`tests/test_sql_validator.py::TestValidateSqlRejectsNestedAggregates`,
+`tests/test_agent_nodes.py::TestExecuteSqlNode::
+test_aggregate_nesting_error_retries_via_generate_sql`,
+`tests/test_agent_nodes.py::TestPlanQueryNode`,
+`tests/test_agent_nodes.py::TestReviewSqlNode`,
+`tests/test_llm_client_planning.py`, `tests/test_complexity.py`.
+
+---
+
 <!--
 Template for new entries — copy this block:
 

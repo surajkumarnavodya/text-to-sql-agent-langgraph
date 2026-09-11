@@ -174,6 +174,39 @@ above), or a genuinely ambiguous/compound question. Check the
 `[router] available=[...] sources=[...] reasoning=...` log line before
 assuming something's broken.
 
+## "Agent could not produce a working query: Gave up after N attempts"
+
+This means every attempt failed validation, review, or execution and the
+retry budget ran out — the last attempted SQL and error are shown below
+the message; check the "🔁 Retry timeline" expander for the full sequence,
+not just the last attempt.
+
+A specific, previously-common root cause for a question involving a
+per-group ranking ("top 3 X per Y") or a period-over-period comparison
+("year-over-year growth"): the model reaching for `TOP N ... GROUP BY`
+(which only limits the *total* result to N rows, not N per group) or
+nesting one aggregate inside another (`AVG(CASE WHEN ... THEN SUM(x) ELSE
+0 END)`, which every SQL engine rejects outright). Both are now caught
+structurally rather than exhausting the retry budget blind:
+`agent/sql_validator.py` rejects the nested-aggregate shape statically
+before it ever reaches the database, with a targeted rewrite hint fed back
+on the next attempt; and, for a question matching this same "non-trivial"
+pattern, an up-front query plan (visible in the "🧭 Query plan" expander,
+if it appears) and a plan-conformance check give the retry loop a semantic
+signal beyond a raw driver error — see `docs/ARCHITECTURE.md`'s "Agentic
+query planning and plan-conformance review" for the full mechanism. If you
+still see this failure on a question of this shape, confirm
+`ENABLE_QUERY_PLANNING` is `true` (the default) in `.env`, and check
+whether a "🧭 Query plan" expander appeared at all — if it didn't, the
+question may not have matched `agent/complexity.py`'s signal detection
+(rephrasing with an explicit "per <group>" or "compared to last <period>"
+often helps it match).
+
+For any other repeated failure shape, a larger or SQL-specialized model
+(`sqlcoder`, `duckdb-nsql` via `OLLAMA_MODEL`) remains the most direct
+lever — see `docs/EVALUATION.md`'s measured accuracy numbers and known
+limitations before assuming the app itself is broken.
+
 ## "It rejected my question and I don't know why"
 
 By design, a rejection message is deliberately generic

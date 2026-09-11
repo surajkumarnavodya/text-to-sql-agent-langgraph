@@ -30,9 +30,12 @@ flowchart TD
     SI --> CF["classify_followup<br/>standalone / follow-up / ambiguous"]
     CF -->|ambiguous| STOP2(["Needs clarification"])
     CF --> RS["retrieve_schema<br/>ChromaDB top-k + FK-adjacency<br/>bridge expansion"]
-    RS --> GS["generate_sql<br/>Ollama, via LangGraph"]
+    RS --> PQ["plan_query<br/>LLM plan, only for complex questions"]
+    PQ --> GS["generate_sql<br/>Ollama, via LangGraph"]
     GS -->|off-topic / LLM error / rate limit| STOP3(["Rejected / Failed / Rate limited"])
-    GS --> VS["validate_sql<br/>sqlglot AST allowlist"]
+    GS --> RV["review_sql<br/>plan-conformance check, only if planned"]
+    RV -->|plan not satisfied, retryable| GS
+    RV --> VS["validate_sql<br/>sqlglot AST allowlist"]
     VS -->|retryable mistake| GS
     VS -->|safety violation| STOP4(["Failed closed<br/>(security gate, no retry)"])
     VS -->|valid| CE["estimate_cost<br/>non-executing EXPLAIN / SHOWPLAN"]
@@ -47,13 +50,19 @@ flowchart TD
     RUN --> RESULTS[Results table, chart, insight]
 ```
 
-Retries are capped (`MAX_RETRIES`, default 3) and every attempt is recorded
-and shown in the UI's "Retry timeline" — the self-correction loop is meant
-to be inspectable, not a black box. See
-[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the full technical
-walkthrough (all eight LangGraph nodes, retry semantics, schema-retrieval
-internals) and [`USER_GUIDE.md`](USER_GUIDE.md) for what this looks like
-from inside the app.
+Retries are capped by an adaptive per-question budget (`MAX_RETRIES`,
+default 3, plus up to `COMPLEX_QUERY_MAX_RETRY_BONUS` extra retries for a
+question that reads as non-trivial — top-N-per-group, year-over-year
+growth, several metrics at once) and every attempt is recorded and shown in
+the UI's "Retry timeline" — the self-correction loop is meant to be
+inspectable, not a black box. `plan_query`/`review_sql` are a zero-cost
+pass-through for an ordinary question — no extra LLM call, no added
+latency — and only engage for that same class of non-trivial question; see
+"Key features" below. See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)
+for the full technical walkthrough (all ten LangGraph nodes, retry
+semantics, schema-retrieval internals) and
+[`USER_GUIDE.md`](USER_GUIDE.md) for what this looks like from inside the
+app.
 
 **Optional: this SQL pipeline is the default destination of a
 multi-source router**, off by default (`ENABLE_MULTI_SOURCE_ROUTER=false`).
@@ -70,6 +79,26 @@ existed.
   attempt, up to a configurable cap (`MAX_RETRIES`), instead of failing on
   the first mistake. Every attempt is recorded and shown in the UI's
   "Retry timeline," not just logged to a terminal.
+- **Agentic query planning + plan-conformance self-correction** — a
+  question that reads as non-trivial (top-N-per-group ranking, year-over-
+  year/period growth, several metrics requested at once) gets an up-front
+  LLM-generated plan before any SQL is written, and the generated SQL is
+  then checked against that plan (a second LLM call) before it ever reaches
+  the validator. A plan-conformance failure loops back into the same
+  self-correction budget above with a targeted critique, not a separate
+  unbounded loop. An ordinary question never triggers either call — zero
+  added latency/cost for the common case. See
+  [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md#2-retry--self-correction-semantics).
+- **Retry budget scales with question complexity** — a cheap, LLM-free
+  heuristic (`agent/complexity.py`) widens `MAX_RETRIES` by up to
+  `COMPLEX_QUERY_MAX_RETRY_BONUS` extra attempts for a question matching
+  one of the same complexity signals above, instead of one flat cap for
+  every question regardless of how hard it is.
+- **Static + execution-time detection of nested aggregates** — a shape
+  every SQL engine rejects (`AVG(CASE WHEN ... THEN SUM(x) ELSE 0 END)`,
+  a common mistake for "average growth"-style questions) is caught by
+  `sqlglot` AST analysis *before* the query ever reaches the database, with
+  an execution-time backstop for anything that slips past the static check.
 - **Read-only SQL validator** — an AST-based allowlist (via `sqlglot`), not
   a regex blocklist: only a single `SELECT`/`UNION`/`EXCEPT`/`INTERSECT`
   statement is ever allowed to execute, in every dialect the project

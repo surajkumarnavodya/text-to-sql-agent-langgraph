@@ -14,7 +14,7 @@ malformed values (not missing ones) fail fast at startup with a
 |---|---|---|
 | `OLLAMA_HOST` | `http://localhost:11434` | Base URL of the Ollama server. `agent/llm_client.py`, `api/main.py`'s health check. |
 | `OLLAMA_MODEL` | `llama3.1:8b` | Model name for SQL generation/insight. Swap to try `sqlcoder`, `duckdb-nsql`, etc. |
-| `OLLAMA_REQUEST_TIMEOUT_SECONDS` | `60` | Per-request timeout for Ollama calls. |
+| `OLLAMA_REQUEST_TIMEOUT_SECONDS` | `300` | Per-request timeout for Ollama calls. Raise further if you see `httpx.ReadTimeout`/`ConnectTimeout` on slower hardware. |
 
 ## Database connection
 
@@ -56,11 +56,25 @@ checks all of them too.
 | Variable | Default | Purpose |
 |---|---|---|
 | `MAX_RETRIES` | `3` | Max self-correction retries in the LangGraph loop. |
+| `COMPLEX_QUERY_MAX_RETRY_BONUS` | `2` | Extra retries (on top of `MAX_RETRIES`) for questions `agent/complexity.py` detects as likely needing more self-correction (top-N-per-group phrasing, YoY/period-over-period comparisons, several metrics requested at once) — one extra retry per distinct signal matched, capped at this value. `0` disables the adaptive bonus. |
 | `MAX_RESULT_ROWS` | `1000` | Row cap applied to every executed query (enforced two independent ways — see `SECURITY.md`). |
 | `QUERY_TIMEOUT_SECONDS` | `15` | Wall-clock timeout for query execution. |
 | `LLM_MAX_TOKENS` | `1024` | Max tokens the LLM may generate per SQL-generation call. |
 | `INSIGHT_MAX_TOKENS` | `120` | Max tokens for the post-query plain-English insight sentence. |
 | `MAX_QUESTION_LENGTH` | `500` | Max accepted character length of a typed question (`agent/input_guard.py`). |
+
+## Agentic query planning + plan-conformance self-correction
+
+`agent/nodes.py::plan_query_node`/`review_sql_node` -- only triggers for a
+question `agent/complexity.py` judges non-trivial (the same signals that
+drive `COMPLEX_QUERY_MAX_RETRY_BONUS` above); an ordinary question makes
+zero extra LLM calls regardless of `ENABLE_QUERY_PLANNING`.
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `ENABLE_QUERY_PLANNING` | `true` | Master switch for the planning + plan-review LLM calls. Off means every question behaves exactly as it did before this feature existed. |
+| `QUERY_PLAN_MAX_TOKENS` | `300` | Max tokens for the up-front query plan (a short JSON array of step strings). |
+| `SQL_REVIEW_MAX_TOKENS` | `200` | Max tokens for the plan-conformance review verdict ("PASS" or a one-sentence "FAIL: ..."). |
 
 ## Rate limiting
 
@@ -139,7 +153,9 @@ for how the router/subgraphs work internally.
 - **Security-relevant values are validated for sanity, not just type.**
   `MAX_RETRIES`, `MAX_RESULT_ROWS`, both rate limits, both cost thresholds,
   `RAG_TOP_K`, `RAG_MAX_RETRIES`, `RAG_CHUNK_SIZE`, `WEB_SEARCH_MAX_RESULTS`,
-  etc. must be positive; `COST_MODERATE_ROW_THRESHOLD` must be strictly
+  etc. must be positive (`COMPLEX_QUERY_MAX_RETRY_BONUS` is the one
+  exception -- `0` is a valid, deliberate "disable this" value, so only
+  negative is rejected); `COST_MODERATE_ROW_THRESHOLD` must be strictly
   less than `COST_HIGH_ROW_THRESHOLD`; `LOG_REDACTION_LEVEL` must be
   `standard` or `strict` — all enforced in
   `Settings._validate_security_settings()`, with regression coverage in

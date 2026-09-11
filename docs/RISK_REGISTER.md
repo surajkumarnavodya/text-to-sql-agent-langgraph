@@ -87,6 +87,19 @@ already discloses model-dependence honestly. A larger or SQL-specialized
 model (`sqlcoder`, `duckdb-nsql`) is the most direct lever, untested as of
 this entry.
 
+**Update (2026-09-11, not yet re-benchmarked):** the specific failure this
+entry's captured trace shows — the retry loop regenerating byte-identical
+incorrect SQL — was traced to a reproducible root cause (a nested-aggregate
+shape, `AVG(CASE WHEN ... THEN SUM(x) ELSE 0 END)`, that every retry kept
+reaching for with no way to know why it kept failing) and addressed
+structurally: a static pre-execution check now catches that shape, and two
+new graph nodes (`plan_query_node`/`review_sql_node`) add an up-front plan
++ plan-conformance self-correction loop for questions matching the same
+"non-trivial" signals (see `docs/ARCHITECTURE.md`). This is a plausible,
+targeted fix for the *observed* failure mode, not a re-measured accuracy
+number — `python scripts/run_benchmark.py --check-regression` has not been
+re-run since these changes landed. Leave this entry Open until it has.
+
 **Review date:** re-run `python scripts/run_benchmark.py --check-regression`
 after any model swap or prompt change (already `GOVERNANCE.md`'s stated
 cadence) — this entry should be updated with the result each time.
@@ -153,6 +166,31 @@ correctness or safety.
 
 **Review date:** if/when this runs as a longer-lived multi-replica service
 where a stuck dependency's blast radius grows — see V2 roadmap.
+
+### R-007 — Agentic query planning/review LLM calls aren't rate-limited
+
+**Severity:** Low (for today's single-user, single-process usage) · **Status:** Open
+
+`plan_query_node` and `review_sql_node` (added 2026-09-11 — see
+`docs/security-changelog.md`'s matching entry) each make their own Ollama
+call but don't check `agent.rate_limit.get_llm_call_limiter`, unlike
+`generate_sql_node`. Both are gated behind `agent/complexity.py`'s
+"non-trivial question" signal detection and `ENABLE_QUERY_PLANNING`, so an
+ordinary question is unaffected, but for a question that does trigger
+them, `LLM_CALL_RATE_LIMIT_PER_MINUTE` no longer bounds the *realistic*
+worst-case LLM-call count for that question the way `SECURITY.md`
+previously described (see that file's "Rate limiting" section for the
+corrected math).
+
+**Mitigation today:** none — this is a genuine, currently-open gap, not a
+mitigated one. The question-submission limiter
+(`QUESTION_RATE_LIMIT_PER_MINUTE`) still bounds how often a new question
+can even start a run, which caps the practical blast radius for today's
+single-user, single-process usage.
+
+**Review date:** before this app is exposed beyond a single trusted local
+user, or if `ENABLE_QUERY_PLANNING` usage patterns suggest LLM load from
+this path is material — whichever comes first.
 
 ---
 

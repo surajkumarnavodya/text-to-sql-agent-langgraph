@@ -54,9 +54,15 @@ infrastructure tooling, not a data-exposing endpoint).
 
 ### `POST /ask`
 
-Runs one question through the full agent graph — schema retrieval, SQL
-generation, validation, cost estimation, execution, self-correction — and
-returns the outcome. Requires auth if `API_AUTH_TOKEN` is set (see below).
+Runs one question through the full agent graph — schema retrieval,
+(for a question that reads as non-trivial — top-N-per-group, year-over-
+year growth, several metrics at once) an up-front query plan, SQL
+generation, plan-conformance review, validation, cost estimation,
+execution, self-correction — and returns the outcome. Requires auth if
+`API_AUTH_TOKEN` is set (see below). The planning/review steps are a
+zero-cost pass-through for an ordinary question and add one or two extra
+LLM round-trips (so extra latency) for a question they do trigger — see
+[`docs/ARCHITECTURE.md`](ARCHITECTURE.md#2-retry--self-correction-semantics).
 
 Request:
 
@@ -85,6 +91,8 @@ Response (mirrors what `ui/app.py` renders — see `agent.state.AgentState`):
   "result_rows": [[1234567.89]],
   "row_count": 1,
   "retry_count": 0,
+  "max_retries": 3,
+  "query_plan": null,
   "attempt_history": [{"attempt": 1, "sql": "...", "outcome": "succeeded", "error": null, "will_retry": false}],
   "insight": "Total internet sales in 2012 were $1,234,567.89.",
   "cost_notice": null,
@@ -99,7 +107,12 @@ Response (mirrors what `ui/app.py` renders — see `agent.state.AgentState`):
 
 `status` is one of `AgentState`'s values (`succeeded`, `failed`,
 `rejected`, `needs_clarification`, `rate_limited`, ...) — check it before
-trusting `sql`/`result_rows`, exactly as the UI does.
+trusting `sql`/`result_rows`, exactly as the UI does. `query_plan` is
+non-null only for a question `agent/complexity.py` judged non-trivial
+(see `docs/ARCHITECTURE.md`) — the ordered plan steps the SQL above was
+generated and checked against; `max_retries` is this question's actual
+retry budget, which can exceed the configured `MAX_RETRIES` for that same
+class of question.
 
 Rate limiting: a per-client-IP question-submission limiter
 (`Settings.question_rate_limit_per_minute`, mirroring the UI's
