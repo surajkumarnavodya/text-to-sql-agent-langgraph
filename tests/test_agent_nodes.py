@@ -16,6 +16,7 @@ not a test fixture) -- validate_sql_node's row-limit rendering
 
 from __future__ import annotations
 
+import dataclasses
 from pathlib import Path
 
 import pytest
@@ -28,10 +29,14 @@ from agent.nodes import (
     execute_sql_node,
     generate_insight_node,
     generate_sql_node,
+    plan_query_node,
     retrieve_schema_node,
+    review_sql_node,
     route_after_classification,
     route_after_cost_estimate,
     route_after_execution,
+    route_after_generation,
+    route_after_review,
     route_after_validation,
     validate_sql_node,
 )
@@ -61,6 +66,7 @@ def _mock_settings(monkeypatch):
         embedding_model_name="all-MiniLM-L6-v2",
         schema_top_k=4,
         max_retries=3,
+        complex_query_max_retry_bonus=2,
         max_result_rows=1000,
         query_timeout_seconds=15,
         llm_max_tokens=1024,
@@ -270,8 +276,91 @@ class TestRetrieveSchemaNode:
         assert captured["top_k"] == 5  # schema_top_k (4) + 1
 
 
+class TestPlanQueryNode:
+    def test_skips_llm_call_when_no_complexity_signals(self, monkeypatch):
+        """The overwhelming common case: a plain question makes zero
+        planning calls, regardless of enable_query_planning."""
+
+        def _fail(*args, **kwargs):
+            raise AssertionError("should not call the LLM for a simple question")
+
+        monkeypatch.setattr("agent.nodes.generate_query_plan_from_llm", _fail)
+
+        state: AgentState = {
+            "question": "How many customers are there?",
+            "schema_context_text": "CREATE TABLE customers (...)",
+            "complexity_signals": [],
+        }
+        result = plan_query_node(state)
+
+        assert result["query_plan"] is None
+        assert result["status"] == "generating"
+
+    def test_skips_llm_call_when_planning_disabled(self, monkeypatch, _mock_settings):
+        """Even a complex question skips planning when the master switch is off."""
+        monkeypatch.setattr(
+            "agent.nodes.get_settings",
+            lambda: dataclasses.replace(_mock_settings, enable_query_planning=False),
+        )
+
+        def _fail(*args, **kwargs):
+            raise AssertionError("should not call the LLM when enable_query_planning=False")
+
+        monkeypatch.setattr("agent.nodes.generate_query_plan_from_llm", _fail)
+
+        state: AgentState = {
+            "question": "top 3 products per region",
+            "schema_context_text": "CREATE TABLE sales (...)",
+            "complexity_signals": ["top_n_per_group"],
+        }
+        result = plan_query_node(state)
+
+        assert result["query_plan"] is None
+        assert result["status"] == "generating"
+
+    def test_calls_llm_and_stores_plan_for_a_complex_question(self, monkeypatch):
+        captured = {}
+
+        def _capture(question, schema_context, settings):
+            captured["question"] = question
+            captured["schema_context"] = schema_context
+            return ["Group by region and year", "Use ROW_NUMBER() partitioned by region"]
+
+        monkeypatch.setattr("agent.nodes.generate_query_plan_from_llm", _capture)
+
+        state: AgentState = {
+            "question": "top 3 products per region",
+            "schema_context_text": "CREATE TABLE sales (...)",
+            "complexity_signals": ["top_n_per_group"],
+        }
+        result = plan_query_node(state)
+
+        assert captured["question"] == "top 3 products per region"
+        assert result["status"] == "generating"
+        assert result["query_plan"] == [
+            "Group by region and year",
+            "Use ROW_NUMBER() partitioned by region",
+        ]
+
+    def test_fails_open_when_ollama_unavailable(self, monkeypatch):
+        def _raise(*args, **kwargs):
+            raise OllamaUnavailableError("connection refused")
+
+        monkeypatch.setattr("agent.nodes.generate_query_plan_from_llm", _raise)
+
+        state: AgentState = {
+            "question": "top 3 products per region",
+            "schema_context_text": "CREATE TABLE sales (...)",
+            "complexity_signals": ["top_n_per_group"],
+        }
+        result = plan_query_node(state)
+
+        assert result["query_plan"] is None
+        assert result["status"] == "generating"
+
+
 class TestGenerateSqlNode:
-    def test_sets_sql_and_advances_to_validating(self, monkeypatch):
+    def test_sets_sql_and_advances_to_reviewing(self, monkeypatch):
         monkeypatch.setattr(
             "agent.nodes.generate_sql_from_llm",
             lambda **kwargs: "SELECT * FROM customers",
@@ -285,7 +374,7 @@ class TestGenerateSqlNode:
         }
         result = generate_sql_node(state)
 
-        assert result["status"] == "validating"
+        assert result["status"] == "reviewing"
         assert result["sql"] == "SELECT * FROM customers"
 
     def test_marks_failed_when_ollama_unavailable(self, monkeypatch):
@@ -407,6 +496,152 @@ class TestGenerateSqlNode:
 
         assert captured["error_category"] == "missing_reference"
 
+    def test_forwards_query_plan_to_llm_call(self, monkeypatch):
+        captured = {}
+
+        def _capture(**kwargs):
+            captured.update(kwargs)
+            return "SELECT 1"
+
+        monkeypatch.setattr("agent.nodes.generate_sql_from_llm", _capture)
+
+        state: AgentState = {
+            "question": "top 3 products per region",
+            "schema_context_text": "",
+            "error_history": [],
+            "retry_count": 0,
+            "query_plan": ["Group by region", "Use ROW_NUMBER() partitioned by region"],
+        }
+        generate_sql_node(state)
+
+        assert captured["query_plan"] == [
+            "Group by region",
+            "Use ROW_NUMBER() partitioned by region",
+        ]
+
+
+class TestReviewSqlNode:
+    def test_skips_llm_call_when_no_plan(self, monkeypatch):
+        """No query_plan (the overwhelming common case) -- zero-cost pass-through."""
+
+        def _fail(*args, **kwargs):
+            raise AssertionError("should not call the LLM when there's no plan to check")
+
+        monkeypatch.setattr("agent.nodes.review_sql_against_plan_from_llm", _fail)
+
+        state: AgentState = {"sql": "SELECT * FROM customers", "retry_count": 0, "query_plan": None}
+        result = review_sql_node(state)
+
+        assert result["plan_review_passed"] is None
+        assert result["plan_review_feedback"] is None
+        assert result["status"] == "validating"
+
+    def test_skips_llm_call_when_plan_is_empty(self, monkeypatch):
+        """An empty plan ([] -- the model judged the question simple) is
+        also "nothing to check against", same as None."""
+
+        def _fail(*args, **kwargs):
+            raise AssertionError("should not call the LLM when the plan is empty")
+
+        monkeypatch.setattr("agent.nodes.review_sql_against_plan_from_llm", _fail)
+
+        state: AgentState = {"sql": "SELECT * FROM customers", "retry_count": 0, "query_plan": []}
+        result = review_sql_node(state)
+
+        assert result["status"] == "validating"
+
+    def test_pass_verdict_advances_to_validating(self, monkeypatch):
+        monkeypatch.setattr(
+            "agent.nodes.review_sql_against_plan_from_llm", lambda *a, **k: (True, None)
+        )
+
+        state: AgentState = {
+            "sql": "SELECT region, ROW_NUMBER() OVER (PARTITION BY region ORDER BY rev DESC) FROM t",
+            "retry_count": 0,
+            "query_plan": ["Group by region", "Use ROW_NUMBER() partitioned by region"],
+        }
+        result = review_sql_node(state)
+
+        assert result["plan_review_passed"] is True
+        assert result["plan_review_feedback"] is None
+        assert result["status"] == "validating"
+
+    def test_fail_verdict_retries_via_generate_sql_when_budget_remains(self, monkeypatch):
+        monkeypatch.setattr(
+            "agent.nodes.review_sql_against_plan_from_llm",
+            lambda *a, **k: (
+                False,
+                "Missing ROW_NUMBER() -- TOP 3 with GROUP BY is not per-group.",
+            ),
+        )
+
+        state: AgentState = {
+            "sql": "SELECT TOP 3 region, SUM(rev) FROM t GROUP BY region",
+            "retry_count": 0,
+            "query_plan": ["Group by region", "Use ROW_NUMBER() partitioned by region"],
+        }
+        result = review_sql_node(state)
+
+        assert result["status"] == "generating"
+        assert result["plan_review_passed"] is False
+        assert "ROW_NUMBER" in result["plan_review_feedback"]
+        assert result["last_error_category"] == "plan_not_satisfied"
+        assert result["attempt_history"][0]["outcome"] == "plan_not_satisfied"
+        assert result["attempt_history"][0]["will_retry"] is True
+        assert result["retry_count"] == 1
+        assert "Plan review" in result["error_history"][0]
+
+    def test_fail_verdict_fails_when_retries_exhausted(self, monkeypatch):
+        monkeypatch.setattr(
+            "agent.nodes.review_sql_against_plan_from_llm",
+            lambda *a, **k: (False, "Still missing the window function."),
+        )
+
+        state: AgentState = {
+            "sql": "SELECT TOP 3 region, SUM(rev) FROM t GROUP BY region",
+            "retry_count": 3,  # == default max_retries
+            "query_plan": ["Group by region", "Use ROW_NUMBER() partitioned by region"],
+        }
+        result = review_sql_node(state)
+
+        assert result["status"] == "failed"
+        assert result["attempt_history"][0]["will_retry"] is False
+        assert result["failure_explanation"] is not None
+
+    def test_fails_open_when_ollama_unavailable(self, monkeypatch):
+        def _raise(*a, **k):
+            raise OllamaUnavailableError("connection refused")
+
+        monkeypatch.setattr("agent.nodes.review_sql_against_plan_from_llm", _raise)
+
+        state: AgentState = {
+            "sql": "SELECT TOP 3 region, SUM(rev) FROM t GROUP BY region",
+            "retry_count": 0,
+            "query_plan": ["Group by region"],
+        }
+        result = review_sql_node(state)
+
+        assert result["plan_review_passed"] is True
+        assert result["plan_review_feedback"] is None
+        assert result["status"] == "validating"
+
+    def test_respects_state_max_retries_override(self, monkeypatch):
+        monkeypatch.setattr(
+            "agent.nodes.review_sql_against_plan_from_llm",
+            lambda *a, **k: (False, "still wrong"),
+        )
+
+        state: AgentState = {
+            "sql": "SELECT TOP 3 region, SUM(rev) FROM t GROUP BY region",
+            "retry_count": 3,  # == default max_retries, but not this state's budget
+            "query_plan": ["Group by region"],
+            "max_retries": 5,
+        }
+        result = review_sql_node(state)
+
+        assert result["status"] == "generating"
+        assert result["attempt_history"][0]["will_retry"] is True
+
 
 class TestValidateSqlNode:
     def test_valid_sql_advances_to_executing(self):
@@ -451,6 +686,21 @@ class TestValidateSqlNode:
         assert result["retry_count"] == 4
         assert result["failure_explanation"] is not None
         assert result["attempt_history"][0]["will_retry"] is False
+
+    def test_state_max_retries_overrides_settings_default(self):
+        """A question agent.complexity flagged as complex gets a wider budget
+        than Settings.max_retries -- set via state["max_retries"] by
+        agent.graph.run_agent, read here instead of the raw setting."""
+        state: AgentState = {
+            "sql": "SELEKT * FORM customers !!!",
+            "retry_count": 3,  # == default max_retries, but not this state's budget
+            "selected_database": "default",
+            "max_retries": 5,
+        }
+        result = validate_sql_node(state)
+
+        assert result["status"] == "generating"  # still under the widened budget
+        assert result["attempt_history"][0]["will_retry"] is True
 
     def test_safety_violation_fails_closed_immediately_with_retries_remaining(self):
         """A non-SELECT statement is a security-gate failure, not a
@@ -777,6 +1027,33 @@ class TestExecuteSqlNode:
         assert result["attempt_history"][0]["outcome"] == "syntax_error"
         assert route_after_execution(result) == "generate_sql"
 
+    def test_aggregate_nesting_error_retries_via_generate_sql(self, monkeypatch):
+        """The execution-time backstop for a nested-aggregate shape that slipped
+        past agent.sql_validator's static check (e.g. a dialect-specific
+        aggregate sqlglot doesn't recognize as exp.AggFunc) -- still routed
+        back to generate_sql with a targeted category, same budget as SYNTAX,
+        not straight to retrieve_schema like MISSING_REFERENCE."""
+
+        def _raise(sql, timeout, max_rows, engine=None):
+            raise SQLAlchemyError(
+                "Cannot perform an aggregate function on an expression containing "
+                "an aggregate or a subquery."
+            )
+
+        monkeypatch.setattr("agent.nodes.execute_readonly_sql", _raise)
+
+        state: AgentState = {
+            "sql": "SELECT AVG(CASE WHEN 1=1 THEN SUM(x) ELSE 0 END) FROM t",
+            "retry_count": 0,
+            "selected_database": "default",
+        }
+        result = execute_sql_node(state)
+
+        assert result["status"] == "generating"
+        assert result["last_error_category"] == "aggregate_nesting"
+        assert result["attempt_history"][0]["outcome"] == "aggregate_nesting"
+        assert route_after_execution(result) == "generate_sql"
+
     def test_timeout_fails_immediately_without_consuming_retry_budget_pointlessly(
         self, monkeypatch
     ):
@@ -979,6 +1256,25 @@ class TestGenerateInsightNode:
 
 
 class TestRoutingFunctions:
+    @pytest.mark.parametrize(
+        "status,expected",
+        [
+            ("reviewing", "review_sql"),
+            ("rejected", "rejected"),
+            ("failed", "failed"),
+            ("rate_limited", "rate_limited"),
+        ],
+    )
+    def test_route_after_generation(self, status, expected):
+        assert route_after_generation({"status": status}) == expected
+
+    @pytest.mark.parametrize(
+        "status,expected",
+        [("validating", "validate_sql"), ("failed", "failed"), ("generating", "generate_sql")],
+    )
+    def test_route_after_review(self, status, expected):
+        assert route_after_review({"status": status}) == expected
+
     @pytest.mark.parametrize(
         "status,expected",
         [("executing", "estimate_cost"), ("failed", "failed"), ("generating", "generate_sql")],

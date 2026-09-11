@@ -22,6 +22,7 @@ AgentStatus = Literal[
     "classifying_followup",
     "retrieving_schema",
     "generating",
+    "reviewing",
     "validating",
     "estimating_cost",
     "executing",
@@ -97,9 +98,12 @@ class AttemptRecord(TypedDict):
         attempt: 1-indexed attempt number.
         sql: The SQL text this attempt validated/executed (None if the
             attempt never got that far, e.g. the LLM call itself failed).
-        outcome: One of "succeeded", "safety_violation", "parse_error",
-            "syntax_error", "missing_reference", "timeout",
-            "unknown_error", "schema_retrieval_error", "llm_error".
+        outcome: One of "succeeded", "safety_violation", "empty",
+            "parse_error", "nested_aggregate", "restricted_column",
+            "high_cost", "syntax_error", "missing_reference",
+            "aggregate_nesting", "plan_not_satisfied", "timeout",
+            "unknown_error", "schema_retrieval_error", "llm_error",
+            "off_topic", "rate_limited".
         error: The raw error message (validator or database), None on success.
         will_retry: Whether the graph will attempt another generation cycle.
     """
@@ -172,6 +176,31 @@ class AgentState(TypedDict, total=False):
     schema_tables: list[TableSchema]
     schema_context_text: str
 
+    # Set by plan_query_node, which runs between retrieve_schema and
+    # generate_sql -- an ordered list of concrete steps the model judged
+    # necessary to answer the question (grouping, metrics, filters, whether
+    # a top-N-per-group ranking or a period-over-period comparison is
+    # needed), or None if planning was skipped. Skipped whenever
+    # Settings.enable_query_planning is False, or the question matched no
+    # agent.complexity signal (see plan_query_node's docstring) -- the
+    # overwhelmingly common case, so this is None for most questions.
+    # Reused unchanged across every generate_sql retry for this question
+    # (only recomputed if retrieve_schema itself reruns, on a
+    # missing_reference retry) -- injected into generate_sql's prompt
+    # (agent.llm_client._build_plan_block) and checked against the
+    # generated SQL by review_sql_node below.
+    query_plan: list[str] | None
+
+    # Set by review_sql_node, only when query_plan is not None (nothing to
+    # check against otherwise) -- whether the LLM judged the just-generated
+    # SQL to implement every plan step. None means review didn't run.
+    plan_review_passed: bool | None
+    # The reviewer's critique when plan_review_passed is False -- fed back
+    # into the next generate_sql attempt the same way any other retryable
+    # error is (error_history/last_error_category). None when review passed
+    # or didn't run.
+    plan_review_feedback: str | None
+
     # Set by generate_sql
     sql: str | None
 
@@ -241,16 +270,34 @@ class AgentState(TypedDict, total=False):
     error_history: Annotated[list[str], operator.add]
     retry_count: int
 
+    # Set once by the caller (agent.graph.run_agent), via
+    # agent.complexity.compute_max_retries -- this question's effective
+    # retry budget, which may exceed Settings.max_retries if the question
+    # text matched one or more complexity signals (top-N-per-group phrasing,
+    # growth/period comparisons, several metrics at once). Every retry-vs-
+    # give-up check (validate_sql/estimate_query_cost/execute_sql) reads
+    # this instead of Settings.max_retries directly, falling back to it if
+    # unset (e.g. a test constructing AgentState by hand).
+    max_retries: int
+    # The signals agent.complexity.detect_complexity_signals matched for
+    # this question (empty list if none) -- carried on state purely for
+    # observability (logged once by run_agent), never read by any node's
+    # own logic.
+    complexity_signals: list[str]
+
     # Full per-attempt timeline (see AttemptRecord) -- one entry per
     # concluded attempt, for the UI's "Retry timeline" expander and for
     # inspecting/testing the retry loop's behavior directly.
     attempt_history: Annotated[list[AttemptRecord], operator.add]
 
-    # Category of the most recent failure ("safety_violation" | "parse_error"
-    # | "syntax_error" | "missing_reference" | "timeout" | "unknown_error" |
-    # None). Overwritten each attempt (not accumulated) -- generate_sql_node
-    # reads it to give the next LLM call a more targeted retry hint than a
-    # generic "fix it."
+    # Category of the most recent failure -- a agent.sql_validator.ViolationType
+    # value ("empty" | "parse_error" | "nested_aggregate" | "restricted_column"
+    # | "high_cost" | "safety_violation") or an
+    # agent.error_classification.ExecutionErrorCategory value ("syntax" |
+    # "missing_reference" | "aggregate_nesting" | "timeout" | "unknown"), or
+    # None. Overwritten each attempt (not accumulated) -- generate_sql_node
+    # reads it to give the next LLM call a more targeted retry hint
+    # (agent.llm_client._ERROR_CATEGORY_HINTS) than a generic "fix it."
     last_error_category: str | None
 
     # Set once, at the point status becomes "failed" -- a plain-language,

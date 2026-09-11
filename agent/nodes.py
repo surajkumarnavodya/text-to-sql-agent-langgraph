@@ -36,7 +36,12 @@ from agent.exceptions import (
 from agent.followup import classify_followup
 from agent.input_guard import NO_RELEVANT_DATA_MESSAGE, check_input, rejection_message
 from agent.insight import is_insight_grounded, should_skip_insight, summarize_result
-from agent.llm_client import generate_insight_from_llm, generate_sql_from_llm
+from agent.llm_client import (
+    generate_insight_from_llm,
+    generate_query_plan_from_llm,
+    generate_sql_from_llm,
+    review_sql_against_plan_from_llm,
+)
 from agent.rate_limit import LLM_CALL_LIMIT_MESSAGE, get_llm_call_limiter
 from agent.sql_validator import (
     SAFETY_VIOLATION_TYPES,
@@ -120,6 +125,17 @@ def _give_up_explanation(state: AgentState, detailed_message: str) -> str:
     if not state.get("schema_tables"):
         return NO_RELEVANT_DATA_MESSAGE
     return detailed_message
+
+
+def _effective_max_retries(state: AgentState, settings) -> int:
+    """Returns this question's retry budget: `state["max_retries"]` if set, else the global default.
+
+    `agent.graph.run_agent` always sets `state["max_retries"]` up front (see
+    `agent.complexity.compute_max_retries`) -- the fallback to
+    `settings.max_retries` here only matters for a test constructing
+    `AgentState` by hand without that field.
+    """
+    return state.get("max_retries", settings.max_retries)
 
 
 def _selected_db_name(state: AgentState) -> str:
@@ -536,6 +552,50 @@ def retrieve_schema_node(state: AgentState) -> dict[str, Any]:
     }
 
 
+@_timed_node("plan_query")
+def plan_query_node(state: AgentState) -> dict[str, Any]:
+    """Produces an up-front, ordered plan for a question judged non-trivial.
+
+    Runs between `retrieve_schema` and `generate_sql` (see `agent/graph.py`),
+    but only makes an LLM call when both:
+      - `Settings.enable_query_planning` is True, and
+      - `state["complexity_signals"]` -- computed once by `agent.graph.
+        run_agent`, via `agent.complexity.detect_complexity_signals`, the
+        same signals that drive the adaptive retry budget
+        (`Settings.complex_query_max_retry_bonus`) -- is non-empty.
+
+    An ordinary question (the overwhelming common case) matches no
+    complexity signal and skips the LLM call entirely: `state["query_plan"]`
+    stays None and every downstream node behaves exactly as it did before
+    this node existed -- zero latency/cost impact on the common path.
+
+    Fails open on any planning failure -- an unreachable Ollama server, or a
+    response `agent.llm_client._parse_plan_response` couldn't parse as a
+    JSON array of strings -- logging it and proceeding with `query_plan =
+    None`, never as a reason the question itself can't be answered.
+    """
+    settings = get_settings()
+    complexity_signals = state.get("complexity_signals") or []
+    if not settings.enable_query_planning or not complexity_signals:
+        logger.info(
+            "[plan_query] skipped (enable_query_planning=%s complexity_signals=%s)",
+            settings.enable_query_planning,
+            complexity_signals,
+        )
+        return {"query_plan": None, "status": "generating"}
+
+    question = state["question"]
+    schema_context = state.get("schema_context_text", "")
+    try:
+        plan = generate_query_plan_from_llm(question, schema_context, settings)
+    except OllamaUnavailableError as exc:
+        logger.warning("[plan_query] LLM call failed, proceeding without a plan: %s", exc)
+        return {"query_plan": None, "status": "generating"}
+
+    logger.info("[plan_query] complexity_signals=%s plan=%s", complexity_signals, plan)
+    return {"query_plan": plan, "status": "generating"}
+
+
 @_timed_node("generate_sql")
 def generate_sql_node(state: AgentState) -> dict[str, Any]:
     """Calls the LLM to produce a candidate SQL statement.
@@ -600,7 +660,7 @@ def generate_sql_node(state: AgentState) -> dict[str, Any]:
     logger.info(
         "[generate_sql] attempt=%d/%d last_error_category=%s last_error=%r followup=%s",
         attempt_number,
-        settings.max_retries + 1,
+        _effective_max_retries(state, settings) + 1,
         last_error_category,
         last_error,
         bool(followup_context),
@@ -614,6 +674,7 @@ def generate_sql_node(state: AgentState) -> dict[str, Any]:
             error_category=last_error_category,
             settings=settings,
             followup_context=followup_context,
+            query_plan=state.get("query_plan"),
         )
     except OffTopicQuestionError as exc:
         # Defense-in-depth backstop, not the normal path: agent.input_guard's
@@ -656,7 +717,88 @@ def generate_sql_node(state: AgentState) -> dict[str, Any]:
         }
 
     logger.info("[generate_sql] attempt %d: generated SQL: %s", attempt_number, raw_sql)
-    return {"sql": raw_sql, "status": "validating"}
+    return {"sql": raw_sql, "status": "reviewing"}
+
+
+@_timed_node("review_sql")
+def review_sql_node(state: AgentState) -> dict[str, Any]:
+    """Checks the just-generated SQL against `plan_query_node`'s plan, before validation.
+
+    Runs between `generate_sql` and `validate_sql` (see `agent/graph.py`).
+    Only makes an LLM call when `state["query_plan"]` is a non-empty list --
+    i.e. only for a question `plan_query_node` judged worth planning in the
+    first place. Skips straight through (zero cost, `status="validating"`
+    either way) whenever there's no plan to check against, which is the
+    overwhelming common case -- an ordinary question behaves exactly as it
+    did before this node existed.
+
+    A "FAIL" verdict is treated exactly like any other retryable
+    correctness mistake (parse_error, syntax_error, ...): the reviewer's
+    critique becomes this attempt's error feedback for the next
+    `generate_sql` call, sharing the same `retry_count`/`state["max_retries"]`
+    budget as every other retryable failure category -- not a separate,
+    unbounded critique loop layered on top.
+
+    Fails open on any review failure -- an unreachable Ollama server, or a
+    verdict `agent.llm_client._parse_review_response` couldn't parse as a
+    clean PASS/FAIL -- treated as a pass, the same "must never be the
+    reason a legitimate query can't run" philosophy as
+    `estimate_query_cost_node`'s own fail-open behavior. The validator and
+    execution layers immediately downstream are still the real safety net
+    regardless of what this step decides.
+    """
+    settings = get_settings()
+    query_plan = state.get("query_plan")
+    sql = state.get("sql") or ""
+    attempt_number = state.get("retry_count", 0) + 1
+
+    if not query_plan:
+        return {"plan_review_passed": None, "plan_review_feedback": None, "status": "validating"}
+
+    try:
+        passed, feedback = review_sql_against_plan_from_llm(query_plan, sql, settings)
+    except OllamaUnavailableError as exc:
+        logger.warning(
+            "[review_sql] attempt %d: LLM call failed, treating as a pass: %s", attempt_number, exc
+        )
+        return {"plan_review_passed": True, "plan_review_feedback": None, "status": "validating"}
+
+    if passed:
+        logger.info("[review_sql] attempt %d: plan satisfied", attempt_number)
+        return {"plan_review_passed": True, "plan_review_feedback": None, "status": "validating"}
+
+    retry_count = state.get("retry_count", 0)
+    max_retries = _effective_max_retries(state, settings)
+    can_retry = retry_count < max_retries
+    logger.warning(
+        "[review_sql] attempt %d: plan not satisfied (retry %d/%d, will_retry=%s): %s",
+        attempt_number,
+        retry_count,
+        max_retries,
+        can_retry,
+        feedback,
+    )
+    record: AttemptRecord = {
+        "attempt": attempt_number,
+        "sql": sql,
+        "outcome": "plan_not_satisfied",
+        "error": feedback,
+        "will_retry": can_retry,
+    }
+    update: dict[str, Any] = {
+        "plan_review_passed": False,
+        "plan_review_feedback": feedback,
+        "error_history": [f"Plan review: {feedback}"],
+        "attempt_history": [record],
+        "last_error_category": "plan_not_satisfied",
+        "retry_count": retry_count + 1,
+        "status": "generating" if can_retry else "failed",
+    }
+    if not can_retry:
+        update["failure_explanation"] = _give_up_explanation(
+            state, f"Gave up after {attempt_number} attempts. Last error (plan review): {feedback}"
+        )
+    return update
 
 
 @_timed_node("validate_sql")
@@ -725,19 +867,28 @@ def validate_sql_node(state: AgentState) -> dict[str, Any]:
             }
 
         retry_count = state.get("retry_count", 0)
-        can_retry = retry_count < settings.max_retries
+        max_retries = _effective_max_retries(state, settings)
+        can_retry = retry_count < max_retries
+        # Propagates the validator's actual violation_type ("empty",
+        # "parse_error", "nested_aggregate", ...) rather than a hardcoded
+        # "parse_error" -- this is what lets generate_sql_from_llm's
+        # _ERROR_CATEGORY_HINTS give a category-specific retry hint (e.g.
+        # the nested-aggregate rewrite instruction) instead of only the raw
+        # error text.
+        violation_category = result.violation_type or "parse_error"
         logger.warning(
-            "[validate_sql] rejected (attempt %d, retry %d/%d, will_retry=%s): %s",
+            "[validate_sql] rejected (attempt %d, retry %d/%d, category=%s, will_retry=%s): %s",
             attempt_number,
             retry_count,
-            settings.max_retries,
+            max_retries,
+            violation_category,
             can_retry,
             result.error,
         )
         record = {
             "attempt": attempt_number,
             "sql": sql,
-            "outcome": "parse_error",
+            "outcome": violation_category,
             "error": result.error,
             "will_retry": can_retry,
         }
@@ -745,7 +896,7 @@ def validate_sql_node(state: AgentState) -> dict[str, Any]:
             "validation_error": result.error,
             "error_history": [f"SQL validation error: {result.error}"],
             "attempt_history": [record],
-            "last_error_category": "parse_error",
+            "last_error_category": violation_category,
             "retry_count": retry_count + 1,
             "status": "generating" if can_retry else "failed",
         }
@@ -806,7 +957,7 @@ def validate_sql_node(state: AgentState) -> dict[str, Any]:
                 attempt=attempt_number,
             )
             retry_count = state.get("retry_count", 0)
-            can_retry = retry_count < settings.max_retries
+            can_retry = retry_count < _effective_max_retries(state, settings)
             restricted_record: AttemptRecord = {
                 "attempt": attempt_number,
                 "sql": safe_sql,
@@ -925,7 +1076,7 @@ def estimate_query_cost_node(state: AgentState) -> dict[str, Any]:
         message,
     )
     retry_count = state.get("retry_count", 0)
-    can_retry = retry_count < settings.max_retries
+    can_retry = retry_count < _effective_max_retries(state, settings)
     record: AttemptRecord = {
         "attempt": attempt_number,
         "sql": sql,
@@ -1035,11 +1186,17 @@ def execute_sql_node(state: AgentState) -> dict[str, Any]:
                 ),
             }
 
-        can_retry = retry_count < settings.max_retries
+        can_retry = retry_count < _effective_max_retries(state, settings)
         outcome = (
             "missing_reference"
             if category is ExecutionErrorCategory.MISSING_REFERENCE
-            else "syntax_error" if category is ExecutionErrorCategory.SYNTAX else "unknown_error"
+            else (
+                "aggregate_nesting"
+                if category is ExecutionErrorCategory.AGGREGATE_NESTING
+                else (
+                    "syntax_error" if category is ExecutionErrorCategory.SYNTAX else "unknown_error"
+                )
+            )
         )
 
         error_text = str(exc)
@@ -1217,7 +1374,7 @@ def route_after_classification(state: AgentState) -> str:
 
 
 def route_after_generation(state: AgentState) -> str:
-    """Conditional edge after generate_sql: validate, or stop (rejected/failed/rate_limited).
+    """Conditional edge after generate_sql: review, or stop (rejected/failed/rate_limited).
 
     Every terminal status generate_sql_node can set without ever producing
     SQL -- "rejected" (the `OffTopicQuestionError` backstop), "failed" (an
@@ -1225,13 +1382,12 @@ def route_after_generation(state: AgentState) -> str:
     itself never returned usable text), and "rate_limited" (the process-
     wide LLM-call limiter denied this attempt -- see `agent.rate_limit`) --
     routes straight to END here rather than falling through to
-    `validate_sql_node`. Letting any of these fall through would have
-    `validate_sql_node` re-validate `state["sql"]` (unset on all three
-    paths), see an "empty SQL" parse error, and retry -- silently
-    overwriting the real status and burning the retry budget (or, for
-    rate_limited specifically, immediately re-tripping the same limiter) on
-    a problem retrying can't fix. Only the ordinary success path
-    (`status="validating"`) proceeds to validation.
+    `review_sql_node`/`validate_sql_node`. Letting any of these fall through
+    would have those nodes operate on `state["sql"]` (unset on all three
+    paths) -- silently overwriting the real status and burning the retry
+    budget (or, for rate_limited specifically, immediately re-tripping the
+    same limiter) on a problem retrying can't fix. Only the ordinary success
+    path (`status="reviewing"`) proceeds to `review_sql`.
     """
     status = state.get("status")
     if status == "rejected":
@@ -1240,7 +1396,25 @@ def route_after_generation(state: AgentState) -> str:
         return "failed"
     if status == "rate_limited":
         return "rate_limited"
-    return "validate_sql"
+    return "review_sql"
+
+
+def route_after_review(state: AgentState) -> str:
+    """Conditional edge after review_sql: validate, retry, or give up.
+
+    Mirrors `route_after_validation`'s shape: "validating" (review passed,
+    or was skipped entirely because `state["query_plan"]` was empty/None)
+    proceeds to `validate_sql`; "failed" (a FAIL verdict with the retry
+    budget exhausted) ends the run; anything else (a FAIL verdict with
+    retries remaining) loops back to `generate_sql` with the reviewer's
+    critique now in `error_history`.
+    """
+    status = state.get("status")
+    if status == "validating":
+        return "validate_sql"
+    if status == "failed":
+        return "failed"
+    return "generate_sql"
 
 
 def route_after_validation(state: AgentState) -> str:

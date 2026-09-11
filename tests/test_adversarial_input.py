@@ -59,6 +59,7 @@ def _mock_settings(monkeypatch):
         embedding_model_name="all-MiniLM-L6-v2",
         schema_top_k=4,
         max_retries=3,
+        complex_query_max_retry_bonus=2,
         max_result_rows=1000,
         query_timeout_seconds=15,
         llm_max_tokens=1024,
@@ -444,8 +445,13 @@ class TestPoisonedValueCannotBypassTheValidatorEvenIfModelIsTricked:
             "retry_count": 0,
         }
         gen_result = generate_sql_node(state)
-        assert gen_result["status"] == "validating"
+        assert gen_result["status"] == "reviewing"
 
+        # review_sql_node would run between generate_sql and validate_sql in
+        # the real graph, but with no query_plan set it's a pure pass-through
+        # (see TestReviewSqlNode) -- calling validate_sql_node directly here
+        # still exercises the thing this test cares about: the validator, not
+        # generate_sql_node, is what stops a hijacked response.
         merged_state = {**state, **gen_result, "schema_tables": [], "selected_database": "default"}
         validate_result = validate_sql_node(merged_state)
         assert validate_result["status"] == "failed"

@@ -42,6 +42,7 @@ _BASE_SETTINGS = Settings(
     embedding_model_name="all-MiniLM-L6-v2",
     schema_top_k=4,
     max_retries=3,
+    complex_query_max_retry_bonus=2,
     max_result_rows=1000,
     query_timeout_seconds=15,
     llm_max_tokens=1024,
@@ -172,7 +173,8 @@ class TestAsk:
             "api.main.get_settings", lambda: _settings(question_rate_limit_per_minute=1)
         )
         monkeypatch.setattr(
-            "api.main.run_orchestrated", lambda *a, **k: {"status": "succeeded", "error_history": []}
+            "api.main.run_orchestrated",
+            lambda *a, **k: {"status": "succeeded", "error_history": []},
         )
 
         first = client.post("/ask", json={"question": "q1"})
@@ -189,7 +191,8 @@ class TestAsk:
         # get_settings, not api.main's -- both must be patched.
         monkeypatch.setattr("api.auth.get_settings", lambda: auth_settings)
         monkeypatch.setattr(
-            "api.main.run_orchestrated", lambda *a, **k: {"status": "succeeded", "error_history": []}
+            "api.main.run_orchestrated",
+            lambda *a, **k: {"status": "succeeded", "error_history": []},
         )
 
         no_header = client.post("/ask", json={"question": "q"})

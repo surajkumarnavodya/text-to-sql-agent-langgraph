@@ -998,6 +998,18 @@ if (
             )
             st.code(table["ddl"], language="sql")
 
+    # Only present for a question agent.complexity judged non-trivial (see
+    # agent.nodes.plan_query_node) -- an ordinary question has no query_plan
+    # at all, so this expander doesn't appear for the common case. Any
+    # plan-conformance critiques along the way are already visible in the
+    # retry timeline above (outcome="plan_not_satisfied"); this just shows
+    # the plan itself, the one piece of information not shown anywhere else.
+    query_plan = state.get("query_plan")
+    if query_plan:
+        with st.expander("🧭 Query plan", expanded=False):
+            for i, step in enumerate(query_plan, start=1):
+                st.markdown(f"{i}. {escape_markdown(step)}")
+
     st.subheader("🛠️ Generated SQL")
     st.caption(
         "Edit if needed -- it will be re-validated and re-run when you click Confirm and Run."

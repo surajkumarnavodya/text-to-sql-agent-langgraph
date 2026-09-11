@@ -27,6 +27,15 @@ class ExecutionErrorCategory(str, Enum):
         name, but it can just as easily mean schema retrieval surfaced the
         wrong tables in the first place -- so this category routes back to
         `retrieve_schema`, not straight to `generate_sql`.
+    AGGREGATE_NESTING: the database rejected the query for calling one
+        aggregate function inside another's arguments (e.g. `AVG(CASE WHEN
+        ... THEN SUM(x) ELSE 0 END)`). `agent.sql_validator._find_nested_
+        aggregate` already catches this shape statically before execution
+        for the common case; this category is the execution-time backstop
+        for whatever that AST check misses (e.g. a dialect-specific
+        aggregate sqlglot doesn't classify as `exp.AggFunc`). Retried via
+        `generate_sql` with a targeted rewrite hint (see
+        `agent.llm_client._ERROR_CATEGORY_HINTS`), same budget as SYNTAX.
     TIMEOUT: the query exceeded `QUERY_TIMEOUT_SECONDS`. Retrying the same
         (or a similarly-shaped) expensive query is unlikely to help and
         wastes a retry budget slot -- this category fails immediately
@@ -38,6 +47,7 @@ class ExecutionErrorCategory(str, Enum):
 
     SYNTAX = "syntax"
     MISSING_REFERENCE = "missing_reference"
+    AGGREGATE_NESTING = "aggregate_nesting"
     TIMEOUT = "timeout"
     UNKNOWN = "unknown"
 
@@ -67,6 +77,18 @@ _SYNTAX_KEYWORDS = (
     "ora-00933",  # oracle: sql command not properly ended
 )
 
+# Keyword fragments for "one aggregate function was called inside another's
+# arguments" -- the execution-time backstop for whatever
+# `agent.sql_validator._find_nested_aggregate`'s static AST check misses
+# (see AGGREGATE_NESTING's docstring above). Checked before _SYNTAX_KEYWORDS
+# since some engines phrase this as a syntax-adjacent error.
+_AGGREGATE_NESTING_KEYWORDS = (
+    "cannot perform an aggregate function on an expression containing an aggregate",  # mssql
+    "aggregate function calls cannot be nested",  # postgres
+    "invalid use of group function",  # mysql
+    "ora-00978",  # oracle: nested group function without group by
+)
+
 
 def classify_execution_error(exc: BaseException) -> ExecutionErrorCategory:
     """Best-effort classification of an execution failure.
@@ -87,6 +109,8 @@ def classify_execution_error(exc: BaseException) -> ExecutionErrorCategory:
     message = str(exc).lower()
     if any(keyword in message for keyword in _MISSING_REFERENCE_KEYWORDS):
         return ExecutionErrorCategory.MISSING_REFERENCE
+    if any(keyword in message for keyword in _AGGREGATE_NESTING_KEYWORDS):
+        return ExecutionErrorCategory.AGGREGATE_NESTING
     if any(keyword in message for keyword in _SYNTAX_KEYWORDS):
         return ExecutionErrorCategory.SYNTAX
     return ExecutionErrorCategory.UNKNOWN

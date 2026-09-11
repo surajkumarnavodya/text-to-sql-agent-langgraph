@@ -118,6 +118,45 @@ class TestValidateSqlRejectsUnsafeInput:
         assert result.violation_type not in SAFETY_VIOLATION_TYPES
 
 
+class TestValidateSqlRejectsNestedAggregates:
+    """Every supported engine rejects one aggregate nested inside another's
+    arguments at execution time -- catching it statically here (before a DB
+    round trip) is what lets a retry get a targeted rewrite hint on attempt
+    2 instead of a raw, hard-to-act-on driver error. See CLAUDE.md's note on
+    this failure mode (reproduced from a real "top N per group + year-over-
+    year growth" question the agent gave up on)."""
+
+    def test_rejects_avg_of_sum_in_case(self):
+        sql = (
+            "SELECT region, "
+            "AVG(CASE WHEN flag = 1 THEN SUM(amount) ELSE 0 END) AS growth "
+            "FROM sales GROUP BY region"
+        )
+        result = validate_sql(sql)
+        assert not result.is_valid
+        assert result.violation_type == "nested_aggregate"
+        assert result.violation_type not in SAFETY_VIOLATION_TYPES
+        assert "AVG" in result.error
+        assert "SUM" in result.error
+
+    def test_rejects_sum_of_count(self):
+        result = validate_sql("SELECT SUM(COUNT(*)) FROM orders GROUP BY region")
+        assert not result.is_valid
+        assert result.violation_type == "nested_aggregate"
+
+    def test_accepts_aggregate_in_separate_subquery_scope(self):
+        """An aggregate inside a nested SELECT is a different scope, not nesting."""
+        sql = "SELECT SUM(sub.x) AS total FROM (SELECT AVG(y) AS x FROM t GROUP BY w) sub"
+        result = validate_sql(sql)
+        assert result.is_valid
+        assert result.violation_type is None
+
+    def test_accepts_two_sibling_aggregates(self):
+        """Two aggregates at the same level (not nested in each other) are fine."""
+        result = validate_sql("SELECT SUM(amount) AS total, COUNT(*) AS n FROM orders")
+        assert result.is_valid
+
+
 class TestValidateSqlAdversarialCases:
     """Cases specifically shaped to probe the allowlist, not just the happy path.
 

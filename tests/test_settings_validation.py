@@ -30,6 +30,7 @@ _BASE_SETTINGS = Settings(
     embedding_model_name="x",
     schema_top_k=4,
     max_retries=3,
+    complex_query_max_retry_bonus=2,
     max_result_rows=1000,
     query_timeout_seconds=15,
     llm_max_tokens=1024,
@@ -86,6 +87,8 @@ class TestPositiveValueValidation:
             "llm_call_rate_limit_per_minute",
             "cost_estimation_timeout_seconds",
             "cost_moderate_row_threshold",
+            "query_plan_max_tokens",
+            "sql_review_max_tokens",
         ],
     )
     @pytest.mark.parametrize("bad_value", [0, -1, -100])
@@ -95,6 +98,25 @@ class TestPositiveValueValidation:
 
     def test_valid_settings_do_not_raise(self):
         _settings()  # should not raise
+
+
+class TestComplexQueryMaxRetryBonusValidation:
+    """Unlike the plain `TestPositiveValueValidation` fields above, `0` is a
+    deliberate, valid value here (disables the adaptive retry budget -- see
+    `agent/complexity.py`); only a negative value is a misconfiguration."""
+
+    def test_zero_is_accepted(self):
+        settings = _settings(complex_query_max_retry_bonus=0)
+        assert settings.complex_query_max_retry_bonus == 0
+
+    def test_positive_is_accepted(self):
+        settings = _settings(complex_query_max_retry_bonus=5)
+        assert settings.complex_query_max_retry_bonus == 5
+
+    @pytest.mark.parametrize("bad_value", [-1, -100])
+    def test_negative_raises(self, bad_value):
+        with pytest.raises(ConfigurationError, match="COMPLEX_QUERY_MAX_RETRY_BONUS"):
+            _settings(complex_query_max_retry_bonus=bad_value)
 
 
 class TestCostThresholdOrdering:

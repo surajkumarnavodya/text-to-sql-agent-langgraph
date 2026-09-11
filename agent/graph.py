@@ -1,12 +1,36 @@
 """Wires the agent nodes into a compiled LangGraph state machine.
 
-    sanitize_input -> classify_followup -> retrieve_schema -> generate_sql -+-> validate_sql -+-> estimate_cost -+-> execute_sql -+-> generate_insight -> END
-         |                    |                    ^                       |                  ^                 |                |
-         |                    |                    +-----(retry, up to max_retries)------------+---(retry, high  |               |
-         |                    |                                            |                      cost only)    +--(retry, only  |
-         |                    +-> END (needs_clarification, ambiguous)     |                                       on a missing_  |
-         |                                                                 +-> END (rejected --                    reference       |
-         +-> END (rejected -- too_long/empty/injection_detected/off_topic)    OffTopicQuestionError backstop)       error)
+    sanitize_input -> classify_followup -> retrieve_schema -> plan_query -> generate_sql -+-> review_sql -+-> validate_sql -+-> estimate_cost -+-> execute_sql -+-> generate_insight -> END
+         |                    |                    ^                                      |               ^                |                  ^                 |                |
+         |                    |                    +----------------(retry, up to max_retries)------------+----------------+---(retry, high    |               |
+         |                    |                                                           |                                   cost only)      +--(retry, only  |
+         |                    +-> END (needs_clarification, ambiguous)                    |                                                        on a missing_  |
+         |                                                                                 +-> END (rejected --                                     reference       |
+         +-> END (rejected -- too_long/empty/injection_detected/off_topic)                    OffTopicQuestionError backstop)                       error)
+
+The retry budget itself ("max_retries" in the diagram above) is not always
+`Settings.max_retries` -- `run_agent()` computes an effective, possibly
+larger budget once per question via `agent.complexity.compute_max_retries`
+and stores it in `state["max_retries"]`, which every retry-vs-give-up check
+(`review_sql_node`/`validate_sql_node`/`estimate_query_cost_node`/
+`execute_sql_node`) reads instead of the raw setting. See
+`agent/complexity.py`'s module docstring.
+
+`plan_query` (between `retrieve_schema` and `generate_sql`) and `review_sql`
+(between `generate_sql` and `validate_sql`) are the agentic query-
+decomposition + plan-conformance self-correction pair: `plan_query_node`
+makes an up-front LLM call that breaks a *non-trivial* question (one that
+matched an `agent.complexity` signal) into an ordered plan, which is then
+injected into `generate_sql`'s own prompt; `review_sql_node` makes a second
+LLM call checking whether the generated SQL actually implements that plan,
+looping back to `generate_sql` with a targeted critique (sharing the same
+`max_retries` budget as every other retryable failure) if not. Both nodes
+are a pure pass-through -- no LLM call, zero added latency -- for the
+overwhelming common case of a question that matched no complexity signal,
+or when `Settings.enable_query_planning` is off. See `agent.nodes.
+plan_query_node`/`review_sql_node` for the full reasoning, including the
+fail-open behavior on an unreachable Ollama server or an unparseable
+plan/verdict.
 
 Three failure shapes never loop back at all and go straight to END: a
 validator SAFETY_VIOLATION_TYPES rejection and a `generate_sql` llm_error
@@ -68,23 +92,28 @@ import logging
 
 from langgraph.graph import END, StateGraph
 
+from agent.complexity import compute_max_retries
 from agent.nodes import (
     classify_followup_node,
     estimate_query_cost_node,
     execute_sql_node,
     generate_insight_node,
     generate_sql_node,
+    plan_query_node,
     retrieve_schema_node,
+    review_sql_node,
     route_after_classification,
     route_after_cost_estimate,
     route_after_execution,
     route_after_generation,
+    route_after_review,
     route_after_sanitization,
     route_after_validation,
     sanitize_input_node,
     validate_sql_node,
 )
 from agent.state import AgentState, ConversationExchange
+from config.settings import get_settings
 
 logger = logging.getLogger(__name__)
 
@@ -100,7 +129,9 @@ def build_graph():
     graph.add_node("sanitize_input", sanitize_input_node)
     graph.add_node("classify_followup", classify_followup_node)
     graph.add_node("retrieve_schema", retrieve_schema_node)
+    graph.add_node("plan_query", plan_query_node)
     graph.add_node("generate_sql", generate_sql_node)
+    graph.add_node("review_sql", review_sql_node)
     graph.add_node("validate_sql", validate_sql_node)
     graph.add_node("estimate_cost", estimate_query_cost_node)
     graph.add_node("execute_sql", execute_sql_node)
@@ -123,15 +154,25 @@ def build_graph():
             "needs_clarification": END,
         },
     )
-    graph.add_edge("retrieve_schema", "generate_sql")
+    graph.add_edge("retrieve_schema", "plan_query")
+    graph.add_edge("plan_query", "generate_sql")
     graph.add_conditional_edges(
         "generate_sql",
         route_after_generation,
         {
-            "validate_sql": "validate_sql",
+            "review_sql": "review_sql",
             "rejected": END,
             "failed": END,
             "rate_limited": END,
+        },
+    )
+    graph.add_conditional_edges(
+        "review_sql",
+        route_after_review,
+        {
+            "validate_sql": "validate_sql",
+            "generate_sql": "generate_sql",
+            "failed": END,
         },
     )
 
@@ -197,11 +238,26 @@ def run_agent(
         "rejected", or "rate_limited") and `state["error_history"]` for the
         outcome.
     """
+    settings = get_settings()
+    # Computed once, up front -- not re-evaluated per retry -- so a
+    # question's budget is fixed for the life of this run regardless of how
+    # the question text might read differently in combination with a later
+    # error message. See agent.complexity's module docstring for why this
+    # exists: certain question shapes (top-N-per-group, period-over-period
+    # growth, several metrics at once) are more likely to need more than
+    # one or two self-correction cycles.
+    effective_max_retries, complexity_signals = compute_max_retries(
+        question, settings.max_retries, settings.complex_query_max_retry_bonus
+    )
     logger.info(
-        "Starting agent run for question=%r conversation_history_len=%d enable_insight=%s",
+        "Starting agent run for question=%r conversation_history_len=%d enable_insight=%s "
+        "max_retries=%d (base=%d) complexity_signals=%s",
         question,
         len(conversation_history or []),
         enable_insight,
+        effective_max_retries,
+        settings.max_retries,
+        complexity_signals,
     )
     compiled_graph = build_graph()
     initial_state: AgentState = {
@@ -214,6 +270,9 @@ def run_agent(
         "followup_resolved_against": None,
         "clarification_message": None,
         "selected_database": None,
+        "query_plan": None,
+        "plan_review_passed": None,
+        "plan_review_feedback": None,
         "enable_insight": enable_insight,
         "insight": None,
         "insight_summary": None,
@@ -222,6 +281,8 @@ def run_agent(
         "cost_notice": None,
         "low_confidence_notice": None,
         "retry_count": 0,
+        "max_retries": effective_max_retries,
+        "complexity_signals": complexity_signals,
         "error_history": [],
         "attempt_history": [],
         "last_error_category": None,

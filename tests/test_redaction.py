@@ -33,6 +33,7 @@ _BASE_SETTINGS = Settings(
     embedding_model_name="x",
     schema_top_k=4,
     max_retries=3,
+    complex_query_max_retry_bonus=2,
     max_result_rows=1000,
     query_timeout_seconds=15,
     llm_max_tokens=1024,

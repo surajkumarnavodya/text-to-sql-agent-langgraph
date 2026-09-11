@@ -215,6 +215,12 @@ class Settings:
         ollama_model: Name of the Ollama model to use for SQL generation.
             Swap this (via OLLAMA_MODEL in .env) to try sqlcoder, duckdb-nsql, etc.
         ollama_request_timeout_seconds: Per-request timeout for calls to Ollama.
+            Defaults to 300s -- local models on modest hardware (no GPU, a
+            large context from schema retrieval, etc.) can take well over
+            the old 60s default to finish a single generation, which
+            surfaced as httpx.ReadTimeout/ConnectTimeout errors bubbling up
+            as ollama.ResponseError in agent/llm_client.py and rag/llm.py.
+            Override via OLLAMA_REQUEST_TIMEOUT_SECONDS in .env.
         db_type: Target database engine, e.g. "postgresql", "mssql", "mysql",
             "oracle". Interpreted by `db/connection.py` -- see
             `db.connection.SUPPORTED_DB_TYPES` for the full list.
@@ -244,6 +250,15 @@ class Settings:
         embedding_model_name: sentence-transformers model used for embeddings.
         schema_top_k: Number of most-relevant tables to retrieve per question.
         max_retries: Max self-correction retries in the LangGraph agent loop.
+        complex_query_max_retry_bonus: Extra retries granted on top of
+            `max_retries`, for questions `agent.complexity.
+            detect_complexity_signals` judges likely to need more than one
+            or two self-correction cycles (e.g. "top N per group" phrasing,
+            year-over-year/period-over-period comparisons, several distinct
+            metrics requested at once) -- one extra retry per distinct
+            signal matched, capped at this value. Zero disables the
+            adaptive budget entirely (every question gets exactly
+            `max_retries`, the pre-existing behavior).
         max_result_rows: Row cap applied to every executed query.
         query_timeout_seconds: Wall-clock timeout for query execution.
         llm_max_tokens: Max tokens the LLM may generate per call (sandboxing).
@@ -308,6 +323,23 @@ class Settings:
             existed. See `agent/orchestrator/graph.py`'s module docstring
             (`docs/ARCHITECTURE.md` gets a matching section once the
             multi-source design lands in full -- see CLAUDE.md's Part 7).
+        enable_query_planning: Whether `agent.nodes.plan_query_node` makes an
+            up-front planning LLM call for a question `agent.complexity.
+            detect_complexity_signals` judges non-trivial (top-N-per-group,
+            period-over-period growth, several metrics at once -- the same
+            signals that widen the retry budget, see
+            `complex_query_max_retry_bonus` above). True by default. A
+            *simple* question never triggers a planning call regardless of
+            this flag -- it only gates the complex-question path, so leaving
+            this on has zero effect on the common case. See
+            `agent/nodes.py::plan_query_node`.
+        query_plan_max_tokens: Max tokens the LLM may generate for the
+            query plan (a short JSON array of step strings) -- deliberately
+            small and separate from `llm_max_tokens`, mirroring
+            `insight_max_tokens`'s reasoning.
+        sql_review_max_tokens: Max tokens the LLM may generate for the
+            plan-conformance review verdict (`agent.nodes.review_sql_node`)
+            -- "PASS" or a one-sentence "FAIL: <reason>", never more.
         rag_store_connection_string: Full SQLAlchemy connection string for
             the document/policy RAG store (`rag/store.py`) -- a SQL Server
             2025+/Azure SQL database using the native `VECTOR` column type
@@ -389,6 +421,7 @@ class Settings:
     embedding_model_name: str
     schema_top_k: int
     max_retries: int
+    complex_query_max_retry_bonus: int
     max_result_rows: int
     query_timeout_seconds: int
     llm_max_tokens: int
@@ -403,6 +436,9 @@ class Settings:
     log_level: str
     log_redaction_level: str
     enable_multi_source_router: bool = False
+    enable_query_planning: bool = True
+    query_plan_max_tokens: int = 300
+    sql_review_max_tokens: int = 200
     api_auth_token: SecretStr | None = None
     rag_store_connection_string: SecretStr | None = None
     rag_store_odbc_driver: str = "ODBC Driver 17 for SQL Server"
@@ -485,6 +521,8 @@ class Settings:
             ("QUERY_TIMEOUT_SECONDS", self.query_timeout_seconds),
             ("LLM_MAX_TOKENS", self.llm_max_tokens),
             ("INSIGHT_MAX_TOKENS", self.insight_max_tokens),
+            ("QUERY_PLAN_MAX_TOKENS", self.query_plan_max_tokens),
+            ("SQL_REVIEW_MAX_TOKENS", self.sql_review_max_tokens),
             ("MAX_QUESTION_LENGTH", self.max_question_length),
             ("QUESTION_RATE_LIMIT_PER_MINUTE", self.question_rate_limit_per_minute),
             ("LLM_CALL_RATE_LIMIT_PER_MINUTE", self.llm_call_rate_limit_per_minute),
@@ -502,6 +540,16 @@ class Settings:
                     f"{name}={value} is not valid -- it must be a positive number. "
                     f"Fix it in .env (or remove it to use the default)."
                 )
+
+        # Zero is a deliberate, valid value here (disables the adaptive retry
+        # budget -- see the field's docstring), unlike positive_fields above;
+        # only negative is a misconfiguration.
+        if self.complex_query_max_retry_bonus < 0:
+            raise ConfigurationError(
+                f"COMPLEX_QUERY_MAX_RETRY_BONUS={self.complex_query_max_retry_bonus} is not "
+                f"valid -- it must be zero or a positive number. Fix it in .env (or remove it "
+                f"to use the default)."
+            )
 
         if self.cost_moderate_row_threshold >= self.cost_high_row_threshold:
             raise ConfigurationError(
@@ -539,7 +587,7 @@ def get_settings() -> Settings:
     settings = Settings(
         ollama_host=_env_str("OLLAMA_HOST", "http://localhost:11434"),
         ollama_model=_env_str("OLLAMA_MODEL", "llama3.1:8b"),
-        ollama_request_timeout_seconds=_env_int("OLLAMA_REQUEST_TIMEOUT_SECONDS", 60),
+        ollama_request_timeout_seconds=_env_int("OLLAMA_REQUEST_TIMEOUT_SECONDS", 300),
         db_type=_env_str("DB_TYPE", "").strip().lower(),
         db_host=_env_optional_str("DB_HOST"),
         db_port=_env_optional_int_strict("DB_PORT"),
@@ -554,6 +602,7 @@ def get_settings() -> Settings:
         embedding_model_name=_env_str("EMBEDDING_MODEL_NAME", "all-MiniLM-L6-v2"),
         schema_top_k=_env_int("SCHEMA_TOP_K", 4),
         max_retries=_env_int("MAX_RETRIES", 3),
+        complex_query_max_retry_bonus=_env_int("COMPLEX_QUERY_MAX_RETRY_BONUS", 2),
         max_result_rows=_env_int("MAX_RESULT_ROWS", 1000),
         query_timeout_seconds=_env_int("QUERY_TIMEOUT_SECONDS", 15),
         llm_max_tokens=_env_int("LLM_MAX_TOKENS", 1024),
@@ -568,6 +617,9 @@ def get_settings() -> Settings:
         log_level=_env_str("LOG_LEVEL", "INFO"),
         log_redaction_level=_env_str("LOG_REDACTION_LEVEL", "standard").strip().lower(),
         enable_multi_source_router=_env_bool("ENABLE_MULTI_SOURCE_ROUTER", False),
+        enable_query_planning=_env_bool("ENABLE_QUERY_PLANNING", True),
+        query_plan_max_tokens=_env_int("QUERY_PLAN_MAX_TOKENS", 300),
+        sql_review_max_tokens=_env_int("SQL_REVIEW_MAX_TOKENS", 200),
         api_auth_token=as_secret(_env_optional_str("API_AUTH_TOKEN")),
         rag_store_connection_string=as_secret(_env_optional_str("RAG_STORE_CONNECTION_STRING")),
         rag_store_odbc_driver=_env_str("RAG_STORE_ODBC_DRIVER", "ODBC Driver 17 for SQL Server"),

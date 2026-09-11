@@ -150,6 +150,7 @@ ViolationType = Literal[
     "select_into",
     "embedded_write",
     "dangerous_function",
+    "nested_aggregate",
 ]
 
 SAFETY_VIOLATION_TYPES: frozenset[str] = frozenset(
@@ -188,6 +189,46 @@ class ValidationResult:
     violation_type: ViolationType | None = None
 
 
+def _find_nested_aggregate(statement: exp.Expression) -> tuple[exp.AggFunc, exp.AggFunc] | None:
+    """Finds an aggregate function called inside another aggregate function's own arguments.
+
+    Every supported engine (mssql, postgres, mysql, oracle) rejects this
+    shape at execution time -- e.g. `AVG(CASE WHEN ... THEN SUM(x) ELSE 0
+    END)` -- but a weak local LLM asked for something like "average
+    year-over-year growth" reaches for exactly this pattern often enough
+    that it's worth catching before a DB round trip (see
+    `agent.error_classification.ExecutionErrorCategory.AGGREGATE_NESTING`
+    for the execution-time backstop when this static check has a false
+    negative, e.g. a dialect-specific aggregate sqlglot doesn't classify as
+    `exp.AggFunc`).
+
+    Walks each aggregate's own argument subtree only (not the whole
+    statement), and does not descend into a nested `exp.Select` -- a
+    subquery is its own scope, so `SUM(x) FROM (SELECT AVG(y) AS x FROM t)`
+    is legitimate and must not be flagged.
+
+    Args:
+        statement: A parsed, single-statement SQL AST (already confirmed
+            SELECT-shaped by the caller).
+
+    Returns:
+        `(outer, inner)` -- the outer aggregate and the aggregate nested
+        inside it -- for the first match found, or None if there is none.
+    """
+    for outer in statement.find_all(exp.AggFunc):
+        nested = next(
+            (
+                node
+                for node in outer.walk(prune=lambda n: isinstance(n, exp.Select))
+                if node is not outer and isinstance(node, exp.AggFunc)
+            ),
+            None,
+        )
+        if nested is not None:
+            return outer, nested
+    return None
+
+
 def validate_sql(sql: str, dialect: str | None = DEFAULT_DIALECT) -> ValidationResult:
     """Parses `sql` and checks it against the SELECT-only allowlist.
 
@@ -208,6 +249,12 @@ def validate_sql(sql: str, dialect: str | None = DEFAULT_DIALECT) -> ValidationR
           `_DANGEROUS_FUNCTION_NAMES` for the full list and why each is
           there. This is a denylist, not an allowlist, and is documented as
           such (not exhaustive) in SECURITY.md.
+        - An aggregate function nested inside another aggregate function's
+          own arguments (e.g. `AVG(CASE WHEN ... THEN SUM(x) ELSE 0 END)`)
+          -- every supported engine rejects this at execution time; see
+          `_find_nested_aggregate`. Retryable (`violation_type=
+          "nested_aggregate"`, not in `SAFETY_VIOLATION_TYPES`), not a
+          security-gate failure.
 
     Args:
         sql: Raw SQL text, as produced by the LLM (already stripped of any
@@ -311,6 +358,22 @@ def validate_sql(sql: str, dialect: str | None = DEFAULT_DIALECT) -> ValidationR
                 "just querying data."
             ),
             violation_type="dangerous_function",
+        )
+
+    nested_aggregate = _find_nested_aggregate(statement)
+    if nested_aggregate is not None:
+        outer, inner = nested_aggregate
+        return ValidationResult(
+            is_valid=False,
+            error=(
+                f"{outer.sql_name().upper()}(...) contains a nested "
+                f"{inner.sql_name().upper()}(...) call -- an aggregate function cannot "
+                "be called inside another aggregate function's arguments. Rewrite this "
+                "using a CTE that pre-aggregates first, or a window function "
+                "(e.g. SUM(...) OVER (PARTITION BY ...), LAG(...) OVER (...)) instead "
+                "of nesting aggregate calls."
+            ),
+            violation_type="nested_aggregate",
         )
 
     return ValidationResult(
