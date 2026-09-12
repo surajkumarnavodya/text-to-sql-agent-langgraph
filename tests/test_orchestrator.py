@@ -316,6 +316,40 @@ class TestWebSearchNode:
         result = web_search_node({"question": "x"})
         assert result["web_result"]["status"] == "failed"
 
+    def test_uses_the_configured_answer_token_budget(self, monkeypatch):
+        """Regression guard: the answer-drafting call must use
+        `Settings.web_search_answer_max_tokens` (a larger, dedicated budget
+        for a structured, in-depth answer), not a small hardcoded value."""
+        settings = _settings(
+            enable_web_search=True,
+            web_search_api_key=SecretStr("tvly-x"),
+            web_search_answer_max_tokens=1200,
+        )
+        monkeypatch.setattr(orchestrator_nodes, "get_settings", lambda: settings)
+        import search.web_search
+        from search.web_search import WebResult
+
+        monkeypatch.setattr(
+            search.web_search,
+            "web_search",
+            lambda query, settings: [
+                WebResult(title="T", url="https://x.test", snippet="s", retrieved_at="now")
+            ],
+        )
+        import rag.llm
+
+        captured = {}
+
+        def _capture(system_prompt, user_prompt, settings, max_tokens, **kwargs):
+            captured["max_tokens"] = max_tokens
+            return "According to a live web search: X."
+
+        monkeypatch.setattr(rag.llm, "call_ollama", _capture)
+
+        web_search_node({"question": "what's new today?"})
+
+        assert captured["max_tokens"] == 1200
+
 
 class TestSynthesisNode:
     def test_is_a_pass_through_for_a_single_source(self):

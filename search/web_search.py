@@ -61,6 +61,12 @@ def _tavily_search(query: str, settings: Settings) -> list[WebResult]:
             "api_key": settings.web_search_api_key.get_secret_value(),
             "query": query,
             "max_results": settings.web_search_max_results,
+            # "advanced" (vs. Tavily's default "basic") returns materially
+            # richer per-result content -- what agent.orchestrator.nodes
+            # .web_search_node's answer-generation prompt actually needs to
+            # synthesize an in-depth, multi-source answer from, rather than
+            # a one-line snippet per source.
+            "search_depth": "advanced",
         },
         timeout=_REQUEST_TIMEOUT_SECONDS,
     )

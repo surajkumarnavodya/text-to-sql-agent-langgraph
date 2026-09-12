@@ -15,9 +15,11 @@ from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
+from sqlalchemy import create_engine, text
 
 import api.main as api_main
 from agent.exceptions import SchemaRetrievalError
+from agent.orchestrator.state import OrchestratorState
 from agent.state import AgentState
 from config.settings import Settings
 from db.schema_introspection import ColumnInfo, TableSchemaInfo
@@ -190,6 +192,88 @@ class TestAsk:
         assert first.status_code == 200
         assert second.status_code == 429
         assert "Retry-After" in second.headers
+
+    def test_multi_source_fields_are_surfaced(self, monkeypatch, client):
+        """Regression guard for the gap the pre-React-migration API audit
+        found: sources_used/citations/synthesized_answer/schema_tables/
+        query_plan/followup fields must reach the client, not just the
+        SQL-only subset AskResponse originally covered."""
+        final_state: OrchestratorState = {
+            "status": "succeeded",
+            "sql": "SELECT 1",
+            "error_history": [],
+            "sources_used": ["sql", "policy"],
+            "synthesized_answer": "**Database**: 1 row(s) returned.\n\n**Policy**: Leave policy is 20 days.",
+            "policy_result": {
+                "answer": "Leave policy is 20 days.",
+                "citations": [
+                    {
+                        "filename": "leave.pdf",
+                        "chunk_index": 0,
+                        "page_number": 1,
+                        "document_id": "doc-1",
+                        "has_pdf_bytes": True,
+                    }
+                ],
+                "status": "succeeded",
+            },
+            "query_plan": ["Group by region", "Sum revenue"],
+            "schema_tables": [
+                {"table_name": "Sales", "ddl": "CREATE TABLE Sales (...)", "similarity_score": 0.9}
+            ],
+            "followup_classification": "followup",
+            "followup_resolved_against": {
+                "question": "Total sales in 2012?",
+                "sql": "SELECT SUM(x) FROM t",
+                "tables": ["t"],
+                "status": "succeeded",
+            },
+        }
+        monkeypatch.setattr("api.main.run_orchestrated", lambda *a, **k: final_state)
+
+        response = client.post("/ask", json={"question": "And the leave policy?"})
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body["sources_used"] == ["sql", "policy"]
+        assert "Leave policy" in body["synthesized_answer"]
+        assert body["policy_result"]["citations"][0]["document_id"] == "doc-1"
+        assert body["policy_result"]["citations"][0]["has_pdf_bytes"] is True
+        assert body["query_plan"] == ["Group by region", "Sum revenue"]
+        assert body["schema_tables"][0]["table_name"] == "Sales"
+        assert body["followup_classification"] == "followup"
+        assert body["followup_resolved_against"]["question"] == "Total sales in 2012?"
+
+    def test_real_sqlalchemy_row_objects_in_result_rows_serialize_correctly(
+        self, monkeypatch, client
+    ):
+        """Regression guard: `agent.nodes.execute_sql_node` populates
+        `result_rows` from `db.execution.execute_readonly_sql`, which
+        returns `sqlalchemy.engine.row.Row` objects, not plain tuples --
+        `Row` isn't recognized by `fastapi.encoders.jsonable_encoder`'s
+        isinstance checks and previously raised ValueError('object is not
+        iterable', ...) the first time /ask ran against a real database
+        (mocked-`run_orchestrated` tests never exercised a real Row)."""
+        engine = create_engine("sqlite:///:memory:")
+        with engine.connect() as conn:
+            real_rows = conn.execute(text("SELECT 1 AS cnt")).fetchall()
+        assert type(real_rows[0]).__name__ == "Row"
+
+        final_state: AgentState = {
+            "status": "succeeded",
+            "sql": "SELECT COUNT(*) AS cnt FROM t",
+            "result_columns": ["cnt"],
+            # Real Row objects, not tuples -- see docstring above.
+            "result_rows": real_rows,  # type: ignore[typeddict-item]
+            "row_count": 1,
+            "error_history": [],
+        }
+        monkeypatch.setattr("api.main.run_orchestrated", lambda *a, **k: final_state)
+
+        response = client.post("/ask", json={"question": "How many rows?"})
+
+        assert response.status_code == 200
+        assert response.json()["result_rows"] == [[1]]
 
     def test_auth_required_when_token_configured(self, monkeypatch, client):
         auth_settings = _settings(api_auth_token=SecretStr("s3cret"))

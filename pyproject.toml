@@ -22,6 +22,14 @@ ignore = [
 [tool.ruff.lint.isort]
 known-first-party = ["agent", "api", "config", "db", "embeddings", "eval", "observability", "rag", "scripts", "search", "security", "ui"]
 
+[tool.ruff.lint.flake8-bugbear]
+# FastAPI's dependency-injection convention requires calling File()/Form()
+# as an argument default (fastapi.Depends is already ruff's built-in
+# default exemption) -- these are singleton marker objects FastAPI itself
+# inspects at request time, not the mutable-default-argument footgun B008
+# actually guards against.
+extend-immutable-calls = ["fastapi.File", "fastapi.Form"]
+
 [tool.mypy]
 # Deliberately not pinned to 3.11 (the project's nominal target, see
 # requires-python above): this machine's venv runs 3.14 (see CLAUDE.md's

@@ -15,16 +15,22 @@ front of.
 
 from __future__ import annotations
 
+import json
 import logging
 import sys
+import time
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import Any
 
+import pandas as pd
 from fastapi import Depends, FastAPI, HTTPException, Request, Response, status
 from fastapi.encoders import jsonable_encoder
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from sqlalchemy.exc import SQLAlchemyError
 
 # `uvicorn api.main:app` does not guarantee the repo root is on sys.path
 # (unlike running as an installed package) -- same reasoning as
@@ -36,23 +42,38 @@ from agent.graph import build_graph
 from agent.llm_client import get_ollama_client
 from agent.orchestrator.graph import build_orchestrator_graph, run_orchestrated
 from agent.rate_limit import QUESTION_LIMIT_MESSAGE, SlidingWindowRateLimiter
-from agent.state import AgentState, ConversationExchange
+from agent.result_charting import build_chart
+from agent.sql_validator import enforce_row_limit, qualify_table_schema, validate_sql
+from agent.state import ConversationExchange
 from api.auth import verify_api_key
+from api.documents import router as documents_router
 from api.schemas import (
     AskRequest,
     AskResponse,
     AttemptRecordOut,
+    CitationOut,
     ColumnOut,
     ComponentHealth,
+    ConversationExchangeOut,
     DatabaseHealth,
+    ExecuteRequest,
+    ExecuteResponse,
+    GoldenExampleFeedbackRequest,
+    GoldenExampleFeedbackResponse,
     HealthResponse,
+    SchemaRefreshResponse,
+    SchemaRefreshResult,
+    SchemaTableOut,
+    SourceAnswerOut,
     TableOut,
     TablesResponse,
 )
 from config.settings import ConfigurationError, configure_logging, get_settings
-from db.connection import get_read_only_engine, test_connection
+from db.connection import get_connection, get_read_only_engine, get_sqlglot_dialect, test_connection
+from db.execution import execute_readonly_sql
 from db.schema_introspection import introspect_schema
-from embeddings.schema_indexer import get_chroma_client, get_collection
+from embeddings.golden_examples import save_golden_example
+from embeddings.schema_indexer import get_chroma_client, get_collection, refresh_all_schema_indexes
 from security.audit_log import get_correlation_id, reset_correlation_id, set_correlation_id
 from security.redaction import redact_secrets
 
@@ -120,6 +141,21 @@ app = FastAPI(
     version="0.1.0",
     lifespan=lifespan,
 )
+app.include_router(documents_router)
+
+# No-op when Settings.cors_allowed_origins is empty (the default) -- a
+# same-origin deployment (the built React app served by this same FastAPI
+# app) needs no CORS at all. Only active when a dev origin (e.g. a Vite
+# dev server) is explicitly configured via .env.
+_cors_origins = get_settings().cors_allowed_origins
+if _cors_origins:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=list(_cors_origins),
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
 
 
 @app.exception_handler(AgentError)
@@ -211,7 +247,7 @@ async def _correlation_id_middleware(request: Request, call_next):
     return response
 
 
-def _attempt_records_out(state: AgentState) -> list[AttemptRecordOut]:
+def _attempt_records_out(state: Mapping[str, Any]) -> list[AttemptRecordOut]:
     return [
         AttemptRecordOut(
             attempt=record["attempt"],
@@ -224,7 +260,63 @@ def _attempt_records_out(state: AgentState) -> list[AttemptRecordOut]:
     ]
 
 
-def _ask_response_from_state(state: AgentState, session_id: str) -> AskResponse:
+def _rows_to_json(rows: list[Any] | None) -> list[list[Any]] | None:
+    """Converts DB result rows to plain JSON-encodable lists.
+
+    `db.execution.execute_readonly_sql` returns `sqlalchemy.engine.row.Row`
+    objects, not plain tuples -- `Row` behaves like a tuple (iterable,
+    indexable) but isn't recognized as one by `fastapi.encoders
+    .jsonable_encoder`'s isinstance checks, so passing it directly raises
+    (its dict()/vars() object-fallback path doesn't apply to Row either).
+    Converting to `list(row)` first sidesteps that entirely; jsonable_encoder
+    still does the real work of encoding each row's actual values (Decimal,
+    datetime, UUID, ...).
+    """
+    if rows is None:
+        return None
+    return jsonable_encoder([list(row) for row in rows])
+
+
+def _source_answer_out(result: Mapping[str, Any] | None) -> SourceAnswerOut | None:
+    """Converts one `agent.orchestrator.state.SourceAnswer` dict (document_result/
+    policy_result/web_result) to its API shape -- None passes through as None."""
+    if result is None:
+        return None
+    return SourceAnswerOut(
+        answer=result.get("answer", ""),
+        citations=[
+            CitationOut(
+                filename=citation["filename"],
+                chunk_index=citation["chunk_index"],
+                page_number=citation.get("page_number"),
+                document_id=citation["document_id"],
+                has_pdf_bytes=citation["has_pdf_bytes"],
+            )
+            for citation in result.get("citations", [])
+        ],
+        status=result.get("status", "succeeded"),
+    )
+
+
+def _followup_resolved_against_out(
+    exchange: Mapping[str, Any] | None,
+) -> ConversationExchangeOut | None:
+    if exchange is None:
+        return None
+    return ConversationExchangeOut(
+        question=exchange["question"],
+        sql=exchange.get("sql"),
+        tables=exchange.get("tables", []),
+        status=exchange["status"],
+    )
+
+
+def _ask_response_from_state(state: Mapping[str, Any], session_id: str) -> AskResponse:
+    # Typed as a plain Mapping, not AgentState, since `run_orchestrated` can
+    # return either an AgentState (router off) or an OrchestratorState
+    # (router on) -- the latter's extra keys (sources_used, document_result,
+    # ...) aren't part of AgentState's declared shape. Same convention
+    # `ui/app.py::_is_sql_result` uses for the identical reason.
     result_rows = state.get("result_rows")
     return AskResponse(
         session_id=session_id,
@@ -232,7 +324,7 @@ def _ask_response_from_state(state: AgentState, session_id: str) -> AskResponse:
         database=state.get("selected_database"),
         sql=state.get("sql"),
         result_columns=state.get("result_columns"),
-        result_rows=jsonable_encoder(result_rows) if result_rows is not None else None,
+        result_rows=_rows_to_json(result_rows),
         row_count=state.get("row_count"),
         retry_count=state.get("retry_count", 0),
         attempt_history=_attempt_records_out(state),
@@ -245,6 +337,24 @@ def _ask_response_from_state(state: AgentState, session_id: str) -> AskResponse:
         clarification_message=state.get("clarification_message"),
         failure_explanation=state.get("failure_explanation"),
         error_history=state.get("error_history", []),
+        sources_used=state.get("sources_used", []),
+        synthesized_answer=state.get("synthesized_answer"),
+        document_result=_source_answer_out(state.get("document_result")),
+        policy_result=_source_answer_out(state.get("policy_result")),
+        web_result=_source_answer_out(state.get("web_result")),
+        query_plan=state.get("query_plan"),
+        schema_tables=[
+            SchemaTableOut(
+                table_name=table["table_name"],
+                ddl=table["ddl"],
+                similarity_score=table["similarity_score"],
+            )
+            for table in state.get("schema_tables", [])
+        ],
+        followup_classification=state.get("followup_classification"),
+        followup_resolved_against=_followup_resolved_against_out(
+            state.get("followup_resolved_against")
+        ),
     )
 
 
@@ -376,6 +486,120 @@ def ask(payload: AskRequest, request: Request) -> AskResponse:
     return _ask_response_from_state(final_state, session_id)
 
 
+@app.post("/execute", response_model=ExecuteResponse, dependencies=[Depends(verify_api_key)])
+def execute(payload: ExecuteRequest) -> ExecuteResponse:
+    """Validates and executes a specific SQL string read-only -- the exact
+    `validate_sql` -> `enforce_row_limit` -> `qualify_table_schema` ->
+    `execute_readonly_sql` sequence `ui/app.py`'s "Confirm and Run" button
+    already runs, reachable here without a Streamlit session. This is the
+    "SQL is untrusted output, always" rule applied at this layer too: `sql`
+    is always re-validated and re-executed exactly as supplied, never
+    trusted because it happens to look like something `/ask` returned.
+    """
+    settings = get_settings()
+    if not settings.databases:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="No database configured."
+        )
+    database_name = payload.database or settings.databases[0].name
+    try:
+        db_config = get_connection(settings, database_name)
+    except ConfigurationError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail=f"Unknown database {database_name!r}."
+        ) from exc
+
+    dialect = get_sqlglot_dialect(db_config.db_type)
+    validation = validate_sql(payload.sql, dialect=dialect)
+    if not validation.is_valid:
+        return ExecuteResponse(
+            status="rejected", database=database_name, error=f"Rejected: {validation.error}"
+        )
+
+    assert validation.normalized_sql is not None  # guaranteed when is_valid is True
+    safe_sql = enforce_row_limit(
+        validation.normalized_sql, settings.max_result_rows, dialect=dialect
+    )
+    # Schema-qualifies unqualified table references for this execution only
+    # -- see qualify_table_schema's docstring. `normalized_sql` in the
+    # response stays bare-named, matching ui/app.py's editable-SQL-box
+    # convention (the box never shows the schema-qualified form).
+    execution_sql = qualify_table_schema(safe_sql, db_config.db_schema, dialect=dialect)
+
+    try:
+        start = time.perf_counter()
+        columns, rows = execute_readonly_sql(
+            execution_sql,
+            settings.query_timeout_seconds,
+            settings.max_result_rows,
+            engine=get_read_only_engine(db_config),
+        )
+        duration_ms = (time.perf_counter() - start) * 1000
+    except (SQLAlchemyError, TimeoutError) as exc:
+        # Passed db_config (not the global settings) so the exact password
+        # redacted is the one actually in play for this connection -- see
+        # security.redaction.redact_secrets' docstring.
+        safe_detail = redact_secrets(str(exc), db_config)
+        return ExecuteResponse(
+            status="failed", database=database_name, error=f"Execution failed: {safe_detail}"
+        )
+
+    chart_json: dict[str, Any] | None = None
+    figure = build_chart(pd.DataFrame(rows, columns=columns))
+    if figure is not None:
+        # figure.to_json() (Plotly's own encoder, not jsonable_encoder) is
+        # what correctly handles the numpy arrays/pandas Timestamps a
+        # Plotly figure's data traces are built from.
+        chart_json = json.loads(figure.to_json())
+
+    return ExecuteResponse(
+        status="succeeded",
+        database=database_name,
+        normalized_sql=safe_sql,
+        result_columns=columns,
+        result_rows=_rows_to_json(rows),
+        row_count=len(rows),
+        duration_ms=duration_ms,
+        chart=chart_json,
+    )
+
+
+@app.post(
+    "/feedback/golden-example",
+    response_model=GoldenExampleFeedbackResponse,
+    dependencies=[Depends(verify_api_key)],
+)
+def feedback_golden_example(payload: GoldenExampleFeedbackRequest) -> GoldenExampleFeedbackResponse:
+    """Records a human-approved (question, SQL) pair for future few-shot
+    retrieval -- the same `embeddings.golden_examples.save_golden_example`
+    call `ui/app.py` makes when a user thumbs-up's a confirmed result.
+    `sql` should be the exact SQL that was actually run and confirmed
+    correct (e.g. from a prior `/execute` call), not necessarily the
+    original `/ask` draft if the caller edited it.
+    """
+    save_golden_example(payload.question, payload.sql, payload.database, get_settings())
+    return GoldenExampleFeedbackResponse(saved=True)
+
+
+@app.post(
+    "/schema/refresh", response_model=SchemaRefreshResponse, dependencies=[Depends(verify_api_key)]
+)
+def schema_refresh() -> SchemaRefreshResponse:
+    """Re-introspects and re-embeds every configured database's schema --
+    the same `refresh_all_schema_indexes` call the Streamlit sidebar's
+    "Refresh Schema" button makes. Skips re-embedding a database whose
+    schema fingerprint hasn't changed (see that function's docstring), so
+    calling this when nothing changed is cheap.
+    """
+    results = refresh_all_schema_indexes(get_settings())
+    return SchemaRefreshResponse(
+        databases=[
+            SchemaRefreshResult(database=db_name, table_count=len(tables))
+            for db_name, tables in results.items()
+        ]
+    )
+
+
 @app.get("/schema/tables", response_model=TablesResponse, dependencies=[Depends(verify_api_key)])
 def schema_tables(database: str | None = None) -> TablesResponse:
     """Live schema listing (table/column names, types) -- the same
@@ -421,3 +645,39 @@ def schema_tables(database: str | None = None) -> TablesResponse:
                 )
             )
     return TablesResponse(tables=tables_out)
+
+
+# Serves the built React frontend (frontend/dist, `npm run build`) from this
+# same process -- what makes "single origin, no CORS needed" true in
+# production. A no-op (one-time log line, not a startup failure) if the
+# frontend hasn't been built yet -- this API is fully usable standalone
+# during development.
+_frontend_dist = Path(__file__).resolve().parent.parent / "frontend" / "dist"
+if _frontend_dist.is_dir():
+    from fastapi.responses import FileResponse
+    from fastapi.staticfiles import StaticFiles
+
+    # Vite's build output puts every hashed JS/CSS bundle under /assets --
+    # a plain mount is enough for those (real files only, never a directory
+    # listing or a fallback).
+    app.mount("/assets", StaticFiles(directory=_frontend_dist / "assets"), name="frontend-assets")
+
+    @app.get("/{full_path:path}", include_in_schema=False)
+    async def serve_frontend(full_path: str) -> FileResponse:
+        """Serves any other built root-level file (favicon, etc.) verbatim,
+        and falls back to `index.html` for everything else -- what lets
+        react-router's client-side routes (e.g. `/knowledge-sources`)
+        survive a hard refresh instead of 404ing on this server. Registered
+        last (after every API route above), so those always win first --
+        FastAPI/Starlette matches routes in registration order.
+        """
+        candidate = _frontend_dist / full_path
+        if full_path and candidate.is_file():
+            return FileResponse(candidate)
+        return FileResponse(_frontend_dist / "index.html")
+
+else:
+    logger.info(
+        "[startup] frontend/dist not found -- run `npm run build` in frontend/ to serve the "
+        "React UI from this API process. The API itself is unaffected."
+    )

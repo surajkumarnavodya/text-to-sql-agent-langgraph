@@ -57,6 +57,9 @@ pydantic-settings==2.15.0
 # transitive) powers fastapi.testclient.TestClient, used by
 # tests/test_api_*.py -- no separate test-only HTTP client needed.
 fastapi==0.141.1
+# Required by FastAPI to parse multipart/form-data -- api/documents.py's
+# POST /documents (PDF upload) is the only route that needs it.
+python-multipart==0.0.32
 
 # Config
 python-dotenv==1.0.1

@@ -474,6 +474,13 @@ class Settings(BaseSettings):
         web_search_api_key: API key for the configured provider. A
             `SecretStr` for the same reason `db_password` is.
         web_search_max_results: Max results requested per web search call.
+        web_search_answer_max_tokens: Max tokens for the LLM call that drafts
+            the web-search answer (`agent.orchestrator.nodes.web_search_node`).
+            Deliberately its own, larger-than-`llm_max_tokens` setting rather
+            than reusing that one -- a web answer is expected to synthesize
+            several external sources into a structured, in-depth response
+            (headings, lists, an inline citation per claim), not a single
+            short SQL-adjacent answer, so it needs materially more budget.
         project_root: Absolute path to the repository root.
         databases: Every configured database connection, parsed from
             `DB_CONNECTIONS` + per-name `DB_<NAME>_*` vars (see
@@ -562,6 +569,17 @@ class Settings(BaseSettings):
     web_search_provider: str = "tavily"
     web_search_api_key: SecretStr | None = None
     web_search_max_results: int = Field(default=5, gt=0)
+    web_search_answer_max_tokens: int = Field(default=1200, gt=0)
+    cors_allowed_origins: tuple[str, ...] = Field(
+        default=(),
+        description=(
+            "Origins allowed to call this API cross-origin (e.g. a React "
+            "dev server at 'http://localhost:5173'). Empty by default -- a "
+            "same-origin deployment (the built React app served by this "
+            "same FastAPI app) needs no CORS at all. Comma-separated in "
+            ".env, e.g. CORS_ALLOWED_ORIGINS=http://localhost:5173."
+        ),
+    )
     project_root: Path = PROJECT_ROOT
     databases: tuple[DatabaseConnectionConfig, ...] = ()
 
@@ -583,6 +601,16 @@ class Settings(BaseSettings):
     @classmethod
     def _lowercase_strip_redaction_level(cls, value: object) -> object:
         return value.strip().lower() if isinstance(value, str) else value
+
+    @field_validator("cors_allowed_origins", mode="before")
+    @classmethod
+    def _split_cors_origins(cls, value: object) -> object:
+        """Accepts a comma-separated `.env` string (`DB_CONNECTIONS`'s own
+        parsing convention) rather than requiring JSON-array syntax for a
+        setting most users will only ever set to zero or one origin."""
+        if isinstance(value, str):
+            return tuple(origin.strip() for origin in value.split(",") if origin.strip())
+        return value
 
     @field_validator("chroma_persist_dir", mode="before")
     @classmethod

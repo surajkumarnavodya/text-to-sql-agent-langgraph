@@ -1,0 +1,94 @@
+{
+  "app": {
+    "title": "Tableau de bord Texte-vers-SQL",
+    "subtitle": "Posez une question en langage naturel — obtenez du SQL validé et en lecture seule, un tableau de résultats en direct et un graphique choisi automatiquement."
+  },
+  "nav": {
+    "chat": "Chat",
+    "knowledgeSources": "Sources de connaissances"
+  },
+  "sidebar": {
+    "connectionStatus": "État de la connexion",
+    "testConnection": "Tester la connexion",
+    "refreshSchema": "Actualiser le schéma",
+    "discoveredTables": "Tables découvertes",
+    "generateInsight": "Générer une analyse IA",
+    "history": "Historique",
+    "clearHistory": "Effacer l'historique",
+    "routedTo": "Dernière question dirigée vers",
+    "appearance": "Apparence",
+    "theme": "Thème",
+    "accentColor": "Couleur d'accent",
+    "font": "Police",
+    "language": "Langue",
+    "noHistory": "Aucune question posée pour le moment.",
+    "installApp": "Installer l'application",
+    "updateAvailable": "Une nouvelle version est disponible.",
+    "reload": "Recharger"
+  },
+  "theme": {
+    "light": "Clair",
+    "dark": "Sombre",
+    "system": "Système"
+  },
+  "chat": {
+    "placeholder": "Posez une question sur vos données...",
+    "view": "Afficher",
+    "rerun": "Relancer",
+    "sources": "Répondu à l'aide de",
+    "followingUpOn": "Suite à"
+  },
+  "sql": {
+    "title": "SQL généré",
+    "hint": "Modifiez si nécessaire — il sera revalidé et réexécuté lorsque vous cliquerez sur Confirmer et exécuter.",
+    "confirmAndRun": "Confirmer et exécuter",
+    "retryTimeline": "Chronologie des tentatives",
+    "schemaContext": "Contexte de schéma récupéré",
+    "queryPlan": "Plan de requête"
+  },
+  "results": {
+    "title": "Résultats",
+    "showChart": "Afficher le graphique",
+    "showTechnical": "Afficher les colonnes techniques",
+    "chart": "Graphique",
+    "noSuitableChart": "Aucun graphique adapté à cette forme de résultat."
+  },
+  "feedback": {
+    "question": "Ce SQL était-il correct ?",
+    "savedToast": "Enregistré — les questions similaires futures utiliseront ceci comme exemple de référence.",
+    "thanksToast": "Merci pour votre retour."
+  },
+  "knowledge": {
+    "title": "Sources de connaissances",
+    "subtitle": "Téléversez des PDF dans la collection « documents » ou « politiques » pour que les sous-graphes RAG agentiques puissent les rechercher.",
+    "upload": "Téléverser",
+    "ingest": "Ingérer",
+    "documents": "Documents",
+    "policies": "Politiques",
+    "sensitivity": "Catégorie de sensibilité (facultatif)",
+    "ingestedDocuments": "Documents ingérés",
+    "none": "Aucune",
+    "compensation": "Rémunération et avantages",
+    "disciplinary": "Contenu disciplinaire / RH",
+    "legal": "Juridique / contentieux",
+    "nothingIngested": "Rien n'a encore été ingéré dans cette collection.",
+    "disabled": "Cette collection est désactivée. Activez-la dans votre configuration .env."
+  },
+  "common": {
+    "download": "Télécharger",
+    "delete": "Supprimer",
+    "cancel": "Annuler",
+    "save": "Enregistrer",
+    "loading": "Chargement…",
+    "rows": "ligne(s)",
+    "chunks": "fragment(s)",
+    "thinking": "Réflexion en cours",
+    "answeredIn": "Répondu en {{seconds}}s",
+    "downloadAnswer": "Télécharger la réponse",
+    "exportCsv": "Exporter en CSV",
+    "search": "Rechercher...",
+    "rowsPerPage": "Lignes par page",
+    "noResults": "Aucune ligne correspondante.",
+    "of": "sur"
+  }
+}

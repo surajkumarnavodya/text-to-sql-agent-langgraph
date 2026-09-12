@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22%3E%3Ctext y=%22.9em%22 font-size=%2290%22%3E%F0%9F%97%84%EF%B8%8F%3C/text%3E%3C/svg%3E" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Text-to-SQL Dashboard</title>
+
+    <!-- PWA installability. vite-plugin-pwa injects the manifest link and
+         registers the service worker automatically at build time; the
+         tags below are the ones it does NOT add for you -- iOS Safari has
+         no manifest-driven "Add to Home Screen" theming, so it reads these
+         directly instead. -->
+    <meta name="theme-color" content="#4f46e5" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="apple-mobile-web-app-title" content="Text-to-SQL" />
+    <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
+    <!-- Optional web fonts for the font picker (src/lib/theme.ts's FONT_OPTIONS)
+         -- each has a system-font fallback in its CSS stack, so the app still
+         renders correctly if this request is blocked (e.g. offline/air-gapped
+         deployment), matching the project's local-first posture. -->
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&family=Merriweather:wght@400;700&family=Roboto:wght@400;500;700&display=swap"
+      rel="stylesheet"
+    />
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

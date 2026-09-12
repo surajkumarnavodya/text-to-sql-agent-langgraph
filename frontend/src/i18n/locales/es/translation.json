@@ -1,0 +1,94 @@
+{
+  "app": {
+    "title": "Panel de Texto a SQL",
+    "subtitle": "Haz una pregunta en lenguaje natural — obtén SQL validado y de solo lectura, una tabla de resultados en vivo y un gráfico seleccionado automáticamente."
+  },
+  "nav": {
+    "chat": "Chat",
+    "knowledgeSources": "Fuentes de conocimiento"
+  },
+  "sidebar": {
+    "connectionStatus": "Estado de la conexión",
+    "testConnection": "Probar conexión",
+    "refreshSchema": "Actualizar esquema",
+    "discoveredTables": "Tablas detectadas",
+    "generateInsight": "Generar análisis con IA",
+    "history": "Historial",
+    "clearHistory": "Borrar historial",
+    "routedTo": "Última pregunta dirigida a",
+    "appearance": "Apariencia",
+    "theme": "Tema",
+    "accentColor": "Color de acento",
+    "font": "Fuente",
+    "language": "Idioma",
+    "noHistory": "Aún no se ha hecho ninguna pregunta.",
+    "installApp": "Instalar aplicación",
+    "updateAvailable": "Hay una nueva versión disponible.",
+    "reload": "Recargar"
+  },
+  "theme": {
+    "light": "Claro",
+    "dark": "Oscuro",
+    "system": "Sistema"
+  },
+  "chat": {
+    "placeholder": "Haz una pregunta sobre tus datos...",
+    "view": "Ver",
+    "rerun": "Volver a ejecutar",
+    "sources": "Respondido usando",
+    "followingUpOn": "Continuando con"
+  },
+  "sql": {
+    "title": "SQL generado",
+    "hint": "Edita si es necesario — se volverá a validar y ejecutar al pulsar Confirmar y ejecutar.",
+    "confirmAndRun": "Confirmar y ejecutar",
+    "retryTimeline": "Cronología de reintentos",
+    "schemaContext": "Contexto de esquema recuperado",
+    "queryPlan": "Plan de consulta"
+  },
+  "results": {
+    "title": "Resultados",
+    "showChart": "Mostrar gráfico",
+    "showTechnical": "Mostrar columnas técnicas",
+    "chart": "Gráfico",
+    "noSuitableChart": "No hay un gráfico adecuado para esta forma de resultado."
+  },
+  "feedback": {
+    "question": "¿Fue correcto este SQL?",
+    "savedToast": "Guardado — las preguntas similares futuras usarán esto como ejemplo de referencia.",
+    "thanksToast": "Gracias por tu comentario."
+  },
+  "knowledge": {
+    "title": "Fuentes de conocimiento",
+    "subtitle": "Sube PDFs a la colección \"documentos\" o \"políticas\" para que los subgrafos de RAG agentic puedan buscarlos.",
+    "upload": "Subir",
+    "ingest": "Procesar",
+    "documents": "Documentos",
+    "policies": "Políticas",
+    "sensitivity": "Categoría de sensibilidad (opcional)",
+    "ingestedDocuments": "Documentos procesados",
+    "none": "Ninguna",
+    "compensation": "Compensación y salario",
+    "disciplinary": "Contenido disciplinario / de RR. HH.",
+    "legal": "Legal / litigios",
+    "nothingIngested": "Aún no se ha procesado nada en esta colección.",
+    "disabled": "Esta colección está deshabilitada. Actívala en tu configuración .env."
+  },
+  "common": {
+    "download": "Descargar",
+    "delete": "Eliminar",
+    "cancel": "Cancelar",
+    "save": "Guardar",
+    "loading": "Cargando…",
+    "rows": "fila(s)",
+    "chunks": "fragmento(s)",
+    "thinking": "Pensando",
+    "answeredIn": "Respondido en {{seconds}}s",
+    "downloadAnswer": "Descargar respuesta",
+    "exportCsv": "Exportar CSV",
+    "search": "Buscar...",
+    "rowsPerPage": "Filas por página",
+    "noResults": "No hay filas coincidentes.",
+    "of": "de"
+  }
+}

@@ -1,0 +1,94 @@
+{
+  "app": {
+    "title": "Text-to-SQL Dashboard",
+    "subtitle": "Ask a question in plain English — get validated, read-only SQL, a live result table, and an auto-picked chart."
+  },
+  "nav": {
+    "chat": "Chat",
+    "knowledgeSources": "Knowledge Sources"
+  },
+  "sidebar": {
+    "connectionStatus": "Connection status",
+    "testConnection": "Test Connection",
+    "refreshSchema": "Refresh Schema",
+    "discoveredTables": "Discovered tables",
+    "generateInsight": "Generate AI insight",
+    "history": "History",
+    "clearHistory": "Clear history",
+    "routedTo": "Last question routed to",
+    "appearance": "Appearance",
+    "theme": "Theme",
+    "accentColor": "Accent color",
+    "font": "Font",
+    "language": "Language",
+    "noHistory": "No questions asked yet.",
+    "installApp": "Install app",
+    "updateAvailable": "A new version is available.",
+    "reload": "Reload"
+  },
+  "theme": {
+    "light": "Light",
+    "dark": "Dark",
+    "system": "System"
+  },
+  "chat": {
+    "placeholder": "Ask a question about your data...",
+    "view": "View",
+    "rerun": "Re-run",
+    "sources": "Answered using",
+    "followingUpOn": "Following up on"
+  },
+  "sql": {
+    "title": "Generated SQL",
+    "hint": "Edit if needed — it will be re-validated and re-run when you click Confirm and Run.",
+    "confirmAndRun": "Confirm and Run",
+    "retryTimeline": "Retry timeline",
+    "schemaContext": "Retrieved schema context",
+    "queryPlan": "Query plan"
+  },
+  "results": {
+    "title": "Results",
+    "showChart": "Show chart",
+    "showTechnical": "Show technical columns",
+    "chart": "Chart",
+    "noSuitableChart": "No suitable chart for this result shape."
+  },
+  "feedback": {
+    "question": "Was this SQL correct?",
+    "savedToast": "Saved — future similar questions will use this as a reference example.",
+    "thanksToast": "Thanks for the feedback."
+  },
+  "knowledge": {
+    "title": "Knowledge Sources",
+    "subtitle": "Upload PDFs into the \"documents\" or \"policies\" collection for the agentic RAG subgraphs to search.",
+    "upload": "Upload",
+    "ingest": "Ingest",
+    "documents": "Documents",
+    "policies": "Policies",
+    "sensitivity": "Sensitivity category (optional)",
+    "ingestedDocuments": "Ingested documents",
+    "none": "None",
+    "compensation": "Compensation & pay",
+    "disciplinary": "Disciplinary / HR case content",
+    "legal": "Legal / litigation",
+    "nothingIngested": "Nothing ingested into this collection yet.",
+    "disabled": "This collection is disabled. Enable it in your .env configuration."
+  },
+  "common": {
+    "download": "Download",
+    "delete": "Delete",
+    "cancel": "Cancel",
+    "save": "Save",
+    "loading": "Loading…",
+    "rows": "row(s)",
+    "chunks": "chunk(s)",
+    "thinking": "Thinking",
+    "answeredIn": "Answered in {{seconds}}s",
+    "downloadAnswer": "Download answer",
+    "exportCsv": "Export CSV",
+    "search": "Search...",
+    "rowsPerPage": "Rows per page",
+    "noResults": "No matching rows.",
+    "of": "of"
+  }
+}

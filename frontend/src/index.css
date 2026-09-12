@@ -1,0 +1,167 @@
+@import "tailwindcss";
+@plugin "@tailwindcss/typography";
+
+/* Our theme is switched via a `data-theme` attribute (light/dark/system --
+   see src/lib/theme.ts), not Tailwind's default class/media strategy, so
+   `dark:` variants (used by the typography plugin's `dark:prose-invert`
+   for rendered markdown answers) are remapped to match it. */
+@custom-variant dark (&:where([data-theme='dark'] *));
+
+/*
+ * Design tokens, mirroring the palette structure ui/theme.py established
+ * for the Streamlit app (light = clean neutral, dark = violet/near-black
+ * glass, both sharing one indigo accent family) -- extended here so the
+ * accent hue and font are independently user-configurable on top of the
+ * light/dark/system choice, via useSettingsStore writing these same CSS
+ * variables at runtime (see src/lib/theme.ts).
+ */
+:root {
+  --background: #f8fafc;
+  --foreground: #0f172a;
+  --card: #ffffff;
+  --card-foreground: #0f172a;
+  --border: #e2e8f0;
+  --muted: #f1f5f9;
+  --muted-foreground: #64748b;
+  --sidebar: #ffffff;
+  --sidebar-foreground: #0f172a;
+  --input: #ffffff;
+  --header: #ffffff;
+
+  /* Accent -- --accent/--accent-foreground are overridden at runtime by
+     the accent-color picker (src/lib/theme.ts); these are just the
+     default swatch ("Indigo") so the app looks correct before the
+     settings store hydrates from localStorage.
+
+     --accent-soft is deliberately a *derived* value (color-mix), not a
+     runtime-set one: mixing the current accent into the current
+     background means it automatically produces a light tint in light
+     mode and a dark tint in dark mode, using whichever accent hue is
+     active -- no separate per-theme, per-accent hex to keep in sync, and
+     no way for it to end up light-on-light (or dark-on-dark) after a
+     theme switch, which is exactly the bug a hardcoded value caused. */
+  --accent: #4f46e5;
+  --accent-foreground: #ffffff;
+  --accent-soft: color-mix(in srgb, var(--accent) 12%, var(--background));
+
+  --success: #16a34a;
+  --warning: #d97706;
+  --danger: #dc2626;
+
+  --radius: 0.75rem;
+  --shadow-color: 220 3% 15%;
+
+  /* Font -- overridden at runtime by the font picker. --font-mono never
+     changes with it (the SQL editor always stays monospace, matching
+     ui/app.py's st.text_area behavior). */
+  --font-sans:
+    'Inter', ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif;
+  --font-mono:
+    'JetBrains Mono', ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace;
+}
+
+:root[data-theme='dark'] {
+  --background: #0b0a14;
+  --foreground: #e5e5f5;
+  --card: #15132485;
+  --card-foreground: #e5e5f5;
+  --border: #2a2745;
+  --muted: #1a1830;
+  --muted-foreground: #a1a1c2;
+  --sidebar: #100e1f;
+  --sidebar-foreground: #e5e5f5;
+  --input: #17152a;
+  --header: #100e1f;
+
+  --shadow-color: 260 60% 3%;
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-sidebar: var(--sidebar);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-header: var(--header);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-accent-soft: var(--accent-soft);
+  --color-success: var(--success);
+  --color-warning: var(--warning);
+  --color-danger: var(--danger);
+  --radius-lg: var(--radius);
+  --radius-md: calc(var(--radius) - 0.25rem);
+  --radius-sm: calc(var(--radius) - 0.375rem);
+  --font-sans: var(--font-sans);
+  --font-mono: var(--font-mono);
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  /* The app always fills the full viewport and manages its own single
+     scroll region per page (see AppShell.tsx/Chat.tsx) -- this guarantees
+     there is never a second, outer document-level scrollbar competing
+     with it. */
+  overflow: hidden;
+}
+
+body {
+  background: var(--background);
+  color: var(--foreground);
+  font-family: var(--font-sans);
+  transition:
+    background-color 0.15s ease,
+    color 0.15s ease;
+}
+
+/* Results table + SQL editor should never grow wider than their card on a
+   narrow (mobile/tablet) viewport -- horizontal scroll inside the card
+   instead of blowing out the page layout. */
+.scroll-x {
+  overflow-x: auto;
+}
+
+::selection {
+  background: var(--accent-soft);
+}
+
+/* Ties the typography plugin's rendered-markdown palette to our own
+   theme/accent CSS variables (see src/components/ui/markdown.tsx) instead
+   of its default gray scale, so a rendered answer's headings/links/bold
+   text match the rest of the app and repaint correctly on theme/accent
+   change without a page reload. */
+.prose {
+  --tw-prose-body: var(--foreground);
+  --tw-prose-headings: var(--foreground);
+  --tw-prose-bold: var(--foreground);
+  --tw-prose-links: var(--accent);
+  --tw-prose-bullets: var(--muted-foreground);
+  --tw-prose-counters: var(--muted-foreground);
+  --tw-prose-hr: var(--border);
+  --tw-prose-quotes: var(--muted-foreground);
+  --tw-prose-quote-borders: var(--border);
+  --tw-prose-code: var(--foreground);
+  --tw-prose-pre-bg: var(--muted);
+  --tw-prose-pre-code: var(--foreground);
+}
+.prose a {
+  font-weight: 500;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+.prose :where(code):not(:where([class~='not-prose'] *))::before,
+.prose :where(code):not(:where([class~='not-prose'] *))::after {
+  content: '';
+}
+.prose :where(code):not(:where(pre code)) {
+  background: var(--muted);
+  border-radius: 0.25rem;
+  padding: 0.125rem 0.375rem;
+}
