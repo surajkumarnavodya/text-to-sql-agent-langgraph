@@ -44,7 +44,7 @@ import sys
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 import requests
 from dotenv import load_dotenv
@@ -61,6 +61,7 @@ logger = logging.getLogger("ai_generator_client")
 # ---------------------------------------------------------------------------
 # Exceptions
 # ---------------------------------------------------------------------------
+
 
 class AIGeneratorError(Exception):
     """Base exception for everything this client raises."""
@@ -94,7 +95,7 @@ class CreditLimitExceededError(AIGeneratorError):
          user instead of a generic failure.
     """
 
-    def __init__(self, message: str, retry_after: Optional[float] = None):
+    def __init__(self, message: str, retry_after: float | None = None):
         super().__init__(message)
         self.retry_after = retry_after
 
@@ -107,7 +108,7 @@ class ProviderRequestError(AIGeneratorError):
     truncated for readability.
     """
 
-    def __init__(self, message: str, status_code: Optional[int] = None, response_body: Any = None):
+    def __init__(self, message: str, status_code: int | None = None, response_body: Any = None):
         super().__init__(message)
         self.status_code = status_code
         self.response_body = response_body
@@ -116,6 +117,7 @@ class ProviderRequestError(AIGeneratorError):
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
+
 
 class Provider(str, Enum):
     PIXAZO = "pixazo"
@@ -127,9 +129,10 @@ class Provider(str, Enum):
 @dataclass(frozen=True)
 class ProviderConfig:
     """Resolved, read-only config for one provider instance."""
+
     provider: Provider
     api_key: str
-    account_id: Optional[str] = None   # Cloudflare only
+    account_id: str | None = None  # Cloudflare only
     timeout: float = 60.0
 
 
@@ -145,7 +148,7 @@ def _require_env(name: str) -> str:
     return value
 
 
-def load_config_from_env(provider: "str | Provider", timeout: float = 60.0) -> ProviderConfig:
+def load_config_from_env(provider: str | Provider, timeout: float = 60.0) -> ProviderConfig:
     """
     Reads credentials for the requested provider from environment variables:
         PIXAZO_API_KEY
@@ -156,7 +159,9 @@ def load_config_from_env(provider: "str | Provider", timeout: float = 60.0) -> P
     provider = Provider(provider)
 
     if provider is Provider.PIXAZO:
-        return ProviderConfig(provider=provider, api_key=_require_env("PIXAZO_API_KEY"), timeout=timeout)
+        return ProviderConfig(
+            provider=provider, api_key=_require_env("PIXAZO_API_KEY"), timeout=timeout
+        )
 
     if provider is Provider.CLOUDFLARE:
         return ProviderConfig(
@@ -167,10 +172,14 @@ def load_config_from_env(provider: "str | Provider", timeout: float = 60.0) -> P
         )
 
     if provider is Provider.LEONARDO:
-        return ProviderConfig(provider=provider, api_key=_require_env("LEONARDO_API_KEY"), timeout=timeout)
+        return ProviderConfig(
+            provider=provider, api_key=_require_env("LEONARDO_API_KEY"), timeout=timeout
+        )
 
     if provider is Provider.IMA_STUDIO:
-        return ProviderConfig(provider=provider, api_key=_require_env("IMA_STUDIO_API_KEY"), timeout=timeout)
+        return ProviderConfig(
+            provider=provider, api_key=_require_env("IMA_STUDIO_API_KEY"), timeout=timeout
+        )
 
     raise UnsupportedProviderError(f"Unknown provider: {provider}")
 
@@ -179,8 +188,8 @@ def load_config_from_env(provider: "str | Provider", timeout: float = 60.0) -> P
 # Endpoint constants -- see module docstring for verified vs. guessed
 # ---------------------------------------------------------------------------
 
-_BASE_URL_PIXAZO = "https://pixazo.ai/api/v1"                      # UNVERIFIED -- confirm with Pixazo docs
-_BASE_URL_IMA_STUDIO = "https://api.imastudio.ai/v1"                # UNVERIFIED -- confirm with Ima Studio docs
+_BASE_URL_PIXAZO = "https://pixazo.ai/api/v1"  # UNVERIFIED -- confirm with Pixazo docs
+_BASE_URL_IMA_STUDIO = "https://www.imaclaw.ai/api/v1"  # UNVERIFIED -- confirm with Ima Studio docs
 _BASE_URL_LEONARDO = "https://cloud.leonardo.ai/api/rest/v1"
 _CLOUDFLARE_BASE_TEMPLATE = "https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/run"
 
@@ -191,6 +200,7 @@ _CLOUDFLARE_IMAGE_MODEL = "@cf/stabilityai/stable-diffusion-xl-base-1.0"
 # ---------------------------------------------------------------------------
 # Client
 # ---------------------------------------------------------------------------
+
 
 class AIGeneratorClient:
     """
@@ -206,10 +216,10 @@ class AIGeneratorClient:
 
     def __init__(
         self,
-        provider: "str | Provider",
+        provider: str | Provider,
         *,
-        config: Optional[ProviderConfig] = None,
-        session: Optional[requests.Session] = None,
+        config: ProviderConfig | None = None,
+        session: requests.Session | None = None,
     ):
         self.provider = Provider(provider)
         self.config = config or load_config_from_env(self.provider)
@@ -224,7 +234,7 @@ class AIGeneratorClient:
         prompt: str,
         width: int = 1024,
         height: int = 1024,
-        model: Optional[str] = None,
+        model: str | None = None,
     ) -> dict:
         """
         Generate a single image. Returns a normalized dict:
@@ -236,7 +246,13 @@ class AIGeneratorClient:
         if width <= 0 or height <= 0:
             raise ValueError("width and height must be positive integers")
 
-        logger.info("generate_image: provider=%s width=%s height=%s model=%s", self.provider.value, width, height, model)
+        logger.info(
+            "generate_image: provider=%s width=%s height=%s model=%s",
+            self.provider.value,
+            width,
+            height,
+            model,
+        )
 
         if self.provider is Provider.PIXAZO:
             return self._generate_image_pixazo(prompt, width, height, model)
@@ -251,8 +267,8 @@ class AIGeneratorClient:
     def generate_video(
         self,
         prompt: str,
-        image_url: Optional[str] = None,
-        model: Optional[str] = None,
+        image_url: str | None = None,
+        model: str | None = None,
     ) -> dict:
         """
         Generate a video: text-to-video if image_url is None, else
@@ -263,7 +279,12 @@ class AIGeneratorClient:
         if not prompt or not prompt.strip():
             raise ValueError("prompt must be a non-empty string")
 
-        logger.info("generate_video: provider=%s image_url=%s model=%s", self.provider.value, bool(image_url), model)
+        logger.info(
+            "generate_video: provider=%s image_url=%s model=%s",
+            self.provider.value,
+            bool(image_url),
+            model,
+        )
 
         if self.provider is Provider.PIXAZO:
             return self._generate_video_pixazo(prompt, image_url, model)
@@ -281,7 +302,9 @@ class AIGeneratorClient:
     def _request(self, method: str, url: str, *, headers: dict, **kwargs) -> requests.Response:
         logger.debug("%s %s", method, url)
         try:
-            response = self._session.request(method, url, headers=headers, timeout=self.config.timeout, **kwargs)
+            response = self._session.request(
+                method, url, headers=headers, timeout=self.config.timeout, **kwargs
+            )
         except requests.exceptions.Timeout as exc:
             raise ProviderRequestError(
                 f"Request to {self.provider.value} timed out after {self.config.timeout}s (url={url})"
@@ -290,7 +313,9 @@ class AIGeneratorClient:
             # Covers DNS failures / connection refused -- the most likely
             # symptom of an unverified base URL (Pixazo/Ima Studio) being
             # wrong, e.g. "Failed to resolve 'pixazo.ai'".
-            raise ProviderRequestError(f"Network error calling {self.provider.value} at {url}: {exc}") from exc
+            raise ProviderRequestError(
+                f"Network error calling {self.provider.value} at {url}: {exc}"
+            ) from exc
 
         self._raise_for_status(response)
         return response
@@ -308,7 +333,9 @@ class AIGeneratorClient:
         # Always logged (not just raised) so a caller who only catches
         # AIGeneratorError broadly still sees the raw provider response
         # that explains *why* nothing generated.
-        logger.error("%s returned HTTP %s for %s: %s", self.provider.value, status, response.url, body)
+        logger.error(
+            "%s returned HTTP %s for %s: %s", self.provider.value, status, response.url, body
+        )
 
         if status in (401, 403):
             raise AuthenticationError(
@@ -343,7 +370,7 @@ class AIGeneratorClient:
         )
 
     @staticmethod
-    def _parse_retry_after(response: requests.Response) -> Optional[float]:
+    def _parse_retry_after(response: requests.Response) -> float | None:
         value = response.headers.get("Retry-After")
         if value is None:
             return None
@@ -356,21 +383,33 @@ class AIGeneratorClient:
     def _looks_like_credit_limit(body: Any) -> bool:
         text = str(body).lower()
         markers = (
-            "insufficient credit", "insufficient_credit", "credit limit",
-            "daily limit", "quota exceeded", "quota_exceeded",
-            "free tier limit", "out of credits",
+            "insufficient credit",
+            "insufficient_credit",
+            "credit limit",
+            "daily limit",
+            "quota exceeded",
+            "quota_exceeded",
+            "free tier limit",
+            "out of credits",
         )
         return any(marker in text for marker in markers)
 
     # ---- Pixazo (UNVERIFIED endpoint -- see module docstring) --------------
 
     def _pixazo_headers(self) -> dict:
-        return {"Authorization": f"Bearer {self.config.api_key}", "Content-Type": "application/json"}
+        return {
+            "Authorization": f"Bearer {self.config.api_key}",
+            "Content-Type": "application/json",
+        }
 
-    def _generate_image_pixazo(self, prompt: str, width: int, height: int, model: Optional[str]) -> dict:
+    def _generate_image_pixazo(
+        self, prompt: str, width: int, height: int, model: str | None
+    ) -> dict:
         model = model or "flux-schnell"
         if model not in _PIXAZO_IMAGE_MODELS:
-            raise UnsupportedProviderError(f"Pixazo image model '{model}' not in {_PIXAZO_IMAGE_MODELS}")
+            raise UnsupportedProviderError(
+                f"Pixazo image model '{model}' not in {_PIXAZO_IMAGE_MODELS}"
+            )
         url = f"{_BASE_URL_PIXAZO}/images/generations"
         payload = {"model": model, "prompt": prompt, "width": width, "height": height}
         data = self._request("POST", url, headers=self._pixazo_headers(), json=payload).json()
@@ -381,7 +420,7 @@ class AIGeneratorClient:
             "image_b64": data.get("image_base64") or data.get("b64_json"),
         }
 
-    def _generate_video_pixazo(self, prompt: str, image_url: Optional[str], model: Optional[str]) -> dict:
+    def _generate_video_pixazo(self, prompt: str, image_url: str | None, model: str | None) -> dict:
         model = model or "ltx-video"
         url = f"{_BASE_URL_PIXAZO}/videos/generations"
         payload: dict[str, Any] = {"model": model, "prompt": prompt}
@@ -399,9 +438,14 @@ class AIGeneratorClient:
     # ---- Cloudflare Workers AI (verified base URL) -------------------------
 
     def _cloudflare_headers(self) -> dict:
-        return {"Authorization": f"Bearer {self.config.api_key}", "Content-Type": "application/json"}
+        return {
+            "Authorization": f"Bearer {self.config.api_key}",
+            "Content-Type": "application/json",
+        }
 
-    def _generate_image_cloudflare(self, prompt: str, width: int, height: int, model: Optional[str]) -> dict:
+    def _generate_image_cloudflare(
+        self, prompt: str, width: int, height: int, model: str | None
+    ) -> dict:
         model = model or _CLOUDFLARE_IMAGE_MODEL
         base = _CLOUDFLARE_BASE_TEMPLATE.format(account_id=self.config.account_id)
         url = f"{base}/{model}"
@@ -436,9 +480,16 @@ class AIGeneratorClient:
             "accept": "application/json",
         }
 
-    def _generate_image_leonardo(self, prompt: str, width: int, height: int, model: Optional[str]) -> dict:
+    def _generate_image_leonardo(
+        self, prompt: str, width: int, height: int, model: str | None
+    ) -> dict:
         url = f"{_BASE_URL_LEONARDO}/generations"
-        payload: dict[str, Any] = {"prompt": prompt, "width": width, "height": height, "num_images": 1}
+        payload: dict[str, Any] = {
+            "prompt": prompt,
+            "width": width,
+            "height": height,
+            "num_images": 1,
+        }
         if model:
             payload["modelId"] = model
         data = self._request("POST", url, headers=self._leonardo_headers(), json=payload).json()
@@ -464,7 +515,9 @@ class AIGeneratorClient:
             "image_urls": [img.get("url") for img in images],
         }
 
-    def _generate_video_leonardo(self, prompt: str, image_url: Optional[str], model: Optional[str]) -> dict:
+    def _generate_video_leonardo(
+        self, prompt: str, image_url: str | None, model: str | None
+    ) -> dict:
         if image_url:
             url = f"{_BASE_URL_LEONARDO}/generations-motion-svd"
             payload: dict[str, Any] = {"imageId": image_url}
@@ -477,14 +530,25 @@ class AIGeneratorClient:
         data = self._request("POST", url, headers=self._leonardo_headers(), json=payload).json()
         job = data.get("motionSvdGenerationJob") or data.get("generationId") or data
         job_id = job.get("generationId") if isinstance(job, dict) else job
-        return {"provider": self.provider.value, "raw": data, "job_id": job_id, "video_url": None, "status": "submitted"}
+        return {
+            "provider": self.provider.value,
+            "raw": data,
+            "job_id": job_id,
+            "video_url": None,
+            "status": "submitted",
+        }
 
     # ---- Ima Studio (UNVERIFIED endpoint -- see module docstring) ----------
 
     def _ima_studio_headers(self) -> dict:
-        return {"Authorization": f"Bearer {self.config.api_key}", "Content-Type": "application/json"}
+        return {
+            "Authorization": f"Bearer {self.config.api_key}",
+            "Content-Type": "application/json",
+        }
 
-    def _generate_image_ima_studio(self, prompt: str, width: int, height: int, model: Optional[str]) -> dict:
+    def _generate_image_ima_studio(
+        self, prompt: str, width: int, height: int, model: str | None
+    ) -> dict:
         url = f"{_BASE_URL_IMA_STUDIO}/images/generations"
         payload: dict[str, Any] = {"prompt": prompt, "width": width, "height": height}
         if model:
@@ -510,7 +574,12 @@ if __name__ == "__main__":
         client = AIGeneratorClient(provider=provider_arg)
         result = client.generate_image("a watercolor fox in snow", width=768, height=768)
         print("SUCCESS")
-        print({k: (v if k != "image_b64" or not v else f"<{len(v)} base64 chars>") for k, v in result.items()})
+        print(
+            {
+                k: (v if k != "image_b64" or not v else f"<{len(v)} base64 chars>")
+                for k, v in result.items()
+            }
+        )
     except ConfigurationError as exc:
         print(f"CONFIG ERROR: {exc}")
     except AuthenticationError as exc:

@@ -41,11 +41,21 @@ _SOURCE_DESCRIPTIONS: dict[str, str] = {
         "data, financial/general-ledger data, HR/employee records, or any "
         "other data that would live in rows and columns"
     ),
-    "documents": "general uploaded PDF documents (not company policy)",
+    "documents": (
+        "general uploaded PDF documents -- the default destination for any "
+        "uploaded document, including HR-adjacent topics like leave, "
+        "holiday, benefits, or onboarding, unless that specific document "
+        "was separately flagged sensitive at upload time (see 'policy' "
+        "below). If the question could plausibly be answered by an "
+        "uploaded PDF on any topic, include this source"
+    ),
     "policy": (
-        "internal company policy documents in PDF form (HR policy, "
-        "compensation policy, disciplinary policy, legal/compliance policy, "
-        "and similar)"
+        "a separate, access-restricted collection of internal documents "
+        "specifically flagged sensitive at upload time -- compensation, "
+        "disciplinary action, or legal/compliance matters only. Do not "
+        "assume a question merely containing the word 'policy' belongs "
+        "here -- most policy-titled documents (e.g. a leave or holiday "
+        "policy) live in 'documents' instead"
     ),
     "web": (
         "live web search, for current or external information not in any "

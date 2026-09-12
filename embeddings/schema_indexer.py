@@ -52,6 +52,7 @@ from __future__ import annotations
 
 import contextlib
 import logging
+from functools import cache
 
 import chromadb
 from chromadb.api.models.Collection import Collection
@@ -92,11 +93,34 @@ def get_embedding_function(settings: Settings) -> embedding_functions.EmbeddingF
     )
 
 
+@cache
+def _cached_chroma_client(persist_dir: str) -> chromadb.ClientAPI:
+    """Process-lifetime-cached `PersistentClient`, keyed on the persist
+    directory -- same `functools.cache` singleton pattern as
+    `db.connection._cached_engine`/`agent.llm_client._get_ollama_client`.
+
+    This existed as a plain uncached factory before (a fresh
+    `chromadb.PersistentClient(...)` on every call) and it was a real,
+    reproduced bug: creating more than one `PersistentClient` instance
+    against the *same* on-disk directory within one process corrupts
+    Chroma's local HNSW segment reader for one of them --
+    `collection.query()` starts raising "Error creating hnsw segment
+    reader: Nothing found on disk" on the second/later client instance.
+    `embeddings.retriever.select_database` catches that per-database (by
+    design, so one broken database can't block routing to the others), so
+    the practical symptom was silent, *wrong* misrouting to whichever
+    other configured database's query still happened to work -- not an
+    error the user or the API response ever saw. Caching so only one
+    `PersistentClient` ever exists per process eliminates the conflict
+    entirely, rather than working around its symptom."""
+    return chromadb.PersistentClient(path=persist_dir)
+
+
 def get_chroma_client(settings: Settings | None = None) -> chromadb.ClientAPI:
     """Returns a Chroma client persisted to `Settings.chroma_persist_dir`."""
     settings = settings or get_settings()
     settings.chroma_persist_dir.mkdir(parents=True, exist_ok=True)
-    return chromadb.PersistentClient(path=str(settings.chroma_persist_dir))
+    return _cached_chroma_client(str(settings.chroma_persist_dir))
 
 
 def _collection_name(settings: Settings, db_name: str) -> str:

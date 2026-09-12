@@ -36,8 +36,8 @@ def _isolate_settings_from_real_environment(monkeypatch: pytest.MonkeyPatch) -> 
 @pytest.fixture(autouse=True)
 def _clear_process_singleton_caches() -> None:
     """Clears the `functools.cache`/`lru_cache`-backed singletons built once
-    per process (compiled LangGraph graphs, the cached Ollama client) before
-    each test.
+    per process (compiled LangGraph graphs, the cached Ollama client, the
+    cached Chroma client) before each test.
 
     These exist for real request-latency reasons (see `agent.graph
     .build_graph`, `agent.orchestrator.graph.build_orchestrator_graph`,
@@ -56,7 +56,9 @@ def _clear_process_singleton_caches() -> None:
     from agent.graph import build_graph
     from agent.llm_client import _get_ollama_client
     from agent.orchestrator.graph import build_orchestrator_graph
+    from embeddings.schema_indexer import _cached_chroma_client
 
     build_graph.cache_clear()
     build_orchestrator_graph.cache_clear()
     _get_ollama_client.cache_clear()
+    _cached_chroma_client.cache_clear()

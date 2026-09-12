@@ -317,7 +317,25 @@ def run_agent(
         "failure_explanation": None,
         "status": "pending",
     }
-    final_state = compiled_graph.invoke(initial_state)
+    # LangGraph's own default recursion_limit (25 total node executions) is
+    # not automatically related to this graph's *own* retry budget
+    # (effective_max_retries above) -- a real, reproduced bug: a worst-case
+    # retry sequence (an execute_sql "missing_reference" retry loops all the
+    # way back to retrieve_schema -- an 8-node cycle: retrieve_schema,
+    # retrieve_golden_examples, plan_query, generate_sql, review_sql,
+    # validate_sql, estimate_cost, execute_sql) can exceed 25 total steps
+    # well before effective_max_retries is exhausted -- e.g. the 10-step
+    # initial pass plus just two such retries is already 26 steps. When that
+    # happened, LangGraph raised an uncaught GraphRecursionError instead of
+    # the graph reaching its own intended terminal "failed" state, which
+    # surfaced to callers as an unhandled 500 rather than a normal failure
+    # response. Sized generously for the worst-case (every retry being the
+    # 8-node missing_reference cycle) plus headroom, scaled to this
+    # question's actual effective_max_retries (which can itself be raised
+    # above the base Settings.max_retries by agent.complexity's adaptive
+    # bonus) so a future config change can't reintroduce this.
+    recursion_limit = 20 + effective_max_retries * 10
+    final_state = compiled_graph.invoke(initial_state, config={"recursion_limit": recursion_limit})
     logger.info(
         "Agent run finished: status=%s retries=%d followup_classification=%s has_insight=%s "
         "rejection_reason=%s",

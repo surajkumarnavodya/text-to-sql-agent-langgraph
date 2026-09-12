@@ -55,8 +55,14 @@ shape.
 
 ## 🌟 Get Started & Stay Tuned
 
-_Screenshot of the chat + generated-SQL view, and a results table with an
-auto-picked chart: TODO._
+<div align="center">
+
+<img width="920" height="330" alt="Animated diagram: a question flowing through the LangGraph router to SQL/Documents/Policy/Web sources and back as a synthesized, cited answer" src="docs/images/architecture-flow-animated.svg" />
+
+</div>
+
+_An animated diagram, not a screen recording — a real screenshot of the
+chat + generated-SQL view is still TODO._
 
 Ready to try it? Jump to [Getting Started](#-getting-started) below.
 
@@ -79,6 +85,12 @@ auto-picked chart. The LLM runs locally via Ollama — no network calls for
 generation, no API keys required for that part. Database connectivity is
 fully config-driven via `.env`; there is no hardcoded connection string,
 host, or schema anywhere in the codebase.
+
+<div align="center">
+
+<img width="920" height="330" alt="Diagram: a question routes through the LangGraph router to one or more of SQL Database, Documents, Policy, and Web Search, then returns as a synthesized, cited answer" src="docs/images/architecture-overview.svg" />
+
+</div>
 
 <a id="choose-your-interface"></a>
 
