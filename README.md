@@ -23,9 +23,9 @@
 
 <!-- Newest first, sourced from real commit history. Keep no more than the three most recent entries. -->
 
+- **2026-09-13** — [Security hardening pass on the agentic orchestrator (media generation, RAG, rate limits)](https://github.com/surajkumarnavodya/text-to-sql-agent-langgraph/commit/ec91b96)
 - **2026-09-13** — [Image/video generation with intent detection and inline media display](https://github.com/surajkumarnavodya/text-to-sql-agent-langgraph/commit/319075a)
 - **2026-09-12** — [Replace Streamlit UI with an installable React dashboard, extend the API to support it](https://github.com/surajkumarnavodya/text-to-sql-agent-langgraph/commit/a29e917)
-- **2026-09-12** — [Reliability hardening, golden-dataset self-improvement, light/dark UI, and source-noise suppression](https://github.com/surajkumarnavodya/text-to-sql-agent-langgraph/commit/c9f21a0)
 
 <a id="example-usage"></a>
 
@@ -137,7 +137,11 @@ duplicated per interface.
   recognizes a request that explicitly asks to *create* new media (e.g.
   "generate an image of monthly spend by category") via IMA Studio, and
   renders the actual result inline as real media, never a bare link. A
-  plain "show me the data" question is never mistaken for one.
+  plain "show me the data" question is never mistaken for one. Generation
+  is the one source that spends real money, so it requires an explicit
+  human confirmation before anything is actually generated — the same
+  "Confirm and Run" philosophy the SQL pipeline already applies, extended
+  to this source.
 - **Grounded insights, not free-form narration.** An optional plain-English
   summary sentence is checked against the actual result data before it's
   shown; an unsupported number is silently dropped rather than displayed as
