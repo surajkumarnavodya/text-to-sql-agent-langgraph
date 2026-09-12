@@ -23,9 +23,9 @@
 
 <!-- Newest first, sourced from real commit history. Keep no more than the three most recent entries. -->
 
+- **2026-09-13** — [Image/video generation with intent detection and inline media display](https://github.com/surajkumarnavodya/text-to-sql-agent-langgraph/commit/319075a)
 - **2026-09-12** — [Replace Streamlit UI with an installable React dashboard, extend the API to support it](https://github.com/surajkumarnavodya/text-to-sql-agent-langgraph/commit/a29e917)
 - **2026-09-12** — [Reliability hardening, golden-dataset self-improvement, light/dark UI, and source-noise suppression](https://github.com/surajkumarnavodya/text-to-sql-agent-langgraph/commit/c9f21a0)
-- **2026-09-11** — [Build docs/User_Guide.pdf from USER_GUIDE.md instead of by hand](https://github.com/surajkumarnavodya/text-to-sql-agent-langgraph/commit/2243b4a)
 
 <a id="example-usage"></a>
 
@@ -133,6 +133,11 @@ duplicated per interface.
   a question out across the SQL pipeline, uploaded PDF documents, a
   separate sensitivity-gated policy collection, and live web search
   (Tavily), attributing each source's contribution under its own heading.
+- **Optional image/video generation** (off by default) — the same router
+  recognizes a request that explicitly asks to *create* new media (e.g.
+  "generate an image of monthly spend by category") via IMA Studio, and
+  renders the actual result inline as real media, never a bare link. A
+  plain "show me the data" question is never mistaken for one.
 - **Grounded insights, not free-form narration.** An optional plain-English
   summary sentence is checked against the actual result data before it's
   shown; an unsupported number is silently dropped rather than displayed as
@@ -350,6 +355,11 @@ of accuracy and production-readiness, not a marketing claim.
   `DB_TYPE`s the core SQL pipeline supports.
 - **Two UIs coexist.** The React dashboard has reached feature parity with
   Streamlit, but Streamlit hasn't been removed yet.
+- **Image/video generation (`ENABLE_MEDIA_GENERATION`, off by default)
+  uses real, metered IMA Studio credits when enabled.** Image generation is
+  confirmed working end-to-end against a live account; video generation
+  shares the same code path but hasn't been separately confirmed with a
+  live call yet.
 
 <a id="contributing"></a>
 
