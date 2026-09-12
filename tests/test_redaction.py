@@ -8,7 +8,6 @@ drivers/failure modes.
 
 from __future__ import annotations
 
-import dataclasses
 from pathlib import Path
 
 from config.settings import Settings
@@ -52,9 +51,10 @@ _BASE_SETTINGS = Settings(
 
 def _settings(**overrides: object) -> Settings:
     """A `_BASE_SETTINGS` copy with `overrides` applied -- see
-    `tests/test_connection.py::_settings` for why `dataclasses.replace` is
-    used here instead of spreading a dict into `Settings(**...)` directly."""
-    return dataclasses.replace(_BASE_SETTINGS, **overrides)  # type: ignore[arg-type]
+    `tests/test_connection.py::_settings` for why this rebuilds via
+    `Settings(**{**_BASE_SETTINGS.__dict__, **overrides})` rather than
+    `BaseModel.model_copy(update=...)`."""
+    return Settings(**{**_BASE_SETTINGS.__dict__, **overrides})
 
 
 class TestRedactSecrets:

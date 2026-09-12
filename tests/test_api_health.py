@@ -83,8 +83,9 @@ class TestHealth:
         )
 
         class _FakeOllamaClient:
-            def __init__(self, host: str) -> None:
+            def __init__(self, host: str, timeout: int | None = None) -> None:
                 self.host = host
+                self.timeout = timeout
 
             def list(self):
                 return {"models": []}
@@ -114,7 +115,7 @@ class TestHealth:
         )
 
         class _FakeOllamaClient:
-            def __init__(self, host: str) -> None:
+            def __init__(self, host: str, timeout: int | None = None) -> None:
                 pass
 
             def list(self):
@@ -140,7 +141,7 @@ class TestHealth:
         )
 
         class _FakeOllamaClient:
-            def __init__(self, host: str) -> None:
+            def __init__(self, host: str, timeout: int | None = None) -> None:
                 pass
 
             def list(self):
@@ -167,7 +168,7 @@ class TestHealth:
         )
 
         class _RaisingOllamaClient:
-            def __init__(self, host: str) -> None:
+            def __init__(self, host: str, timeout: int | None = None) -> None:
                 pass
 
             def list(self):

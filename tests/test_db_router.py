@@ -8,7 +8,6 @@ mocked -- no real ChromaDB, database, or embedding backend.
 
 from __future__ import annotations
 
-import dataclasses
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -59,9 +58,9 @@ def _two_db_settings() -> Settings:
     """A Settings with two named connections ("sales", "hr"), same shape
     otherwise -- for exercising select_database's actual comparison logic
     (the single-database case short-circuits and never reaches it)."""
-    sales = dataclasses.replace(_BASE_SETTINGS.databases[0], name="sales")
-    hr = dataclasses.replace(_BASE_SETTINGS.databases[0], name="hr")
-    return dataclasses.replace(_BASE_SETTINGS, databases=(sales, hr))
+    sales = _BASE_SETTINGS.databases[0].model_copy(update={"name": "sales"})
+    hr = _BASE_SETTINGS.databases[0].model_copy(update={"name": "hr"})
+    return Settings(**{**_BASE_SETTINGS.__dict__, "databases": (sales, hr)})
 
 
 def _mock_collection(score: float | None, count: int = 5) -> MagicMock:

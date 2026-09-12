@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from agent.state import AgentStatus
 
@@ -23,13 +23,25 @@ class ConversationExchangeIn(BaseModel):
     state (the API has no server-side session of its own; the caller is
     responsible for resending recent turns each request)."""
 
-    question: str
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    question: str = Field(..., min_length=1)
     sql: str | None = None
     tables: list[str] = Field(default_factory=list)
-    status: str = "succeeded"
+    status: AgentStatus = "succeeded"
 
 
 class AskRequest(BaseModel):
+    """The upper bound on `question`'s length is deliberately NOT duplicated
+    here as a `Field(max_length=...)` -- it's config-driven
+    (`Settings.max_question_length`, default 500, overridable via `.env`)
+    and already enforced downstream by `agent.input_guard.check_input`
+    (the "too_long" `RejectionReason`), which is the single source of
+    truth for it. A static schema-level cap would either hardcode a wrong
+    number or drift from that setting the moment someone changes it."""
+
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
     question: str = Field(..., min_length=1, description="Natural-language question.")
     conversation_history: list[ConversationExchangeIn] = Field(
         default_factory=list,
@@ -39,9 +51,24 @@ class AskRequest(BaseModel):
         default=True,
         description="Whether to attempt a plain-English insight sentence after execution.",
     )
+    session_id: str | None = Field(
+        default=None,
+        max_length=128,
+        description=(
+            "Caller-supplied conversation identifier. Omit on the first turn of a "
+            "conversation -- the API generates one and returns it in AskResponse. "
+            "Pass the same value back on every subsequent turn of that conversation. "
+            "Purely a correlation token today (the API is still stateless -- see "
+            "ConversationExchangeIn's docstring); it does not yet gate or scope "
+            "anything server-side, but is the identifier future server-side "
+            "conversation state (e.g. the multi-source router) will key off of."
+        ),
+    )
 
 
 class AttemptRecordOut(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
     attempt: int
     sql: str | None = None
     outcome: str
@@ -54,6 +81,15 @@ class AskResponse(BaseModel):
     already surfaces to a human -- see that module for the reference
     rendering this response shape is kept consistent with."""
 
+    model_config = ConfigDict(frozen=True)
+
+    session_id: str = Field(
+        description=(
+            "Echoes AskRequest.session_id, or a freshly generated one if the "
+            "caller didn't supply one -- pass this back on the next request "
+            "in the same conversation."
+        )
+    )
     status: AgentStatus
     database: str | None = Field(
         default=None,
@@ -87,6 +123,8 @@ class AskResponse(BaseModel):
 
 
 class ComponentHealth(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
     ok: bool
     detail: str
 
@@ -96,18 +134,24 @@ class DatabaseHealth(BaseModel):
     entry per `Settings.databases[i]` ('default' for a plain
     single-database setup)."""
 
+    model_config = ConfigDict(frozen=True)
+
     name: str
     connection: ComponentHealth
     schema_index: ComponentHealth
 
 
 class HealthResponse(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
     status: Literal["ok", "degraded"]
     databases: list[DatabaseHealth]
     ollama: ComponentHealth
 
 
 class ColumnOut(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
     name: str
     type: str
     nullable: bool
@@ -115,10 +159,14 @@ class ColumnOut(BaseModel):
 
 
 class TableOut(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
     database: str
     table_name: str
     columns: list[ColumnOut]
 
 
 class TablesResponse(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
     tables: list[TableOut]

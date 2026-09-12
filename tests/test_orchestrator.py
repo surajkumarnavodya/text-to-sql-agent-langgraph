@@ -78,7 +78,7 @@ def _settings(**overrides: object) -> Settings:
         enable_multi_source_router=False,
     )
     base.update(overrides)
-    return Settings(**base)  # type: ignore[arg-type]
+    return Settings(**base)
 
 
 class TestGetAvailableSources:
@@ -333,6 +333,77 @@ class TestSynthesisNode:
         assert "Database" in synthesized
         assert "Policy" in synthesized
         assert "Policy says X." in synthesized
+
+    def test_suppresses_an_empty_source_when_another_one_succeeded(self):
+        """The database answered; the policy collection found nothing --
+        the user should see only the database's answer, not a "nothing in
+        the policies collection" aside."""
+        state = {
+            "sources_used": ["sql", "policy"],
+            "status": "succeeded",
+            "row_count": 3,
+            "policy_result": {
+                "answer": "I couldn't find any relevant information to answer that question.",
+                "citations": [],
+                "status": "insufficient_information",
+            },
+        }
+        synthesized = synthesis_node(state)["synthesized_answer"]
+        assert "Database" in synthesized
+        assert "3 row(s)" in synthesized
+        assert "Policy" not in synthesized
+        assert "couldn't find" not in synthesized
+
+    def test_suppresses_a_failed_sql_result_when_another_source_succeeded(self):
+        state = {
+            "sources_used": ["sql", "policy"],
+            "status": "failed",
+            "failure_explanation": "Gave up after 3 attempts.",
+            "policy_result": {"answer": "Policy says X.", "citations": [], "status": "succeeded"},
+        }
+        synthesized = synthesis_node(state)["synthesized_answer"]
+        assert "Policy says X." in synthesized
+        assert "Database" not in synthesized
+        assert "Gave up" not in synthesized
+
+    def test_generic_not_found_message_when_every_source_is_empty(self):
+        state = {
+            "sources_used": ["sql", "policy", "web"],
+            "status": "failed",
+            "failure_explanation": "Gave up after 3 attempts.",
+            "policy_result": {
+                "answer": "I couldn't find any relevant information to answer that question.",
+                "citations": [],
+                "status": "insufficient_information",
+            },
+            "web_result": {
+                "answer": "No web results found for this question.",
+                "citations": [],
+                "status": "insufficient_information",
+            },
+        }
+        synthesized = synthesis_node(state)["synthesized_answer"]
+        assert synthesized == "I couldn't find any relevant information to answer that question."
+
+    def test_restricted_result_is_shown_even_alongside_a_successful_one(self):
+        """A restricted match means relevant content exists but can't be
+        shown -- that's worth telling the user, unlike a genuinely empty
+        result, so it must never be suppressed just because another source
+        also answered."""
+        state = {
+            "sources_used": ["sql", "policy"],
+            "status": "succeeded",
+            "row_count": 2,
+            "policy_result": {
+                "answer": "This question touches policy content classified 'compensation', ...",
+                "citations": [],
+                "status": "restricted",
+            },
+        }
+        synthesized = synthesis_node(state)["synthesized_answer"]
+        assert "Database" in synthesized
+        assert "Policy" in synthesized
+        assert "classified 'compensation'" in synthesized
 
 
 class TestRunOrchestrated:

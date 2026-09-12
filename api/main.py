@@ -18,18 +18,23 @@ from __future__ import annotations
 import logging
 import sys
 import uuid
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import Depends, FastAPI, HTTPException, Request, Response, status
 from fastapi.encoders import jsonable_encoder
+from fastapi.responses import JSONResponse
 
 # `uvicorn api.main:app` does not guarantee the repo root is on sys.path
 # (unlike running as an installed package) -- same reasoning as
 # ui/app.py's identical sys.path.insert for `streamlit run`.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from agent.exceptions import SchemaRetrievalError
-from agent.orchestrator.graph import run_orchestrated
+from agent.exceptions import AgentError
+from agent.graph import build_graph
+from agent.llm_client import get_ollama_client
+from agent.orchestrator.graph import build_orchestrator_graph, run_orchestrated
 from agent.rate_limit import QUESTION_LIMIT_MESSAGE, SlidingWindowRateLimiter
 from agent.state import AgentState, ConversationExchange
 from api.auth import verify_api_key
@@ -44,20 +49,130 @@ from api.schemas import (
     TableOut,
     TablesResponse,
 )
-from config.settings import configure_logging, get_settings
+from config.settings import ConfigurationError, configure_logging, get_settings
 from db.connection import get_read_only_engine, test_connection
 from db.schema_introspection import introspect_schema
 from embeddings.schema_indexer import get_chroma_client, get_collection
-from security.audit_log import reset_correlation_id, set_correlation_id
+from security.audit_log import get_correlation_id, reset_correlation_id, set_correlation_id
+from security.redaction import redact_secrets
 
 configure_logging()
 logger = logging.getLogger(__name__)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    """Builds every expensive, process-lifetime resource once at startup
+    instead of lazily on whichever request happens to need it first.
+
+    None of this is strictly required for correctness -- `db.connection
+    .get_read_only_engine`, `agent.llm_client._get_ollama_client`, and
+    `agent.graph.build_graph`/`agent.orchestrator.graph
+    .build_orchestrator_graph` are all already process-wide singletons
+    (`functools.cache`/`lru_cache`), so the *first* request to touch each
+    one would build and cache it anyway. What this buys is moving that
+    one-time cost (DB connection-pool spin-up, compiling ten LangGraph
+    nodes into a graph, an Ollama client's initial handshake) out of the
+    request that happens to arrive first and into startup, where it
+    doesn't cost a real user any latency. The built objects are also
+    stashed on `app.state` so they're discoverable/inspectable from a
+    debugger or a future admin endpoint, even though every request path
+    keeps reaching them the same way it always did -- through the cached
+    module-level functions, not by reading `app.state` -- since those
+    functions are also called from `ui/app.py`, `eval/runner.py`, and
+    scripts that never go through this FastAPI app at all.
+    """
+    settings = get_settings()
+    app.state.settings = settings
+
+    db_engines = {}
+    for db_config in settings.databases:
+        try:
+            db_engines[db_config.name] = get_read_only_engine(db_config)
+        except ConfigurationError as exc:
+            # A misconfigured *additional* database shouldn't prevent the
+            # app from starting at all -- /health already surfaces a
+            # per-database "not OK" status for exactly this case, the same
+            # way it tolerates one unreachable database among several.
+            logger.warning(
+                "[startup] could not pre-warm engine for database %r: %s",
+                db_config.name,
+                redact_secrets(str(exc), db_config),
+            )
+    app.state.db_engines = db_engines
+
+    app.state.ollama_client = get_ollama_client(settings)
+    app.state.compiled_graph = build_graph()
+    app.state.orchestrator_graph = (
+        build_orchestrator_graph() if settings.enable_multi_source_router else None
+    )
+
+    logger.info(
+        "[startup] warmed %d database engine(s), the Ollama client, and the compiled agent graph.",
+        len(settings.databases),
+    )
+    yield
+
 
 app = FastAPI(
     title="Text-to-SQL API",
     description=__doc__,
     version="0.1.0",
+    lifespan=lifespan,
 )
+
+
+@app.exception_handler(AgentError)
+async def _agent_error_handler(request: Request, exc: AgentError) -> JSONResponse:
+    """Last-resort net for an `AgentError` that escapes its usual handling.
+
+    Every *known* agent-layer failure mode is normally absorbed inside
+    `agent/nodes.py` into `AgentState` fields (see that module) or, for the
+    couple of exceptions that can still propagate out of `run_orchestrated`
+    today, caught locally in `/ask` -- both paths already use
+    `exc.safe_message`, never `str(exc)`. This handler exists for whatever
+    isn't covered by either yet (a genuinely new source added later, a
+    call site that forgets), so the fallback is still "log the full detail,
+    show the safe one" rather than a raw exception leaking through
+    FastAPI's default error handling.
+    """
+    logger.error(
+        "[api] unhandled AgentError on %s %s: %s",
+        request.method,
+        request.url.path,
+        exc,
+        exc_info=exc,
+    )
+    return JSONResponse(
+        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        content={"detail": exc.safe_message, "correlation_id": get_correlation_id()},
+    )
+
+
+@app.exception_handler(Exception)
+async def _unhandled_exception_handler(request: Request, exc: Exception) -> JSONResponse:
+    """Catches anything not already handled -- a bug, an unexpected
+    third-party exception type, anything. The one guarantee this makes:
+    whatever the internal exception text says (which can be an arbitrary
+    driver/library message, potentially including connection details this
+    app never intended to display), the response body never contains it.
+    The full exception (with traceback) still goes to the logs, tagged
+    with the same correlation ID returned to the caller, so it's still
+    fully debuggable server-side.
+    """
+    logger.exception(
+        "[api] unhandled exception on %s %s",
+        request.method,
+        request.url.path,
+    )
+    return JSONResponse(
+        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        content={
+            "detail": "An unexpected error occurred. Please try again.",
+            "correlation_id": get_correlation_id(),
+        },
+    )
+
 
 # Per-client-IP question-submission limiter, mirroring ui/app.py's
 # per-Streamlit-session `SlidingWindowRateLimiter` -- the API has no
@@ -109,9 +224,10 @@ def _attempt_records_out(state: AgentState) -> list[AttemptRecordOut]:
     ]
 
 
-def _ask_response_from_state(state: AgentState) -> AskResponse:
+def _ask_response_from_state(state: AgentState, session_id: str) -> AskResponse:
     result_rows = state.get("result_rows")
     return AskResponse(
+        session_id=session_id,
         status=state.get("status", "failed"),
         database=state.get("selected_database"),
         sql=state.get("sql"),
@@ -168,19 +284,25 @@ def health(response: Response) -> HealthResponse:
                 ),
             )
         except Exception as exc:  # noqa: BLE001 - health check must never crash the endpoint
-            schema_index = ComponentHealth(ok=False, detail=f"Unreachable: {exc}")
+            # redact_secrets: this endpoint is unauthenticated (no
+            # Depends(verify_api_key), unlike /ask and /schema/tables --
+            # health checks typically need to be reachable by an
+            # orchestrator with no API key), so raw driver/Chroma text
+            # ending up here is a real, publicly-visible leak, not just an
+            # internal one.
+            schema_index = ComponentHealth(
+                ok=False, detail=f"Unreachable: {redact_secrets(str(exc), config)}"
+            )
 
         databases.append(
             DatabaseHealth(name=config.name, connection=connection, schema_index=schema_index)
         )
 
     try:
-        import ollama
-
-        ollama.Client(host=settings.ollama_host).list()
+        get_ollama_client(settings).list()
         ollama_health = ComponentHealth(ok=True, detail=f"Reachable at {settings.ollama_host}.")
     except Exception as exc:  # noqa: BLE001 - health check must never crash the endpoint
-        ollama_health = ComponentHealth(ok=False, detail=f"Unreachable: {exc}")
+        ollama_health = ComponentHealth(ok=False, detail=f"Unreachable: {redact_secrets(str(exc))}")
 
     overall_ok = ollama_health.ok and all(
         db.connection.ok and db.schema_index.ok for db in databases
@@ -204,7 +326,15 @@ def ask(payload: AskRequest, request: Request) -> AskResponse:
     Every safety layer that governs the UI (input guard, SQL validator, row
     cap, timeout, LLM-call rate limit, sensitive-column blocking) applies
     identically here, since it's the same underlying graph.
+
+    `payload.session_id`, if supplied, is echoed back unchanged; if omitted
+    (the first turn of a new conversation), a fresh one is generated and
+    returned -- see `AskRequest.session_id`'s docstring for what this does
+    and does not do today (a correlation token, not yet a server-side
+    session key).
     """
+    session_id = payload.session_id or str(uuid.uuid4())
+
     client_ip = request.client.host if request.client else "unknown"
     rate_limit_result = _limiter_for(client_ip).check()
     if not rate_limit_result.allowed:
@@ -225,12 +355,25 @@ def ask(payload: AskRequest, request: Request) -> AskResponse:
         final_state = run_orchestrated(
             payload.question, conversation_history, enable_insight=payload.enable_insight
         )
-    except SchemaRetrievalError as exc:
-        # Same fallback shape ui/app.py uses for the same exception -- see
-        # that module's chat-input handler.
-        final_state = {"status": "failed", "error_history": [str(exc)]}
+    except AgentError as exc:
+        # A source (schema retrieval today; document/policy RAG or web
+        # search tomorrow, once they're wired into run_orchestrated the
+        # same way) failed outside the graph's own internal retry/self-
+        # correction handling. Same 200-with-a-"failed"-body shape
+        # ui/app.py uses for the same exceptions, just now built from
+        # exc.safe_message rather than str(exc) -- the full detail is
+        # logged, never returned. See agent/exceptions.py's module
+        # docstring for why both exist on every AgentError.
+        logger.error(
+            "[api] /ask failed with %s (session_id=%s): %s",
+            type(exc).__name__,
+            session_id,
+            exc,
+            exc_info=exc,
+        )
+        final_state = {"status": "failed", "error_history": [exc.safe_message]}
 
-    return _ask_response_from_state(final_state)
+    return _ask_response_from_state(final_state, session_id)
 
 
 @app.get("/schema/tables", response_model=TablesResponse, dependencies=[Depends(verify_api_key)])

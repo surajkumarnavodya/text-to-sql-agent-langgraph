@@ -14,10 +14,10 @@ from __future__ import annotations
 
 import logging
 import re
-from dataclasses import dataclass
 from typing import Literal
 
 import sqlglot
+from pydantic import BaseModel, ConfigDict, model_validator
 from sqlglot import exp
 from sqlglot.errors import SqlglotError
 
@@ -164,9 +164,18 @@ SAFETY_VIOLATION_TYPES: frozenset[str] = frozenset(
 )
 
 
-@dataclass(frozen=True)
-class ValidationResult:
+class ValidationResult(BaseModel):
     """Outcome of validating a candidate SQL string.
+
+    A `pydantic.BaseModel` rather than a plain dataclass specifically for
+    the `model_validator` below: `is_valid`, `error`/`violation_type`, and
+    `normalized_sql` are not three independent fields in practice -- they
+    move together in exactly two fixed shapes (valid-with-SQL,
+    invalid-with-a-reason) -- and this is a genuine invariant worth a
+    machine-checked guarantee rather than just a docstring's word for it,
+    since every caller (`agent.nodes.validate_sql_node`,
+    `agent.llm_client`'s retry-hint lookup) branches on `is_valid` and then
+    trusts the other fields' presence/absence without re-checking.
 
     Attributes:
         is_valid: Whether the SQL passed all checks.
@@ -183,10 +192,26 @@ class ValidationResult:
             "fail closed, do not retry" versus "ordinary retry-able mistake."
     """
 
+    model_config = ConfigDict(frozen=True)
+
     is_valid: bool
     error: str | None = None
     normalized_sql: str | None = None
     violation_type: ViolationType | None = None
+
+    @model_validator(mode="after")
+    def _check_shape_matches_validity(self) -> ValidationResult:
+        if self.is_valid:
+            if self.error is not None or self.violation_type is not None:
+                raise ValueError("A valid ValidationResult must not carry error/violation_type.")
+        else:
+            if self.error is None or self.violation_type is None:
+                raise ValueError(
+                    "An invalid ValidationResult must carry both error and violation_type."
+                )
+            if self.normalized_sql is not None:
+                raise ValueError("An invalid ValidationResult must not carry normalized_sql.")
+        return self
 
 
 def _find_nested_aggregate(statement: exp.Expression) -> tuple[exp.AggFunc, exp.AggFunc] | None:

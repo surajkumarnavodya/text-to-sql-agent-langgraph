@@ -20,7 +20,7 @@ ignore = [
 ]
 
 [tool.ruff.lint.isort]
-known-first-party = ["agent", "api", "config", "db", "embeddings", "eval", "observability", "scripts", "security", "ui"]
+known-first-party = ["agent", "api", "config", "db", "embeddings", "eval", "observability", "rag", "scripts", "search", "security", "ui"]
 
 [tool.mypy]
 # Deliberately not pinned to 3.11 (the project's nominal target, see

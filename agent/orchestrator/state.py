@@ -15,9 +15,8 @@ from __future__ import annotations
 import operator
 from typing import Annotated, TypedDict
 
-from rag.graph import Citation
-
 from agent.state import AgentState
+from rag.graph import Citation
 
 
 class RouteDecision(TypedDict):

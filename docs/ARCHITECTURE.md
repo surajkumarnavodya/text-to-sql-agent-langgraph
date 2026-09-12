@@ -16,7 +16,7 @@ The agent is a small, explicit `StateGraph` (`agent/graph.py`), not a
 free-form ReAct-style agent. That's a deliberate choice: every possible
 transition is a named edge in a fixed graph, so the retry/error-feedback
 path is something you can read off the graph definition, not something
-that emerges from a model's own planning. The graph has **ten nodes**,
+that emerges from a model's own planning. The graph has **eleven nodes**,
 not just the four covering the "happy path" of retrieval → generation →
 validation → execution — the full picture, straight from
 `agent/graph.py::build_graph()`:
@@ -28,7 +28,8 @@ flowchart TD
     SI --> CF["classify_followup<br/>standalone / follow-up / ambiguous"]
     CF -->|ambiguous| ENDCLAR(["END — needs_clarification"])
     CF --> RS["retrieve_schema<br/>ChromaDB top-k + FK-adjacency bridge"]
-    RS --> PQ["plan_query<br/>LLM plan, only for complex questions"]
+    RS --> RGE["retrieve_golden_examples<br/>human-approved past (question, SQL) pairs"]
+    RGE --> PQ["plan_query<br/>LLM plan, only for complex questions"]
     PQ --> GS["generate_sql<br/>Ollama via agent/llm_client.py"]
     GS -->|off-topic sentinel| ENDREJ2(["END — rejected"])
     GS -->|LLM/Ollama error| ENDFAIL1(["END — failed"])
@@ -78,7 +79,7 @@ lets `generate_sql` see the full trail of prior failures on a retry, and
 what lets the UI render a complete "Attempt 1: ..., Attempt 2: ..." timeline
 instead of just the latest attempt.
 
-### The ten nodes
+### The eleven nodes
 
 **`sanitize_input_node`** — the graph's true entry point, before anything
 else (including follow-up classification) touches the question. Runs
@@ -111,6 +112,19 @@ is also the re-entry point on a `missing_reference` execution failure — see
 §2 — in which case the already-selected database is **reused**, not
 re-routed, since a retry must keep targeting the same database the failed
 attempt did.
+
+**`retrieve_golden_examples_node`** — looks up human-approved (question,
+SQL) pairs a user previously saved via the UI's thumbs-up feedback (see
+"Golden-dataset feedback loop" below), from that database's own per-database
+ChromaDB collection (`embeddings/golden_examples.py`, mirroring
+`retrieve_schema_node`'s own per-database collection pattern). Only queries
+the store when `ENABLE_GOLDEN_EXAMPLES` is on (default `true`), and only
+examples clearing `GOLDEN_EXAMPLES_MIN_SIMILARITY` (default 0.75) are kept.
+Matches are stored in `state["golden_examples"]` and injected into every
+subsequent `generate_sql` attempt's prompt as reference-only few-shot
+material. Fails open exactly like `plan_query_node` right below: a disabled
+flag, an empty/unreachable store, or a lookup error all resolve to "no
+examples," never a reason a question can't be answered.
 
 **`plan_query_node`** — the agentic query-decomposition step. Reads
 `state["complexity_signals"]` (computed once, up front, by `run_agent()` —

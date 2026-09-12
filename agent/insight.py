@@ -13,8 +13,9 @@ from __future__ import annotations
 
 import contextlib
 import re
-from dataclasses import dataclass
 from decimal import Decimal
+
+from pydantic import BaseModel, ConfigDict
 
 from security.sanitization import normalize_text
 
@@ -34,8 +35,7 @@ def _is_numeric(value: object) -> bool:
     return isinstance(value, _NUMERIC_TYPES) and not isinstance(value, bool)
 
 
-@dataclass(frozen=True)
-class ColumnStat:
+class ColumnStat(BaseModel):
     """Aggregate shape of one column -- never the column's raw values.
 
     Attributes:
@@ -46,6 +46,8 @@ class ColumnStat:
             distinct values the column took across the result.
     """
 
+    model_config = ConfigDict(frozen=True)
+
     name: str
     is_numeric: bool
     minimum: float | None = None
@@ -54,8 +56,7 @@ class ColumnStat:
     distinct_count: int | None = None
 
 
-@dataclass(frozen=True)
-class ResultSummary:
+class ResultSummary(BaseModel):
     """A SMALL, aggregate-only summary of a query result -- what the LLM sees.
 
     Deliberately excludes raw rows: row count, column names, and per-column
@@ -74,6 +75,8 @@ class ResultSummary:
     never has to do arithmetic to produce a claim like "roughly 60% of the
     total," which it would otherwise be prone to getting wrong.
     """
+
+    model_config = ConfigDict(frozen=True)
 
     row_count: int
     columns: tuple[str, ...]

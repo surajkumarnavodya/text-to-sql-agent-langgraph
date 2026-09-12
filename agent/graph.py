@@ -1,12 +1,12 @@
 """Wires the agent nodes into a compiled LangGraph state machine.
 
-    sanitize_input -> classify_followup -> retrieve_schema -> plan_query -> generate_sql -+-> review_sql -+-> validate_sql -+-> estimate_cost -+-> execute_sql -+-> generate_insight -> END
-         |                    |                    ^                                      |               ^                |                  ^                 |                |
-         |                    |                    +----------------(retry, up to max_retries)------------+----------------+---(retry, high    |               |
-         |                    |                                                           |                                   cost only)      +--(retry, only  |
-         |                    +-> END (needs_clarification, ambiguous)                    |                                                        on a missing_  |
-         |                                                                                 +-> END (rejected --                                     reference       |
-         +-> END (rejected -- too_long/empty/injection_detected/off_topic)                    OffTopicQuestionError backstop)                       error)
+    sanitize_input -> classify_followup -> retrieve_schema -> retrieve_golden_examples -> plan_query -> generate_sql -+-> review_sql -+-> validate_sql -+-> estimate_cost -+-> execute_sql -+-> generate_insight -> END
+         |                    |                    ^                                                                  |               ^                |                  ^                 |                |
+         |                    |                    +----------------------------------(retry, up to max_retries)------+----------------+---(retry, high    |               |
+         |                    |                                                                                       |                                   cost only)      +--(retry, only  |
+         |                    +-> END (needs_clarification, ambiguous)                                                |                                                        on a missing_  |
+         |                                                                                                             +-> END (rejected --                                     reference       |
+         +-> END (rejected -- too_long/empty/injection_detected/off_topic)                                                OffTopicQuestionError backstop)                       error)
 
 The retry budget itself ("max_retries" in the diagram above) is not always
 `Settings.max_retries` -- `run_agent()` computes an effective, possibly
@@ -16,7 +16,17 @@ and stores it in `state["max_retries"]`, which every retry-vs-give-up check
 `execute_sql_node`) reads instead of the raw setting. See
 `agent/complexity.py`'s module docstring.
 
-`plan_query` (between `retrieve_schema` and `generate_sql`) and `review_sql`
+`retrieve_golden_examples` (between `retrieve_schema` and `plan_query`) looks
+up human-approved (question, SQL) pairs a user previously saved via the UI's
+thumbs-up feedback (see `embeddings.golden_examples`), and, when any clear
+the configured similarity threshold, injects them into `generate_sql`'s
+prompt as few-shot examples on top of the static `_QUERY_PATTERNS_BLOCK`.
+Fails open exactly like `plan_query`/`review_sql` below -- disabled via
+`Settings.enable_golden_examples`, an empty/unreachable store, or no example
+clearing the threshold all resolve to "no examples," never a reason a
+question can't be answered. See `agent.nodes.retrieve_golden_examples_node`.
+
+`plan_query` (between `retrieve_golden_examples` and `generate_sql`) and `review_sql`
 (between `generate_sql` and `validate_sql`) are the agentic query-
 decomposition + plan-conformance self-correction pair: `plan_query_node`
 makes an up-front LLM call that breaks a *non-trivial* question (one that
@@ -89,6 +99,7 @@ to use the agent.
 from __future__ import annotations
 
 import logging
+from functools import lru_cache
 
 from langgraph.graph import END, StateGraph
 
@@ -100,6 +111,7 @@ from agent.nodes import (
     generate_insight_node,
     generate_sql_node,
     plan_query_node,
+    retrieve_golden_examples_node,
     retrieve_schema_node,
     review_sql_node,
     route_after_classification,
@@ -118,8 +130,22 @@ from config.settings import get_settings
 logger = logging.getLogger(__name__)
 
 
+@lru_cache(maxsize=1)
 def build_graph():
-    """Constructs and compiles the LangGraph state graph.
+    """Constructs and compiles the LangGraph state graph, once per process.
+
+    `StateGraph.compile()`'s result is stateless -- all per-question state
+    lives in the `initial_state` dict `run_agent()` passes to `.invoke()`,
+    never on the compiled graph object itself -- so building it once and
+    reusing it (the same `functools`-based singleton pattern already used
+    for `config.settings.get_settings()` and `db.connection._cached_engine`)
+    is safe and avoids re-wiring all eleven nodes on every single question.
+    Graph *shape* never depends on `Settings` (`retrieve_golden_examples`/
+    `plan_query`/`review_sql`
+    are pass-throughs, not conditionally-omitted nodes, when planning is
+    off -- see this module's docstring), so there's no per-settings cache
+    key to worry about; like every other process-lifetime singleton here, a
+    config change that would matter takes a process restart.
 
     Returns:
         A compiled LangGraph graph exposing `.invoke(state)`.
@@ -129,6 +155,7 @@ def build_graph():
     graph.add_node("sanitize_input", sanitize_input_node)
     graph.add_node("classify_followup", classify_followup_node)
     graph.add_node("retrieve_schema", retrieve_schema_node)
+    graph.add_node("retrieve_golden_examples", retrieve_golden_examples_node)
     graph.add_node("plan_query", plan_query_node)
     graph.add_node("generate_sql", generate_sql_node)
     graph.add_node("review_sql", review_sql_node)
@@ -154,7 +181,8 @@ def build_graph():
             "needs_clarification": END,
         },
     )
-    graph.add_edge("retrieve_schema", "plan_query")
+    graph.add_edge("retrieve_schema", "retrieve_golden_examples")
+    graph.add_edge("retrieve_golden_examples", "plan_query")
     graph.add_edge("plan_query", "generate_sql")
     graph.add_conditional_edges(
         "generate_sql",

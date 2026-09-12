@@ -45,6 +45,7 @@ See `agent/orchestrator/nodes.py` for what each node does and
 from __future__ import annotations
 
 import logging
+from functools import lru_cache
 
 from langgraph.graph import END, StateGraph
 
@@ -65,8 +66,13 @@ from config.settings import get_settings
 logger = logging.getLogger(__name__)
 
 
+@lru_cache(maxsize=1)
 def build_orchestrator_graph():
-    """Constructs and compiles the orchestrator's top-level LangGraph graph.
+    """Constructs and compiles the orchestrator's top-level LangGraph graph,
+    once per process -- see `agent.graph.build_graph`'s docstring for why
+    this is safe (a compiled graph is stateless; shape never depends on
+    which sources happen to be configured, only `route_after_router`'s
+    per-invocation decision does).
 
     Returns:
         A compiled LangGraph graph exposing `.invoke(state)`.

@@ -50,6 +50,17 @@ class TableSchema(TypedDict):
     similarity_score: float
 
 
+class GoldenExample(TypedDict):
+    """One retrieved human-approved (question, SQL) pair from the golden
+    dataset (see `embeddings.golden_examples`) -- same shape/spirit as
+    `TableSchema` above (a retrieved, scored search result), not the raw
+    storage record."""
+
+    question: str
+    sql: str
+    similarity_score: float
+
+
 class ConversationExchange(TypedDict):
     """One prior turn's resolved shape, for follow-up reference resolution.
 
@@ -175,6 +186,18 @@ class AgentState(TypedDict, total=False):
     # Set by retrieve_schema
     schema_tables: list[TableSchema]
     schema_context_text: str
+
+    # Set by retrieve_golden_examples_node, which runs immediately after
+    # retrieve_schema (and before plan_query) -- the best-matching
+    # human-approved (question, SQL) pairs for this database's golden
+    # dataset (see embeddings.golden_examples), or None if the feature is
+    # disabled (Settings.enable_golden_examples), the store is empty/
+    # unreachable (fails open, same as plan_query_node), or nothing cleared
+    # Settings.golden_examples_min_similarity. Reused unchanged across every
+    # generate_sql retry for this question, exactly like query_plan below
+    # (only recomputed if retrieve_schema itself reruns) -- injected into
+    # generate_sql's prompt via agent.llm_client._build_golden_examples_block.
+    golden_examples: list[GoldenExample] | None
 
     # Set by plan_query_node, which runs between retrieve_schema and
     # generate_sql -- an ordered list of concrete steps the model judged

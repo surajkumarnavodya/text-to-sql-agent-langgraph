@@ -11,7 +11,6 @@ touched.
 
 from __future__ import annotations
 
-import dataclasses
 from pathlib import Path
 
 import pytest
@@ -60,7 +59,10 @@ _BASE_SETTINGS = Settings(
 
 
 def _settings(**overrides: object) -> Settings:
-    return dataclasses.replace(_BASE_SETTINGS, **overrides)  # type: ignore[arg-type]
+    """See `tests/test_connection.py::_settings` for why this rebuilds via
+    `Settings(**{**_BASE_SETTINGS.__dict__, **overrides})` rather than
+    `BaseModel.model_copy(update=...)`."""
+    return Settings(**{**_BASE_SETTINGS.__dict__, **overrides})
 
 
 @pytest.fixture(autouse=True)
@@ -162,7 +164,12 @@ class TestAsk:
         assert response.status_code == 200
         body = response.json()
         assert body["status"] == "failed"
-        assert "Chroma index is empty" in body["error_history"][0]
+        # The raw internal detail ("Chroma index is empty -- run scripts/
+        # build_embeddings.py.") must NOT reach the response body -- only
+        # SchemaRetrievalError.safe_message may. See agent/exceptions.py's
+        # module docstring and api/main.py's /ask handler.
+        assert body["error_history"][0] == SchemaRetrievalError("x").safe_message
+        assert "Chroma index is empty" not in body["error_history"][0]
 
     def test_empty_question_is_rejected_by_request_validation(self, client):
         response = client.post("/ask", json={"question": ""})

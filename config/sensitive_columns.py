@@ -22,11 +22,11 @@ Two independent enforcement points read this, once populated:
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
 import yaml
+from pydantic import BaseModel, ConfigDict
 
 _DEFAULT_PATH = Path(__file__).resolve().parent / "sensitive_columns.yaml"
 
@@ -35,9 +35,10 @@ SensitivityTier = Literal["public", "internal", "restricted"]
 _VALID_TIERS: frozenset[str] = frozenset({"public", "internal", "restricted"})
 
 
-@dataclass(frozen=True)
-class ColumnClassification:
+class ColumnClassification(BaseModel):
     """One column's data-sensitivity tier, as loaded from the YAML file."""
+
+    model_config = ConfigDict(frozen=True)
 
     table_name: str
     column_name: str

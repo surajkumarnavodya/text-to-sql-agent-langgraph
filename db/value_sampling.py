@@ -200,6 +200,31 @@ def attach_sample_values(
     sensitive column (e.g. a small, closed set of medical/demographic
     categories) -- see `docs/GOVERNANCE.md`'s "Data classification policy."
 
+    Beyond withholding its *values*, a restricted column is also omitted
+    from the rendered DDL text entirely -- its name and type never reach
+    the LLM (or the Chroma-embedded schema chunk) at all, not just its
+    sample values. This is deliberately layered on top of, not instead of,
+    `agent.sql_validator.find_restricted_column_references`'s existing
+    post-generation block (`agent.nodes.validate_sql_node`): that check
+    stays as the real, tested gate against a restricted column actually
+    ending up in a query, since a model can still reason about (or a user
+    can still ask for) a plausibly-named column that isn't in the schema
+    shown to it -- this is about not handing the model the column's mere
+    existence unnecessarily, not a replacement for the gate that actually
+    matters. A foreign key referencing a restricted column is dropped from
+    the rendered FK lines the same way, so the column's name can't leak
+    back in via a `FOREIGN KEY (...) REFERENCES` line even though it was
+    removed from the column list above it.
+
+    Only the *rendered DDL text* is affected -- the returned
+    `TableSchemaInfo.columns`/`.foreign_keys` still reflect the real,
+    complete schema (needed by callers like `agent.sql_validator`'s
+    restricted-column check itself, which must know a restricted column
+    exists in order to block a reference to it). `api/main.py`'s
+    `/schema/tables` endpoint is unaffected either way -- it calls
+    `introspect_schema()` directly for its own admin/ops schema listing,
+    never through this function.
+
     Args:
         engine: A read-only SQLAlchemy engine.
         tables: Already-introspected tables (from `introspect_schema()`).
@@ -208,10 +233,11 @@ def attach_sample_values(
             Defaults to `config.sensitive_columns.load_sensitive_columns()`.
 
     Returns:
-        A new list of `TableSchemaInfo`, same columns/foreign_keys, with
-        `ddl` re-rendered to include sample values where found. Tables/
-        columns where sampling fails, doesn't qualify, or is restricted are
-        left exactly as `introspect_schema()` produced them.
+        A new list of `TableSchemaInfo` with `ddl` re-rendered (sample
+        values added where found, restricted columns/FKs omitted); `columns`
+        and `foreign_keys` are always the original, complete introspected
+        values. A table with nothing sampled and nothing restricted is left
+        exactly as `introspect_schema()` produced it.
     """
     classifications = (
         sensitive_columns if sensitive_columns is not None else load_sensitive_columns()
@@ -219,31 +245,48 @@ def attach_sample_values(
     enriched: list[TableSchemaInfo] = []
     for table in tables:
         sample_values: dict[str, tuple[str, ...]] = {}
+        restricted_names: set[str] = set()
         for column in table.columns:
-            if not _is_sampling_candidate(column.name, column.type, column.is_primary_key):
-                continue
             if is_restricted(table.table_name, column.name, classifications):
+                restricted_names.add(column.name)
                 logger.info(
-                    "Skipping value sampling for restricted column %s.%s",
+                    "Omitting restricted column %s.%s from the schema shown to the LLM",
                     table.table_name,
                     column.name,
                 )
+                continue
+            if not _is_sampling_candidate(column.name, column.type, column.is_primary_key):
                 continue
             values = _sample_column(engine, table.table_name, column.name)
             if values:
                 sample_values[column.name] = values
 
-        if not sample_values:
+        if not sample_values and not restricted_names:
             enriched.append(table)
             continue
 
-        logger.info(
-            "Sampled values for %s: %s",
-            table.table_name,
-            {col: len(vals) for col, vals in sample_values.items()},
+        if sample_values:
+            logger.info(
+                "Sampled values for %s: %s",
+                table.table_name,
+                {col: len(vals) for col, vals in sample_values.items()},
+            )
+
+        visible_columns = tuple(
+            column for column in table.columns if column.name not in restricted_names
+        )
+        # Only checks this table's own constrained_columns against its own
+        # restricted_names -- a referred column living on some *other*
+        # table (fk.referred_table) would need that other table's own
+        # classification to check correctly, and a restricted column being
+        # the referenced side of an FK (rather than a PK/unique key) is not
+        # a realistic shape in practice, so it's not worth the cross-table
+        # complexity here.
+        visible_foreign_keys = tuple(
+            fk for fk in table.foreign_keys if not (restricted_names & set(fk.constrained_columns))
         )
         new_ddl = render_ddl(
-            table.table_name, table.columns, table.foreign_keys, sample_values=sample_values
+            table.table_name, visible_columns, visible_foreign_keys, sample_values=sample_values
         )
         enriched.append(
             TableSchemaInfo(

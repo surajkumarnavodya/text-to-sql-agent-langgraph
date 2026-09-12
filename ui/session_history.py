@@ -66,6 +66,13 @@ class QueryHistoryEntry:
             see ui/app.py's module docstring on why nothing is shown until
             confirmed. "View" restores exactly this, never the agent's
             internal (unconfirmed) execution result.
+        confirmed_sql: The *exact* SQL text that produced confirmed_columns/
+            confirmed_rows -- distinct from `sql` (the agent's original
+            generated SQL) since the user may have edited the SQL box before
+            clicking "Confirm and Run". None until a confirmed result
+            exists. This is what a golden-example save (see ui/app.py's
+            thumbs-up feedback) must use, not `sql`, since it's the version
+            actually verified correct.
     """
 
     entry_id: str
@@ -80,6 +87,7 @@ class QueryHistoryEntry:
     confirmed_columns: list[str] | None = None
     confirmed_rows: list[tuple] | None = None
     confirmed_error: str | None = None
+    confirmed_sql: str | None = None
 
 
 def new_history_entry(question: str, final_state: AgentState) -> QueryHistoryEntry:
@@ -111,15 +119,34 @@ def clear_history() -> list[QueryHistoryEntry]:
 
 
 def with_confirmed_result(
-    entry: QueryHistoryEntry, columns: list[str], rows: list[tuple]
+    entry: QueryHistoryEntry, columns: list[str], rows: list[tuple], confirmed_sql: str
 ) -> QueryHistoryEntry:
-    """Returns a copy of `entry` recording what "Confirm and Run" actually displayed."""
-    return replace(entry, confirmed_columns=columns, confirmed_rows=rows, confirmed_error=None)
+    """Returns a copy of `entry` recording what "Confirm and Run" actually displayed.
+
+    Args:
+        confirmed_sql: The exact SQL text that was executed to produce
+            `columns`/`rows` -- the current contents of the editable SQL
+            box at the moment of confirming, which may differ from
+            `entry.sql` (the agent's original draft) if the user edited it.
+    """
+    return replace(
+        entry,
+        confirmed_columns=columns,
+        confirmed_rows=rows,
+        confirmed_error=None,
+        confirmed_sql=confirmed_sql,
+    )
 
 
 def with_confirmed_error(entry: QueryHistoryEntry, error: str) -> QueryHistoryEntry:
     """Returns a copy of `entry` recording a "Confirm and Run" execution failure."""
-    return replace(entry, confirmed_columns=None, confirmed_rows=None, confirmed_error=error)
+    return replace(
+        entry,
+        confirmed_columns=None,
+        confirmed_rows=None,
+        confirmed_error=error,
+        confirmed_sql=None,
+    )
 
 
 def replace_entry(

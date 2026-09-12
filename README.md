@@ -1,26 +1,71 @@
+
 # Text-to-SQL Dashboard
 
-Ask questions about a real database in plain English and get back validated,
-read-only SQL, a results table, and an auto-picked chart — powered by a
-fully local LLM stack (Ollama) and an explicit, self-correcting
-[LangGraph](https://langchain-ai.github.io/langgraph/) state machine rather
-than a black-box agent.
+[![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+[![Docs](https://img.shields.io/badge/docs-available-blue.svg)](USER_GUIDE.md)
+[![Status](https://img.shields.io/badge/status-alpha-yellow.svg)](USER_GUIDE.md)
 
-**Why I built this:** most "chat with your database" demos either trust the
-LLM's SQL blindly or hide the reasoning behind an opaque agent loop. I
-wanted to build the version that treats LLM output as untrusted by
-construction — every query is parsed and allowlisted before it can run,
-every retry is visible and inspectable, and the schema the model sees
-scales to a database with hundreds of tables instead of assuming a toy
-5-table sample. It's also a fully local stack (Ollama + ChromaDB, no API
-keys, no data leaving the machine), which matters for anyone who can't send
-a real schema or query results to a hosted API — this holds for the core
-SQL pipeline unconditionally; the optional multi-source router's web
-search feature (off by default) is the one deliberate exception, since a
-live web search inherently needs to leave the machine — see "Multi-source
-knowledge" below.
+High-quality, inspectable Text-to-SQL: generate validated, read-only SQL
+from plain English, review and confirm before execution, and view results
+with charts — built on a fully local LLM stack (Ollama + ChromaDB) and a
+transparent LangGraph state machine.
 
-## Architecture
+-- Highlights
+
+- Read-only SQL generation with AST-based validation (sqlglot)
+- Self-correcting retry loop and plan-conformance checks
+- Schema-aware retrieval (top-k + FK bridge expansion)
+- Optional multi-source routing (documents, policies, web search)
+
+-- Quick links
+
+- User guide: USER_GUIDE.md
+- Architecture: docs/ARCHITECTURE.md
+- Configuration reference: docs/CONFIGURATION.md
+
+Table of Contents
+- Overview
+- Features
+- Architecture
+- Quick start
+- Configuration
+- Security & limitations
+- Project layout
+- Contributing
+- License
+
+Overview
+--------
+
+This repository provides a conservative Text-to-SQL pipeline where the
+LLM is never trusted implicitly. Generated SQL is parsed and allowlisted
+before execution, and a visible retry timeline records all attempts. The
+default pipeline is read-only and geared for local development and
+evaluation; multi-source features are optional and gated.
+
+Features
+--------
+
+- Self-correcting retry loop with recorded attempts
+- Optional agentic planning + plan-conformance checks for complex queries
+- Golden-dataset feedback loop for saving approved (question, SQL) pairs
+- sqlglot-based AST allowlist enforcing a read-only execution surface
+- Schema-aware retrieval to limit model-visible schema context
+
+Architecture
+------------
+
+See docs/ARCHITECTURE.md for a full technical walkthrough. At a high
+level the system:
+
+1. Sanitizes and classifies user input
+2. Retrieves schema context and optional golden examples
+3. Optionally generates a plan for complex questions
+4. Generates SQL via an LLM (Ollama) under LangGraph orchestration
+5. Validates SQL (AST allowlist) and estimates execution cost
+6. Executes read-only queries under caps/timeouts and returns results
+
+Mermaid diagram (high level)
 
 ```mermaid
 flowchart TD
@@ -30,7 +75,8 @@ flowchart TD
     SI --> CF["classify_followup<br/>standalone / follow-up / ambiguous"]
     CF -->|ambiguous| STOP2(["Needs clarification"])
     CF --> RS["retrieve_schema<br/>ChromaDB top-k + FK-adjacency<br/>bridge expansion"]
-    RS --> PQ["plan_query<br/>LLM plan, only for complex questions"]
+    RS --> RGE["retrieve_golden_examples<br/>human-approved past (question, SQL) pairs"]
+    RGE --> PQ["plan_query<br/>LLM plan, only for complex questions"]
     PQ --> GS["generate_sql<br/>Ollama, via LangGraph"]
     GS -->|off-topic / LLM error / rate limit| STOP3(["Rejected / Failed / Rate limited"])
     GS --> RV["review_sql<br/>plan-conformance check, only if planned"]
@@ -50,63 +96,53 @@ flowchart TD
     RUN --> RESULTS[Results table, chart, insight]
 ```
 
-Retries are capped by an adaptive per-question budget (`MAX_RETRIES`,
-default 3, plus up to `COMPLEX_QUERY_MAX_RETRY_BONUS` extra retries for a
-question that reads as non-trivial — top-N-per-group, year-over-year
-growth, several metrics at once) and every attempt is recorded and shown in
-the UI's "Retry timeline" — the self-correction loop is meant to be
-inspectable, not a black box. `plan_query`/`review_sql` are a zero-cost
-pass-through for an ordinary question — no extra LLM call, no added
-latency — and only engage for that same class of non-trivial question; see
-"Key features" below. See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)
-for the full technical walkthrough (all ten LangGraph nodes, retry
-semantics, schema-retrieval internals) and
-[`USER_GUIDE.md`](USER_GUIDE.md) for what this looks like from inside the
-app.
+Quick start
+-----------
 
-**Optional: this SQL pipeline is the default destination of a
-multi-source router**, off by default (`ENABLE_MULTI_SOURCE_ROUTER=false`).
-Turned on, a question can also be routed to (or fanned out across) uploaded
-PDF documents, a separate sensitivity-gated company-policy collection, or
-live web search — see "Multi-source knowledge" below. With the router off,
-this diagram is the *entire* app, unchanged from before that feature
-existed.
+1. Read the user guide: USER_GUIDE.md
+2. Follow docs/DEPLOYMENT.md for local Docker/compose instructions
+3. Configure environment variables in docs/CONFIGURATION.md
 
-## Key features
+Configuration
+-------------
 
-- **Self-correcting retry loop** — a validation, cost-estimate, or
-  execution failure feeds the actual error back into the next generation
-  attempt, up to a configurable cap (`MAX_RETRIES`), instead of failing on
-  the first mistake. Every attempt is recorded and shown in the UI's
-  "Retry timeline," not just logged to a terminal.
-- **Agentic query planning + plan-conformance self-correction** — a
-  question that reads as non-trivial (top-N-per-group ranking, year-over-
-  year/period growth, several metrics requested at once) gets an up-front
-  LLM-generated plan before any SQL is written, and the generated SQL is
-  then checked against that plan (a second LLM call) before it ever reaches
-  the validator. A plan-conformance failure loops back into the same
-  self-correction budget above with a targeted critique, not a separate
-  unbounded loop. An ordinary question never triggers either call — zero
-  added latency/cost for the common case. See
-  [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md#2-retry--self-correction-semantics).
-- **Retry budget scales with question complexity** — a cheap, LLM-free
-  heuristic (`agent/complexity.py`) widens `MAX_RETRIES` by up to
-  `COMPLEX_QUERY_MAX_RETRY_BONUS` extra attempts for a question matching
-  one of the same complexity signals above, instead of one flat cap for
-  every question regardless of how hard it is.
-- **Static + execution-time detection of nested aggregates** — a shape
-  every SQL engine rejects (`AVG(CASE WHEN ... THEN SUM(x) ELSE 0 END)`,
-  a common mistake for "average growth"-style questions) is caught by
-  `sqlglot` AST analysis *before* the query ever reaches the database, with
-  an execution-time backstop for anything that slips past the static check.
-- **Read-only SQL validator** — an AST-based allowlist (via `sqlglot`), not
-  a regex blocklist: only a single `SELECT`/`UNION`/`EXCEPT`/`INTERSECT`
-  statement is ever allowed to execute, in every dialect the project
-  supports. Also rejects a write/DDL statement embedded anywhere in the
-  parsed tree (e.g. a data-modifying CTE) and a denylist of known-dangerous
-  functions (`pg_sleep`, `xp_cmdshell`, `OPENROWSET`, ...) — see
-  [`SECURITY.md`](SECURITY.md).
-- **Schema-aware retrieval** — the LLM never sees the whole schema. Each
+See docs/CONFIGURATION.md for the complete list of options. Notable
+flags:
+
+- ENABLE_MULTI_SOURCE_ROUTER (default: false)
+- MAX_RETRIES (adaptive per question)
+- RAG_STORE_CONNECTION_STRING (for document/policy RAG on supported DBs)
+
+Security & limitations
+----------------------
+
+- Read-only by design but not production-hardened for multi-tenant usage
+- Local inference increases latency compared to hosted APIs
+- Schema retrieval may miss multi-hop joins; FK bridge expansion mitigates
+
+Project layout
+--------------
+
+- ui/ — Streamlit UI and pages
+- agent/ — LangGraph nodes, retry logic, planners
+- docs/ — architecture, deployment, configuration, and guides
+- tests/ — tests and evaluation harness
+
+Contributing
+------------
+
+See CONTRIBUTING.md. Typical workflow:
+
+1. Fork the repo and create a branch
+2. Add tests and docs for substantial changes
+3. Open a PR with descriptive rationale
+
+License
+-------
+
+MIT — see LICENSE.
+
+
   table's DDL (plus sampled real column values, for disambiguating coded
   columns) is embedded in ChromaDB; only the top-k relevant tables are
   retrieved per question, with FK-adjacency expansion to pull in

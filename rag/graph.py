@@ -49,15 +49,30 @@ _RESTRICTED_MESSAGE_TEMPLATE = (
     "be shown here; consult HR/the policy owner directly."
 )
 
-_INSUFFICIENT_MESSAGE = (
-    "I couldn't find information related to that in the {collection} collection."
-)
+# Deliberately doesn't name the collection ("documents"/"policies" is an
+# internal storage detail, not something a user asked about) -- kept
+# identical in spirit to agent.orchestrator.nodes._NO_INFORMATION_FOUND_MESSAGE
+# (the equivalent "nothing found anywhere" message for a multi-source
+# question) so a user sees the same tone regardless of whether one source
+# or several were consulted; update both together if this wording changes.
+_INSUFFICIENT_MESSAGE = "I couldn't find any relevant information to answer that question."
 
 
 class Citation(TypedDict):
     filename: str
     chunk_index: int
     page_number: int | None
+    # Identifies which rag.documents row this citation came from, and
+    # whether that row actually has original PDF bytes stored (see
+    # rag/store.py's `has_pdf_bytes`/`enable_pdf_download`) -- lets the UI
+    # offer a download button per cited source without a second query.
+    # Both fields flow straight through from the already-available
+    # `ChunkResult` (see `_generate_node` below); the restricted-content
+    # path a few lines down still resets `citations` to `[]` entirely, so a
+    # sensitivity-tagged document's document_id never reaches this shape
+    # either -- these two additions don't change that gate at all.
+    document_id: str
+    has_pdf_bytes: bool
 
 
 class RagState(TypedDict, total=False):
@@ -146,7 +161,13 @@ def _generate_node(state: RagState, *, settings: Settings) -> dict[str, Any]:
     user_prompt = f"Question: {state['question']}\n\nExcerpts:\n{excerpts}"
     answer = call_ollama(_GENERATE_SYSTEM_PROMPT, user_prompt, settings, max_tokens=400)
     citations: list[Citation] = [
-        {"filename": c.filename, "chunk_index": c.chunk_index, "page_number": c.page_number}
+        {
+            "filename": c.filename,
+            "chunk_index": c.chunk_index,
+            "page_number": c.page_number,
+            "document_id": c.document_id,
+            "has_pdf_bytes": c.has_pdf_bytes,
+        }
         for c in chunks
     ]
     logger.info("[rag.generate] answer_chars=%d citations=%d", len(answer), len(citations))
@@ -155,7 +176,7 @@ def _generate_node(state: RagState, *, settings: Settings) -> dict[str, Any]:
 
 def _insufficient_node(state: RagState) -> dict[str, Any]:
     return {
-        "answer": _INSUFFICIENT_MESSAGE.format(collection=state["collection"]),
+        "answer": _INSUFFICIENT_MESSAGE,
         "citations": [],
         "status": "insufficient_information",
     }

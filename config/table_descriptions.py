@@ -17,23 +17,24 @@ re-parsing it per question is cheap next to the LLM call it feeds into.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
 from pathlib import Path
 
 import yaml
+from pydantic import BaseModel, ConfigDict, Field
 
 from security.sanitization import normalize_text
 
 _DEFAULT_PATH = Path(__file__).resolve().parent / "table_descriptions.yaml"
 
 
-@dataclass(frozen=True)
-class TableDescription:
+class TableDescription(BaseModel):
     """One table's hand-authored notes, as loaded from the YAML file."""
+
+    model_config = ConfigDict(frozen=True)
 
     purpose: str
     key_relationships: str
-    column_notes: dict[str, str] = field(default_factory=dict)
+    column_notes: dict[str, str] = Field(default_factory=dict)
 
 
 def load_table_descriptions(path: Path | None = None) -> dict[str, TableDescription]:

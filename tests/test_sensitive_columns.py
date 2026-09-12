@@ -8,7 +8,7 @@ from pathlib import Path
 from sqlalchemy.engine.default import DefaultDialect
 
 from config.sensitive_columns import SensitivityTier, is_restricted, load_sensitive_columns
-from db.schema_introspection import ColumnInfo, TableSchemaInfo
+from db.schema_introspection import ColumnInfo, ForeignKeyInfo, TableSchemaInfo
 from db.value_sampling import attach_sample_values
 
 
@@ -145,6 +145,53 @@ class TestAttachSampleValuesRespectsRestriction:
         # No sample-value comment should have been added -- the column
         # would otherwise easily qualify (short VARCHAR, 2 distinct values).
         assert "-- e.g." not in result[0].ddl
+        # The column itself is omitted from the DDL entirely now, not just
+        # its sample values -- its name/type never reach the LLM at all.
+        assert "MaritalStatus" not in result[0].ddl
+        # ... but the returned TableSchemaInfo.columns still reflects the
+        # real, complete schema -- callers like the restricted-column
+        # validator gate need to know the column exists.
+        assert result[0].columns == table.columns
+
+    def test_restricted_column_that_is_a_foreign_key_is_omitted_from_both(self):
+        """A restricted column that also happens to be an FK's constrained
+        column must not leak its name back in via the FOREIGN KEY line
+        even though it's dropped from the column list above it."""
+        table = TableSchemaInfo(
+            table_name="EmployeeSalary",
+            columns=(
+                ColumnInfo(name="EmployeeId", type="INT", nullable=False, is_primary_key=True),
+                ColumnInfo(
+                    name="ManagerSsn", type="VARCHAR(11)", nullable=True, is_primary_key=False
+                ),
+            ),
+            foreign_keys=(
+                ForeignKeyInfo(
+                    constrained_columns=("ManagerSsn",),
+                    referred_table="Employee",
+                    referred_columns=("Ssn",),
+                ),
+            ),
+            ddl=(
+                "CREATE TABLE EmployeeSalary (\n"
+                "    EmployeeId INT PRIMARY KEY,\n"
+                "    ManagerSsn VARCHAR(11),\n"
+                "    FOREIGN KEY (ManagerSsn) REFERENCES Employee (Ssn)\n"
+                ");"
+            ),
+        )
+        engine = _StubEngine([])
+        classifications: dict[tuple[str, str], SensitivityTier] = {
+            ("EmployeeSalary", "ManagerSsn"): "restricted"
+        }
+
+        result = attach_sample_values(engine, [table], sensitive_columns=classifications)
+
+        assert "ManagerSsn" not in result[0].ddl
+        assert "FOREIGN KEY" not in result[0].ddl
+        assert "EmployeeId" in result[0].ddl
+        # Original, complete metadata is preserved on the returned object.
+        assert result[0].foreign_keys == table.foreign_keys
 
     def test_unrestricted_qualifying_column_is_still_sampled(self):
         """Sanity check against over-blocking: a column with no

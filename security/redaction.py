@@ -96,7 +96,14 @@ def redact_secrets(text: str, settings: DbConnectionLike | None = None) -> str:
     """
     redacted = text
     if settings is not None and settings.db_password:
-        password = str(settings.db_password)
-        if password:
+        password = settings.db_password.get_secret_value()
+        # isinstance, not just truthiness: a test double standing in for
+        # `settings` (a bare `unittest.mock.MagicMock()`, common across this
+        # codebase's test suite) makes `.db_password.get_secret_value()`
+        # itself a truthy `MagicMock`, not a string -- `str.replace` would
+        # raise on that, which is exactly the "redaction bug" this
+        # function's own docstring promises never to become the reason a
+        # legitimate error message can't be shown.
+        if isinstance(password, str) and password:
             redacted = redacted.replace(password, _REDACTED)
     return _CONNECTION_STRING_SECRET_RE.sub(_redact_match, redacted)

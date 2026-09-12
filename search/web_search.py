@@ -58,7 +58,7 @@ def _tavily_search(query: str, settings: Settings) -> list[WebResult]:
     response = httpx.post(
         _TAVILY_ENDPOINT,
         json={
-            "api_key": str(settings.web_search_api_key),
+            "api_key": settings.web_search_api_key.get_secret_value(),
             "query": query,
             "max_results": settings.web_search_max_results,
         },

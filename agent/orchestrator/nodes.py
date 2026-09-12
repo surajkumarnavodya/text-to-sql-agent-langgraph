@@ -22,13 +22,12 @@ import logging
 from collections.abc import Hashable
 from typing import Any, cast
 
-from rag.graph import Citation
-from rag.store import RagStoreNotConfiguredError
-from search.web_search import WebSearchNotConfiguredError
-
 from agent.graph import run_agent
 from agent.orchestrator.state import OrchestratorState, RouteDecision, SourceAnswer
 from config.settings import Settings, get_settings
+from rag.graph import Citation
+from rag.store import RagStoreNotConfiguredError
+from search.web_search import WebSearchNotConfiguredError
 
 logger = logging.getLogger(__name__)
 
@@ -303,7 +302,18 @@ def web_search_node(state: OrchestratorState) -> dict[str, Any]:
         max_tokens=300,
     )
     citations: list[Citation] = [
-        {"filename": r.url, "chunk_index": 0, "page_number": None} for r in results
+        # Not a rag.documents row -- document_id/has_pdf_bytes have no real
+        # meaning for a live web result, so these are the honest "nothing
+        # to download" values (has_pdf_bytes=False already means the UI
+        # never tries to render a download button for one of these).
+        {
+            "filename": r.url,
+            "chunk_index": 0,
+            "page_number": None,
+            "document_id": "",
+            "has_pdf_bytes": False,
+        }
+        for r in results
     ]
     return {
         "web_result": SourceAnswer(answer=answer, citations=citations, status="succeeded"),
@@ -318,6 +328,12 @@ _SOURCE_LABELS: dict[str, str] = {
     "web": "Web (external, live)",
 }
 
+# Shown only when EVERY contributing source came up empty -- kept identical
+# in spirit to rag.graph._INSUFFICIENT_MESSAGE (the single-source
+# equivalent) so the tone is consistent regardless of how many sources were
+# consulted; update both together if this wording changes.
+_NO_INFORMATION_FOUND_MESSAGE = "I couldn't find any relevant information to answer that question."
+
 
 def synthesis_node(state: OrchestratorState) -> dict[str, Any]:
     """Composes a final answer when more than one source contributed.
@@ -326,33 +342,70 @@ def synthesis_node(state: OrchestratorState) -> dict[str, Any]:
     common case, and the only case a plain SQL-only setup ever reaches):
     that source's own answer *is* the final answer, unedited -- no LLM call
     spent restating something already complete. With two or more, each
-    source's contribution is shown under its own clearly labeled heading
-    (see `_SOURCE_LABELS`) rather than blended into one unattributed claim
-    -- CLAUDE.md's "never blend without attribution" rule for this design.
+    source that actually found something is shown under its own clearly
+    labeled heading (see `_SOURCE_LABELS`) rather than blended into one
+    unattributed claim -- CLAUDE.md's "never blend without attribution"
+    rule for this design.
+
+    A source that found *nothing* (SQL failed/produced no usable result, or
+    a RAG/web source's own status is "insufficient_information"/"failed")
+    is silently omitted as long as at least one other source did find
+    something -- there's no reason to tell the user "nothing in the
+    policies collection" once the database already answered the question.
+    "restricted" is the one non-"succeeded" status still always shown
+    alongside a real answer: it means relevant content exists but can't be
+    surfaced (an access restriction, not an absence), which is itself
+    worth telling the user, not noise to hide. Only when *every*
+    contributing source is empty does this fall back to a single, generic
+    "couldn't find anything" message, rather than concatenating each
+    source's own "nothing here" text -- see `_NO_INFORMATION_FOUND_MESSAGE`.
     """
     sources_used = list(dict.fromkeys(state.get("sources_used", [])))
     if len(sources_used) <= 1:
         return {}
 
-    sections: list[str] = []
+    found_sections: list[str] = []
+    restricted_sections: list[str] = []
+    empty_count = 0
+
     if "sql" in sources_used:
         if state.get("status") == "succeeded":
-            sections.append(
+            found_sections.append(
                 f"**{_SOURCE_LABELS['sql']}**: {state.get('row_count', 0)} row(s) returned."
             )
         else:
-            sections.append(
-                f"**{_SOURCE_LABELS['sql']}**: {state.get('failure_explanation') or 'no result.'}"
-            )
+            # Any non-succeeded SQL outcome (no data, an error, rejected,
+            # needs clarification, ...) is treated as "nothing to
+            # contribute" here -- same as an empty RAG/web result below.
+            empty_count += 1
+
     for key, source_name in (
         ("document_result", "documents"),
         ("policy_result", "policy"),
         ("web_result", "web"),
     ):
         result = cast("SourceAnswer | None", state.get(key))
-        if result:
-            sections.append(f"**{_SOURCE_LABELS[source_name]}**: {result['answer']}")
+        if not result:
+            continue
+        status = result.get("status", "succeeded")
+        if status == "succeeded":
+            found_sections.append(f"**{_SOURCE_LABELS[source_name]}**: {result['answer']}")
+        elif status == "restricted":
+            restricted_sections.append(f"**{_SOURCE_LABELS[source_name]}**: {result['answer']}")
+        else:
+            empty_count += 1
 
+    sections = (
+        found_sections + restricted_sections
+        if found_sections or restricted_sections
+        else [_NO_INFORMATION_FOUND_MESSAGE]
+    )
     synthesized = "\n\n".join(sections)
-    logger.info("[synthesis] sources=%s", sources_used)
+    logger.info(
+        "[synthesis] sources=%s found=%d restricted=%d empty=%d",
+        sources_used,
+        len(found_sections),
+        len(restricted_sections),
+        empty_count,
+    )
     return {"synthesized_answer": synthesized}

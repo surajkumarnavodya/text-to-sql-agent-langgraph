@@ -114,6 +114,7 @@ from agent.exceptions import SchemaRetrievalError
 from agent.state import TableSchema
 from config.settings import Settings, get_settings
 from embeddings.schema_indexer import get_chroma_client, get_collection
+from security.redaction import redact_secrets
 
 logger = logging.getLogger(__name__)
 
@@ -618,7 +619,13 @@ def retrieve_relevant_schema(
     except SchemaRetrievalError:
         raise
     except Exception as exc:  # noqa: BLE001 - Chroma/onnxruntime error types vary by backend
-        raise SchemaRetrievalError(f"Failed to query the schema index: {exc}") from exc
+        # Chroma/onnxruntime error text isn't something this codebase
+        # controls the shape of -- redact_secrets is the same defensive
+        # layer db/connection.py applies to raw driver text, for the same
+        # reason (see that module's docstring): an unanticipated backend
+        # could in principle render a configured secret verbatim.
+        safe_detail = redact_secrets(str(exc), settings)
+        raise SchemaRetrievalError(f"Failed to query the schema index: {safe_detail}") from exc
 
     documents = result.get("documents") or [[]]
     metadatas = result.get("metadatas") or [[]]

@@ -86,7 +86,7 @@ class TestReplaceEntry:
         e2 = new_history_entry("q2", _succeeded_state())
         history = [e1, e2]
 
-        updated_e1 = with_confirmed_result(e1, ["col"], [(1,)])
+        updated_e1 = with_confirmed_result(e1, ["col"], [(1,)], "SELECT col FROM t")
         result = replace_entry(history, e1.entry_id, updated_e1)
 
         assert result[0].confirmed_columns == ["col"]
@@ -96,24 +96,36 @@ class TestReplaceEntry:
 class TestConfirmedResultTracking:
     def test_with_confirmed_result_sets_columns_and_rows_clears_error(self):
         entry = new_history_entry("q1", _succeeded_state())
-        updated = with_confirmed_result(entry, ["a", "b"], [(1, 2)])
+        updated = with_confirmed_result(entry, ["a", "b"], [(1, 2)], "SELECT a, b FROM t")
         assert updated.confirmed_columns == ["a", "b"]
         assert updated.confirmed_rows == [(1, 2)]
         assert updated.confirmed_error is None
+        assert updated.confirmed_sql == "SELECT a, b FROM t"
+
+    def test_with_confirmed_result_records_the_exact_sql_that_was_run(self):
+        """confirmed_sql must be the SQL actually executed, which may differ
+        from entry.sql if the user edited the SQL box before confirming."""
+        entry = new_history_entry("q1", _succeeded_state())
+        assert entry.sql != "SELECT a, b FROM edited_table"
+        updated = with_confirmed_result(entry, ["a"], [(1,)], "SELECT a, b FROM edited_table")
+        assert updated.confirmed_sql == "SELECT a, b FROM edited_table"
+        assert updated.sql == entry.sql  # the original agent-generated SQL is untouched
 
     def test_with_confirmed_error_clears_columns_and_rows(self):
         entry = new_history_entry("q1", _succeeded_state())
-        entry = with_confirmed_result(entry, ["a"], [(1,)])
+        entry = with_confirmed_result(entry, ["a"], [(1,)], "SELECT a FROM t")
         updated = with_confirmed_error(entry, "timeout")
         assert updated.confirmed_error == "timeout"
         assert updated.confirmed_columns is None
         assert updated.confirmed_rows is None
+        assert updated.confirmed_sql is None
 
     def test_confirmed_update_returns_new_object(self):
         entry = new_history_entry("q1", _succeeded_state())
-        updated = with_confirmed_result(entry, ["a"], [(1,)])
+        updated = with_confirmed_result(entry, ["a"], [(1,)], "SELECT a FROM t")
         assert updated is not entry
         assert entry.confirmed_columns is None  # original untouched
+        assert entry.confirmed_sql is None
 
 
 class TestBuildConversationHistory:

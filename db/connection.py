@@ -27,6 +27,7 @@ from enum import Enum
 from functools import cache
 from typing import Protocol, runtime_checkable
 
+from pydantic import BaseModel, ConfigDict
 from sqlalchemy import Engine, create_engine, text
 from sqlalchemy.engine import URL
 from sqlalchemy.exc import NoSuchModuleError
@@ -50,7 +51,8 @@ class DbConnectionLike(Protocol):
     multi-database connection) interchangeably.
 
     Declared as read-only `@property` members (not plain attributes):
-    both `Settings` and `DatabaseConnectionConfig` are frozen dataclasses,
+    both `Settings` and `DatabaseConnectionConfig` are frozen Pydantic
+    models (`ConfigDict(frozen=True)`/`SettingsConfigDict(frozen=True)`),
     so their fields are read-only from mypy's perspective -- a plain
     mutable-attribute Protocol member would reject them as non-conforming
     ("expected settable variable, got read-only attribute") even though
@@ -143,7 +145,7 @@ def build_connection_url(settings: DbConnectionLike) -> URL | str:
             and produce a confusing downstream error.
     """
     if settings.db_connection_string:
-        return settings.db_connection_string
+        return settings.db_connection_string.get_secret_value()
 
     db_type = settings.db_type
     if db_type not in SUPPORTED_DB_TYPES:
@@ -172,7 +174,7 @@ def build_connection_url(settings: DbConnectionLike) -> URL | str:
     return URL.create(
         drivername=info.drivername,
         username=settings.db_user or None,
-        password=settings.db_password or None,
+        password=settings.db_password.get_secret_value() if settings.db_password else None,
         host=settings.db_host,
         port=settings.db_port or info.default_port,
         database=settings.db_name,
@@ -310,8 +312,7 @@ def _classify_error(exc: Exception) -> ConnectionErrorCategory:
     return ConnectionErrorCategory.UNKNOWN
 
 
-@dataclass(frozen=True)
-class ConnectionTestResult:
+class ConnectionTestResult(BaseModel):
     """Outcome of `test_connection()`.
 
     Attributes:
@@ -322,6 +323,8 @@ class ConnectionTestResult:
         db_version: Database version string, if it could be fetched (best
             effort; None on failure or if the DB_TYPE's version query fails).
     """
+
+    model_config = ConfigDict(frozen=True)
 
     success: bool
     message: str

@@ -89,6 +89,7 @@ class DocumentRecord:
     status: DocumentStatus
     chunk_count: int
     error_message: str | None
+    has_pdf_bytes: bool
 
 
 @dataclass(frozen=True)
@@ -102,6 +103,7 @@ class ChunkResult:
     chunk_index: int
     page_number: int | None
     sensitivity_category: str | None
+    has_pdf_bytes: bool
 
 
 def _require_connection_string(settings: Settings) -> str:
@@ -112,7 +114,7 @@ def _require_connection_string(settings: Settings) -> str:
             ".env. Set it to a SQL Server 2025+/Azure SQL connection string -- "
             "see .env.example's RAG section."
         )
-    return str(settings.rag_store_connection_string)
+    return settings.rag_store_connection_string.get_secret_value()
 
 
 @cache
@@ -140,6 +142,14 @@ def ensure_schema(engine: Engine) -> None:
     migration step, the same "just works on first use" posture
     `db.schema_introspection` and `embeddings.schema_indexer` already have
     for their own storage.
+
+    Also handles the one schema *migration* this module has needed so far:
+    an existing `rag.documents` table (created before `pdf_bytes` existed)
+    gets the column added via `IF NOT EXISTS (SELECT ... sys.columns) ALTER
+    TABLE`, guarded the same idempotent way as the `CREATE TABLE` blocks
+    above -- an operator upgrading this codebase never needs a separate
+    manual migration step, the next call to `ensure_schema()` (i.e. the
+    next ingestion or question) just adds it.
     """
     with engine.begin() as conn:
         conn.execute(text("IF SCHEMA_ID('rag') IS NULL EXEC('CREATE SCHEMA rag')"))
@@ -159,8 +169,25 @@ def ensure_schema(engine: Engine) -> None:
                     chunk_count INT NOT NULL CONSTRAINT DF_rag_documents_chunk_count DEFAULT 0,
                     error_message NVARCHAR(MAX) NULL,
                     source_metadata NVARCHAR(MAX) NULL,
+                    pdf_bytes VARBINARY(MAX) NULL,
                     CONSTRAINT PK_rag_documents PRIMARY KEY (id)
                 )
+                """
+            )
+        )
+        # Migration for a `rag.documents` table created before `pdf_bytes`
+        # existed -- a fresh CREATE TABLE above already includes it, so this
+        # is a no-op on a new install and only fires once per pre-existing
+        # deployment (see `enable_pdf_download`'s docstring in
+        # config/settings.py for what this column is for).
+        conn.execute(
+            text(
+                """
+                IF NOT EXISTS (
+                    SELECT 1 FROM sys.columns
+                    WHERE object_id = OBJECT_ID('rag.documents') AND name = 'pdf_bytes'
+                )
+                ALTER TABLE rag.documents ADD pdf_bytes VARBINARY(MAX) NULL
                 """
             )
         )
@@ -191,8 +218,17 @@ def insert_document(
     collection: Collection,
     sensitivity_category: SensitivityCategory = None,
     source_metadata: dict | None = None,
+    pdf_bytes: bytes | None = None,
 ) -> str:
     """Inserts a new `rag.documents` row with status "processing" and returns its id.
+
+    Args:
+        pdf_bytes: The original uploaded file's raw bytes, or None to store
+            nothing (e.g. `Settings.enable_pdf_download` is off). Binds
+            directly as `VARBINARY` -- unlike `insert_chunks`' embedding
+            column, this needs none of `_VECTOR_CAST`'s ntext-vs-nvarchar
+            workaround, since that quirk is specific to casting a long JSON
+            string into `VECTOR`.
 
     Raises:
         ValueError: if `sensitivity_category` isn't one of the reviewed
@@ -212,9 +248,10 @@ def insert_document(
         result = conn.execute(
             text(
                 """
-                INSERT INTO rag.documents (filename, collection, sensitivity_category, source_metadata)
+                INSERT INTO rag.documents
+                    (filename, collection, sensitivity_category, source_metadata, pdf_bytes)
                 OUTPUT inserted.id
-                VALUES (:filename, :collection, :sensitivity_category, :source_metadata)
+                VALUES (:filename, :collection, :sensitivity_category, :source_metadata, :pdf_bytes)
                 """
             ),
             {
@@ -222,6 +259,7 @@ def insert_document(
                 "collection": collection,
                 "sensitivity_category": sensitivity_category,
                 "source_metadata": json.dumps(source_metadata) if source_metadata else None,
+                "pdf_bytes": pdf_bytes,
             },
         )
         return str(result.scalar_one())
@@ -288,10 +326,18 @@ def insert_chunks(
 
 
 def list_documents(engine: Engine, collection: Collection | None = None) -> list[DocumentRecord]:
-    """Lists ingested documents, newest first -- the management view's data source."""
+    """Lists ingested documents, newest first -- the management view's data source.
+
+    Deliberately projects `has_pdf_bytes` (a cheap NULL check) rather than
+    `pdf_bytes` itself -- a listing query must never pull every document's
+    full blob into memory just to render a table; the actual bytes are only
+    ever fetched on demand, by `get_document_bytes`, when a user clicks a
+    download button for one specific document.
+    """
     query = """
         SELECT id, filename, collection, sensitivity_category, upload_date,
-               status, chunk_count, error_message
+               status, chunk_count, error_message,
+               CASE WHEN pdf_bytes IS NOT NULL THEN 1 ELSE 0 END AS has_pdf_bytes
         FROM rag.documents
     """
     params: dict[str, str] = {}
@@ -312,9 +358,28 @@ def list_documents(engine: Engine, collection: Collection | None = None) -> list
             status=row.status,
             chunk_count=row.chunk_count,
             error_message=row.error_message,
+            has_pdf_bytes=bool(row.has_pdf_bytes),
         )
         for row in rows
     ]
+
+
+def get_document_bytes(engine: Engine, document_id: str) -> bytes | None:
+    """Fetches one document's original PDF bytes, or None if never stored.
+
+    The only place `pdf_bytes` is ever read in full -- called on demand
+    right when a download button needs data (see `ui/app.py`'s and
+    `ui/pages/1_Knowledge_Sources.py`'s cached wrappers around this), never
+    as part of a listing/search query.
+    """
+    with engine.connect() as conn:
+        row = conn.execute(
+            text("SELECT pdf_bytes FROM rag.documents WHERE id = :document_id"),
+            {"document_id": document_id},
+        ).fetchone()
+    if row is None or row.pdf_bytes is None:
+        return None
+    return bytes(row.pdf_bytes)
 
 
 def delete_document(engine: Engine, document_id: str) -> None:
@@ -349,6 +414,7 @@ def similarity_search(
                 SELECT TOP (:top_k)
                     c.chunk_text, c.chunk_index, c.page_number,
                     d.id AS document_id, d.filename, d.sensitivity_category,
+                    CASE WHEN d.pdf_bytes IS NOT NULL THEN 1 ELSE 0 END AS has_pdf_bytes,
                     VECTOR_DISTANCE('cosine', c.embedding, {_VECTOR_CAST}) AS distance
                 FROM rag.chunks c
                 JOIN rag.documents d ON d.id = c.document_id
@@ -371,6 +437,7 @@ def similarity_search(
             chunk_index=row.chunk_index,
             page_number=row.page_number,
             sensitivity_category=row.sensitivity_category,
+            has_pdf_bytes=bool(row.has_pdf_bytes),
         )
         for row in rows
     ]

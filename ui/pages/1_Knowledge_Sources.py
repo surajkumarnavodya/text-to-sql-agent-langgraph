@@ -18,22 +18,28 @@ import streamlit as st
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
+from config.settings import configure_logging, get_settings
 from rag.ingestion import ingest_pdf
 from rag.store import (
     RagStoreNotConfiguredError,
     delete_document,
     ensure_schema,
+    get_document_bytes,
     get_rag_engine,
     list_documents,
 )
-
-from config.settings import configure_logging, get_settings
 from security.redaction import redact_secrets
+from ui.theme import inject_theme_css, render_theme_toggle
 
 configure_logging()
 logger = logging.getLogger(__name__)
 
 st.set_page_config(page_title="Knowledge Sources", page_icon="📚", layout="wide")
+inject_theme_css()
+
+with st.sidebar:
+    render_theme_toggle()
+
 st.title("📚 Knowledge Sources")
 st.caption(
     'Upload PDFs into the "documents" or "policies" collection for the agentic RAG '
@@ -42,6 +48,19 @@ st.caption(
 )
 
 settings = get_settings()
+
+
+@st.cache_data(show_spinner=False)
+def _fetch_pdf_bytes(_engine, document_id: str) -> bytes | None:
+    """Cached per (document, session) -- without this, every document row
+    with a stored PDF would re-fetch its full blob from the RAG store on
+    every page rerun (any button click, upload, or checkbox toggle
+    anywhere on the page), not just when its own download button is
+    clicked. `_engine` is prefixed with an underscore so `st.cache_data`
+    doesn't try to hash it (a SQLAlchemy Engine isn't hashable in a way
+    that would be meaningful for cache-key purposes anyway)."""
+    return get_document_bytes(_engine, document_id)
+
 
 _SENSITIVITY_OPTIONS = {
     "None": None,
@@ -127,13 +146,29 @@ def _render_collection_tab(collection: str, enabled_flag: bool, label: str) -> N
         return
 
     for doc in documents:
-        cols = st.columns([4, 2, 2, 2, 1])
+        cols = st.columns([4, 2, 2, 2, 1, 1])
         status_icon = {"ready": "✅", "processing": "⏳", "failed": "❌"}.get(doc.status, "❓")
         cols[0].markdown(f"{status_icon} **{doc.filename}**")
         cols[1].caption(doc.upload_date)
         cols[2].caption(f"{doc.chunk_count} chunk(s)")
         cols[3].caption(doc.sensitivity_category or "—")
-        if cols[4].button("🗑️", key=f"delete_{doc.id}", help="Delete this document and its chunks"):
+        # Only fetches the blob when there's actually one to fetch -- a
+        # document ingested before ENABLE_PDF_DOWNLOAD existed (or while it
+        # was off) has has_pdf_bytes=False and simply gets no button,
+        # rather than a broken one (see Settings.enable_pdf_download's
+        # docstring for why re-upload is the only way to backfill it).
+        if doc.has_pdf_bytes:
+            pdf_bytes = _fetch_pdf_bytes(engine, doc.id)
+            if pdf_bytes is not None:
+                cols[4].download_button(
+                    "⬇️",
+                    data=pdf_bytes,
+                    file_name=doc.filename,
+                    mime="application/pdf",
+                    key=f"download_{doc.id}",
+                    help="Download the original PDF",
+                )
+        if cols[5].button("🗑️", key=f"delete_{doc.id}", help="Delete this document and its chunks"):
             delete_document(engine, doc.id)
             st.rerun()
         if doc.status == "failed" and doc.error_message:

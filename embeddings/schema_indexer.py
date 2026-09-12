@@ -71,7 +71,7 @@ def _hash_filename(db_name: str) -> str:
     return f".schema_hash__{db_name}"
 
 
-def _get_embedding_function(settings: Settings) -> embedding_functions.EmbeddingFunction:
+def get_embedding_function(settings: Settings) -> embedding_functions.EmbeddingFunction:
     """Returns the embedding function configured by `EMBEDDING_MODEL_NAME`.
 
     The default ("all-MiniLM-L6-v2") uses Chroma's own bundled ONNX runtime
@@ -137,7 +137,7 @@ def get_collection(client: chromadb.ClientAPI, settings: Settings, db_name: str)
     """
     return client.get_or_create_collection(
         name=_collection_name(settings, db_name),
-        embedding_function=_get_embedding_function(settings),
+        embedding_function=get_embedding_function(settings),
         metadata={"hnsw:space": "cosine"},
     )
 

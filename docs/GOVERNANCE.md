@@ -31,17 +31,18 @@ context: reviewed by one person, not independently verified by another
 
 ## Data classification policy
 
-**Current status (as of 2026-09-01): implemented as an enforced control.**
+**Current status (as of 2026-09-11): implemented as an enforced control.**
 `config/sensitive_columns.yaml` (loaded by `config/sensitive_columns.py`)
 exists and is wired into two enforcement points: `db/value_sampling.py`
-never samples a column classified "restricted" into the schema prompt
-regardless of cardinality, and `agent/nodes.py::validate_sql_node` rejects
-(retryable) generated SQL that directly selects a "restricted" column. The
-file ships empty — the mechanism exists, but no column has been reviewed
-and classified yet, so this has no effect on any real question until that
-happens. See `tests/test_sensitive_columns.py` and
-`tests/test_nodes_security_wiring.py` for the enforcement's regression
-coverage.
+omits a column classified "restricted" from the schema text shown to the
+LLM entirely (name and type, not just its sampled values — see "What
+exists today" below for what changed 2026-09-11), and
+`agent/nodes.py::validate_sql_node` rejects (retryable) generated SQL that
+directly selects a "restricted" column. The file ships empty — the
+mechanism exists, but no column has been reviewed and classified yet, so
+this has no effect on any real question until that happens. See
+`tests/test_sensitive_columns.py` and `tests/test_nodes_security_wiring.py`
+for the enforcement's regression coverage.
 
 ### The three tiers
 
@@ -78,7 +79,19 @@ database. Two independent enforcement points read it:
   (disambiguating coded columns like `ProductLine`), not a deliberate
   sensitivity control, and provides no protection on its own for a
   low-cardinality sensitive column (e.g. a small, closed set of medical or
-  demographic categories).
+  demographic categories). **Since 2026-09-11**, the column is omitted
+  from the rendered schema text entirely, not just its sample values — its
+  name and type never reach the LLM (or the Chroma-embedded schema chunk)
+  at all, and a foreign key referencing it is dropped from the rendered
+  `FOREIGN KEY (...)` line the same way, so the name can't leak back in
+  that path either. This is layered on top of, not instead of, the
+  post-generation block below — a model can still ask about (or a user can
+  still request) a plausibly-named column that isn't in the schema shown
+  to it, so the actual, tested gate remains the one that matters.
+  `TableSchemaInfo.columns`/`.foreign_keys` still reflect the real,
+  complete schema on the object returned by `attach_sample_values` (needed
+  by the validator gate below, which must know a restricted column exists
+  in order to block it) — only the rendered `.ddl` text omits it.
 - `agent/nodes.py::validate_sql_node` rejects (retryable, not a hard
   safety-violation failure — the model can drop the column and answer
   with what remains) any validated SQL that directly selects a

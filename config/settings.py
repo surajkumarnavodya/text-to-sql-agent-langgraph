@@ -9,6 +9,18 @@ Database connectivity is fully config-driven (see the `db_*` fields below) --
 there is no hardcoded connection string or sample schema anywhere in the
 project. `db/connection.py` is the only other module allowed to interpret
 these `db_*` fields into an actual SQLAlchemy engine/URL.
+
+Built on `pydantic_settings.BaseSettings`, not a hand-rolled `@dataclass` --
+this is what gives every field below automatic environment-variable
+loading, type coercion (a `.env` value is always a string; pydantic parses
+it into the field's real type), and validation (`Field(gt=0)`, `Literal`
+types, and the two `model_validator`s below) essentially for free, instead
+of the ~80 lines of `_env_int`/`_env_bool`/manual-validation-loop
+boilerplate this file used before. See `Settings.__init__`'s docstring for
+the one deliberate seam this migration preserves: every construction
+failure -- whether from Pydantic's own type coercion or this file's
+business-rule validators -- still raises `ConfigurationError`, the same
+type this codebase has always caught, not a raw `pydantic.ValidationError`.
 """
 
 from __future__ import annotations
@@ -16,72 +28,91 @@ from __future__ import annotations
 import logging
 import os
 import re
-from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
+from typing import Literal
 
 from dotenv import load_dotenv
-
-from security.secrets import SecretStr, as_secret
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    SecretStr,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # Project root is the parent of this file's parent (config/settings.py -> repo root).
 PROJECT_ROOT: Path = Path(__file__).resolve().parent.parent
 
 # Load .env once at import time. Safe to call even if .env doesn't exist yet
 # (e.g. a fresh checkout that hasn't run `Copy-Item .env.example .env`).
+# Kept as an explicit python-dotenv call (rather than pydantic-settings'
+# own `env_file=` support) because `_parse_named_connections` below reads
+# `os.environ` directly for dynamically-prefixed `DB_<NAME>_*` vars that
+# can't be declared as static Pydantic fields -- both that function and
+# every `Settings` field need the same populated `os.environ` regardless
+# of which one actually consumes it.
 load_dotenv(PROJECT_ROOT / ".env")
 
 
 class ConfigurationError(Exception):
-    """Raised when a config value is present but malformed.
+    """Raised when a config value is present but malformed, or a business
+    rule between two values is violated.
 
     Deliberately distinct from a missing value (which callers may have a
     sensible default for): this means "the user set something, and it's
-    wrong" -- e.g. DB_PORT=notanumber -- which should fail fast and loudly
-    rather than silently falling back to a default and connecting to the
-    wrong thing.
+    wrong" -- e.g. DB_PORT=notanumber, or COST_MODERATE_ROW_THRESHOLD set
+    higher than COST_HIGH_ROW_THRESHOLD -- which should fail fast and
+    loudly rather than silently falling back to a default or producing a
+    security control that doesn't actually do what its name says.
+
+    Raised for *every* `Settings`/`DatabaseConnectionConfig` construction
+    failure, including ones Pydantic's own type system catches (a
+    non-numeric `MAX_RETRIES`) -- see `Settings.__init__`'s docstring for
+    how a raw `pydantic.ValidationError` gets translated into this type
+    rather than leaking Pydantic's own exception type to callers that have
+    always caught `ConfigurationError` specifically (`db/connection.py`,
+    `scripts/test_db_connection.py`, `scripts/integration_test.py`, and
+    this module's own `RagStoreNotConfiguredError`/
+    `WebSearchNotConfiguredError` subclasses in `rag/store.py`/
+    `search/web_search.py`).
     """
 
 
 def _env_str(name: str, default: str) -> str:
-    """Read a string environment variable, falling back to `default`."""
+    """Read a string environment variable, falling back to `default`.
+
+    Only used by `_parse_named_connections` below, for dynamically-
+    prefixed `DB_<NAME>_*` vars that can't be declared as static Pydantic
+    fields -- every *statically* named field on `Settings` itself gets
+    this behavior automatically from `pydantic_settings.BaseSettings`
+    (see `Settings.model_config`'s `env_ignore_empty=True`).
+    """
     return os.environ.get(name, default)
 
 
 def _env_optional_str(name: str) -> str | None:
-    """Read an optional string environment variable; None if unset/blank."""
+    """Read an optional string environment variable; None if unset/blank.
+
+    Same "dynamic prefix only" scope as `_env_str` above.
+    """
     raw = os.environ.get(name)
     return raw if raw and raw.strip() else None
 
 
-def _env_int(name: str, default: int) -> int:
-    """Read an integer environment variable, falling back to `default`."""
-    raw = os.environ.get(name)
-    if raw is None or raw.strip() == "":
-        return default
-    try:
-        return int(raw)
-    except ValueError:
-        return default
-
-
-def _env_bool(name: str, default: bool) -> bool:
-    """Read a boolean environment variable ("true"/"1"/"yes", case-insensitive), falling back to `default`."""
-    raw = os.environ.get(name)
-    if raw is None or raw.strip() == "":
-        return default
-    return raw.strip().lower() in ("true", "1", "yes")
-
-
 def _env_optional_int_strict(name: str) -> int | None:
-    """Read an optional integer environment variable.
+    """Read an optional integer environment variable for a dynamically-
+    prefixed `DB_<NAME>_PORT` var (see `_env_str` above for why this can't
+    just be a Pydantic field).
 
-    Unlike `_env_int`, this does not silently fall back to a default when
-    the value is malformed -- a *present but invalid* value (e.g.
-    `DB_PORT=abc`) raises `ConfigurationError` immediately, since that's a
-    real mistake in `.env`, not an intentional "use the default" signal.
-    Absent/blank is fine and returns None (caller decides the fallback,
-    e.g. a per-DB_TYPE default port).
+    A *present but invalid* value (e.g. `DB_SALES_PORT=abc`) raises
+    `ConfigurationError` immediately, since that's a real mistake in
+    `.env`, not an intentional "use the default" signal. Absent/blank is
+    fine and returns None (caller decides the fallback, e.g. a per-
+    DB_TYPE default port).
     """
     raw = os.environ.get(name)
     if raw is None or raw.strip() == "":
@@ -108,8 +139,7 @@ def _connection_env_prefix(name: str) -> str:
     return re.sub(r"[^A-Za-z0-9]", "_", name).upper()
 
 
-@dataclass(frozen=True)
-class DatabaseConnectionConfig:
+class DatabaseConnectionConfig(BaseModel):
     """One named database connection's worth of `DB_*`-shaped fields.
 
     Mirrors `Settings`' own `db_*` fields exactly (same names, same
@@ -121,23 +151,25 @@ class DatabaseConnectionConfig:
 
     See `config/settings.py`'s module docstring and `Settings.databases`
     for how these are parsed from `.env` (`DB_CONNECTIONS` + per-name
-    `DB_<NAME>_*` vars).
+    `DB_<NAME>_*` vars). A plain `BaseModel`, not a `BaseSettings` --
+    unlike `Settings`, this is never constructed by reading the process
+    environment directly; `_parse_named_connections` below does that
+    reading itself (dynamic `DB_<NAME>_*` prefixes aren't expressible as
+    static Pydantic fields) and passes already-resolved values in.
     """
+
+    model_config = ConfigDict(frozen=True)
 
     name: str
     db_type: str
-    db_host: str | None
-    db_port: int | None
-    db_name: str | None
-    db_user: str | None
-    db_password: SecretStr | None
-    db_connection_string: SecretStr | None
-    db_schema: str | None
-    db_odbc_driver: str
-
-    def __post_init__(self) -> None:
-        object.__setattr__(self, "db_password", as_secret(self.db_password))
-        object.__setattr__(self, "db_connection_string", as_secret(self.db_connection_string))
+    db_host: str | None = None
+    db_port: int | None = None
+    db_name: str | None = None
+    db_user: str | None = None
+    db_password: SecretStr | None = None
+    db_connection_string: SecretStr | None = None
+    db_schema: str | None = None
+    db_odbc_driver: str = "ODBC Driver 17 for SQL Server"
 
 
 def _parse_named_connections() -> tuple[DatabaseConnectionConfig, ...]:
@@ -153,9 +185,14 @@ def _parse_named_connections() -> tuple[DatabaseConnectionConfig, ...]:
     `DB_*` vars, just namespaced per connection.
 
     Returns an empty tuple if `DB_CONNECTIONS` is unset/blank -- the
-    caller (`Settings.__post_init__`) falls back to a single "default"
-    connection built from the legacy flat `DB_*` vars in that case, so an
-    existing single-database `.env` needs zero changes.
+    caller (`get_settings()`, via `Settings`' `_fill_default_database`
+    validator) falls back to a single "default" connection built from the
+    legacy flat `DB_*` vars in that case, so an existing single-database
+    `.env` needs zero changes. Deliberately hand-written rather than
+    Pydantic fields: `DB_CONNECTIONS` names an *open-ended* set of env-var
+    prefixes only known at runtime, which static field declarations can't
+    express -- this is the one part of config loading Pydantic's own
+    settings-from-env machinery isn't the right tool for.
 
     Raises:
         ConfigurationError: on a blank name, a duplicate name (or two
@@ -186,6 +223,8 @@ def _parse_named_connections() -> tuple[DatabaseConnectionConfig, ...]:
                 f"other DB_<NAME>_* fields)."
             )
 
+        raw_password = _env_optional_str(f"DB_{prefix}_PASSWORD")
+        raw_connection_string = _env_optional_str(f"DB_{prefix}_CONNECTION_STRING")
         connections.append(
             DatabaseConnectionConfig(
                 name=name,
@@ -194,8 +233,10 @@ def _parse_named_connections() -> tuple[DatabaseConnectionConfig, ...]:
                 db_port=_env_optional_int_strict(f"DB_{prefix}_PORT"),
                 db_name=_env_optional_str(f"DB_{prefix}_NAME"),
                 db_user=_env_optional_str(f"DB_{prefix}_USER"),
-                db_password=as_secret(_env_optional_str(f"DB_{prefix}_PASSWORD")),
-                db_connection_string=as_secret(_env_optional_str(f"DB_{prefix}_CONNECTION_STRING")),
+                db_password=SecretStr(raw_password) if raw_password is not None else None,
+                db_connection_string=(
+                    SecretStr(raw_connection_string) if raw_connection_string is not None else None
+                ),
                 db_schema=_env_optional_str(f"DB_{prefix}_SCHEMA"),
                 db_odbc_driver=_env_str(
                     f"DB_{prefix}_ODBC_DRIVER", "ODBC Driver 17 for SQL Server"
@@ -206,9 +247,25 @@ def _parse_named_connections() -> tuple[DatabaseConnectionConfig, ...]:
     return tuple(connections)
 
 
-@dataclass(frozen=True)
-class Settings:
-    """Immutable snapshot of application configuration.
+def _format_validation_error(exc: ValidationError) -> str:
+    """Turns a `pydantic.ValidationError` into one `ConfigurationError`-style message.
+
+    Field names are upper-cased to match this project's env-var naming
+    convention (`log_redaction_level` -> `LOG_REDACTION_LEVEL`) -- every
+    field on `Settings` is named identically to its env var, just
+    lower-cased, so this mapping is exact, not a guess.
+    """
+    parts = []
+    for error in exc.errors():
+        field = ".".join(str(loc) for loc in error["loc"]).upper()
+        parts.append(f"{field}: {error['msg']} (got {error['input']!r}).")
+    return " ".join(parts) + " Fix it in .env (or remove it to use the default)."
+
+
+class Settings(BaseSettings):
+    """Immutable snapshot of application configuration, loaded from the process
+    environment (and `.env`, via the `load_dotenv()` call at module import
+    time above).
 
     Attributes:
         ollama_host: Base URL of the local Ollama server.
@@ -229,17 +286,16 @@ class Settings:
         db_name: Database (catalog) name.
         db_user: Database login username. Should be a dedicated read-only
             account -- see README's "Security" section.
-        db_password: Database login password. Never logged. Stored as a
-            `security.secrets.SecretStr` (coerced in `__post_init__` below,
+        db_password: Database login password. Never logged. A
+            `pydantic.SecretStr` (coerced automatically by Pydantic
             regardless of whether the caller passed a plain `str` or an
-            already-wrapped value) -- a real `str` for every purpose that
-            needs the actual value, but its `repr()`/`%r` output is
-            redacted, so an accidental `logger.debug("%r", settings)` or a
-            traceback's local-variable dump can't leak it.
+            already-wrapped value) -- `str()`/`repr()` both mask it; only
+            `.get_secret_value()` returns the real value, so an accidental
+            `logger.debug("%r", settings)`, a traceback's local-variable
+            dump, or a naive `settings.model_dump()` can't leak it.
         db_connection_string: Optional full SQLAlchemy connection string,
             used as-is instead of building one from the discrete db_* fields
-            above if set. Also coerced to `SecretStr` -- it may itself embed
-            a password.
+            above if set. Also a `SecretStr` -- it may itself embed a password.
         db_schema: Optional schema name to restrict introspection to (so
             only that schema's tables are exposed to the LLM). None means
             "use the database's default schema".
@@ -312,7 +368,7 @@ class Settings:
             full auth system" posture (see `docs/DEPLOYMENT.md`): anything
             beyond local/trusted-network use should sit behind a real
             authenticating reverse proxy regardless of whether this is set.
-            Stored as `SecretStr` for the same reason `db_password` is.
+            A `SecretStr` for the same reason `db_password` is.
         enable_multi_source_router: Whether `ui/app.py`/`api/main.py` route
             questions through `agent.orchestrator.graph.run_orchestrated`
             (the multi-source router) instead of calling
@@ -320,9 +376,7 @@ class Settings:
             off, `run_orchestrated` itself just calls `run_agent` and
             returns its result unwrapped, so a fresh clone with no other
             `.env` changes behaves identically to the app before this
-            existed. See `agent/orchestrator/graph.py`'s module docstring
-            (`docs/ARCHITECTURE.md` gets a matching section once the
-            multi-source design lands in full -- see CLAUDE.md's Part 7).
+            existed. See `agent/orchestrator/graph.py`'s module docstring.
         enable_query_planning: Whether `agent.nodes.plan_query_node` makes an
             up-front planning LLM call for a question `agent.complexity.
             detect_complexity_signals` judges non-trivial (top-N-per-group,
@@ -340,6 +394,22 @@ class Settings:
         sql_review_max_tokens: Max tokens the LLM may generate for the
             plan-conformance review verdict (`agent.nodes.review_sql_node`)
             -- "PASS" or a one-sentence "FAIL: <reason>", never more.
+        enable_golden_examples: Whether `agent.nodes
+            .retrieve_golden_examples_node` looks up human-approved past
+            (question, SQL) pairs (see `embeddings.golden_examples`) and
+            injects the best-matching ones into the generation prompt as
+            few-shot examples. True by default -- safe even with an empty
+            golden dataset (the common case until a user has saved any),
+            since retrieval on an empty/missing collection simply returns
+            no examples, the same fail-open contract `plan_query_node`
+            already has. See `agent/nodes.py::retrieve_golden_examples_node`.
+        golden_examples_top_k: Max golden examples retrieved per question
+            (before the similarity filter below is applied).
+        golden_examples_min_similarity: Minimum cosine similarity
+            (0.0-1.0) a saved example must clear to actually be injected --
+            a poor match is worse than no example at all (it can mislead
+            the model toward an unrelated pattern), so this is a real
+            quality gate, not just a top-k cap.
         rag_store_connection_string: Full SQLAlchemy connection string for
             the document/policy RAG store (`rag/store.py`) -- a SQL Server
             2025+/Azure SQL database using the native `VECTOR` column type
@@ -377,6 +447,22 @@ class Settings:
             model already embedding schema DDL) -- set this only if
             documents genuinely need a different model than schema
             retrieval does.
+        enable_pdf_download: Whether `rag/ingestion.py::ingest_pdf` stores
+            the original uploaded PDF's raw bytes (a new `pdf_bytes`
+            column on `rag.documents` -- see `rag/store.py::ensure_schema`)
+            so it can later be downloaded from a chat answer's citation or
+            the Knowledge Sources management page. True by default because
+            that's a real, requested capability and PDFs are typically not
+            huge, but unlike the compute-only `enable_query_planning`/
+            `enable_golden_examples` flags this is a genuine, visible
+            storage-growth cost (every ingested PDF's full bytes, on top of
+            its extracted chunks) -- turn this off if that matters for your
+            deployment. Only ever applies to newly-ingested documents from
+            the point this is enabled; a document ingested before this
+            existed (or while it was off) has no bytes to serve and simply
+            never shows a download option (`DocumentRecord.has_pdf_bytes`/
+            `rag.store.ChunkResult.has_pdf_bytes` are both False for it) --
+            re-uploading it is the only way to make it downloadable.
         enable_web_search: Whether the web_search node is offered to the
             router at all. False by default, and independent of
             `web_search_api_key` being set -- both must be true/present for
@@ -385,98 +471,187 @@ class Settings:
             see `search.web_search.SUPPORTED_SEARCH_PROVIDERS` for the
             supported values. Swapping providers is a config change, not a
             code change, mirroring `DB_TYPE`'s own pattern.
-        web_search_api_key: API key for the configured provider. Stored as
+        web_search_api_key: API key for the configured provider. A
             `SecretStr` for the same reason `db_password` is.
         web_search_max_results: Max results requested per web search call.
         project_root: Absolute path to the repository root.
         databases: Every configured database connection, parsed from
             `DB_CONNECTIONS` + per-name `DB_<NAME>_*` vars (see
             `_parse_named_connections`). Always has at least one entry:
-            when `DB_CONNECTIONS` is unset, `__post_init__` synthesizes a
-            single connection named `"default"` from this same instance's
-            flat `db_*` fields below, so `db_type`/`db_host`/... above stay
-            the single source of truth for a plain single-database setup,
-            and `databases` is the one multi-database-aware code
-            (`embeddings.retriever.select_database`, the Streamlit sidebar,
-            the scripts) should read instead. `db.connection.
-            get_connection(settings, name)` looks one up by name.
+            when `DB_CONNECTIONS` is unset, `_fill_default_database` below
+            synthesizes a single connection named `"default"` from this
+            same instance's flat `db_*` fields, so `db_type`/`db_host`/...
+            above stay the single source of truth for a plain
+            single-database setup, and `databases` is the one multi-
+            database-aware code (`embeddings.retriever.select_database`,
+            the Streamlit sidebar, the scripts) should read instead.
+            `db.connection.get_connection(settings, name)` looks one up by
+            name.
     """
 
-    ollama_host: str
-    ollama_model: str
-    ollama_request_timeout_seconds: int
+    model_config = SettingsConfigDict(
+        frozen=True,
+        case_sensitive=False,
+        # A blank env var ("FOO=" with nothing after it) behaves like unset
+        # -- falls back to the field's default -- matching this file's old
+        # `_env_str`/`_env_int` helpers exactly, rather than Pydantic's own
+        # default of treating "" as a real, explicit empty-string value.
+        env_ignore_empty=True,
+        # Env vars this model doesn't declare a field for (PATH, a
+        # completely unrelated tool's own env vars, ...) must never cause a
+        # validation error -- pydantic-settings already ignores these by
+        # default for env-var loading; stated explicitly since `extra`
+        # would otherwise also govern (and reject) unexpected constructor
+        # kwargs, which several call sites below pass deliberately
+        # (`databases=`, in tests).
+        extra="ignore",
+    )
 
-    db_type: str
-    db_host: str | None
-    db_port: int | None
-    db_name: str | None
-    db_user: str | None
-    db_password: SecretStr | None
-    db_connection_string: SecretStr | None
-    db_schema: str | None
-    db_odbc_driver: str
+    ollama_host: str = "http://localhost:11434"
+    ollama_model: str = "llama3.1:8b"
+    ollama_request_timeout_seconds: int = Field(default=300, gt=0)
 
-    chroma_persist_dir: Path
-    chroma_collection_name: str
-    embedding_model_name: str
-    schema_top_k: int
-    max_retries: int
-    complex_query_max_retry_bonus: int
-    max_result_rows: int
-    query_timeout_seconds: int
-    llm_max_tokens: int
-    insight_max_tokens: int
-    max_question_length: int
-    question_rate_limit_per_minute: int
-    llm_call_rate_limit_per_minute: int
-    cost_estimation_enabled: bool
-    cost_estimation_timeout_seconds: int
-    cost_moderate_row_threshold: int
-    cost_high_row_threshold: int
-    log_level: str
-    log_redaction_level: str
+    db_type: str = ""
+    db_host: str | None = None
+    db_port: int | None = None
+    db_name: str | None = None
+    db_user: str | None = None
+    db_password: SecretStr | None = None
+    db_connection_string: SecretStr | None = None
+    db_schema: str | None = None
+    db_odbc_driver: str = "ODBC Driver 17 for SQL Server"
+
+    chroma_persist_dir: Path = Path("./embeddings/.chroma")
+    chroma_collection_name: str = "schema_ddl"
+    embedding_model_name: str = "all-MiniLM-L6-v2"
+    schema_top_k: int = 4
+    max_retries: int = Field(default=3, gt=0)
+    complex_query_max_retry_bonus: int = Field(default=2, ge=0)
+    max_result_rows: int = Field(default=1000, gt=0)
+    query_timeout_seconds: int = Field(default=15, gt=0)
+    llm_max_tokens: int = Field(default=1024, gt=0)
+    insight_max_tokens: int = Field(default=120, gt=0)
+    max_question_length: int = Field(default=500, gt=0)
+    question_rate_limit_per_minute: int = Field(default=10, gt=0)
+    llm_call_rate_limit_per_minute: int = Field(default=20, gt=0)
+    cost_estimation_enabled: bool = True
+    cost_estimation_timeout_seconds: int = Field(default=3, gt=0)
+    cost_moderate_row_threshold: int = Field(default=50_000, gt=0)
+    cost_high_row_threshold: int = Field(default=1_000_000, gt=0)
+    log_level: str = "INFO"
+    log_redaction_level: Literal["standard", "strict"] = "standard"
     enable_multi_source_router: bool = False
     enable_query_planning: bool = True
-    query_plan_max_tokens: int = 300
-    sql_review_max_tokens: int = 200
+    query_plan_max_tokens: int = Field(default=300, gt=0)
+    sql_review_max_tokens: int = Field(default=200, gt=0)
+    enable_golden_examples: bool = True
+    golden_examples_top_k: int = Field(default=3, gt=0)
+    golden_examples_min_similarity: float = Field(default=0.75, ge=0.0, le=1.0)
     api_auth_token: SecretStr | None = None
     rag_store_connection_string: SecretStr | None = None
     rag_store_odbc_driver: str = "ODBC Driver 17 for SQL Server"
     enable_document_rag: bool = False
     enable_policy_rag: bool = False
-    rag_top_k: int = 4
-    rag_max_retries: int = 2
-    rag_chunk_size: int = 1200
+    rag_top_k: int = Field(default=4, gt=0)
+    rag_max_retries: int = Field(default=2, gt=0)
+    rag_chunk_size: int = Field(default=1200, gt=0)
     rag_chunk_overlap: int = 150
     rag_embedding_model_name: str = ""
+    enable_pdf_download: bool = True
     enable_web_search: bool = False
     web_search_provider: str = "tavily"
     web_search_api_key: SecretStr | None = None
-    web_search_max_results: int = 5
+    web_search_max_results: int = Field(default=5, gt=0)
     project_root: Path = PROJECT_ROOT
     databases: tuple[DatabaseConnectionConfig, ...] = ()
 
-    def __post_init__(self) -> None:
-        """Coerces secret fields, fills in `databases`, and validates security-relevant values.
-
-        Runs on *every* construction of `Settings` -- not just the one path
-        through `get_settings()` below -- so both protections apply
-        uniformly, including to every test in this codebase that builds a
-        `Settings(...)` directly.
-
-        `object.__setattr__` is required because `Settings` is a frozen
-        dataclass (immutable after construction is the point -- see the
-        class docstring); `__post_init__` is the one place frozen dataclass
-        fields may still be set, exactly for this kind of post-construction
-        normalization.
+    @field_validator("db_type", "web_search_provider", mode="before")
+    @classmethod
+    def _lowercase_strip(cls, value: object) -> object:
+        """`db/connection.py::SUPPORTED_DB_TYPES` and
+        `search/web_search.py::SUPPORTED_SEARCH_PROVIDERS` are both keyed by
+        lowercase name -- applied here (rather than trusting every caller to
+        lowercase their own `.env` value) so `DB_TYPE=MSSQL` and
+        `DB_TYPE=mssql` behave identically. `log_redaction_level` gets the
+        same treatment via its own validator below, since it also needs the
+        lowercasing to happen *before* the `Literal["standard", "strict"]`
+        match, not after.
         """
-        object.__setattr__(self, "db_password", as_secret(self.db_password))
-        object.__setattr__(self, "db_connection_string", as_secret(self.db_connection_string))
-        object.__setattr__(self, "api_auth_token", as_secret(self.api_auth_token))
-        object.__setattr__(
-            self, "rag_store_connection_string", as_secret(self.rag_store_connection_string)
-        )
-        object.__setattr__(self, "web_search_api_key", as_secret(self.web_search_api_key))
+        return value.strip().lower() if isinstance(value, str) else value
+
+    @field_validator("log_redaction_level", mode="before")
+    @classmethod
+    def _lowercase_strip_redaction_level(cls, value: object) -> object:
+        return value.strip().lower() if isinstance(value, str) else value
+
+    @field_validator("chroma_persist_dir", mode="before")
+    @classmethod
+    def _resolve_chroma_dir(cls, value: object) -> Path:
+        """Resolves a relative `CHROMA_PERSIST_DIR` against the project
+        root rather than the process's current working directory -- applied
+        to *any* value (the field's own default included, not just an
+        explicit env var), so both stay consistent regardless of where the
+        app happens to be launched from."""
+        return _resolve_path(str(value))
+
+    def __init__(self, **data: object) -> None:
+        """Wraps construction so every failure -- Pydantic's own type
+        coercion included, not just this file's custom validators below --
+        raises `ConfigurationError`, matching this codebase's long-standing
+        exception contract (see that class's docstring for every call site
+        that catches it specifically).
+
+        Safe to layer like this because a validator that raises
+        `ConfigurationError` directly (not a bare `ValueError`) already
+        propagates through Pydantic's validation machinery completely
+        unwrapped -- verified empirically before relying on it, since
+        Pydantic only intercepts `ValueError`/`TypeError`/`AssertionError`
+        to build its own `ValidationError` out of them. This `__init__`
+        override exists for the *other* case: a field failing Pydantic's
+        own built-in type coercion (e.g. `MAX_RETRIES=abc`) raises
+        `pydantic.ValidationError` directly, with no validator of this
+        file's own in the call stack to intercept it -- so it's caught and
+        translated here instead, the one place guaranteed to run for every
+        construction path (`get_settings()` and every test that builds a
+        `Settings(...)` directly).
+        """
+        try:
+            # `BaseSettings.__init__`'s real signature is a long list of
+            # `_env_file`/`_case_sensitive`/etc. special keyword-only
+            # params, which mypy can't reconcile with a generic `**data:
+            # object` forward -- this override's whole point is to accept
+            # arbitrary field kwargs, so the mismatch is expected here.
+            super().__init__(**data)  # type: ignore[arg-type]
+        except ValidationError as exc:
+            raise ConfigurationError(_format_validation_error(exc)) from exc
+
+    @model_validator(mode="after")
+    def _validate_cost_threshold_ordering(self) -> Settings:
+        """`COST_MODERATE_ROW_THRESHOLD` must be strictly less than
+        `COST_HIGH_ROW_THRESHOLD` -- otherwise a query is never classified
+        "moderate", only "low" or "high". A cross-field rule Pydantic's
+        per-field `Field(gt=0)` constraints can't express on their own."""
+        if self.cost_moderate_row_threshold >= self.cost_high_row_threshold:
+            raise ConfigurationError(
+                f"COST_MODERATE_ROW_THRESHOLD ({self.cost_moderate_row_threshold}) must be "
+                f"strictly less than COST_HIGH_ROW_THRESHOLD ({self.cost_high_row_threshold}) "
+                f"-- otherwise a query is never classified 'moderate', only 'low' or 'high'. "
+                f"Fix both in .env."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _fill_default_database(self) -> Settings:
+        """Ensures `databases` always has >=1 entry.
+
+        `object.__setattr__` is required because `Settings` is frozen
+        (immutable after construction is the point -- see the class
+        docstring); a `model_validator(mode="after")` is the one place a
+        frozen Pydantic model's own fields may still be set, exactly for
+        this kind of post-construction normalization (mirrors the
+        `object.__setattr__` escape hatch frozen dataclasses' own
+        `__post_init__` used before this migration).
+        """
         if not self.databases:
             # No DB_CONNECTIONS configured (or a Settings(...) built directly,
             # e.g. by a test, without passing databases=) -- fall back to a
@@ -501,69 +676,7 @@ class Settings:
                     ),
                 ),
             )
-        self._validate_security_settings()
-
-    def _validate_security_settings(self) -> None:
-        """Fails fast on a nonsensical security-relevant value.
-
-        Mirrors the existing "malformed value fails fast" philosophy this
-        module already applies to `DB_PORT` (see
-        `_env_optional_int_strict`) -- a *present* value that's negative,
-        zero, or internally inconsistent (e.g. the "run a query without
-        blocking" threshold set higher than the "block this query"
-        threshold) is a real misconfiguration, not a style choice, and
-        should raise here rather than silently produce a security control
-        that doesn't actually do what its name says.
-        """
-        positive_fields = (
-            ("MAX_RETRIES", self.max_retries),
-            ("MAX_RESULT_ROWS", self.max_result_rows),
-            ("QUERY_TIMEOUT_SECONDS", self.query_timeout_seconds),
-            ("LLM_MAX_TOKENS", self.llm_max_tokens),
-            ("INSIGHT_MAX_TOKENS", self.insight_max_tokens),
-            ("QUERY_PLAN_MAX_TOKENS", self.query_plan_max_tokens),
-            ("SQL_REVIEW_MAX_TOKENS", self.sql_review_max_tokens),
-            ("MAX_QUESTION_LENGTH", self.max_question_length),
-            ("QUESTION_RATE_LIMIT_PER_MINUTE", self.question_rate_limit_per_minute),
-            ("LLM_CALL_RATE_LIMIT_PER_MINUTE", self.llm_call_rate_limit_per_minute),
-            ("COST_ESTIMATION_TIMEOUT_SECONDS", self.cost_estimation_timeout_seconds),
-            ("COST_MODERATE_ROW_THRESHOLD", self.cost_moderate_row_threshold),
-            ("COST_HIGH_ROW_THRESHOLD", self.cost_high_row_threshold),
-            ("RAG_TOP_K", self.rag_top_k),
-            ("RAG_MAX_RETRIES", self.rag_max_retries),
-            ("RAG_CHUNK_SIZE", self.rag_chunk_size),
-            ("WEB_SEARCH_MAX_RESULTS", self.web_search_max_results),
-        )
-        for name, value in positive_fields:
-            if value <= 0:
-                raise ConfigurationError(
-                    f"{name}={value} is not valid -- it must be a positive number. "
-                    f"Fix it in .env (or remove it to use the default)."
-                )
-
-        # Zero is a deliberate, valid value here (disables the adaptive retry
-        # budget -- see the field's docstring), unlike positive_fields above;
-        # only negative is a misconfiguration.
-        if self.complex_query_max_retry_bonus < 0:
-            raise ConfigurationError(
-                f"COMPLEX_QUERY_MAX_RETRY_BONUS={self.complex_query_max_retry_bonus} is not "
-                f"valid -- it must be zero or a positive number. Fix it in .env (or remove it "
-                f"to use the default)."
-            )
-
-        if self.cost_moderate_row_threshold >= self.cost_high_row_threshold:
-            raise ConfigurationError(
-                f"COST_MODERATE_ROW_THRESHOLD ({self.cost_moderate_row_threshold}) must be "
-                f"strictly less than COST_HIGH_ROW_THRESHOLD ({self.cost_high_row_threshold}) "
-                f"-- otherwise a query is never classified 'moderate', only 'low' or 'high'. "
-                f"Fix both in .env."
-            )
-
-        if self.log_redaction_level not in ("standard", "strict"):
-            raise ConfigurationError(
-                f"LOG_REDACTION_LEVEL={self.log_redaction_level!r} is not valid -- it must be "
-                f"'standard' or 'strict'. Fix it in .env (or remove it to use the default)."
-            )
+        return self
 
 
 @lru_cache(maxsize=1)
@@ -573,6 +686,14 @@ def get_settings() -> Settings:
     Cached with `lru_cache` so repeated calls (e.g. from every agent node) do
     not re-parse the environment; this mirrors Streamlit's own
     `@st.cache_resource` pattern for one-time setup.
+
+    Every field is read from the environment automatically by
+    `pydantic_settings.BaseSettings` (case-insensitively, so `OLLAMA_HOST`
+    in `.env` fills the `ollama_host` field with no extra wiring here) --
+    the one field that still needs explicit help is `databases`, since its
+    source (`DB_CONNECTIONS` + dynamically-prefixed `DB_<NAME>_*` vars) is
+    a genuinely dynamic set of env-var names no static field declaration
+    can express.
 
     Raises:
         ConfigurationError: if a present-but-malformed value is found (e.g.
@@ -584,59 +705,7 @@ def get_settings() -> Settings:
             require a fully-configured database connection just to import
             this module.
     """
-    settings = Settings(
-        ollama_host=_env_str("OLLAMA_HOST", "http://localhost:11434"),
-        ollama_model=_env_str("OLLAMA_MODEL", "llama3.1:8b"),
-        ollama_request_timeout_seconds=_env_int("OLLAMA_REQUEST_TIMEOUT_SECONDS", 300),
-        db_type=_env_str("DB_TYPE", "").strip().lower(),
-        db_host=_env_optional_str("DB_HOST"),
-        db_port=_env_optional_int_strict("DB_PORT"),
-        db_name=_env_optional_str("DB_NAME"),
-        db_user=_env_optional_str("DB_USER"),
-        db_password=as_secret(_env_optional_str("DB_PASSWORD")),
-        db_connection_string=as_secret(_env_optional_str("DB_CONNECTION_STRING")),
-        db_schema=_env_optional_str("DB_SCHEMA"),
-        db_odbc_driver=_env_str("DB_ODBC_DRIVER", "ODBC Driver 17 for SQL Server"),
-        chroma_persist_dir=_resolve_path(_env_str("CHROMA_PERSIST_DIR", "./embeddings/.chroma")),
-        chroma_collection_name=_env_str("CHROMA_COLLECTION_NAME", "schema_ddl"),
-        embedding_model_name=_env_str("EMBEDDING_MODEL_NAME", "all-MiniLM-L6-v2"),
-        schema_top_k=_env_int("SCHEMA_TOP_K", 4),
-        max_retries=_env_int("MAX_RETRIES", 3),
-        complex_query_max_retry_bonus=_env_int("COMPLEX_QUERY_MAX_RETRY_BONUS", 2),
-        max_result_rows=_env_int("MAX_RESULT_ROWS", 1000),
-        query_timeout_seconds=_env_int("QUERY_TIMEOUT_SECONDS", 15),
-        llm_max_tokens=_env_int("LLM_MAX_TOKENS", 1024),
-        insight_max_tokens=_env_int("INSIGHT_MAX_TOKENS", 120),
-        max_question_length=_env_int("MAX_QUESTION_LENGTH", 500),
-        question_rate_limit_per_minute=_env_int("QUESTION_RATE_LIMIT_PER_MINUTE", 10),
-        llm_call_rate_limit_per_minute=_env_int("LLM_CALL_RATE_LIMIT_PER_MINUTE", 20),
-        cost_estimation_enabled=_env_bool("COST_ESTIMATION_ENABLED", True),
-        cost_estimation_timeout_seconds=_env_int("COST_ESTIMATION_TIMEOUT_SECONDS", 3),
-        cost_moderate_row_threshold=_env_int("COST_MODERATE_ROW_THRESHOLD", 50_000),
-        cost_high_row_threshold=_env_int("COST_HIGH_ROW_THRESHOLD", 1_000_000),
-        log_level=_env_str("LOG_LEVEL", "INFO"),
-        log_redaction_level=_env_str("LOG_REDACTION_LEVEL", "standard").strip().lower(),
-        enable_multi_source_router=_env_bool("ENABLE_MULTI_SOURCE_ROUTER", False),
-        enable_query_planning=_env_bool("ENABLE_QUERY_PLANNING", True),
-        query_plan_max_tokens=_env_int("QUERY_PLAN_MAX_TOKENS", 300),
-        sql_review_max_tokens=_env_int("SQL_REVIEW_MAX_TOKENS", 200),
-        api_auth_token=as_secret(_env_optional_str("API_AUTH_TOKEN")),
-        rag_store_connection_string=as_secret(_env_optional_str("RAG_STORE_CONNECTION_STRING")),
-        rag_store_odbc_driver=_env_str("RAG_STORE_ODBC_DRIVER", "ODBC Driver 17 for SQL Server"),
-        enable_document_rag=_env_bool("ENABLE_DOCUMENT_RAG", False),
-        enable_policy_rag=_env_bool("ENABLE_POLICY_RAG", False),
-        rag_top_k=_env_int("RAG_TOP_K", 4),
-        rag_max_retries=_env_int("RAG_MAX_RETRIES", 2),
-        rag_chunk_size=_env_int("RAG_CHUNK_SIZE", 1200),
-        rag_chunk_overlap=_env_int("RAG_CHUNK_OVERLAP", 150),
-        rag_embedding_model_name=_env_str("RAG_EMBEDDING_MODEL_NAME", ""),
-        enable_web_search=_env_bool("ENABLE_WEB_SEARCH", False),
-        web_search_provider=_env_str("WEB_SEARCH_PROVIDER", "tavily").strip().lower(),
-        web_search_api_key=as_secret(_env_optional_str("WEB_SEARCH_API_KEY")),
-        web_search_max_results=_env_int("WEB_SEARCH_MAX_RESULTS", 5),
-        databases=_parse_named_connections(),
-    )
-    return settings
+    return Settings(databases=_parse_named_connections())
 
 
 def configure_logging(level: str | None = None) -> None:

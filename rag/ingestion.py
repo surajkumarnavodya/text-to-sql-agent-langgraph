@@ -147,7 +147,11 @@ def ingest_pdf(
     ensure_schema(engine)
 
     document_id = insert_document(
-        engine, filename, collection, sensitivity_category=sensitivity_category
+        engine,
+        filename,
+        collection,
+        sensitivity_category=sensitivity_category,
+        pdf_bytes=file_bytes if settings.enable_pdf_download else None,
     )
 
     try:

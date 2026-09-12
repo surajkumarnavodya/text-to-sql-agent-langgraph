@@ -40,7 +40,7 @@ def verify_api_key(authorization: str | None = Header(default=None)) -> None:
     settings = get_settings()
     if settings.api_auth_token is None:
         return
-    expected = str(settings.api_auth_token)
+    expected = settings.api_auth_token.get_secret_value()
     if authorization is None or not _is_matching_bearer_token(authorization, expected):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,

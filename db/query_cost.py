@@ -49,6 +49,7 @@ import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from typing import Literal
 
+from pydantic import BaseModel, ConfigDict
 from sqlalchemy import Engine, text
 
 from config.settings import Settings
@@ -65,9 +66,15 @@ _MSSQL_SHOWPLAN_NS = {"sp": "http://schemas.microsoft.com/sqlserver/2004/07/show
 MODERATE_COST_NOTICE = "This query scans a large amount of data and may take a moment to run."
 
 
-@dataclass(frozen=True)
-class CostEstimate:
+class CostEstimate(BaseModel):
     """A non-executing plan estimate for one candidate query.
+
+    A `pydantic.BaseModel` (unlike `_RawPlanInfo` below, a plain dataclass)
+    because this type crosses a real boundary -- returned from
+    `estimate_query_cost()` into `agent.nodes.estimate_query_cost_node`
+    and, via `state["cost_estimate"]`, potentially into `ui/app.py` --
+    where `severity`'s `Literal["low", "moderate", "high"]` type is worth
+    Pydantic actually validating rather than just documenting.
 
     Attributes:
         estimated_rows: Estimated row count the plan's root/largest scan
@@ -82,6 +89,8 @@ class CostEstimate:
             top/largest operation (e.g. "Clustered Index Scan on
             FactInternetSales"), for logging and the moderate-cost notice.
     """
+
+    model_config = ConfigDict(frozen=True)
 
     estimated_rows: float | None
     estimated_cost: float | None

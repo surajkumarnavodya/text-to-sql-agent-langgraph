@@ -49,7 +49,7 @@ from sqlalchemy.exc import SQLAlchemyError
 # same pattern used in scripts/build_embeddings.py and scripts/test_db_connection.py.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from agent.exceptions import SchemaRetrievalError
+from agent.exceptions import AgentError
 from agent.orchestrator.graph import run_orchestrated
 from agent.rate_limit import QUESTION_LIMIT_MESSAGE, SlidingWindowRateLimiter
 from agent.sql_validator import enforce_row_limit, qualify_table_schema, validate_sql
@@ -64,7 +64,9 @@ from db.connection import (
 )
 from db.execution import execute_readonly_sql
 from db.schema_introspection import TableSchemaInfo
+from embeddings.golden_examples import save_golden_example
 from embeddings.schema_indexer import refresh_all_schema_indexes
+from rag.store import get_document_bytes, get_rag_engine
 from security.redaction import redact_secrets
 from ui.column_formatting import (
     escape_markdown,
@@ -83,6 +85,7 @@ from ui.session_history import (
     with_confirmed_error,
     with_confirmed_result,
 )
+from ui.theme import inject_theme_css, render_theme_toggle
 
 configure_logging()
 logger = logging.getLogger(__name__)
@@ -90,175 +93,7 @@ logger = logging.getLogger(__name__)
 st.set_page_config(page_title="Text-to-SQL", page_icon="🗄️", layout="wide")
 
 
-def _inject_custom_css() -> None:
-    """Light, modern, responsive visual polish -- CSS only, no behavior change.
-
-    Targets Streamlit's stable `data-testid` hooks (1.41.x) rather than
-    generated class names, so it doesn't silently break on a Streamlit
-    version bump. Colors intentionally stay light per project preference --
-    see `.streamlit/config.toml` for the widget-level (button/input) theme
-    this complements.
-    """
-    st.markdown(
-        """
-        <style>
-        :root {
-            --tsql-primary: #4f46e5;
-            --tsql-primary-light: #eef2ff;
-            --tsql-border: #e2e8f0;
-            --tsql-card: #ffffff;
-            --tsql-text: #1e293b;
-            --tsql-muted: #64748b;
-            --tsql-radius: 14px;
-            --tsql-shadow: 0 1px 3px rgba(15, 23, 42, 0.06), 0 1px 2px rgba(15, 23, 42, 0.04);
-        }
-
-        .stApp {
-            background: linear-gradient(180deg, #f8fafc 0%, #eef2ff 100%);
-        }
-
-        .block-container {
-            padding-top: 1.75rem;
-            padding-bottom: 3rem;
-            max-width: 1200px;
-        }
-
-        /* Hero header */
-        .tsql-hero {
-            display: flex;
-            align-items: center;
-            gap: 1rem;
-            background: var(--tsql-card);
-            border: 1px solid var(--tsql-border);
-            border-radius: var(--tsql-radius);
-            padding: 1.25rem 1.5rem;
-            box-shadow: var(--tsql-shadow);
-            margin-bottom: 1rem;
-        }
-        .tsql-hero-icon { font-size: 2.25rem; line-height: 1; }
-        .tsql-hero h1 {
-            margin: 0;
-            font-size: 1.6rem;
-            font-weight: 700;
-            color: var(--tsql-text);
-        }
-        .tsql-hero p {
-            margin: 0.2rem 0 0;
-            color: var(--tsql-muted);
-            font-size: 0.92rem;
-        }
-
-        .tsql-badges {
-            display: flex;
-            flex-wrap: wrap;
-            gap: 0.5rem;
-            margin-bottom: 1.5rem;
-        }
-        .tsql-badge {
-            background: var(--tsql-primary-light);
-            color: var(--tsql-primary);
-            border: 1px solid #c7d2fe;
-            border-radius: 999px;
-            padding: 0.3rem 0.75rem;
-            font-size: 0.8rem;
-            font-weight: 600;
-            white-space: nowrap;
-        }
-
-        /* Sidebar */
-        [data-testid="stSidebar"] {
-            background: var(--tsql-card);
-            border-right: 1px solid var(--tsql-border);
-        }
-
-        /* Buttons */
-        .stButton > button {
-            border-radius: 10px;
-            font-weight: 600;
-            box-shadow: var(--tsql-shadow);
-            transition: transform 0.05s ease, box-shadow 0.15s ease;
-        }
-        .stButton > button:hover {
-            transform: translateY(-1px);
-            box-shadow: 0 4px 10px rgba(79, 70, 229, 0.18);
-        }
-
-        /* Chat messages */
-        [data-testid="stChatMessage"] {
-            background: var(--tsql-card);
-            border: 1px solid var(--tsql-border);
-            border-radius: var(--tsql-radius);
-            padding: 0.75rem 1rem;
-            box-shadow: var(--tsql-shadow);
-            margin-bottom: 0.6rem;
-        }
-
-        /* SQL editor */
-        [data-testid="stTextArea"] textarea {
-            font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
-            font-size: 0.85rem;
-            background: #f8fafc;
-            border-radius: 10px;
-        }
-
-        /* Expanders */
-        [data-testid="stExpander"] {
-            border: 1px solid var(--tsql-border);
-            border-radius: var(--tsql-radius);
-            box-shadow: var(--tsql-shadow);
-            background: var(--tsql-card);
-            overflow: hidden;
-        }
-
-        /* DataFrame */
-        [data-testid="stDataFrame"] {
-            border: 1px solid var(--tsql-border);
-            border-radius: var(--tsql-radius);
-            overflow: hidden;
-            box-shadow: var(--tsql-shadow);
-        }
-
-        /* Alerts */
-        [data-testid="stAlert"] {
-            border-radius: 10px;
-        }
-
-        /* AI insight callout -- deliberately distinct from both the chat
-           bubbles and the results table, so it reads as an interpretation
-           layered on top of the data rather than part of the data itself. */
-        .tsql-insight {
-            display: flex;
-            align-items: flex-start;
-            gap: 0.6rem;
-            background: var(--tsql-primary-light);
-            border: 1px solid #c7d2fe;
-            border-left: 4px solid var(--tsql-primary);
-            border-radius: 10px;
-            padding: 0.75rem 1rem;
-            margin: 0.75rem 0 1.25rem;
-            font-size: 0.92rem;
-            color: var(--tsql-text);
-        }
-        .tsql-insight-icon { font-size: 1.1rem; line-height: 1.4; }
-        .tsql-insight-label {
-            font-weight: 700;
-            color: var(--tsql-primary);
-            margin-right: 0.35rem;
-        }
-
-        /* Responsive tweaks for narrow / mobile viewports */
-        @media (max-width: 768px) {
-            .block-container { padding-left: 0.75rem; padding-right: 0.75rem; }
-            .tsql-hero { flex-direction: column; align-items: flex-start; text-align: left; }
-            .tsql-hero h1 { font-size: 1.3rem; }
-        }
-        </style>
-        """,
-        unsafe_allow_html=True,
-    )
-
-
-_inject_custom_css()
+inject_theme_css()
 
 
 # --------------------------------------------------------------------------
@@ -432,6 +267,13 @@ if "display_duration_seconds" not in st.session_state:
     # (None means "no confirmed execution yet, or the SQL box no longer
     # matches what was run" -- same staleness rule as display_sql itself).
     st.session_state.display_duration_seconds = None
+if "golden_feedback_given" not in st.session_state:
+    # entry_ids the golden-example thumbs widget has already recorded a
+    # click for this session -- st.feedback's own selection persists across
+    # reruns (it's a normal stateful widget), so without this the save/
+    # toast action would re-fire on every unrelated rerun after the first
+    # click, not just once.
+    st.session_state.golden_feedback_given = set()
 if "enable_insight" not in st.session_state:
     st.session_state.enable_insight = True  # default ON -- see sidebar toggle
 if "question_rate_limiter" not in st.session_state:
@@ -454,6 +296,8 @@ if "question_rate_limiter" not in st.session_state:
 _multi_db = len(settings.databases) > 1
 
 with st.sidebar:
+    render_theme_toggle()
+    st.divider()
     st.subheader("🔌 Database Connections" if _multi_db else "🔌 Database Connection")
     for config in settings.databases:
         check = _startup_checks.get(config.name)
@@ -686,18 +530,20 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
+_CHAT_AVATARS = {"user": "🧑", "assistant": "🗄️"}
+
 for message in st.session_state.chat_history:
-    with st.chat_message(message["role"]):
+    with st.chat_message(message["role"], avatar=_CHAT_AVATARS.get(message["role"])):
         st.markdown(message["content"])
 
 question = st.chat_input("Ask a question about your data...")
 
 if question:
     st.session_state.chat_history.append({"role": "user", "content": question})
-    with st.chat_message("user"):
+    with st.chat_message("user", avatar=_CHAT_AVATARS["user"]):
         st.markdown(question)
 
-    with st.chat_message("assistant"):
+    with st.chat_message("assistant", avatar=_CHAT_AVATARS["assistant"]):
         # Checked before anything else -- including the dup-question cache
         # lookup below, which is a separate, independent mechanism (see
         # agent/rate_limit.py's module docstring). A denial here means no
@@ -735,8 +581,12 @@ if question:
                             question, prior_context, enable_insight=st.session_state.enable_insight
                         )
                     st.session_state.nl_question_cache[cache_key] = final_state
-                except SchemaRetrievalError as exc:
-                    final_state = {"status": "failed", "error_history": [str(exc)]}
+                except AgentError as exc:
+                    # .safe_message, not str(exc) -- see agent/exceptions.py's
+                    # module docstring and api/main.py's identical handling
+                    # for the same reasoning. The full detail is still logged.
+                    logger.error("Question failed with %s: %s", type(exc).__name__, exc)
+                    final_state = {"status": "failed", "error_history": [exc.safe_message]}
 
             new_entry = new_history_entry(question, final_state)
             st.session_state.query_history = append_entry(st.session_state.query_history, new_entry)
@@ -895,6 +745,22 @@ _SOURCE_RESULT_LABELS: dict[str, str] = {
 }
 
 
+@st.cache_data(show_spinner=False)
+def _fetch_pdf_bytes(document_id: str) -> bytes | None:
+    """Fetches one document's original PDF bytes, cached per session.
+
+    Only ever called for a citation that already claims `has_pdf_bytes`
+    (see `_render_source_answer` below), but still returns `None`
+    gracefully rather than raising if the row somehow has none by the time
+    this runs (e.g. deleted between retrieval and render) -- a download
+    button failing quietly is preferable to crashing the whole answer.
+    Cached (`st.cache_data`) so re-rendering the same chat turn across
+    Streamlit reruns doesn't re-fetch the same blob from the RAG store
+    every time.
+    """
+    return get_document_bytes(get_rag_engine(settings), document_id)
+
+
 def _render_source_answer(label: str, result: dict) -> None:
     st.markdown(f"**{label}**")
     # No unsafe_allow_html -- this text can carry content sourced from an
@@ -907,6 +773,30 @@ def _render_source_answer(label: str, result: dict) -> None:
     if citations:
         cited = ", ".join(dict.fromkeys(c["filename"] for c in citations))
         st.caption(f"Sources: {cited}")
+
+        # Download buttons -- built strictly from this already-filtered
+        # `citations` list, never a separately-fetched document list. This
+        # is what makes it safe: a sensitivity-restricted policy match
+        # never produces a citation at all (rag/graph.py's _generate_node
+        # resets citations to [] entirely for a restricted result), so
+        # there's no separate check to remember here -- a document simply
+        # never has a button unless it was already safe to cite by name.
+        seen_document_ids: set[str] = set()
+        for citation in citations:
+            document_id = citation.get("document_id") or ""
+            if not citation.get("has_pdf_bytes") or document_id in seen_document_ids:
+                continue
+            seen_document_ids.add(document_id)
+            pdf_bytes = _fetch_pdf_bytes(document_id)
+            if pdf_bytes is None:
+                continue
+            st.download_button(
+                f"⬇️ Download {citation['filename']}",
+                data=pdf_bytes,
+                file_name=citation["filename"],
+                mime="application/pdf",
+                key=f"download_{document_id}",
+            )
 
 
 def _render_sources_used(state: dict) -> None:
@@ -1085,7 +975,7 @@ if (
                 st.session_state.display_sql = safe_sql
                 st.session_state.display_duration_seconds = query_duration_seconds
                 if active_entry is not None:
-                    updated_entry = with_confirmed_result(active_entry, columns, rows)
+                    updated_entry = with_confirmed_result(active_entry, columns, rows, safe_sql)
                     st.session_state.query_history = replace_entry(
                         st.session_state.query_history, active_id, updated_entry
                     )
@@ -1122,6 +1012,43 @@ if (
         # display_duration_seconds's session_state init comment).
         if st.session_state.display_duration_seconds is not None:
             st.caption(f"⏱️ Query executed in {st.session_state.display_duration_seconds:.2f}s")
+
+        # Golden-example feedback -- offered only for the entry currently
+        # active, and only once it has a genuinely confirmed (successfully
+        # executed) result. Re-derived fresh here rather than reusing any
+        # earlier-computed lookup, so it reflects this rerun's just-applied
+        # Confirm-and-Run outcome, not a stale pre-confirm snapshot -- see
+        # ui/session_history.py's QueryHistoryEntry.confirmed_sql docstring
+        # for why confirmed_sql (not entry.sql) is what gets saved.
+        _feedback_entry = next(
+            (
+                e
+                for e in st.session_state.query_history
+                if e.entry_id == st.session_state.active_entry_id
+            ),
+            None,
+        )
+        if (
+            _feedback_entry is not None
+            and _feedback_entry.confirmed_sql is not None
+            and _feedback_entry.entry_id not in st.session_state.golden_feedback_given
+        ):
+            st.caption("Was this SQL correct?")
+            feedback = st.feedback("thumbs", key=f"golden_feedback_{_feedback_entry.entry_id}")
+            if feedback is not None:
+                st.session_state.golden_feedback_given.add(_feedback_entry.entry_id)
+                if feedback == 1:
+                    save_golden_example(
+                        _feedback_entry.question,
+                        _feedback_entry.confirmed_sql,
+                        _feedback_entry.final_state.get("selected_database") or "default",
+                        settings,
+                    )
+                    st.toast(
+                        "Saved -- future similar questions will use this as a reference example."
+                    )
+                else:
+                    st.toast("Thanks for the feedback.")
 
         # Detection-only signal from execute_sql_node (see AgentState.
         # low_confidence_notice's docstring) -- only shown when the

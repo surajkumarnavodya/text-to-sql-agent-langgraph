@@ -4,7 +4,6 @@ configuration validation)."""
 
 from __future__ import annotations
 
-import dataclasses
 from pathlib import Path
 
 import pytest
@@ -49,16 +48,22 @@ _BASE_SETTINGS = Settings(
 
 def _settings(**overrides: object) -> Settings:
     """A `_BASE_SETTINGS` copy with `overrides` applied -- see
-    `tests/test_connection.py::_settings` for why `dataclasses.replace` is
-    used here instead of spreading a dict into `Settings(**...)` directly."""
-    return dataclasses.replace(_BASE_SETTINGS, **overrides)  # type: ignore[arg-type]
+    `tests/test_connection.py::_settings` for why this rebuilds via
+    `Settings(**{**_BASE_SETTINGS.__dict__, **overrides})` rather than
+    `BaseModel.model_copy(update=...)` (this file in particular relies on
+    the rebuild re-running full field validation, since every test in
+    `TestPositiveValueValidation` et al. expects a bad override to raise)."""
+    return Settings(**{**_BASE_SETTINGS.__dict__, **overrides})
 
 
 class TestSecretFieldCoercion:
     def test_db_password_is_wrapped_in_secretstr(self):
         settings = _settings()
         assert isinstance(settings.db_password, SecretStr)
-        assert settings.db_password == "S3cr3t!"
+        # Pydantic's SecretStr, unlike the old hand-rolled one, doesn't
+        # compare equal to the raw string -- see tests/test_secrets.py's
+        # `test_equality_compares_the_wrapped_value_not_the_raw_string`.
+        assert settings.db_password.get_secret_value() == "S3cr3t!"
 
     def test_db_connection_string_is_wrapped_in_secretstr(self):
         settings = _settings(db_connection_string="postgresql://reader:pw@host/db")
@@ -93,7 +98,7 @@ class TestPositiveValueValidation:
     )
     @pytest.mark.parametrize("bad_value", [0, -1, -100])
     def test_non_positive_value_raises(self, field, bad_value):
-        with pytest.raises(ConfigurationError, match="positive"):
+        with pytest.raises(ConfigurationError, match="greater than 0"):
             _settings(**{field: bad_value})
 
     def test_valid_settings_do_not_raise(self):
@@ -161,13 +166,14 @@ class TestMultiDatabaseConfig:
         assert default.db_password == settings.db_password
 
     def test_directly_constructed_settings_without_databases_still_gets_a_default(self):
-        """`__post_init__` runs on *every* construction (see its docstring)
-        -- not just `get_settings()` -- so a hand-built `Settings(...)` in a
-        test (or any other caller) never has an empty `.databases`.
+        """`_fill_default_database` (a `model_validator(mode="after")`) runs
+        on *every* construction -- not just `get_settings()` -- so a
+        hand-built `Settings(...)` in a test (or any other caller) never has
+        an empty `.databases`.
 
         `databases=()` is passed explicitly alongside the overrides: `_BASE_
         SETTINGS` already has its own (postgresql-flavored) `.databases`
-        baked in from its own construction, and `dataclasses.replace` only
+        baked in from its own construction, and `_settings()`'s rebuild only
         overwrites the fields named in **overrides -- without resetting
         `databases` too, the stale postgresql entry would be copied over
         unchanged even though `db_type` below is being changed to mysql.

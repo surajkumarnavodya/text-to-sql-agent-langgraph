@@ -51,6 +51,7 @@ below, and `docs/MULTI_SOURCE_GUIDE.md` for how to configure each source.
 | Concern | Choice |
 |---|---|
 | LLM runtime | Ollama, default model `llama3.1:8b` (swap via `.env` / `config/settings.py`, e.g. `sqlcoder`, `duckdb-nsql`) |
+| Config / validation | Pydantic v2 — `config/settings.py`'s `Settings` is a `pydantic_settings.BaseSettings` (env-var-driven, `Field`/`Literal`-validated); secrets are `pydantic.SecretStr`; request/response models (`api/schemas.py`) and several boundary dataclasses were converted to `BaseModel` too. See "Pydantic-based configuration and validation" below |
 | Orchestration | LangGraph — explicit state machine, not a black-box agent. Two graphs: `agent/graph.py` (the SQL pipeline, always present) and, when multi-source is enabled, `agent/orchestrator/graph.py` (router + fan-out, sitting in front of it) |
 | Schema retrieval | ChromaDB (persisted locally) — embeds table DDL synthesized from live introspection, retrieves top-k relevant tables per question |
 | Database | User's own — PostgreSQL, MySQL, SQL Server, or Oracle, via SQLAlchemy. Config-driven (`DB_TYPE` + connection params in `.env`), pluggable per `db.connection.SUPPORTED_DB_TYPES`. One or more named connections (`DB_CONNECTIONS` in `.env`); the agent auto-routes each question to the right one when more than one is configured |
@@ -89,11 +90,13 @@ below, and `docs/MULTI_SOURCE_GUIDE.md` for how to configure each source.
 - `config/` — all tunables (model name, Ollama host, DB connection fields,
   Chroma path, row limit, timeout, max retries) live in `config/settings.py`,
   sourced from `.env`. Never hardcode a model name, path, or connection
-  detail anywhere else — import from here. `Settings` is a passive config
-  bag; it validates *individual* malformed values (e.g. `DB_PORT=abc`) at
-  load time but does not require DB fields to be present just to import the
-  module — `db/connection.py` validates *combinations* (e.g. "DB_TYPE set
-  but DB_HOST missing") at the point something actually tries to connect.
+  detail anywhere else — import from here. `Settings` (a
+  `pydantic_settings.BaseSettings` — see "Pydantic-based configuration and
+  validation" below) is a passive config bag; it validates *individual*
+  malformed values (e.g. `DB_PORT=abc`) at load time but does not require DB
+  fields to be present just to import the module — `db/connection.py`
+  validates *combinations* (e.g. "DB_TYPE set but DB_HOST missing") at the
+  point something actually tries to connect.
 - `db/` — `connection.py` owns the SQLAlchemy engine lifecycle: builds the
   connection URL from config (`build_connection_url`), exposes a cached
   `get_engine()`/`get_read_only_engine()`, and `test_connection()` (a
@@ -131,7 +134,10 @@ below, and `docs/MULTI_SOURCE_GUIDE.md` for how to configure each source.
   auto-router: with one configured database it short-circuits immediately
   (no behavior change); with several, it compares each database's own
   best-matching table and picks the winner, before per-table retrieval
-  runs. See "Multi-database auto-routing" below.
+  runs. See "Multi-database auto-routing" below. `golden_examples.py` is a
+  sibling collection on the same Chroma client/persist dir, one per
+  configured database (`f"golden_examples__{db_name}"`) — see "Golden-dataset
+  feedback loop" below.
 - `agent/` — LangGraph nodes live in `nodes.py`, one function per node, each
   taking and returning `AgentState` (defined in `state.py`). `graph.py`
   wires them together and compiles the graph. `sql_validator.py` is the
@@ -196,6 +202,24 @@ below, and `docs/MULTI_SOURCE_GUIDE.md` for how to configure each source.
   exposes per-database connection status, a manual re-test, a manual schema
   refresh (all databases), a schema browser grouped by database, and which
   database the most recent question was routed to.
+- `ui/theme.py` — the dark/light theme system shared by both Streamlit
+  pages (multipage apps don't share a layout wrapper, so each page calls
+  this independently rather than duplicating CSS). `render_theme_toggle()`
+  (a sidebar `st.toggle`) writes `st.session_state.theme_mode`, which
+  persists across page navigation within a session;
+  `inject_theme_css()` reads it back (via `get_theme_mode()`, defaulting
+  to `"light"` — flipping the toggle never changes the default experience
+  for anyone who doesn't touch it) and emits the matching `<style>` block.
+  Server-side conditional CSS, not a client-side JS switch — Streamlit
+  reruns the whole script on the toggle click, so the next render just
+  picks the other variable set. Deliberately doesn't touch
+  `.streamlit/config.toml` (loaded once at server startup, can't be
+  flipped per-session at runtime) — instead overrides Streamlit's actual
+  rendered surfaces directly via `data-testid` selectors, the same
+  technique the original light-only styling already used. Known,
+  disclosed gap: Streamlit's own built-in chrome (the top header bar, its
+  native hamburger "Settings" menu) isn't reachable by this CSS and won't
+  flip with the toggle.
 - `ui/pages/1_Knowledge_Sources.py` — PDF upload + management for the
   "documents"/"policies" collections (Streamlit's native multipage
   convention: any script under `ui/pages/` becomes its own page
@@ -204,6 +228,29 @@ below, and `docs/MULTI_SOURCE_GUIDE.md` for how to configure each source.
   `ENABLE_*_RAG` flag or `RAG_STORE_CONNECTION_STRING` isn't set. A policy
   upload gets an optional sensitivity-category selector (compensation/
   disciplinary/legal/none — see `rag/store.py`'s `SensitivityCategory`).
+- `api/` — `main.py`'s FastAPI app is the programmatic/scripted-access
+  surface alongside the Streamlit UI, same underlying graph either way (see
+  "Multi-source orchestration" above). A `lifespan` context manager warms
+  every process-lifetime singleton at startup rather than on whichever
+  request happens to arrive first — every configured database's read-only
+  engine, the cached Ollama client, and the compiled SQL/orchestrator
+  LangGraph graph(s) — and stashes them on `app.state` for
+  discoverability, though request handling itself still reaches them
+  through the same cached module-level functions `ui/app.py`/
+  `eval/runner.py` use, not through `app.state` (see "Process-lifetime
+  singletons" below). Two global exception handlers
+  (`@app.exception_handler(AgentError)` /
+  `@app.exception_handler(Exception)`) are the last-resort net ensuring no
+  response body ever contains a raw internal exception string — every
+  known failure path already uses `.safe_message` locally (see "Centralized
+  exception handling" below), so in normal operation these only fire for a
+  genuinely new/forgotten call site, not the common case. `/ask` accepts an
+  optional `session_id` (`AskRequest.session_id`), generating one via
+  `uuid4()` when omitted, and always echoes it back in `AskResponse
+  .session_id` — a pure correlation token today (the API stays fully
+  stateless, per `ConversationExchangeIn`'s docstring), but the identifier
+  future server-side conversation state (the multi-source router keeping
+  context coherent across sources) will key off of.
 - `scripts/` — standalone entry points: `test_db_connection.py` (verify
   `.env` before booting anything else — prints pass/fail, DB version, table
   count, or a classified readable error, per configured database),
@@ -238,14 +285,23 @@ below, and `docs/MULTI_SOURCE_GUIDE.md` for how to configure each source.
   out-of-scope follow-up (see the multi-database auto-routing design note
   below).
 - `tests/` — pytest, all fully mocked, no real DB or Ollama required.
-  Mirrors package names (`test_sql_validator.py`, `test_connection.py`,
+  `conftest.py`'s autouse `_isolate_settings_from_real_environment` fixture
+  strips every env var one of `Settings`'s fields could read before each
+  test, so a test building `Settings(**partial_kwargs)` never silently
+  inherits this developer's own real `.env` (see "Pydantic-based
+  configuration and validation" above for why that isolation is needed at
+  all now). Mirrors package names (`test_sql_validator.py`, `test_connection.py`,
   `test_schema_introspection.py`, `test_schema_retriever.py`,
-  `test_agent_nodes.py` — including `TestPlanQueryNode`/`TestReviewSqlNode`
-  and the nested-aggregate `TestValidateSqlRejectsNestedAggregates` cases,
+  `test_agent_nodes.py` — including `TestPlanQueryNode`/`TestReviewSqlNode`,
+  `TestRetrieveGoldenExamplesNode`, and the nested-aggregate
+  `TestValidateSqlRejectsNestedAggregates` cases,
   `test_complexity.py` (the adaptive-retry-budget heuristic, including the
-  "top N *by* metric" false-positive regression case), and
+  "top N *by* metric" false-positive regression case),
   `test_llm_client_planning.py` (the plan/review response parsers'
-  fail-open contracts) — plus `test_db_router.py` (the multi-database
+  fail-open contracts, and the golden-examples prompt-block ordering), and
+  `test_golden_examples.py` (the golden-dataset store itself — id
+  determinism/upsert idempotency, similarity filtering, fail-open on a
+  Chroma error) — plus `test_db_router.py` (the multi-database
   auto-router, `embeddings.retriever.select_database`, and
   `retrieve_schema_node`'s retry-reuses-the-same-database contract),
   `test_orchestrator.py` (source availability, LLM classification parsing +
@@ -263,10 +319,10 @@ below, and `docs/MULTI_SOURCE_GUIDE.md` for how to configure each source.
 ## Key design decisions
 
 ### Self-correcting retry loop (LangGraph)
-The full graph (`agent/graph.py`) is ten nodes, not four:
-`sanitize_input → classify_followup → retrieve_schema → plan_query →
-generate_sql → review_sql → validate_sql → estimate_cost → execute_sql →
-generate_insight`. On a review, validation, cost-estimate, or execution
+The full graph (`agent/graph.py`) is eleven nodes, not four:
+`sanitize_input → classify_followup → retrieve_schema →
+retrieve_golden_examples → plan_query → generate_sql → review_sql →
+validate_sql → estimate_cost → execute_sql → generate_insight`. On a review, validation, cost-estimate, or execution
 failure, a conditional edge routes back to `generate_sql` (or, for a
 "missing reference" execution error, back to `retrieve_schema`) with the
 error message appended to the state's history, so the LLM sees what went
@@ -309,6 +365,43 @@ if there were no plan/pass the review) — this feature is an accuracy aid,
 never a reason a question can't be answered. See
 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md#2-retry--self-correction-semantics)
 for the full reasoning.
+
+### Golden-dataset feedback loop
+`retrieve_golden_examples_node` (between `retrieve_schema` and
+`plan_query`) looks up human-approved (question, SQL) pairs from a
+per-database ChromaDB collection (`embeddings/golden_examples.py`,
+`f"golden_examples__{db_name}"` — deliberately modeled on
+`embeddings/schema_indexer.py`'s pattern rather than `rag/store.py`'s
+SQL-Server-`VECTOR` one, since the core pipeline already depends
+unconditionally on a local Chroma client and this reuses the exact same
+embedding runtime already resident in the process, no new optional
+subsystem). Gated by `ENABLE_GOLDEN_EXAMPLES` (default `true` — safe even
+with an empty store, since retrieval on an empty/missing collection just
+returns no examples) and `GOLDEN_EXAMPLES_MIN_SIMILARITY` (default 0.75 —
+a poor match is withheld entirely rather than injected, since a
+misleading example is worse than none). When one or more examples clear
+the threshold, they're injected into every `generate_sql` attempt's
+prompt (`agent.llm_client._build_golden_examples_block`) as reference-only
+few-shot material, on top of the static `_QUERY_PATTERNS_BLOCK` — framed
+as DATA, never instructions, the same security posture every other
+per-question prompt block already has. Fails open exactly like
+`plan_query_node`/`review_sql_node` above: a disabled flag, an
+unreachable/empty store, or a lookup error all resolve to "no examples,"
+never a reason a question can't be answered.
+
+Examples are added only via the UI's explicit thumbs-up feedback
+(`ui/app.py`, `st.feedback("thumbs")`, shown once a "Confirm and Run"
+result is genuinely confirmed successful) — never automatically, and
+never from the API today (a natural, easy follow-up, not built yet). The
+SQL saved is `QueryHistoryEntry.confirmed_sql` (the *exact* SQL actually
+executed), not the agent's original draft — the user may have edited the
+SQL box before confirming, and the corrected version is exactly what's
+worth remembering. Saved with a deterministic id
+(`embeddings.golden_examples._example_id`, a hash of database+question+SQL)
+so re-clicking the widget upserts the same document rather than
+accumulating duplicates. Both the UI and the API benefit from retrieval
+automatically, since both call the same underlying `agent.graph.run_agent`
+graph.
 
 ### Nested-aggregate detection (validator + execution backstop)
 A real, reproduced failure: a local model asked for something like
@@ -479,6 +572,30 @@ in `rag/graph.py`'s `_GENERATE_SYSTEM_PROMPT` — the same "SQL is untrusted
 output" principle below, applied to what a poisoned/malicious uploaded PDF
 could contain, since that's this feature's realistic injection vector.
 
+**Downloadable source PDF (`ENABLE_PDF_DOWNLOAD`, default `true`):** the
+original uploaded PDF's bytes are stored in a new `rag.documents.pdf_bytes`
+column (`rag/store.py::ensure_schema` migrates an existing table
+automatically — an idempotent `ALTER TABLE ... ADD` guard, the one schema
+migration this module has needed) and served on demand
+(`get_document_bytes`) from a chat answer's citation
+(`ui/app.py::_render_source_answer`) or the Knowledge Sources management
+page, never fetched into a listing/search query itself — both
+`list_documents` and `similarity_search` project a cheap `has_pdf_bytes`
+boolean instead. Before this existed, ingestion discarded the raw bytes
+right after text extraction, so **only documents uploaded after this
+shipped are downloadable** — there's nothing to backfill from for an
+already-ingested one; re-uploading it is the only way to make it
+downloadable. The chat-answer download button is built strictly from the
+existing `citations` list, never a separately-fetched document list — this
+is what makes it inherit the sensitivity gate above for free: a restricted
+policy match already produces `citations == []` before any button could be
+built from it, so there's no separate access check to remember. The
+Knowledge Sources page's own per-document download button has no such
+gate, but that page already shows every document's `sensitivity_category`
+and offers an unconditional delete button for all of them — a download
+button there is consistent with that page's already-fully-privileged,
+no-per-user-authorization exposure level, not a new escalation.
+
 ### Live web search (`search/`)
 `search/web_search.py` mirrors `db/connection.py`'s `SUPPORTED_DB_TYPES`
 pattern exactly: `SUPPORTED_SEARCH_PROVIDERS` maps a provider name to its
@@ -529,6 +646,155 @@ assumed). If you're asked to "harden" this further, that's the layer to
 push on — a DB-level read-only user, not more code-level checks, since the
 validator is already an AST-based allowlist rather than a blocklist.
 
+### Pydantic-based configuration and validation
+`config.settings.Settings` is a `pydantic_settings.BaseSettings` (not a
+plain `@dataclass`, as it was originally) — field types, `Field(gt=0)`
+constraints, and `Literal` types (`log_redaction_level`) get automatic
+env-var coercion and validation essentially for free, instead of the
+hand-written `_env_int`/`_validate_security_settings()` loop this replaced.
+A `Settings.__init__` override still guarantees the codebase's
+long-standing `ConfigurationError` contract: it catches
+`pydantic.ValidationError` (raised by Pydantic's own type coercion, e.g.
+`MAX_RETRIES=abc`) and translates it, while two `model_validator`s
+(cross-field cost-threshold ordering; filling in a default `databases`
+entry) raise `ConfigurationError` directly — verified to propagate
+unwrapped through Pydantic's validation machinery, since Pydantic only
+intercepts `ValueError`/`TypeError`/`AssertionError` to build its own
+`ValidationError`. `DatabaseConnectionConfig` is a plain (non-Settings)
+`BaseModel`, `frozen=True` like `Settings` itself.
+
+**Because `Settings` now reads `os.environ` for any field a caller doesn't
+explicitly pass** (the entire point of `BaseSettings` — unlike the old
+dataclass, which just used its class-level default), constructing
+`Settings(**partial_kwargs)` directly is no longer isolated from this
+machine's real `.env` the way it used to be. `tests/conftest.py`'s
+autouse `_isolate_settings_from_real_environment` fixture strips every
+env var one of `Settings`'s fields could read before each test — without
+it, a test's `Settings(enable_document_rag=True)` would silently inherit
+this project's own `ENABLE_POLICY_RAG=true`/`ENABLE_WEB_SEARCH=true` etc.
+from the real `.env` for every field it didn't explicitly override. Tests
+that build a `Settings` copy with a few fields changed
+(`tests/test_connection.py::_settings` is the canonical example) rebuild
+via `Settings(**{**base.__dict__, **overrides})` rather than
+`BaseModel.model_copy(update=...)`, because `model_copy` skips validation
+entirely — several tests (`test_settings_validation.py` in particular)
+depend on a bad override still raising `ConfigurationError`.
+
+Secrets (`db_password`, `db_connection_string`, `api_auth_token`,
+`rag_store_connection_string`, `web_search_api_key`) are `pydantic.SecretStr`
+(see `security/secrets.py`'s docstring) rather than the project's old
+hand-rolled `str` subclass, which only masked `repr()`/`%r` and stayed
+fully transparent everywhere else (`str()`, f-strings, even `.upper()`).
+Pydantic's version masks `str()`/`repr()`/`%r`-formatting alike and isn't
+a `str` subclass at all — every call site that needs the real value
+(`db/connection.py`'s URL builder, `api/auth.py`'s bearer-token check,
+`rag/store.py`, `search/web_search.py`, `security/redaction.py`) must call
+`.get_secret_value()` explicitly now; a leftover `str(secret)` would
+silently send/compare/search for the literal string `"**********"`
+instead.
+
+Several other hand-rolled `@dataclass`es that sit at a real validation
+boundary were converted to `BaseModel` (`ConfigDict(frozen=True)`, same
+shape as before) the same way: `agent/sql_validator.py`'s
+`ValidationResult` (gained a `model_validator` enforcing its
+is_valid/error/violation_type invariant), `db/query_cost.py`'s
+`CostEstimate`, `agent/insight.py`'s `ColumnStat`/`ResultSummary`,
+`db/connection.py`'s `ConnectionTestResult`,
+`config/sensitive_columns.py`'s `ColumnClassification`, and
+`config/table_descriptions.py`'s `TableDescription`. Purely-internal
+plumbing dataclasses with no external validation boundary (`DbTypeInfo`/
+`WritePrivilegeCheckResult` in `db/connection.py`, `db/query_cost.py`'s
+`_RawPlanInfo`, `db/schema_introspection.py`'s introspection types, the
+`eval/` benchmark's own dataclasses, and others) were deliberately left
+alone — converting everything would have added validation overhead with
+no real boundary to protect. `api/schemas.py`'s request/response models
+(already Pydantic) were hardened alongside this: `extra="forbid"` +
+`str_strip_whitespace=True` on request models (`AskRequest`,
+`ConversationExchangeIn`), `frozen=True` on every response model.
+`AskRequest.question` deliberately does NOT duplicate
+`Settings.max_question_length` as a schema-level `Field(max_length=...)`
+— that cap is config-driven and already enforced downstream by
+`agent.input_guard.check_input`, and a static schema-level number would
+either hardcode the wrong value or drift from it.
+
+### Centralized exception handling (safe vs. internal messages)
+Every `agent.exceptions.AgentError` (and its subclasses —
+`OllamaUnavailableError`, `MalformedLLMOutputError`, `SchemaRetrievalError`,
+`SqlExecutionTimeoutError`, `OffTopicQuestionError`) now carries two
+messages, not one: `str(exc)` stays the full internal detail (a raw
+driver/Chroma/Ollama error — genuinely useful for logs and for feeding
+back into the retry loop's own self-correction prompt), and `.safe_message`
+is a short, non-technical sentence with no driver internals, hostnames, or
+connection-string-shaped text, each subclass defaulting to something
+sensible. This exists because those two things used to be the same string
+everywhere — `agent/nodes.py` and `api/main.py` both embedded `str(exc)`
+directly into fields the client sees (`AskResponse.error_history`/
+`failure_explanation`), which is exactly how a raw DB error could reach a
+response.
+
+Two complementary fixes ride along with this:
+- `security.redaction.redact_secrets` (previously applied only to
+  `db/connection.py`'s connection-test failures) is now also applied to the
+  raw driver text in `agent.nodes.execute_sql_node`'s
+  `(SQLAlchemyError, TimeoutError)` handling and
+  `embeddings.retriever.retrieve_relevant_schema`'s generic-exception
+  wrapping — both are genuine "text this app did not construct itself"
+  call sites (see that module's docstring) that weren't covered before.
+  Redaction happens once, before the text is used anywhere (logs, the
+  retry-feedback prompt, and the user-facing fields alike) — a redacted
+  password doesn't change what a syntax/missing-column error says, so
+  retry self-correction quality is unaffected.
+- `api/main.py` registers two global handlers:
+  `@app.exception_handler(AgentError)` (uses `.safe_message`) and
+  `@app.exception_handler(Exception)` (a generic "something went wrong"
+  body) — both log the full detail server-side, tagged with the request's
+  correlation ID, and guarantee no response body ever contains raw
+  exception text, even for a failure mode nothing already handles locally.
+  `/ask`'s own local `except AgentError` (previously
+  `except SchemaRetrievalError`, widened to the whole hierarchy so a future
+  source's exception is covered the same way without another special case)
+  is the common path in practice — it keeps returning the existing
+  200-with-a-`"failed"`-body shape, just built from `.safe_message` now;
+  the global handlers are the defense-in-depth net behind it. `/health`'s
+  own raw `f"Unreachable: {exc}"` strings (that endpoint has no
+  `Depends(verify_api_key)` — it's meant to be reachable by an
+  orchestrator with no API key, so a leak there is a *public*, not just
+  internal, exposure) are now redacted the same way.
+
+### Process-lifetime singletons (DB engine, Ollama client, compiled graph)
+Three things are now built once per process instead of once per call,
+using the same `functools.cache`/`lru_cache` pattern
+`config.settings.get_settings()` and `db.connection._cached_engine`
+already established:
+- `agent.llm_client._get_ollama_client(host, timeout)` (public wrapper:
+  `get_ollama_client(settings)`) — every `generate_*_from_llm` call site
+  used to build a fresh `ollama.Client` (and therefore a fresh underlying
+  `httpx.Client` connection pool) on every single call, including every
+  retry. Reused now, keyed by `(host, timeout)`.
+- `agent.graph.build_graph()` and `agent.orchestrator.graph
+  .build_orchestrator_graph()` — previously rebuilt (re-wiring all ten SQL
+  nodes, or the orchestrator's six) on *every* `run_agent()`/
+  `run_orchestrated()` call. A compiled LangGraph graph is stateless (all
+  per-question state lives in the `initial_state` dict passed to
+  `.invoke()`), and graph *shape* never depends on `Settings` (`plan_query`/
+  `review_sql` are pass-throughs when planning is off, not conditionally
+  omitted nodes — see "Agentic query planning" above), so caching is safe
+  and this was the single largest avoidable per-question cost of the three.
+- `db.connection._cached_engine` — already a singleton before this (see
+  its own docstring); unchanged.
+
+`api/main.py`'s `lifespan` context manager (see the `api/` folder note
+above) exists purely to move each of these singletons' one-time build cost
+from whichever request arrives first to process startup — none of them
+were *incorrect* without it, since the cached functions build lazily on
+first use either way. **Test isolation note:** because these caches persist
+for the life of the Python process, `tests/conftest.py`'s
+`_clear_process_singleton_caches` autouse fixture clears all three before
+every test — without it, a test that monkeypatches `ollama.Client` (or a
+node function referenced by a compiled graph) to a fake would silently see
+no effect whenever an earlier test already populated that cache slot,
+since the cached function body simply wouldn't re-run.
+
 ### Caching
 - Chroma embeddings: SHA-256 fingerprint of the *introspected* schema
   (`db.schema_introspection.get_schema_fingerprint`), not a file hash
@@ -543,6 +809,8 @@ validator is already an AST-based allowlist rather than a blocklist.
   results keyed by SQL text; a simple in-memory dict cache in `session_state`
   for repeated identical NL questions within a session, to skip redundant
   LLM calls.
+- Process-lifetime singletons (DB engine, Ollama client, compiled LangGraph
+  graph) — see "Process-lifetime singletons" above.
 
 ## How to run
 

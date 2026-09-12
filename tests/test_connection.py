@@ -9,7 +9,6 @@ raises.
 
 from __future__ import annotations
 
-import dataclasses
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -71,16 +70,20 @@ def _settings(**overrides: object) -> Settings:
     """A `_BASE_SETTINGS` copy with `overrides` applied, per test.
 
     `_BASE_SETTINGS` itself is a normal, fully type-checked `Settings(...)`
-    call (every one of its ~30 fields is verified against the real dataclass
-    signature). Only the per-test `**overrides` spread -- inherently
-    arbitrary, since any test may override any subset of fields -- can't be
-    verified statically and needs the one `type: ignore` below, same as
-    `dataclasses.replace` would need spreading an untyped dict into any
-    dataclass constructor. That's a much smaller surface than the previous
-    pattern, which spread an untyped `dict` into the constructor for *every*
-    field, defaults included.
+    call (every one of its ~50 fields is verified against the real Pydantic
+    model signature). The per-test `**overrides` spread is inherently
+    arbitrary, since any test may override any subset of fields, and isn't
+    separately verified statically.
+
+    Rebuilds via `Settings(**{**_BASE_SETTINGS.__dict__, **overrides})`
+    rather than `BaseModel.model_copy(update=...)`: `model_copy` skips
+    validation entirely, which would silently defeat every test (here and
+    in `test_settings_validation.py`) that expects a bad override to raise
+    `ConfigurationError` -- re-running full construction through
+    `Settings.__init__` is what keeps `_settings(...)` behaving the way
+    `dataclasses.replace` did on the old frozen-dataclass `Settings`.
     """
-    return dataclasses.replace(_BASE_SETTINGS, **overrides)  # type: ignore[arg-type]
+    return Settings(**{**_BASE_SETTINGS.__dict__, **overrides})
 
 
 class TestBuildConnectionUrl:
@@ -161,8 +164,10 @@ class TestGetConnection:
         assert get_connection(settings, "default").db_type == settings.db_type
 
     def test_looks_up_a_named_connection_among_several(self):
-        sales = dataclasses.replace(_BASE_SETTINGS.databases[0], name="sales", db_type="postgresql")
-        hr = dataclasses.replace(_BASE_SETTINGS.databases[0], name="hr", db_type="mysql")
+        sales = _BASE_SETTINGS.databases[0].model_copy(
+            update={"name": "sales", "db_type": "postgresql"}
+        )
+        hr = _BASE_SETTINGS.databases[0].model_copy(update={"name": "hr", "db_type": "mysql"})
         settings = _settings(databases=(sales, hr))
 
         assert list_connection_names(settings) == ["sales", "hr"]

@@ -16,7 +16,6 @@ not a test fixture) -- validate_sql_node's row-limit rendering
 
 from __future__ import annotations
 
-import dataclasses
 from pathlib import Path
 
 import pytest
@@ -30,6 +29,7 @@ from agent.nodes import (
     generate_insight_node,
     generate_sql_node,
     plan_query_node,
+    retrieve_golden_examples_node,
     retrieve_schema_node,
     review_sql_node,
     route_after_classification,
@@ -276,6 +276,85 @@ class TestRetrieveSchemaNode:
         assert captured["top_k"] == 5  # schema_top_k (4) + 1
 
 
+class TestRetrieveGoldenExamplesNode:
+    def test_populates_golden_examples_on_success(self, monkeypatch):
+        fake_examples = [
+            {
+                "question": "how many orders?",
+                "sql": "SELECT COUNT(*) FROM orders",
+                "similarity_score": 0.9,
+            }
+        ]
+        monkeypatch.setattr(
+            "agent.nodes.retrieve_golden_examples",
+            lambda question, db_name, settings: fake_examples,
+        )
+
+        result = retrieve_golden_examples_node(
+            {"question": "how many orders are there?", "selected_database": "default"}
+        )
+
+        assert result["status"] == "generating"
+        assert result["golden_examples"] == fake_examples
+
+    def test_no_matches_returns_none_not_empty_list(self, monkeypatch):
+        monkeypatch.setattr(
+            "agent.nodes.retrieve_golden_examples", lambda question, db_name, settings: []
+        )
+
+        result = retrieve_golden_examples_node({"question": "anything", "selected_database": None})
+
+        assert result["golden_examples"] is None
+
+    def test_skipped_when_disabled(self, monkeypatch, _mock_settings):
+        monkeypatch.setattr(
+            "agent.nodes.get_settings",
+            lambda: Settings(**{**_mock_settings.__dict__, "enable_golden_examples": False}),
+        )
+
+        def _fail(*args, **kwargs):
+            raise AssertionError("should not query the store when enable_golden_examples=False")
+
+        monkeypatch.setattr("agent.nodes.retrieve_golden_examples", _fail)
+
+        result = retrieve_golden_examples_node(
+            {"question": "anything", "selected_database": "default"}
+        )
+
+        assert result["golden_examples"] is None
+        assert result["status"] == "generating"
+
+    def test_fails_open_on_lookup_error(self, monkeypatch):
+        """A retrieval bug must never block the graph -- this is an
+        accuracy aid, not a required step (same philosophy as
+        plan_query_node)."""
+
+        def _raise(question, db_name, settings):
+            raise RuntimeError("chroma unavailable")
+
+        monkeypatch.setattr("agent.nodes.retrieve_golden_examples", _raise)
+
+        result = retrieve_golden_examples_node(
+            {"question": "anything", "selected_database": "default"}
+        )
+
+        assert result["golden_examples"] is None
+        assert result["status"] == "generating"
+
+    def test_defaults_to_the_default_database_when_none_selected(self, monkeypatch):
+        captured = {}
+
+        def _capture(question, db_name, settings):
+            captured["db_name"] = db_name
+            return []
+
+        monkeypatch.setattr("agent.nodes.retrieve_golden_examples", _capture)
+
+        retrieve_golden_examples_node({"question": "anything", "selected_database": None})
+
+        assert captured["db_name"] == "default"
+
+
 class TestPlanQueryNode:
     def test_skips_llm_call_when_no_complexity_signals(self, monkeypatch):
         """The overwhelming common case: a plain question makes zero
@@ -300,7 +379,7 @@ class TestPlanQueryNode:
         """Even a complex question skips planning when the master switch is off."""
         monkeypatch.setattr(
             "agent.nodes.get_settings",
-            lambda: dataclasses.replace(_mock_settings, enable_query_planning=False),
+            lambda: Settings(**{**_mock_settings.__dict__, "enable_query_planning": False}),
         )
 
         def _fail(*args, **kwargs):

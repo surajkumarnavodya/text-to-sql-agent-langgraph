@@ -53,16 +53,25 @@ from agent.sql_validator import (
     strip_row_limit,
     validate_sql,
 )
-from agent.state import AgentState, AttemptRecord, ConversationExchange, StageTiming, TableSchema
+from agent.state import (
+    AgentState,
+    AttemptRecord,
+    ConversationExchange,
+    GoldenExample,
+    StageTiming,
+    TableSchema,
+)
 from config.sensitive_columns import load_sensitive_columns
 from config.settings import get_settings
 from config.table_descriptions import apply_table_description, load_table_descriptions
 from db.connection import get_connection, get_read_only_engine, get_sqlglot_dialect
 from db.execution import execute_readonly_sql
 from db.query_cost import MODERATE_COST_NOTICE, estimate_query_cost, high_cost_error_message
+from embeddings.golden_examples import retrieve_golden_examples
 from embeddings.retriever import retrieve_relevant_schema, select_database
 from security.audit_log import log_security_event
 from security.injection_patterns import INJECTION_PATTERNS
+from security.redaction import redact_secrets
 
 # Re-exported for `tests/test_agent_nodes.py`'s
 # `monkeypatch.setattr("agent.nodes.execute_readonly_sql", ...)` seam -- the
@@ -552,6 +561,44 @@ def retrieve_schema_node(state: AgentState) -> dict[str, Any]:
     }
 
 
+@_timed_node("retrieve_golden_examples")
+def retrieve_golden_examples_node(state: AgentState) -> dict[str, Any]:
+    """Looks up human-approved past (question, SQL) pairs for this database's
+    golden dataset (see `embeddings.golden_examples`) and stores the
+    best-matching ones for `generate_sql_node` to inject as few-shot
+    examples.
+
+    Runs between `retrieve_schema` and `plan_query` (see `agent/graph.py`),
+    only queries the store when `Settings.enable_golden_examples` is True,
+    and fails open on absolutely anything -- a disabled flag, an empty/
+    missing collection, or any lookup error all resolve to
+    `golden_examples = None`, never a reason a question can't be answered.
+    `embeddings.golden_examples.retrieve_golden_examples` already never
+    raises on its own; the `except Exception` here is defense-in-depth
+    against anything unexpected surfacing from this call site specifically,
+    matching `plan_query_node`'s identical fail-open contract right below.
+    """
+    settings = get_settings()
+    if not settings.enable_golden_examples:
+        logger.info("[retrieve_golden_examples] skipped (enable_golden_examples=False)")
+        return {"golden_examples": None, "status": "generating"}
+
+    question = state["question"]
+    db_name = state.get("selected_database") or "default"
+    try:
+        examples: list[GoldenExample] = retrieve_golden_examples(question, db_name, settings)
+    except Exception as exc:  # noqa: BLE001 - an accuracy aid must never block the run
+        logger.warning("[retrieve_golden_examples] lookup failed, proceeding without: %s", exc)
+        return {"golden_examples": None, "status": "generating"}
+
+    logger.info(
+        "[retrieve_golden_examples] found %d example(s) for database %r",
+        len(examples),
+        db_name,
+    )
+    return {"golden_examples": examples or None, "status": "generating"}
+
+
 @_timed_node("plan_query")
 def plan_query_node(state: AgentState) -> dict[str, Any]:
     """Produces an up-front, ordered plan for a question judged non-trivial.
@@ -675,6 +722,7 @@ def generate_sql_node(state: AgentState) -> dict[str, Any]:
             settings=settings,
             followup_context=followup_context,
             query_plan=state.get("query_plan"),
+            golden_examples=state.get("golden_examples"),
         )
     except OffTopicQuestionError as exc:
         # Defense-in-depth backstop, not the normal path: agent.input_guard's
@@ -1156,11 +1204,19 @@ def execute_sql_node(state: AgentState) -> dict[str, Any]:
         )
     except (SQLAlchemyError, TimeoutError) as exc:
         category = classify_execution_error(exc)
+        # Redacted once, right here, before this raw driver text touches
+        # anything else -- the retry-feedback prompt and attempt_history
+        # both still need the real error content to be useful (a redacted
+        # password doesn't change what a syntax/missing-column error says),
+        # but a driver can render the full connection string (password
+        # included) verbatim on some failure modes; see
+        # security/redaction.py's module docstring.
+        redacted_detail = redact_secrets(str(exc), db_config)
         logger.warning(
             "[execute_sql] attempt %d failed (category=%s): %s",
             attempt_number,
             category.value,
-            exc,
+            redacted_detail,
         )
 
         if category is ExecutionErrorCategory.TIMEOUT:
@@ -1168,12 +1224,12 @@ def execute_sql_node(state: AgentState) -> dict[str, Any]:
                 "attempt": attempt_number,
                 "sql": sql,
                 "outcome": "timeout",
-                "error": str(exc),
+                "error": redacted_detail,
                 "will_retry": False,
             }
             return {
-                "execution_error": str(exc),
-                "error_history": [f"SQL execution error (timeout): {exc}"],
+                "execution_error": redacted_detail,
+                "error_history": [f"SQL execution error (timeout): {redacted_detail}"],
                 "attempt_history": [record],
                 "last_error_category": "timeout",
                 "retry_count": attempt_number,
@@ -1199,7 +1255,7 @@ def execute_sql_node(state: AgentState) -> dict[str, Any]:
             )
         )
 
-        error_text = str(exc)
+        error_text = redacted_detail
         if category is ExecutionErrorCategory.MISSING_REFERENCE:
             suggestion = _suggest_correct_column(error_text, state.get("schema_tables", []))
             if suggestion:
@@ -1228,7 +1284,7 @@ def execute_sql_node(state: AgentState) -> dict[str, Any]:
             )
         )
         update: dict[str, Any] = {
-            "execution_error": str(exc),
+            "execution_error": redacted_detail,
             "error_history": [f"SQL execution error: {error_text}"],
             "attempt_history": [record],
             "last_error_category": category.value,
