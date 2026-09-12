@@ -112,6 +112,26 @@ class SourceAnswerOut(BaseModel):
     status: str
 
 
+class MediaGenerationResultOut(BaseModel):
+    """Mirrors `agent.orchestrator.state.MediaGenerationResult` -- the
+    "generation" source's contribution. `media_id` is an opaque id to fetch
+    the actual bytes via `GET /media/{media_id}` (`api/media.py`) --
+    deliberately never the provider's raw CDN URL, so nothing the client
+    ever sees can go stale/expire on IMA's side or bypass this app's own
+    control over what gets served. `media_id`/`media_type`/`model` are None
+    whenever `status != "succeeded"` (a rejected/rate-limited request, a
+    provider failure, or media generation simply being disabled --
+    see `Settings.enable_media_generation`'s docstring)."""
+
+    model_config = ConfigDict(frozen=True)
+
+    answer: str
+    status: str
+    media_id: str | None = None
+    media_type: str | None = None
+    model: str | None = None
+
+
 class ConversationExchangeOut(BaseModel):
     """Mirrors `agent.state.ConversationExchange` -- the specific prior turn
     a "followup" question was resolved against, for a client to render a
@@ -184,6 +204,7 @@ class AskResponse(BaseModel):
     document_result: SourceAnswerOut | None = None
     policy_result: SourceAnswerOut | None = None
     web_result: SourceAnswerOut | None = None
+    generation_result: MediaGenerationResultOut | None = None
     query_plan: list[str] | None = Field(
         default=None,
         description="Ordered plan steps for a complexity-flagged question; None if planning was skipped.",

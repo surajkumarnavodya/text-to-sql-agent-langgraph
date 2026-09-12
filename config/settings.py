@@ -482,24 +482,35 @@ class Settings(BaseSettings):
             (headings, lists, an inline citation per claim), not a single
             short SQL-adjacent answer, so it needs materially more budget.
         enable_media_generation: Whether IMA Studio image/video/audio
-            generation is offered as an agent tool at all. False by
+            generation (`media_gen/`, routed as the orchestrator's
+            "generation" source -- see `agent.orchestrator.nodes
+            .generation_node`) is offered to the router at all. False by
             default, and independent of `ima_api_key` being set -- both
-            must be true/present for generation to actually run, mirroring
-            `enable_web_search`/`web_search_api_key`'s own pair. NOTE:
-            config-only as of this writing -- no code reads this yet.
-            IMA's actual endpoint paths/request-response shape/auth header
-            convention are not yet verified against their (login-gated)
-            API reference, so the `media_gen/` wrapper, LangGraph tool
-            registration, and orchestrator integration described in this
-            feature's design are intentionally not built until that
-            reference is in hand -- see the design note this shipped
-            alongside for what's blocked and why.
+            must be true/present for `get_available_sources` to include
+            it, mirroring `enable_web_search`/`web_search_api_key`'s own
+            pair. `media_gen/client.py`'s `IMAEndpoints` paths are
+            confirmed working against a real IMA account (a live
+            text-to-image call succeeded end-to-end: generation, download,
+            and serving via `GET /media/{media_id}`) -- video generation
+            shares the same client/task-creation code path but has not yet
+            been separately confirmed with a live call. Still off by
+            default so a fresh clone never spends real IMA credits without
+            the operator deliberately opting in.
         ima_api_key: IMA Studio API key. A `SecretStr` for the same reason
             `web_search_api_key` is.
         ima_api_base_url: IMA Studio API base URL. Kept a separate,
-            explicit field (not hardcoded in a future `media_gen/` module)
-            in case IMA's own docs specify a different host than this
-            default once actually confirmed.
+            explicit field (not hardcoded in `media_gen/`) in case IMA's
+            own docs specify a different host than this default once
+            actually confirmed.
+        media_gen_rate_limit: Max media generation calls allowed within
+            `media_gen_rate_window_seconds`, checked by
+            `agent.orchestrator.nodes.generation_node` via
+            `agent.rate_limit.get_media_generation_limiter` before every
+            call into `media_gen`. Deliberately its own, tighter budget --
+            not `llm_call_rate_limit_per_minute` reused -- since image/
+            video/audio generation costs meaningfully more per call than a
+            text LLM turn.
+        media_gen_rate_window_seconds: Window width for the limiter above.
         project_root: Absolute path to the repository root.
         databases: Every configured database connection, parsed from
             `DB_CONNECTIONS` + per-name `DB_<NAME>_*` vars (see
@@ -592,6 +603,8 @@ class Settings(BaseSettings):
     enable_media_generation: bool = False
     ima_api_key: SecretStr | None = None
     ima_api_base_url: str = "https://api.imastudio.com"
+    media_gen_rate_limit: int = Field(default=5, gt=0)
+    media_gen_rate_window_seconds: float = Field(default=60.0, gt=0)
     cors_allowed_origins: tuple[str, ...] = Field(
         default=(),
         description=(

@@ -10,7 +10,7 @@ import { VitePWA } from 'vite-plugin-pwa'
 // `/ask`/`/execute` in both modes with no `/api` prefix to keep in sync.
 // Listed explicitly (rather than proxying everything) so client-side
 // react-router routes never accidentally get proxied to the backend.
-const BACKEND_ROUTES = ['/ask', '/execute', '/documents', '/schema', '/feedback', '/health']
+const BACKEND_ROUTES = ['/ask', '/execute', '/documents', '/schema', '/feedback', '/health', '/media']
 
 export default defineConfig({
   plugins: [

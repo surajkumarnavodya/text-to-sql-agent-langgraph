@@ -1,7 +1,7 @@
 """LangGraph node functions for the top-level multi-source orchestrator.
 
-Flow: router -> {sql_subgraph, document_rag, policy_rag, web_search} (any
-combination the router selects) -> synthesis -> END. See
+Flow: router -> {sql_subgraph, document_rag, policy_rag, web_search,
+generation} (any combination the router selects) -> synthesis -> END. See
 `agent/orchestrator/graph.py` for the compiled graph and the module docstring
 there for why a fully-off `ENABLE_MULTI_SOURCE_ROUTER` bypasses this graph
 entirely rather than running it with one trivial destination.
@@ -11,19 +11,28 @@ and it touches it only through `agent.graph.run_agent` -- the already-
 compiled, already-tested eight-node graph, called exactly as
 `ui/app.py`/`api/main.py` always have. `document_rag_node`/`policy_rag_node`
 call `rag.graph.run_rag` (itself its own compiled subgraph -- see that
-module); `web_search_node` calls `search.web_search.web_search`. None of
-these three duplicate any retrieval/generation logic here -- this module is
-purely the wiring between them and `OrchestratorState`.
+module); `web_search_node` calls `search.web_search.web_search`;
+`generation_node` calls `media_gen.generate_image`/`generate_video`
+(confirmed working end-to-end against a real IMA account -- see that
+module's own docstring). None of these duplicate any retrieval/generation
+logic here -- this module is purely the wiring between them and
+`OrchestratorState`.
 """
 
 from __future__ import annotations
 
 import logging
 from collections.abc import Hashable
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 from agent.graph import run_agent
-from agent.orchestrator.state import OrchestratorState, RouteDecision, SourceAnswer
+from agent.orchestrator.state import (
+    MediaGenerationResult,
+    OrchestratorState,
+    RouteDecision,
+    SourceAnswer,
+)
+from agent.rate_limit import MEDIA_GENERATION_LIMIT_MESSAGE, get_media_generation_limiter
 from config.settings import Settings, get_settings
 from rag.graph import Citation
 from rag.store import RagStoreNotConfiguredError
@@ -62,7 +71,58 @@ _SOURCE_DESCRIPTIONS: dict[str, str] = {
         "of the company's own systems (e.g. today's news, a public fact, "
         "something outside this company entirely)"
     ),
+    "generation": (
+        "generating a brand-new image or video artifact that doesn't exist "
+        "yet -- only for a question that explicitly asks to "
+        "create/generate/draw/render/animate/make new media. Never use this "
+        "for retrieving, displaying, or visualizing already-computed data "
+        "-- that's 'sql'/'documents'/'policy'/'web'"
+    ),
 }
+
+# Few-shot guidance for the "generation" option specifically, appended to
+# classify_sources's system prompt only when "generation" is one of the
+# available sources (see classify_sources below) -- keeps the prompt short
+# for the common case (media generation off) and avoids training the model
+# on an option it can't actually pick. There is deliberately no "existing
+# media" counter-example category here: this app has no tool that searches
+# a store of already-created images/videos/recordings (a real, separate
+# capability that doesn't exist in this codebase yet -- see CLAUDE.md's
+# "Known gaps"), so a question that would otherwise mean "find the existing
+# photo/recording of X" has nowhere else specific to route to and simply
+# falls through to the data sources below like any other question, same as
+# it did before this feature existed.
+_GENERATION_FEW_SHOT_GUIDANCE = (
+    "\n\nExamples that DO mean 'generation' (creating brand-new media):\n"
+    '- "Create an image of the top 5 merchants by dispute count"\n'
+    '- "Generate a picture showing monthly spend by category"\n'
+    '- "Can you draw/illustrate a chart of active accounts by type?"\n'
+    '- "Make a graphic/infographic summarizing this report"\n'
+    '- "Visualize the results as a picture" / "Turn this into a picture"\n'
+    '- "Create a video showing the spend trend over the year"\n'
+    '- "Generate a short clip animating this growth"\n'
+    '- "Can you animate the transaction flow?"\n'
+    '- "Turn this into a video summary"\n'
+    "\nExamples that do NOT mean 'generation' -- route to the data source "
+    "instead, even though they also say 'show me' / 'visually' / 'picture':\n"
+    '- "Show me the top 5 accounts" (wants the existing data, as a table)\n'
+    '- "Can I see this as a picture instead of a table?" said about data '
+    "already retrieved is about chart/format preference, not new media -- "
+    "still route to the data source that has that data\n"
+    "\nRule: 'show me' / 'display' / 'visualize' ALONE, without an explicit "
+    "create/generate/draw/render/animate/make verb, is NOT a generation "
+    "request. When in doubt, prefer the data source over 'generation' -- a "
+    "missed generation is cheap to ask for again; an unwanted paid "
+    "generation call is not.\n"
+    "\nRule: do NOT add 'sql'/'documents'/'policy'/'web' alongside "
+    "'generation' just because the image/video's subject matter loosely "
+    "relates to one of them. Pick 'generation' ALONE unless the question "
+    "explicitly asks a second, separate question beyond describing what "
+    "to create (e.g. 'generate an image of our top merchants AND tell me "
+    "this quarter's total revenue' genuinely needs both 'generation' and "
+    "'sql'; 'create an image of a cat' does not need 'web' just because "
+    "cats exist on the internet)."
+)
 
 
 def get_available_sources(settings: Settings) -> list[str]:
@@ -71,9 +131,14 @@ def get_available_sources(settings: Settings) -> list[str]:
     `sql` is always available (`Settings.databases` always has >=1 entry --
     see that field's own docstring). Every other source requires both its
     feature flag AND the config its module actually needs to run at all
-    (a document/policy store connection string, a web search API key) --
-    an `ENABLE_*` flag alone with nothing configured behind it does not
-    make a source "available," since routing to it would just fail.
+    (a document/policy store connection string, a web search API key, an
+    IMA API key) -- an `ENABLE_*` flag alone with nothing configured
+    behind it does not make a source "available," since routing to it
+    would just fail. NOTE: "generation" being listed as configured only
+    means the flag+key are set -- it does not mean IMA's endpoints are
+    confirmed to actually work (see `Settings.enable_media_generation`'s
+    docstring); enabling this without a confirmed API reference will make
+    the router route real questions to a source that fails.
     """
     sources = ["sql"]
     if settings.enable_document_rag and settings.rag_store_connection_string:
@@ -82,6 +147,8 @@ def get_available_sources(settings: Settings) -> list[str]:
         sources.append("policy")
     if settings.enable_web_search and settings.web_search_api_key:
         sources.append("web")
+    if settings.enable_media_generation and settings.ima_api_key:
+        sources.append("generation")
     return sources
 
 
@@ -110,6 +177,8 @@ def classify_sources(
         "question can need more than one (e.g. comparing a database figure "
         "against a policy document)."
     )
+    if "generation" in available:
+        system_prompt += _GENERATION_FEW_SHOT_GUIDANCE
     user_prompt = f"Available sources:\n{options}\n\nQuestion: {question}"
     response = call_ollama(system_prompt, user_prompt, settings, max_tokens=30)
 
@@ -173,6 +242,7 @@ _DESTINATION_NODE_NAMES: dict[str, str] = {
     "documents": "document_rag",
     "policy": "policy_rag",
     "web": "web_search",
+    "generation": "generation",
 }
 
 
@@ -355,11 +425,175 @@ def web_search_node(state: OrchestratorState) -> dict[str, Any]:
     }
 
 
+# Placeholder-only safety check on outgoing generation prompts -- exactly
+# what it looks like, not a real moderation system. Replace with a genuine
+# moderation-API call before this is ever enabled for real use; kept here
+# only to mark *where* that check belongs in the call path, same honesty
+# standard as the reference implementation this was adapted from.
+_DISALLOWED_PROMPT_SUBSTRINGS = ("nsfw", "explicit")
+
+
+def _basic_prompt_safety_check(text: str) -> str | None:
+    """Returns a rejection reason if `text` fails the (placeholder) content
+    policy check, else None."""
+    lowered = text.lower()
+    for bad in _DISALLOWED_PROMPT_SUBSTRINGS:
+        if bad in lowered:
+            return "This request was rejected by the content policy check."
+    return None
+
+
+# Cheap keyword heuristic, not a second LLM call -- mirrors
+# `agent.complexity.py`'s own regex-heuristic style for a cheap per-question
+# signal. "footage" is arguably as much a "find an existing recording" word
+# as a "generate a video" one, but since this app has no tool that searches
+# existing media (see CLAUDE.md's "Known gaps"), treating it as a video
+# generation request here is the least-bad default within this feature's
+# current scope.
+_VIDEO_INTENT_KEYWORDS = ("video", "clip", "animate", "animation", "footage", "motion")
+
+
+def _infer_media_kind(question: str) -> Literal["image", "video"]:
+    """Decides whether a generation request wants an image or a video,
+    from the question's own phrasing -- image is the default when no
+    video-shaped keyword is present."""
+    lowered = question.lower()
+    return "video" if any(keyword in lowered for keyword in _VIDEO_INTENT_KEYWORDS) else "image"
+
+
+def _failed_media_result(answer: str, media_type: str | None = None) -> MediaGenerationResult:
+    return MediaGenerationResult(
+        answer=answer,
+        citations=[],
+        status="failed",
+        media_id=None,
+        media_type=media_type,
+        model=None,
+    )
+
+
+def generation_node(state: OrchestratorState) -> dict[str, Any]:
+    """Generates an image or video via IMA Studio for a question that
+    explicitly asked to create/generate new media -- see `media_gen/` for
+    the client, and `_infer_media_kind` above for the image-vs-video
+    decision.
+
+    Image generation is confirmed working end-to-end against a real IMA
+    account (a live text-to-image call succeeded: generation, download,
+    and serving via `GET /media/{media_id}`) -- see `Settings
+    .enable_media_generation`'s docstring. Video generation shares the
+    same client/task-creation code path but hasn't been separately
+    confirmed with a live call yet. Either way, a provider failure or a
+    misconfigured key still fails closed into a clean `MediaGenerationResult`
+    (`status="failed"`), exactly like every other source here -- never an
+    uncaught exception reaching the orchestrator graph.
+
+    On success, the generated asset's bytes are downloaded once
+    (`media_gen.download.download_media_bytes`) and cached under an opaque
+    id (`media_gen.cache.get_media_cache`) -- `answer`/`MediaGenerationResult
+    .media_id` never carry the provider's raw CDN URL, so nothing the LLM
+    could echo back or the API could return ever exposes it. If the
+    download itself fails after a successful generation, the whole result
+    is reported as failed rather than falling back to the raw URL -- see
+    `MediaGenerationResult.media_id`'s docstring for why.
+
+    `generate_audio` is built and tested but not auto-routed here (nothing
+    in this feature's scope asks for audio); call it directly if needed.
+    """
+    from media_gen import (
+        MediaGenerationError,
+        MediaGenerationNotConfiguredError,
+        download_media_bytes,
+        generate_image,
+        generate_video,
+        get_ima_client,
+        get_media_cache,
+    )
+
+    settings = get_settings()
+    question = state["question"]
+
+    safety_rejection = _basic_prompt_safety_check(question)
+    if safety_rejection:
+        return {
+            "generation_result": _failed_media_result(safety_rejection),
+            "sources_used": ["generation"],
+        }
+
+    limiter = get_media_generation_limiter(
+        settings.media_gen_rate_limit, settings.media_gen_rate_window_seconds
+    )
+    limit_result = limiter.check()
+    if not limit_result.allowed:
+        logger.warning("[generation] rate limit tripped: %s", MEDIA_GENERATION_LIMIT_MESSAGE)
+        return {
+            "generation_result": _failed_media_result(MEDIA_GENERATION_LIMIT_MESSAGE),
+            "sources_used": ["generation"],
+        }
+
+    try:
+        client = get_ima_client(settings)
+    except MediaGenerationNotConfiguredError as exc:
+        logger.error("[generation] not configured: %s", exc)
+        return {
+            "generation_result": _failed_media_result(str(exc)),
+            "sources_used": ["generation"],
+        }
+
+    kind = _infer_media_kind(question)
+    generate = generate_video if kind == "video" else generate_image
+    result = generate(client, prompt=question)
+    if not result.ok:
+        logger.warning("[generation] %s generation failed: %s", kind, result.error)
+        return {
+            "generation_result": _failed_media_result(
+                f"{kind.capitalize()} generation failed: {result.error or 'unknown error'}",
+                media_type=kind,
+            ),
+            "sources_used": ["generation"],
+        }
+
+    try:
+        data, content_type = download_media_bytes(result.url)  # type: ignore[arg-type]
+    except MediaGenerationError as exc:
+        logger.warning("[generation] %s generated but download failed: %s", kind, exc)
+        return {
+            "generation_result": _failed_media_result(
+                f"{kind.capitalize()} generation succeeded but the result could not be "
+                "retrieved.",
+                media_type=kind,
+            ),
+            "sources_used": ["generation"],
+        }
+
+    media_id = get_media_cache().put(data, content_type)
+    logger.info("[generation] %s generated: model=%s media_id=%s", kind, result.model, media_id)
+    return {
+        "generation_result": MediaGenerationResult(
+            answer=f"{kind.capitalize()} generated successfully.",
+            citations=[],
+            status="succeeded",
+            media_id=media_id,
+            media_type=kind,
+            model=result.model,
+        ),
+        "sources_used": ["generation"],
+    }
+
+
 _SOURCE_LABELS: dict[str, str] = {
     "sql": "Database",
     "documents": "Documents",
     "policy": "Policy",
     "web": "Web (external, live)",
+    "generation": "Generated Media",
+}
+
+_SOURCE_RESULT_KEYS: dict[str, str] = {
+    "documents": "document_result",
+    "policy": "policy_result",
+    "web": "web_result",
+    "generation": "generation_result",
 }
 
 # Shown only when EVERY contributing source came up empty -- kept identical
@@ -393,10 +627,49 @@ def synthesis_node(state: OrchestratorState) -> dict[str, Any]:
     contributing source is empty does this fall back to a single, generic
     "couldn't find anything" message, rather than concatenating each
     source's own "nothing here" text -- see `_NO_INFORMATION_FOUND_MESSAGE`.
+
+    `generation_result` deliberately never contributes a text bullet to
+    `synthesized_answer`, even when it's one of several sources that fired
+    (e.g. the router picking `["generation", "web"]` for a plain "generate
+    an image of X" question -- it does this often enough in practice that
+    the UI must handle it, not just the common single-source case). Both
+    UIs (`ui/app.py`'s `_render_sources_used`, the React
+    `SourcesUsedPanel.tsx`) always render the actual generated image/video
+    from `generation_result` as its own component *in addition to*
+    `synthesized_answer`'s text, regardless of how many other sources also
+    fired -- folding a "Generated image successfully" sentence into the
+    combined text would be redundant with (and could easily get scrolled
+    past/ignored ahead of) that real rendering. It's still counted toward
+    "was anything found at all" below, so a successful generation
+    alongside every other source coming up empty doesn't wrongly trigger
+    the generic `_NO_INFORMATION_FOUND_MESSAGE`.
+
+    Also the only place that sets the top-level `state["status"]` for a
+    run that never touched `sql` at all: `sql_subgraph_node` sets it via
+    `agent.graph.run_agent`'s full merge, but a documents/policy/web/
+    generation-only run has nothing else that ever does -- it would
+    otherwise stay stuck at `run_orchestrated`'s initial `"pending"`
+    forever (a real bug this closes, since e.g. the frontend's
+    `buildConversationHistory` only includes a `"succeeded"` turn as
+    follow-up context). Never overrides `status` when `sql` is one of the
+    sources -- that one stays authoritative even in a multi-source run.
     """
     sources_used = list(dict.fromkeys(state.get("sources_used", [])))
-    if len(sources_used) <= 1:
+    if not sources_used:
         return {}
+
+    if "sql" in sources_used:
+        status_update: dict[str, Any] = {}
+    else:
+        found_any = any(
+            (result := cast("SourceAnswer | None", state.get(_SOURCE_RESULT_KEYS.get(source, ""))))
+            and result.get("status") in ("succeeded", "restricted")
+            for source in sources_used
+        )
+        status_update = {"status": "succeeded" if found_any else "failed"}
+
+    if len(sources_used) <= 1:
+        return status_update
 
     found_sections: list[str] = []
     restricted_sections: list[str] = []
@@ -429,9 +702,20 @@ def synthesis_node(state: OrchestratorState) -> dict[str, Any]:
         else:
             empty_count += 1
 
+    # Never folded into found_sections/restricted_sections -- see this
+    # function's docstring. Still counted here so a successful generation
+    # alongside every other source coming up empty doesn't trigger the
+    # generic "nothing found" fallback below.
+    generation_result = state.get("generation_result")
+    generation_found = bool(
+        generation_result and generation_result.get("status") in ("succeeded", "restricted")
+    )
+    if generation_result and not generation_found:
+        empty_count += 1
+
     sections = (
         found_sections + restricted_sections
-        if found_sections or restricted_sections
+        if found_sections or restricted_sections or generation_found
         else [_NO_INFORMATION_FOUND_MESSAGE]
     )
     synthesized = "\n\n".join(sections)
@@ -442,4 +726,4 @@ def synthesis_node(state: OrchestratorState) -> dict[str, Any]:
         len(restricted_sections),
         empty_count,
     )
-    return {"synthesized_answer": synthesized}
+    return {**status_update, "synthesized_answer": synthesized}

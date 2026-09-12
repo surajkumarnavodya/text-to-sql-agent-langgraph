@@ -52,6 +52,9 @@ QUESTION_LIMIT_MESSAGE = (
 LLM_CALL_LIMIT_MESSAGE = (
     "The system is handling a lot of requests right now -- please wait a moment and try again."
 )
+MEDIA_GENERATION_LIMIT_MESSAGE = (
+    "Too many media generation requests right now -- please wait a moment and try again."
+)
 
 
 @dataclass(frozen=True)
@@ -135,6 +138,7 @@ class SlidingWindowRateLimiter:
 
 
 _llm_call_limiter: SlidingWindowRateLimiter | None = None
+_media_generation_limiter: SlidingWindowRateLimiter | None = None
 
 
 def get_llm_call_limiter(max_calls_per_minute: int) -> SlidingWindowRateLimiter:
@@ -155,3 +159,25 @@ def get_llm_call_limiter(max_calls_per_minute: int) -> SlidingWindowRateLimiter:
             max_events=max_calls_per_minute, window_seconds=60.0, name="llm_generation_calls"
         )
     return _llm_call_limiter
+
+
+def get_media_generation_limiter(
+    max_calls_per_window: int, window_seconds: float
+) -> SlidingWindowRateLimiter:
+    """Returns the process-wide media-generation-call limiter, creating it
+    on first use -- same singleton pattern as `get_llm_call_limiter`, and
+    deliberately its own, separate budget: image/video/audio generation
+    costs meaningfully more per call than a text LLM turn (per-call cost,
+    latency, and, for video, wall-clock time all much higher), so it must
+    not share `llm_call_rate_limit_per_minute`'s budget unmodified. Checked
+    inside `agent.orchestrator.nodes.generation_node` before every call
+    into `media_gen`, process-global rather than per-session for the same
+    reason `get_llm_call_limiter` is (see this module's own docstring)."""
+    global _media_generation_limiter
+    if _media_generation_limiter is None:
+        _media_generation_limiter = SlidingWindowRateLimiter(
+            max_events=max_calls_per_window,
+            window_seconds=window_seconds,
+            name="media_generation_calls",
+        )
+    return _media_generation_limiter

@@ -63,6 +63,7 @@ function emptyAskResponse(message: string): AskResponse {
     document_result: null,
     policy_result: null,
     web_result: null,
+    generation_result: null,
     query_plan: null,
     schema_tables: [],
     followup_classification: null,

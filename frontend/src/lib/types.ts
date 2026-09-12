@@ -54,6 +54,16 @@ export interface SourceAnswer {
   status: string
 }
 
+export interface MediaGenerationResult {
+  answer: string
+  status: string
+  // Opaque id to fetch via GET /media/{media_id} -- never the provider's
+  // raw CDN URL. null whenever status != 'succeeded'.
+  media_id: string | null
+  media_type: 'image' | 'video' | null
+  model: string | null
+}
+
 export interface AskRequest {
   question: string
   conversation_history?: ConversationExchange[]
@@ -85,6 +95,7 @@ export interface AskResponse {
   document_result: SourceAnswer | null
   policy_result: SourceAnswer | null
   web_result: SourceAnswer | null
+  generation_result: MediaGenerationResult | null
   query_plan: string[] | null
   schema_tables: SchemaTable[]
   followup_classification: 'standalone' | 'followup' | 'ambiguous' | null

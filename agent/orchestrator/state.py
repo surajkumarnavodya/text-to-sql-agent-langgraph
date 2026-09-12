@@ -53,6 +53,27 @@ class SourceAnswer(TypedDict):
     status: str
 
 
+class MediaGenerationResult(SourceAnswer):
+    """The "generation" source's contribution -- extends `SourceAnswer`
+    (`citations` is always `[]`, unused, kept only so `synthesis_node`'s
+    existing per-source loop can read `answer`/`status` identically to
+    document_result/policy_result/web_result with no special-casing) with
+    the fields specific to a generated media artifact. See
+    `agent.orchestrator.nodes.generation_node` and `media_gen/`.
+    """
+
+    # An opaque `media_gen.cache.MediaCache` id, never the provider's raw
+    # CDN URL -- `generation_node` downloads the bytes once and stores them
+    # under this id (see `media_gen/cache.py`/`media_gen/download.py`).
+    # Fetch the actual bytes via `GET /media/{media_id}`
+    # (`api/media.py`) or, in-process from `ui/app.py`,
+    # `media_gen.cache.get_media_cache().get(media_id)`. None whenever
+    # `status != "succeeded"`.
+    media_id: str | None
+    media_type: str | None
+    model: str | None
+
+
 class OrchestratorState(AgentState, total=False):
     """Full state threaded through the orchestrator graph."""
 
@@ -72,6 +93,8 @@ class OrchestratorState(AgentState, total=False):
     policy_result: SourceAnswer | None
     # Set by web_search_node -- see search/web_search.py.
     web_result: SourceAnswer | None
+    # Set by generation_node -- see media_gen/ and Settings.enable_media_generation.
+    generation_result: MediaGenerationResult | None
 
     # Set by synthesis_node -- None when only one source fired (that source's
     # own answer stands unedited; see synthesis_node's docstring).

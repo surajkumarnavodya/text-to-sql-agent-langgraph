@@ -29,6 +29,7 @@ from agent.orchestrator import nodes as orchestrator_nodes
 from agent.orchestrator.nodes import (
     classify_sources,
     document_rag_node,
+    generation_node,
     get_available_sources,
     policy_rag_node,
     route_after_router,
@@ -112,6 +113,12 @@ class TestGetAvailableSources:
         )
         assert get_available_sources(settings) == ["sql", "documents", "policy", "web"]
 
+    def test_media_generation_needs_both_flag_and_api_key(self):
+        assert get_available_sources(_settings(enable_media_generation=True)) == ["sql"]
+        assert get_available_sources(
+            _settings(enable_media_generation=True, ima_api_key=SecretStr("ima_x"))
+        ) == ["sql", "generation"]
+
 
 class TestClassifySources:
     def test_parses_a_single_source_response(self, monkeypatch):
@@ -145,6 +152,52 @@ class TestClassifySources:
         sources, reasoning = classify_sources("x", ["sql", "policy"], _settings())
         assert sources == ["sql", "policy"]
         assert "unparseable" in reasoning
+
+    def test_picks_generation_for_a_generate_phrased_question(self, monkeypatch):
+        """Only tests the plumbing (the LLM's response is mocked, so this
+        doesn't validate real classification judgment -- that needs a
+        manual/eval run against live Ollama, same documented limitation as
+        rag/search in CLAUDE.md's "Known gaps")."""
+        import rag.llm
+
+        monkeypatch.setattr(rag.llm, "call_ollama", lambda *a, **k: "generation")
+        sources, _ = classify_sources(
+            "create an image of monthly spend", ["sql", "generation"], _settings()
+        )
+        assert sources == ["generation"]
+
+    def test_picks_sql_for_a_show_me_data_question_even_with_generation_available(
+        self, monkeypatch
+    ):
+        import rag.llm
+
+        monkeypatch.setattr(rag.llm, "call_ollama", lambda *a, **k: "sql")
+        sources, _ = classify_sources(
+            "show me the top 5 accounts", ["sql", "generation"], _settings()
+        )
+        assert sources == ["sql"]
+
+    def test_generation_prompt_includes_few_shot_guidance_only_when_available(self, monkeypatch):
+        """Regression guard: the GENERATE few-shot examples/counter-rule
+        must actually reach the LLM prompt when 'generation' is offered,
+        and must NOT bloat the prompt when it isn't configured at all."""
+        import rag.llm
+
+        captured: dict[str, str] = {}
+
+        def _capture(system_prompt, user_prompt, settings, max_tokens):
+            captured["system_prompt"] = system_prompt
+            return "sql"
+
+        monkeypatch.setattr(rag.llm, "call_ollama", _capture)
+
+        classify_sources("x", ["sql", "generation"], _settings())
+        assert "Create an image of the top 5 merchants" in captured["system_prompt"]
+        assert "show me" in captured["system_prompt"].lower()
+        assert "do NOT add" in captured["system_prompt"]
+
+        classify_sources("x", ["sql", "policy"], _settings())
+        assert "Create an image of the top 5 merchants" not in captured["system_prompt"]
 
 
 class TestRouterNode:
@@ -351,9 +404,325 @@ class TestWebSearchNode:
         assert captured["max_tokens"] == 1200
 
 
+class TestGenerationNode:
+    """Mocks `media_gen`'s client construction and `generate_image`/
+    `generate_video`/`download_media_bytes` -- never a real network call,
+    even though image generation is separately confirmed working against a
+    real IMA account (see `media_gen/client.py`'s module docstring); these
+    tests stay fully mocked like the rest of this suite regardless.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _reset_media_generation_limiter(self):
+        """Same reasoning as test_agent_nodes.py's `_reset_llm_call_limiter`
+        -- `get_media_generation_limiter` is a module-level singleton, so
+        tests in this class would otherwise share one running counter.
+        Unlike that fixture, this clears the singleton back to unconstructed
+        (rather than calling the getter with one fixed limit/window) since
+        `test_rate_limit_blocks_after_the_configured_number_of_calls` below
+        needs its own `_settings(media_gen_rate_limit=1, ...)` to actually
+        take effect on first construction, not be silently ignored because
+        an earlier test already built the singleton with a different limit."""
+        import agent.rate_limit as rate_limit_module
+
+        rate_limit_module._media_generation_limiter = None
+        yield
+        rate_limit_module._media_generation_limiter = None
+
+    def test_not_configured_degrades_gracefully(self, monkeypatch):
+        settings = _settings()  # enable_media_generation False, no key
+        monkeypatch.setattr(orchestrator_nodes, "get_settings", lambda: settings)
+        result = generation_node({"question": "generate a picture of a cat"})
+        assert result["generation_result"]["status"] == "failed"
+        assert result["sources_used"] == ["generation"]
+
+    def test_successful_generation_returns_media_id(self, monkeypatch):
+        """The raw provider URL must never reach `generation_result` --
+        only an opaque `media_id` to fetch via `GET /media/{media_id}`
+        (api/media.py) -- and `answer` must never contain a link either."""
+        settings = _settings(enable_media_generation=True, ima_api_key=SecretStr("ima_x"))
+        monkeypatch.setattr(orchestrator_nodes, "get_settings", lambda: settings)
+        import media_gen
+
+        monkeypatch.setattr(media_gen, "get_ima_client", lambda settings: object())
+        monkeypatch.setattr(
+            media_gen,
+            "generate_image",
+            lambda client, prompt: media_gen.MediaResult(
+                status="completed", url="https://cdn.example/img.png", model="seedream-4.5"
+            ),
+        )
+        monkeypatch.setattr(
+            media_gen, "download_media_bytes", lambda url, timeout=30.0: (b"bytes", "image/png")
+        )
+        result = generation_node({"question": "generate a chart-style image of top sales"})
+        assert result["generation_result"]["status"] == "succeeded"
+        assert result["generation_result"]["media_id"]
+        assert result["generation_result"]["media_type"] == "image"
+        assert "http" not in result["generation_result"]["answer"]
+        assert "://" not in result["generation_result"]["answer"]
+
+        cached = media_gen.get_media_cache().get(result["generation_result"]["media_id"])
+        assert cached is not None
+        assert cached.data == b"bytes"
+        assert cached.content_type == "image/png"
+
+    def test_download_failure_after_successful_generation_fails_closed(self, monkeypatch):
+        """If the generated asset's bytes can't be downloaded, the whole
+        result must be reported as failed rather than falling back to
+        exposing the raw provider URL."""
+        settings = _settings(enable_media_generation=True, ima_api_key=SecretStr("ima_x"))
+        monkeypatch.setattr(orchestrator_nodes, "get_settings", lambda: settings)
+        import media_gen
+
+        monkeypatch.setattr(media_gen, "get_ima_client", lambda settings: object())
+        monkeypatch.setattr(
+            media_gen,
+            "generate_image",
+            lambda client, prompt: media_gen.MediaResult(
+                status="completed", url="https://cdn.example/img.png", model="seedream-4.5"
+            ),
+        )
+
+        def _fail_download(url, timeout=30.0):
+            raise media_gen.MediaGenerationError("boom")
+
+        monkeypatch.setattr(media_gen, "download_media_bytes", _fail_download)
+
+        result = generation_node({"question": "generate a picture of a cat"})
+        assert result["generation_result"]["status"] == "failed"
+        assert result["generation_result"]["media_id"] is None
+
+    def test_video_phrased_question_calls_generate_video_not_generate_image(self, monkeypatch):
+        settings = _settings(enable_media_generation=True, ima_api_key=SecretStr("ima_x"))
+        monkeypatch.setattr(orchestrator_nodes, "get_settings", lambda: settings)
+        import media_gen
+
+        monkeypatch.setattr(media_gen, "get_ima_client", lambda settings: object())
+        monkeypatch.setattr(
+            media_gen, "download_media_bytes", lambda url, timeout=30.0: (b"bytes", "video/mp4")
+        )
+
+        def _fail_if_called(*args, **kwargs):
+            raise AssertionError("generate_image must not be called for a video-phrased question")
+
+        monkeypatch.setattr(media_gen, "generate_image", _fail_if_called)
+        monkeypatch.setattr(
+            media_gen,
+            "generate_video",
+            lambda client, prompt: media_gen.MediaResult(
+                status="completed", url="https://cdn.example/video.mp4", model="wan-2.6"
+            ),
+        )
+
+        result = generation_node({"question": "animate the growth in spend over the year"})
+        assert result["generation_result"]["status"] == "succeeded"
+        assert result["generation_result"]["media_type"] == "video"
+
+    def test_provider_failure_surfaces_as_clean_message(self, monkeypatch):
+        """A rejection/error from IMA (e.g. insufficient credits, an
+        invalid key, no model available for the account) must become a
+        clean generation_result, never an uncaught exception reaching the
+        orchestrator graph."""
+        settings = _settings(enable_media_generation=True, ima_api_key=SecretStr("ima_x"))
+        monkeypatch.setattr(orchestrator_nodes, "get_settings", lambda: settings)
+        import media_gen
+
+        monkeypatch.setattr(media_gen, "get_ima_client", lambda settings: object())
+        monkeypatch.setattr(
+            media_gen,
+            "generate_image",
+            lambda client, prompt: media_gen.MediaResult(
+                status="failed", error="IMA API error 404 on POST /v1/images/generate: ..."
+            ),
+        )
+        result = generation_node({"question": "generate a picture of a cat"})
+        assert result["generation_result"]["status"] == "failed"
+        assert "Image generation failed" in result["generation_result"]["answer"]
+
+    def test_rate_limit_blocks_after_the_configured_number_of_calls(self, monkeypatch):
+        """Confirms the sliding-window limiter is actually checked before
+        every call into media_gen -- not just constructed and ignored."""
+        settings = _settings(
+            enable_media_generation=True,
+            ima_api_key=SecretStr("ima_x"),
+            media_gen_rate_limit=1,
+            media_gen_rate_window_seconds=60.0,
+        )
+        monkeypatch.setattr(orchestrator_nodes, "get_settings", lambda: settings)
+        import media_gen
+
+        call_count = {"n": 0}
+
+        def _fake_generate_image(client, prompt):
+            call_count["n"] += 1
+            return media_gen.MediaResult(status="completed", url="https://cdn.example/img.png")
+
+        monkeypatch.setattr(media_gen, "get_ima_client", lambda settings: object())
+        monkeypatch.setattr(media_gen, "generate_image", _fake_generate_image)
+        monkeypatch.setattr(
+            media_gen, "download_media_bytes", lambda url, timeout=30.0: (b"bytes", "image/png")
+        )
+
+        first = generation_node({"question": "generate a picture of a cat"})
+        second = generation_node({"question": "generate a picture of a dog"})
+
+        assert first["generation_result"]["status"] == "succeeded"
+        assert second["generation_result"]["status"] == "failed"
+        assert "too many" in second["generation_result"]["answer"].lower()
+        assert call_count["n"] == 1  # the second call never reached media_gen at all
+
+    def test_basic_prompt_safety_check_rejects_before_any_api_call(self, monkeypatch):
+        settings = _settings(enable_media_generation=True, ima_api_key=SecretStr("ima_x"))
+        monkeypatch.setattr(orchestrator_nodes, "get_settings", lambda: settings)
+        import media_gen
+
+        def _fail_if_called(*args, **kwargs):
+            raise AssertionError("generate_image must not be called when the safety check rejects")
+
+        monkeypatch.setattr(media_gen, "generate_image", _fail_if_called)
+
+        result = generation_node({"question": "generate an explicit image of X"})
+        assert result["generation_result"]["status"] == "failed"
+        assert "content policy" in result["generation_result"]["answer"].lower()
+
+
 class TestSynthesisNode:
-    def test_is_a_pass_through_for_a_single_source(self):
+    def test_is_a_pass_through_for_a_single_sql_source(self):
+        """`sql_subgraph_node`'s own merge already set `status` -- synthesis
+        must never override it."""
         assert synthesis_node({"sources_used": ["sql"]}) == {}
+
+    def test_sets_status_succeeded_for_a_single_non_sql_source(self):
+        """Regression test: before this fix, a documents/policy/web/
+        generation-only run's top-level `status` stayed stuck at
+        `run_orchestrated`'s initial "pending" forever, since nothing else
+        in the graph ever set it for a non-SQL source."""
+        state = {
+            "sources_used": ["generation"],
+            "generation_result": {
+                "answer": "Image generated successfully.",
+                "citations": [],
+                "status": "succeeded",
+                "media_id": "abc123",
+                "media_type": "image",
+                "model": "seedream",
+            },
+        }
+        assert synthesis_node(state) == {"status": "succeeded"}
+
+    def test_sets_status_failed_when_the_single_non_sql_source_found_nothing(self):
+        state = {
+            "sources_used": ["web"],
+            "web_result": {
+                "answer": "No web results found for this question.",
+                "citations": [],
+                "status": "insufficient_information",
+            },
+        }
+        assert synthesis_node(state) == {"status": "failed"}
+
+    def test_sets_status_succeeded_for_a_restricted_single_source(self):
+        """A restricted match means something relevant was found, just not
+        shown -- that's still a "succeeded" outcome, not a failure."""
+        state = {
+            "sources_used": ["policy"],
+            "policy_result": {
+                "answer": "This question touches restricted policy content.",
+                "citations": [],
+                "status": "restricted",
+            },
+        }
+        assert synthesis_node(state) == {"status": "succeeded"}
+
+    def test_multi_source_without_sql_also_sets_status(self):
+        state = {
+            "sources_used": ["generation", "web"],
+            "generation_result": {
+                "answer": "Image generated successfully.",
+                "citations": [],
+                "status": "succeeded",
+                "media_id": "abc123",
+                "media_type": "image",
+                "model": "seedream",
+            },
+            "web_result": {
+                "answer": "According to a live web search: ...",
+                "citations": [],
+                "status": "succeeded",
+            },
+        }
+        result = synthesis_node(state)
+        assert result["status"] == "succeeded"
+        assert "synthesized_answer" in result
+
+    def test_generation_never_contributes_a_text_bullet_to_synthesized_answer(self):
+        """Regression test for a real reported bug: the router sometimes
+        picks ["generation", "web"] (or similar) for a plain "generate an
+        image of X" question, not just ["generation"] alone. Both UIs
+        always render the actual image/video from `generation_result`
+        separately (outside this text), so folding "Image generated
+        successfully." into the combined text would be redundant -- and
+        is exactly what made the image look "missing" (the UI showed only
+        the web source's synthesized text)."""
+        state = {
+            "sources_used": ["generation", "web"],
+            "generation_result": {
+                "answer": "Image generated successfully.",
+                "citations": [],
+                "status": "succeeded",
+                "media_id": "abc123",
+                "media_type": "image",
+                "model": "seedream",
+            },
+            "web_result": {
+                "answer": "According to a live web search: cats are popular pets.",
+                "citations": [],
+                "status": "succeeded",
+            },
+        }
+        synthesized = synthesis_node(state)["synthesized_answer"]
+        assert "cats are popular pets" in synthesized
+        assert "Image generated successfully" not in synthesized
+        assert "Generated Media" not in synthesized
+
+    def test_successful_generation_alone_suppresses_the_not_found_fallback(self):
+        """If generation succeeds but the only other source came up empty,
+        the generic "I couldn't find anything" message must not appear --
+        something *was* found (the image), even though generation itself
+        never contributes a text bullet."""
+        state = {
+            "sources_used": ["generation", "web"],
+            "generation_result": {
+                "answer": "Image generated successfully.",
+                "citations": [],
+                "status": "succeeded",
+                "media_id": "abc123",
+                "media_type": "image",
+                "model": "seedream",
+            },
+            "web_result": {
+                "answer": "No web results found for this question.",
+                "citations": [],
+                "status": "insufficient_information",
+            },
+        }
+        result = synthesis_node(state)
+        assert result["status"] == "succeeded"
+        assert (
+            result["synthesized_answer"]
+            != "I couldn't find any relevant information to answer that question."
+        )
+
+    def test_multi_source_with_sql_never_overrides_sql_status(self):
+        state = {
+            "sources_used": ["sql", "policy"],
+            "status": "failed",
+            "failure_explanation": "Gave up after 3 attempts.",
+            "policy_result": {"answer": "Policy says X.", "citations": [], "status": "succeeded"},
+        }
+        result = synthesis_node(state)
+        assert "status" not in result  # sql_subgraph_node's own status stands
 
     def test_attributes_each_source_separately_for_multiple_sources(self):
         state = {

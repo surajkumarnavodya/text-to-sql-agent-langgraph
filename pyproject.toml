@@ -11,7 +11,7 @@ target-version = ["py311"]
 [tool.ruff]
 line-length = 100
 target-version = "py311"
-src = ["agent", "api", "config", "db", "embeddings", "eval", "scripts", "security", "tests", "ui"]
+src = ["agent", "api", "config", "db", "embeddings", "eval", "media_gen", "scripts", "security", "tests", "ui"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM"]
@@ -20,7 +20,7 @@ ignore = [
 ]
 
 [tool.ruff.lint.isort]
-known-first-party = ["agent", "api", "config", "db", "embeddings", "eval", "observability", "rag", "scripts", "search", "security", "ui"]
+known-first-party = ["agent", "api", "config", "db", "embeddings", "eval", "media_gen", "observability", "rag", "scripts", "search", "security", "ui"]
 
 [tool.ruff.lint.flake8-bugbear]
 # FastAPI's dependency-injection convention requires calling File()/Form()

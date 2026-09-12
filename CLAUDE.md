@@ -610,6 +610,60 @@ presented as if it came from the company's own systems, and the same
 too, since a search result's content is exactly as attacker-influenceable
 as a stored database value or an uploaded document.
 
+### Media generation (image/video) (`media_gen/`)
+`media_gen/` is a tested IMA Studio client wired into the orchestrator as a
+`"generation"` source (`agent.orchestrator.nodes.generation_node`). Image
+generation is confirmed working end-to-end against a real IMA account (a
+live text-to-image call succeeded: generation, download, and serving via
+`GET /media/{media_id}`); video generation shares the same client/
+task-creation code path but hasn't been separately confirmed with a live
+call yet. `ENABLE_MEDIA_GENERATION` still stays off by default so a fresh
+clone never spends real IMA credits without the operator deliberately
+opting in. Two design points worth knowing if you touch this:
+
+- **Image vs. video is a cheap keyword heuristic, not a second LLM call**
+  (`generation_node._infer_media_kind`, mirroring `agent/complexity.py`'s
+  own regex-heuristic style) — a question containing "video"/"clip"/
+  "animate"/"animation"/"footage"/"motion" gets `generate_video`, else
+  `generate_image`. `generate_audio` is built and tested but not
+  auto-routed here (nothing in this feature's scope asks for audio).
+- **Generated media is served through this app, never the provider's raw
+  CDN URL.** `generation_node` downloads the bytes once
+  (`media_gen.download.download_media_bytes`) and stores them under an
+  opaque id in a bounded, process-lifetime in-memory cache
+  (`media_gen.cache.MediaCache`, FIFO eviction past 100 entries, not
+  persisted — a restart loses in-flight generated media, an accepted
+  tradeoff same as this app's other process-global caches). Neither
+  `MediaGenerationResult.answer` nor the API's `MediaGenerationResultOut`
+  ever carries the raw URL — only `media_id`. The React frontend fetches
+  the bytes via the new authenticated `GET /media/{media_id}`
+  (`api/media.py`, mirroring `api/documents.py`'s PDF download route) and
+  renders an `<img>`/`<video>` from a blob object URL
+  (`MediaResultCard.tsx`); `ui/app.py` runs `run_orchestrated` in-process
+  and reads the cache directly (`_render_generation_result`), no HTTP round
+  trip needed. This was chosen over persisting to a DB column (bigger
+  lift, no real need yet) or passing the provider's URL straight through
+  (simpler, but the link can expire and there's no server-side
+  re-inspection of the bytes before display).
+- The router's `classify_sources` prompt carries explicit few-shot
+  examples distinguishing a genuine "create new media" request from a
+  plain "show me the data" one that merely mentions a picture/video in
+  passing (`agent.orchestrator.nodes._GENERATION_FEW_SHOT_GUIDANCE`) — see
+  that constant for the exact phrasing this was tuned against.
+
+**Known gaps, named rather than silently left:**
+- **No "search existing media" capability exists.** A question that really
+  means "find the existing photo/recording of X" has no dedicated tool to
+  route to — it simply falls through to the ordinary data sources like any
+  other question, same as before this feature existed. Building a real
+  media-search tool (an index, a store) is a separate, larger feature, not
+  attempted here.
+- **Multi-source synthesis doesn't embed generated media inline.**
+  `synthesis_node` only ever concatenates text; a generation result folded
+  into a multi-source answer shows only its (link-free) confirmation text,
+  not the image/video itself. Single-source generation (the realistic
+  case) is unaffected.
+
 ### SQL is untrusted output, always
 The LLM's SQL is never trusted at face value. `agent/sql_validator.py`
 parses it with `sqlglot` (in the dialect matching `DB_TYPE`) and rejects

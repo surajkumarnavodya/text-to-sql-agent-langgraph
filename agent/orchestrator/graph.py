@@ -2,12 +2,17 @@
 
     router -+-> sql_subgraph  -+
             |   (agent.graph.run_agent -- unmodified)
-            +-> document_rag   +-> synthesis -> END
+            +-> document_rag   +
             |   (rag.graph.run_rag, collection="documents")
-            +-> policy_rag     |
+            +-> policy_rag     +-> synthesis -> END
             |   (rag.graph.run_rag, collection="policies")
-            +-> web_search    -+
-                (search.web_search.web_search)
+            +-> web_search     |
+            |   (search.web_search.web_search)
+            +-> generation    -+
+                (media_gen.generate_image/generate_video -- off by
+                 default, Settings.enable_media_generation; image
+                 generation confirmed working end-to-end against a
+                 real IMA account, see media_gen/client.py)
 
 `route_after_router` returns a *list* of destination node names -- LangGraph
 runs every one of them as a parallel branch before the graph proceeds to
@@ -52,6 +57,7 @@ from langgraph.graph import END, StateGraph
 from agent.graph import run_agent
 from agent.orchestrator.nodes import (
     document_rag_node,
+    generation_node,
     policy_rag_node,
     route_after_router,
     router_node,
@@ -84,6 +90,7 @@ def build_orchestrator_graph():
     graph.add_node("document_rag", document_rag_node)
     graph.add_node("policy_rag", policy_rag_node)
     graph.add_node("web_search", web_search_node)
+    graph.add_node("generation", generation_node)
     graph.add_node("synthesis", synthesis_node)
 
     graph.set_entry_point("router")
@@ -95,9 +102,10 @@ def build_orchestrator_graph():
             "document_rag": "document_rag",
             "policy_rag": "policy_rag",
             "web_search": "web_search",
+            "generation": "generation",
         },
     )
-    for destination in ("sql_subgraph", "document_rag", "policy_rag", "web_search"):
+    for destination in ("sql_subgraph", "document_rag", "policy_rag", "web_search", "generation"):
         graph.add_edge(destination, "synthesis")
     graph.add_edge("synthesis", END)
 
@@ -171,6 +179,7 @@ def run_orchestrated(
         "document_result": None,
         "policy_result": None,
         "web_result": None,
+        "generation_result": None,
         "synthesized_answer": None,
     }
     final_state = compiled_graph.invoke(initial_state)

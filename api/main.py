@@ -47,6 +47,7 @@ from agent.sql_validator import enforce_row_limit, qualify_table_schema, validat
 from agent.state import ConversationExchange
 from api.auth import verify_api_key
 from api.documents import router as documents_router
+from api.media import router as media_router
 from api.schemas import (
     AskRequest,
     AskResponse,
@@ -61,6 +62,7 @@ from api.schemas import (
     GoldenExampleFeedbackRequest,
     GoldenExampleFeedbackResponse,
     HealthResponse,
+    MediaGenerationResultOut,
     SchemaRefreshResponse,
     SchemaRefreshResult,
     SchemaTableOut,
@@ -142,6 +144,7 @@ app = FastAPI(
     lifespan=lifespan,
 )
 app.include_router(documents_router)
+app.include_router(media_router)
 
 # No-op when Settings.cors_allowed_origins is empty (the default) -- a
 # same-origin deployment (the built React app served by this same FastAPI
@@ -298,6 +301,22 @@ def _source_answer_out(result: Mapping[str, Any] | None) -> SourceAnswerOut | No
     )
 
 
+def _media_generation_result_out(
+    result: Mapping[str, Any] | None,
+) -> MediaGenerationResultOut | None:
+    """Converts one `agent.orchestrator.state.MediaGenerationResult` dict
+    (generation_result) to its API shape -- None passes through as None."""
+    if result is None:
+        return None
+    return MediaGenerationResultOut(
+        answer=result.get("answer", ""),
+        status=result.get("status", "succeeded"),
+        media_id=result.get("media_id"),
+        media_type=result.get("media_type"),
+        model=result.get("model"),
+    )
+
+
 def _followup_resolved_against_out(
     exchange: Mapping[str, Any] | None,
 ) -> ConversationExchangeOut | None:
@@ -342,6 +361,7 @@ def _ask_response_from_state(state: Mapping[str, Any], session_id: str) -> AskRe
         document_result=_source_answer_out(state.get("document_result")),
         policy_result=_source_answer_out(state.get("policy_result")),
         web_result=_source_answer_out(state.get("web_result")),
+        generation_result=_media_generation_result_out(state.get("generation_result")),
         query_plan=state.get("query_plan"),
         schema_tables=[
             SchemaTableOut(

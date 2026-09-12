@@ -116,3 +116,21 @@ export async function downloadDocument(documentId: string, filename: string): Pr
   link.click()
   URL.revokeObjectURL(url)
 }
+
+/** Fetches one generated image/video's bytes and returns a blob object URL
+ * suitable for an `<img>`/`<video>` `src` -- unlike `downloadDocument`,
+ * this doesn't trigger a browser download, it's for inline rendering
+ * (`MediaResultCard`). A plain `<img src="/media/{id}">` can't carry the
+ * `Authorization` header this route requires, so the bytes must be
+ * fetched here and turned into a same-origin blob URL instead. Callers
+ * must `URL.revokeObjectURL` the result once it's no longer displayed. */
+export async function fetchMediaBlobUrl(mediaId: string): Promise<string> {
+  const headers = new Headers()
+  if (API_TOKEN) headers.set('Authorization', `Bearer ${API_TOKEN}`)
+  const response = await fetch(`/media/${mediaId}`, { headers })
+  if (!response.ok) {
+    throw new ApiError('Could not load the generated media.', response.status)
+  }
+  const blob = await response.blob()
+  return URL.createObjectURL(blob)
+}
