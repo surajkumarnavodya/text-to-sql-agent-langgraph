@@ -3,9 +3,7 @@
 <h1>Text-to-SQL Dashboard</h1>
 
 <p><strong>Ask your own database a question in plain English — get validated, read-only SQL you review before it ever runs.</strong></p>
-.\.venv\Scripts\python.exe ai_generator_client.py cloudflare
-.\.venv\Scripts\python.exe ai_generator_client.py pixazo
-.\.venv\Scripts\python.exe ai_generator_client.py ima_studio
+
 [User Guide](USER_GUIDE.md)&nbsp;&nbsp;&nbsp;|&nbsp;&nbsp;&nbsp;[Architecture](docs/ARCHITECTURE.md)&nbsp;&nbsp;&nbsp;|&nbsp;&nbsp;&nbsp;[API Reference](docs/API.md)&nbsp;&nbsp;&nbsp;|&nbsp;&nbsp;&nbsp;[Configuration](docs/CONFIGURATION.md)
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
