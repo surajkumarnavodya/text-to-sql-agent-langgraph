@@ -28,7 +28,7 @@ const SOURCE_CHIP_LABELS: Record<string, string> = {
  * a real user-reported bug: ask to "generate an image of X", the router
  * also picks "web", and the image silently never appears because only
  * the combined text branch rendered. */
-export function SourcesUsedPanel({ state }: { state: AskResponse }) {
+export function SourcesUsedPanel({ state, entryId }: { state: AskResponse; entryId: string }) {
   const { t } = useTranslation()
   if (state.sources_used.length === 0) return null
 
@@ -51,7 +51,7 @@ export function SourcesUsedPanel({ state }: { state: AskResponse }) {
           {state.web_result && <SourceAnswerCard sourceKey="web_result" result={state.web_result} />}
         </>
       )}
-      {state.generation_result && <MediaResultCard result={state.generation_result} />}
+      {state.generation_result && <MediaResultCard result={state.generation_result} entryId={entryId} />}
     </div>
   )
 }

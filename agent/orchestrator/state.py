@@ -77,6 +77,15 @@ class MediaGenerationResult(SourceAnswer):
 class OrchestratorState(AgentState, total=False):
     """Full state threaded through the orchestrator graph."""
 
+    # Set once by run_orchestrated from its own `session_id` parameter --
+    # a real (if untrusted) per-conversation correlation token
+    # (AskRequest.session_id), used by router_node to scope the
+    # session-level expensive-source cost ceiling (see
+    # agent.rate_limit.get_session_expensive_source_limiter). None for a
+    # caller that never supplied one (e.g. eval/runner.py, scripts) -- the
+    # ceiling simply doesn't apply when there's no session to scope it to.
+    session_id: str | None
+
     # Set by router_node -- see RouteDecision above.
     route_decision: RouteDecision | None
 

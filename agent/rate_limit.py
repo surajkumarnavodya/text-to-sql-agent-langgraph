@@ -181,3 +181,46 @@ def get_media_generation_limiter(
             name="media_generation_calls",
         )
     return _media_generation_limiter
+
+
+# Keyed by session_id -- unlike the two process-wide limiters above, this
+# one deliberately needs per-session scope (see get_session_expensive_source_limiter's
+# docstring for why).
+_session_expensive_source_limiters: dict[str, SlidingWindowRateLimiter] = {}
+
+
+def get_session_expensive_source_limiter(
+    session_id: str, max_calls_per_window: int, window_seconds: float
+) -> SlidingWindowRateLimiter:
+    """Returns the per-session limiter on "expensive" orchestrator sources
+    (generation, web -- see `agent.orchestrator.nodes._EXPENSIVE_SOURCES`),
+    creating it on first use for that session.
+
+    Every other limiter in this module is process-wide, which is
+    deliberate for a single-user-oriented app (see this module's own
+    docstring) -- but a single question can already fan out to *multiple*
+    expensive sources at once (the router picking `["generation", "web"]`
+    together is observed, real behavior, not a hypothetical), and nothing
+    previously capped how many times *one session* could keep doing that
+    across many questions. The per-source limiters (`get_media_generation_limiter`,
+    the implicit one-call-per-Tavily-request in `search.web_search`) each
+    bound their own call rate individually, but not the combination, and
+    not per caller -- this closes that gap without needing a full
+    session/identity system: `session_id` is already a real, if untrusted,
+    per-conversation correlation token (`AskRequest.session_id`), good
+    enough to scope a soft cost ceiling even though it isn't a substitute
+    for real per-user authentication (see SECURITY.md's existing
+    no-auth/no-tenant-isolation disclosure -- a caller can always mint a
+    fresh session_id, exactly like the existing per-IP API rate limiters
+    can be evaded by changing IP; this is a cost-control speed bump, not an
+    access-control boundary).
+    """
+    limiter = _session_expensive_source_limiters.get(session_id)
+    if limiter is None:
+        limiter = SlidingWindowRateLimiter(
+            max_events=max_calls_per_window,
+            window_seconds=window_seconds,
+            name=f"session_expensive_source[{session_id}]",
+        )
+        _session_expensive_source_limiters[session_id] = limiter
+    return limiter

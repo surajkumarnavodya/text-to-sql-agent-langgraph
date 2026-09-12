@@ -131,15 +131,51 @@ introspection the UI's sidebar schema browser uses. Requires auth if
 {"tables": [{"table_name": "DimCustomer", "columns": [{"name": "CustomerKey", "type": "INT", "nullable": false, "is_primary_key": true}, ...]}]}
 ```
 
+### `POST /generate/confirm`
+
+The human-approval confirmation step for media generation (`api/generation.py`)
+— only meaningful when `ENABLE_MULTI_SOURCE_ROUTER` and
+`ENABLE_MEDIA_GENERATION` are both on. A prior `/ask` response's
+`generation_result.status == "pending_approval"` means the router picked
+the "generation" source but nothing has been generated or charged yet
+(`Settings.require_generation_approval`, default `true` — see
+`SECURITY.md`'s "Media generation" section). This endpoint is what
+actually calls the provider:
+
+```json
+// Request
+{"question": "generate an image of monthly spend by category"}
+
+// Response
+{"answer": "Image generated successfully.", "status": "succeeded", "media_id": "a1b2c3...", "media_type": "image", "model": "seedream-4.5"}
+```
+
+`question` is typically the exact text from the proposal (possibly
+hand-edited first, same as `/execute`'s SQL text can be) — the media kind
+(image vs. video) is always re-inferred from it server-side, never
+accepted from the caller. Fetch the actual bytes via `GET /media/{media_id}`.
+Rate-limited per client IP (`API_ACTION_RATE_LIMIT_PER_MINUTE`) in addition
+to the existing process-wide `MEDIA_GEN_RATE_LIMIT`. Requires auth if
+`API_AUTH_TOKEN` is set.
+
+### Other routes
+
+`POST /execute` (SQL "Confirm and Run" equivalent), `POST /schema/refresh`,
+`GET`/`POST`/`DELETE /documents`, `GET /documents/{id}/download`, and
+`GET /media/{media_id}` also exist (`api/main.py`, `api/documents.py`,
+`api/media.py`) — not yet given their own subsection here; see each
+module's own docstrings for the authoritative contract in the meantime.
+
 ## Auth: a lightweight hook, not a full auth system
 
 `API_AUTH_TOKEN` (`.env`, unset by default) is an optional shared bearer
-token: when set, `/ask` and `/schema/tables` require a matching
-`Authorization: Bearer <token>` header (checked with a constant-time
-comparison — see `api/auth.py`); `/health` never requires it. This is
-**one shared secret, not per-user identity** — there is no login, no
-token issuance, no session, no authorization model beyond "has the
-token or doesn't." It exists so this isn't wide open by default the
+token: when set, every route requires a matching `Authorization: Bearer
+<token>` header (checked with a constant-time comparison — see
+`api/auth.py`) *except* `GET /health`, which never requires it (health
+checks typically need to be reachable by an orchestrator with no API
+key). This is **one shared secret, not per-user identity** — there is no
+login, no token issuance, no session, no authorization model beyond "has
+the token or doesn't." It exists so this isn't wide open by default the
 moment it's reachable from more than localhost, not as a substitute for
 real auth.
 

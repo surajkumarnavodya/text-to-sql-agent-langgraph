@@ -63,6 +63,19 @@ def _mock_settings(monkeypatch):
     return _BASE_SETTINGS
 
 
+@pytest.fixture(autouse=True)
+def _reset_api_action_limiters():
+    """`api.rate_limit._limiters` is a process-wide singleton dict --
+    reset before/after every test so one test's requests can't trip
+    another's rate limit purely by test order/count (same reasoning as
+    `test_api_ask.py`'s `_reset_ip_limiters`)."""
+    import api.rate_limit as api_rate_limit
+
+    api_rate_limit._limiters.clear()
+    yield
+    api_rate_limit._limiters.clear()
+
+
 @pytest.fixture
 def client() -> TestClient:
     return TestClient(api_main.app)
@@ -173,3 +186,20 @@ class TestExecute:
     def test_empty_sql_is_rejected_by_request_validation(self, client):
         response = client.post("/execute", json={"sql": ""})
         assert response.status_code == 422
+
+    def test_rate_limit_trip_returns_429(self, monkeypatch, client):
+        """SEC-08: /execute previously had no rate limit of its own at
+        all -- confirm it's actually enforced, not just constructed."""
+        settings = Settings(**{**_BASE_SETTINGS.__dict__, "api_action_rate_limit_per_minute": 1})
+        monkeypatch.setattr("api.main.get_settings", lambda: settings)
+        monkeypatch.setattr(
+            "api.main.execute_readonly_sql",
+            lambda sql, timeout, max_rows, engine=None: (["a"], [(1,)]),
+        )
+
+        first = client.post("/execute", json={"sql": "SELECT 1"})
+        second = client.post("/execute", json={"sql": "SELECT 1"})
+
+        assert first.status_code == 200
+        assert second.status_code == 429
+        assert "Retry-After" in second.headers

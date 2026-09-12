@@ -126,10 +126,11 @@ class TestAsk:
     def test_conversation_history_is_forwarded_to_run_agent(self, monkeypatch, client):
         captured = {}
 
-        def _capture(question, conversation_history=None, enable_insight=True):
+        def _capture(question, conversation_history=None, enable_insight=True, session_id=None):
             captured["question"] = question
             captured["conversation_history"] = conversation_history
             captured["enable_insight"] = enable_insight
+            captured["session_id"] = session_id
             return {"status": "succeeded", "error_history": []}
 
         monkeypatch.setattr("api.main.run_orchestrated", _capture)

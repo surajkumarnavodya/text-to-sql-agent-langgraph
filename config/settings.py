@@ -336,6 +336,16 @@ class Settings(BaseSettings):
             question's self-correction retries (up to `max_retries + 1`
             calls) could otherwise multiply load well past what the
             question-level limit alone would suggest.
+        api_action_rate_limit_per_minute: Max calls per minute, per client
+            IP, to `POST /execute`, `POST /schema/refresh`, the mutating
+            `/documents` routes (upload/delete), and `POST /generate/confirm`
+            -- every state-changing or resource-intensive API action that
+            previously had no rate limit of its own (`/ask` already had one;
+            these didn't). Deliberately one shared setting rather than a
+            separate knob per route -- these are all the same class of
+            "a human clicks a button" action with a similar expected
+            frequency, and splitting them out can be revisited if one
+            route's real usage pattern needs a different budget.
         cost_estimation_enabled: Whether `db.query_cost` runs a proactive,
             non-executing cost estimate (EXPLAIN/SHOWPLAN) before running a
             validated query. Fails open regardless (see
@@ -463,6 +473,12 @@ class Settings(BaseSettings):
             never shows a download option (`DocumentRecord.has_pdf_bytes`/
             `rag.store.ChunkResult.has_pdf_bytes` are both False for it) --
             re-uploading it is the only way to make it downloadable.
+        max_document_upload_mb: Upper bound on one `POST /documents`
+            upload, enforced by reading at most this many bytes (+1, to
+            detect an over-limit upload) regardless of what the request
+            claims its size is -- `api/documents.py::upload_document`
+            previously called `file.read()` with no cap at all, an
+            unbounded-memory-read risk from a single oversized upload.
         enable_web_search: Whether the web_search node is offered to the
             router at all. False by default, and independent of
             `web_search_api_key` being set -- both must be true/present for
@@ -511,6 +527,37 @@ class Settings(BaseSettings):
             video/audio generation costs meaningfully more per call than a
             text LLM turn.
         media_gen_rate_window_seconds: Window width for the limiter above.
+        require_generation_approval: Whether `agent.orchestrator.nodes
+            .generation_node` requires an explicit human confirmation
+            (`POST /generate/confirm`) before it actually calls IMA --
+            secure by default (`true`): generation is a real, metered
+            third-party API call, the only source in the orchestrator that
+            spends money, so it gets the same human-in-the-loop gate the
+            SQL pipeline's "Confirm and Run" already applies to query
+            execution. When true, `generation_node` only proposes what
+            would be generated (`status="pending_approval"`, no `media_id`,
+            nothing charged) until confirmed. Set `false` only for a
+            trusted automation context that has already reviewed this
+            tradeoff and wants the previous fully-autonomous behavior.
+        session_expensive_source_limit: Max combined "generation"/"web"
+            source invocations allowed per `session_id` within
+            `session_expensive_source_window_seconds`, checked in
+            `agent.orchestrator.nodes.router_node` via `agent.rate_limit
+            .get_session_expensive_source_limiter`. Each of those two
+            sources already has its own call-rate limiter (media
+            generation's, and the implicit one-request-per-question cost
+            of a Tavily call), but nothing previously capped how many
+            times *one session* could keep triggering either or both
+            together across many questions -- a single question can
+            already fan out to both at once (observed, real router
+            behavior). `session_id` is a real per-conversation
+            correlation token, not a substitute for authentication (see
+            `get_session_expensive_source_limiter`'s own docstring) -- a
+            cost-control speed bump, not an access-control boundary.
+        session_expensive_source_window_seconds: Window width for the
+            limiter above. An hour by default -- deliberately wider than
+            the per-minute limiters elsewhere, since this is a
+            session-lifetime cost ceiling, not a burst-rate control.
         project_root: Absolute path to the repository root.
         databases: Every configured database connection, parsed from
             `DB_CONNECTIONS` + per-name `DB_<NAME>_*` vars (see
@@ -571,6 +618,7 @@ class Settings(BaseSettings):
     max_question_length: int = Field(default=500, gt=0)
     question_rate_limit_per_minute: int = Field(default=10, gt=0)
     llm_call_rate_limit_per_minute: int = Field(default=20, gt=0)
+    api_action_rate_limit_per_minute: int = Field(default=20, gt=0)
     cost_estimation_enabled: bool = True
     cost_estimation_timeout_seconds: int = Field(default=3, gt=0)
     cost_moderate_row_threshold: int = Field(default=50_000, gt=0)
@@ -595,6 +643,7 @@ class Settings(BaseSettings):
     rag_chunk_overlap: int = 150
     rag_embedding_model_name: str = ""
     enable_pdf_download: bool = True
+    max_document_upload_mb: int = Field(default=25, gt=0)
     enable_web_search: bool = False
     web_search_provider: str = "tavily"
     web_search_api_key: SecretStr | None = None
@@ -605,6 +654,9 @@ class Settings(BaseSettings):
     ima_api_base_url: str = "https://api.imastudio.com"
     media_gen_rate_limit: int = Field(default=5, gt=0)
     media_gen_rate_window_seconds: float = Field(default=60.0, gt=0)
+    require_generation_approval: bool = True
+    session_expensive_source_limit: int = Field(default=10, gt=0)
+    session_expensive_source_window_seconds: float = Field(default=3600.0, gt=0)
     cors_allowed_origins: tuple[str, ...] = Field(
         default=(),
         description=(

@@ -234,6 +234,24 @@ class ExecuteRequest(BaseModel):
     )
 
 
+class GenerateConfirmRequest(BaseModel):
+    """The human-approval confirmation step for media generation -- the
+    API equivalent of `/execute` above, applied to the "generation" source
+    instead of SQL. `question` is typically the exact prompt text a prior
+    `AskResponse.generation_result` proposed (its `answer` field, when
+    `status == "pending_approval"`), though a caller may edit it before
+    confirming, same as `/execute`'s SQL text can be hand-edited first.
+    There is deliberately no `media_type` field here -- the kind (image vs.
+    video) is always re-inferred server-side from `question`
+    (`agent.orchestrator.nodes.infer_media_kind`), never trusted from the
+    client, so a caller can't under-report a more expensive video request
+    as a cheaper image one."""
+
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    question: str = Field(..., min_length=1)
+
+
 class ExecuteResponse(BaseModel):
     model_config = ConfigDict(frozen=True)
 

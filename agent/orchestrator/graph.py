@@ -116,6 +116,7 @@ def run_orchestrated(
     question: str,
     conversation_history: list[ConversationExchange] | None = None,
     enable_insight: bool = True,
+    session_id: str | None = None,
 ) -> AgentState | OrchestratorState:
     """Routes a question to one or more sources and returns the combined result.
 
@@ -129,6 +130,13 @@ def run_orchestrated(
         enable_insight: Same shape and meaning as `agent.graph.run_agent`'s
             parameter of the same name -- only consulted by the SQL
             destination today.
+        session_id: A real (if untrusted) per-conversation correlation
+            token -- `api/main.py`'s `/ask` passes its own
+            `AskRequest.session_id`. Used only to scope `router_node`'s
+            session-level expensive-source cost ceiling (see
+            `agent.rate_limit.get_session_expensive_source_limiter`);
+            `None` (the default, e.g. for `eval/runner.py` or standalone
+            scripts) simply means that ceiling doesn't apply.
 
     Returns:
         When `Settings.enable_multi_source_router` is off, exactly what
@@ -152,6 +160,7 @@ def run_orchestrated(
     # reason: never rely on a reducer channel's implicit empty state.
     initial_state: OrchestratorState = {
         "question": question,
+        "session_id": session_id,
         "rejection_reason": None,
         "rejection_message": None,
         "rate_limit_message": None,

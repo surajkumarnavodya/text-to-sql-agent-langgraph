@@ -151,6 +151,16 @@ Neither service needs to know this exists; point the proxy at
 depth) but should never be the *only* layer for anything but a single
 trusted caller.
 
+`docker-compose.yml`'s port mappings are bound to `127.0.0.1` by default
+(`${APP_BIND_HOST:-127.0.0.1}:8501:8501` / `${API_BIND_HOST:-127.0.0.1}:8000:8000`)
+— an unqualified `"8501:8501"` mapping binds every host interface, reachable
+from the whole network the host sits on, not just the host itself. Set
+`APP_BIND_HOST`/`API_BIND_HOST` in `.env` (e.g. to `0.0.0.0`, or the specific
+interface your reverse proxy connects from) only once that proxy is
+actually in place — the localhost-only default is what makes "put a
+reverse proxy in front of it" a real boundary rather than something a
+network-reachable port mapping already bypassed.
+
 ## Horizontal scaling considerations
 
 - **`app`/`api` are effectively stateless per-request** (LangGraph rebuilds

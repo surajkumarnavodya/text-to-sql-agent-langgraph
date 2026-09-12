@@ -53,6 +53,25 @@ open gaps.
   receives the full state (SQL, results, retry history) and decides what
   to do with it — the API never takes an action beyond returning data from
   a read-only, validated query.
+- **Media generation (image/video, optional, off by default) gets the same
+  treatment, added 2026-09-13.** Unlike every other orchestrator source,
+  a successful generation spends real, metered third-party (IMA Studio)
+  credit — until this was added, it fired the instant the router picked
+  it, with no human confirmation step at all, unlike SQL's "Confirm and
+  Run." `Settings.require_generation_approval` (default `true`) closes
+  this: `generation_node` only proposes what would be generated
+  (`status="pending_approval"`, nothing charged) until a human explicitly
+  confirms (`POST /generate/confirm`, or the matching UI button in both
+  the React dashboard and Streamlit). **Content-safety honesty note:** the
+  check gating what may be generated at all
+  (`agent.orchestrator.nodes._basic_prompt_safety_check`) is a keyword
+  heuristic — broadened in scope during this pass, but still explicitly
+  not a real ML-based content-moderation system, and still trivially
+  bypassed by a synonym, a non-English phrasing, or an indirect
+  description. This is disclosed here rather than left to look more solid
+  than it is; a genuine moderation-API call (several image/video providers,
+  including IMA, expose one) is the honest next step before this feature
+  is exposed to untrusted users at any real scale.
 
 ## Fairness and limitations
 
@@ -128,6 +147,10 @@ as adversarial input, at the same trust level, not just the former:
 - Not guaranteed safe for any database — the read-only DB role requirement
   (`SECURITY.md`) is load-bearing, not optional, and this project cannot
   enforce it from inside the app.
+- Media generation's content-policy check is not a real moderation system
+  — see "Human oversight" above. Not a claim that generated content is
+  screened to any serious standard, only that a human must explicitly
+  approve the (metered, real-cost) act of generating it at all.
 
 ## Cross-references
 

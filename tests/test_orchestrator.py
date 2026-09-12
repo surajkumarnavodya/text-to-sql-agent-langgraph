@@ -222,6 +222,68 @@ class TestRouterNode:
         assert decision["sources"] == ["sql", "policy"]
         assert decision["short_circuited"] is False
 
+    # -- SEC-10: session-scoped expensive-source (generation/web) ceiling --
+
+    def test_drops_expensive_sources_once_session_limit_is_reached(self, monkeypatch):
+        import uuid
+
+        settings = _settings(
+            enable_web_search=True,
+            web_search_api_key=SecretStr("tvly-x"),
+            session_expensive_source_limit=1,
+            session_expensive_source_window_seconds=3600.0,
+        )
+        monkeypatch.setattr(orchestrator_nodes, "get_settings", lambda: settings)
+        monkeypatch.setattr(
+            orchestrator_nodes, "classify_sources", lambda q, avail, s: (["sql", "web"], "reason")
+        )
+        session_id = f"test-session-{uuid.uuid4().hex}"
+
+        first = router_node({"question": "q1", "session_id": session_id})
+        assert first["route_decision"]["sources"] == ["sql", "web"]
+
+        second = router_node({"question": "q2", "session_id": session_id})
+        assert second["route_decision"]["sources"] == ["sql"]
+        assert "expensive-source limit" in second["route_decision"]["reasoning"]
+
+    def test_no_session_id_never_triggers_the_ceiling(self, monkeypatch):
+        """The ceiling only applies when a caller supplies a session_id
+        (e.g. eval/runner.py and standalone scripts never do) -- it must
+        never silently cap a caller that has no session concept at all."""
+        settings = _settings(
+            enable_web_search=True,
+            web_search_api_key=SecretStr("tvly-x"),
+            session_expensive_source_limit=1,
+        )
+        monkeypatch.setattr(orchestrator_nodes, "get_settings", lambda: settings)
+        monkeypatch.setattr(
+            orchestrator_nodes, "classify_sources", lambda q, avail, s: (["sql", "web"], "reason")
+        )
+        first = router_node({"question": "q1"})
+        second = router_node({"question": "q2"})
+        assert first["route_decision"]["sources"] == ["sql", "web"]
+        assert second["route_decision"]["sources"] == ["sql", "web"]
+
+    def test_ceiling_does_not_affect_a_different_session(self, monkeypatch):
+        import uuid
+
+        settings = _settings(
+            enable_web_search=True,
+            web_search_api_key=SecretStr("tvly-x"),
+            session_expensive_source_limit=1,
+        )
+        monkeypatch.setattr(orchestrator_nodes, "get_settings", lambda: settings)
+        monkeypatch.setattr(
+            orchestrator_nodes, "classify_sources", lambda q, avail, s: (["sql", "web"], "reason")
+        )
+        session_a = f"test-session-{uuid.uuid4().hex}"
+        session_b = f"test-session-{uuid.uuid4().hex}"
+
+        router_node({"question": "q1", "session_id": session_a})
+        # A different session's budget is untouched by session_a's usage.
+        second = router_node({"question": "q2", "session_id": session_b})
+        assert second["route_decision"]["sources"] == ["sql", "web"]
+
 
 class TestRouteAfterRouter:
     def test_routes_sql_only_decision_to_sql_subgraph(self):
@@ -436,8 +498,128 @@ class TestGenerationNode:
         assert result["generation_result"]["status"] == "failed"
         assert result["sources_used"] == ["generation"]
 
+    def test_basic_prompt_safety_check_rejects_before_any_api_call(self, monkeypatch):
+        settings = _settings(enable_media_generation=True, ima_api_key=SecretStr("ima_x"))
+        monkeypatch.setattr(orchestrator_nodes, "get_settings", lambda: settings)
+        import media_gen
+
+        def _fail_if_called(*args, **kwargs):
+            raise AssertionError("generate_image must not be called when the safety check rejects")
+
+        monkeypatch.setattr(media_gen, "generate_image", _fail_if_called)
+
+        result = generation_node({"question": "generate an explicit image of X"})
+        assert result["generation_result"]["status"] == "failed"
+        assert "content policy" in result["generation_result"]["answer"].lower()
+
+    # -- SEC-03: human-in-the-loop approval gate --------------------------
+
+    def test_defaults_to_requiring_approval(self):
+        """Settings.require_generation_approval defaults to True -- secure
+        by default, since this is the only source that spends real money."""
+        assert _settings().require_generation_approval is True
+
+    def test_proposes_without_calling_the_provider_when_approval_required(self, monkeypatch):
+        """The whole point of the gate: no real, metered API call happens
+        just because the router picked "generation" -- only a proposal."""
+        settings = _settings(enable_media_generation=True, ima_api_key=SecretStr("ima_x"))
+        monkeypatch.setattr(orchestrator_nodes, "get_settings", lambda: settings)
+        import media_gen
+
+        def _fail_if_called(*args, **kwargs):
+            raise AssertionError("no provider call may happen before human confirmation")
+
+        monkeypatch.setattr(media_gen, "generate_image", _fail_if_called)
+        monkeypatch.setattr(media_gen, "generate_video", _fail_if_called)
+        monkeypatch.setattr(media_gen, "download_media_bytes", _fail_if_called)
+
+        result = generation_node({"question": "generate a picture of a cat"})
+        assert result["generation_result"]["status"] == "pending_approval"
+        assert result["generation_result"]["media_id"] is None
+        assert "cat" in result["generation_result"]["answer"]
+
+    def test_pending_approval_does_not_consume_the_rate_limit(self, monkeypatch):
+        """Proposing costs nothing -- the media-generation rate limiter
+        must only be checked at actual execution time (confirm), not here,
+        or a user could exhaust their budget just by asking questions that
+        get proposed and never confirmed."""
+        settings = _settings(
+            enable_media_generation=True,
+            ima_api_key=SecretStr("ima_x"),
+            media_gen_rate_limit=1,
+        )
+        monkeypatch.setattr(orchestrator_nodes, "get_settings", lambda: settings)
+
+        first = generation_node({"question": "generate a picture of a cat"})
+        second = generation_node({"question": "generate a picture of a dog"})
+        assert first["generation_result"]["status"] == "pending_approval"
+        assert second["generation_result"]["status"] == "pending_approval"
+
+    def test_not_configured_fails_fast_even_with_approval_required(self, monkeypatch):
+        """No reason to make a human click 'confirm' just to learn
+        generation was never going to work -- this is a free config check,
+        not a provider call, so it happens at propose time too."""
+        settings = _settings(enable_media_generation=True)  # no ima_api_key
+        monkeypatch.setattr(orchestrator_nodes, "get_settings", lambda: settings)
+        result = generation_node({"question": "generate a picture of a cat"})
+        assert result["generation_result"]["status"] == "failed"
+        assert result["generation_result"]["media_id"] is None
+
+    def test_executes_directly_when_approval_disabled(self, monkeypatch):
+        """Settings.require_generation_approval=false restores the
+        previous fully-autonomous behavior, opt-in only."""
+        settings = _settings(
+            enable_media_generation=True,
+            ima_api_key=SecretStr("ima_x"),
+            require_generation_approval=False,
+        )
+        monkeypatch.setattr(orchestrator_nodes, "get_settings", lambda: settings)
+        import media_gen
+
+        monkeypatch.setattr(media_gen, "get_ima_client", lambda settings: object())
+        monkeypatch.setattr(
+            media_gen,
+            "generate_image",
+            lambda client, prompt: media_gen.MediaResult(
+                status="completed", url="https://cdn.example/img.png", model="seedream-4.5"
+            ),
+        )
+        monkeypatch.setattr(
+            media_gen, "download_media_bytes", lambda url, timeout=30.0: (b"bytes", "image/png")
+        )
+        result = generation_node({"question": "generate a picture of a cat"})
+        assert result["generation_result"]["status"] == "succeeded"
+        assert result["generation_result"]["media_id"]
+
+
+class TestExecuteGeneration:
+    """Unit tests for `execute_generation` -- the function that actually
+    calls IMA, whether reached via `generation_node` (approval disabled) or
+    `POST /generate/confirm` (approval required, the default). Mocks
+    `media_gen`'s client construction and `generate_image`/`generate_video`/
+    `download_media_bytes` -- never a real network call, even though image
+    generation is separately confirmed working against a real IMA account
+    (see `media_gen/client.py`'s module docstring)."""
+
+    @pytest.fixture(autouse=True)
+    def _reset_media_generation_limiter(self):
+        """Same reasoning as test_agent_nodes.py's `_reset_llm_call_limiter`
+        -- `get_media_generation_limiter` is a module-level singleton, so
+        tests in this class would otherwise share one running counter.
+        Unlike that fixture, this clears the singleton back to unconstructed
+        (rather than calling the getter with one fixed limit/window) since
+        `test_rate_limit_blocks_after_the_configured_number_of_calls` below
+        needs its own `_settings(media_gen_rate_limit=1, ...)` to actually
+        take effect on first construction, not be silently ignored because
+        an earlier test already built the singleton with a different limit."""
+        import agent.rate_limit as rate_limit_module
+
+        rate_limit_module._media_generation_limiter = None
+        yield
+        rate_limit_module._media_generation_limiter = None
+
     def test_successful_generation_returns_media_id(self, monkeypatch):
-        """The raw provider URL must never reach `generation_result` --
+        """The raw provider URL must never reach `MediaGenerationResult` --
         only an opaque `media_id` to fetch via `GET /media/{media_id}`
         (api/media.py) -- and `answer` must never contain a link either."""
         settings = _settings(enable_media_generation=True, ima_api_key=SecretStr("ima_x"))
@@ -455,14 +637,16 @@ class TestGenerationNode:
         monkeypatch.setattr(
             media_gen, "download_media_bytes", lambda url, timeout=30.0: (b"bytes", "image/png")
         )
-        result = generation_node({"question": "generate a chart-style image of top sales"})
-        assert result["generation_result"]["status"] == "succeeded"
-        assert result["generation_result"]["media_id"]
-        assert result["generation_result"]["media_type"] == "image"
-        assert "http" not in result["generation_result"]["answer"]
-        assert "://" not in result["generation_result"]["answer"]
+        result = orchestrator_nodes.execute_generation(
+            "generate a chart-style image of top sales", "image", settings
+        )
+        assert result["status"] == "succeeded"
+        assert result["media_id"]
+        assert result["media_type"] == "image"
+        assert "http" not in result["answer"]
+        assert "://" not in result["answer"]
 
-        cached = media_gen.get_media_cache().get(result["generation_result"]["media_id"])
+        cached = media_gen.get_media_cache().get(result["media_id"])
         assert cached is not None
         assert cached.data == b"bytes"
         assert cached.content_type == "image/png"
@@ -489,11 +673,13 @@ class TestGenerationNode:
 
         monkeypatch.setattr(media_gen, "download_media_bytes", _fail_download)
 
-        result = generation_node({"question": "generate a picture of a cat"})
-        assert result["generation_result"]["status"] == "failed"
-        assert result["generation_result"]["media_id"] is None
+        result = orchestrator_nodes.execute_generation(
+            "generate a picture of a cat", "image", settings
+        )
+        assert result["status"] == "failed"
+        assert result["media_id"] is None
 
-    def test_video_phrased_question_calls_generate_video_not_generate_image(self, monkeypatch):
+    def test_video_kind_calls_generate_video_not_generate_image(self, monkeypatch):
         settings = _settings(enable_media_generation=True, ima_api_key=SecretStr("ima_x"))
         monkeypatch.setattr(orchestrator_nodes, "get_settings", lambda: settings)
         import media_gen
@@ -504,7 +690,7 @@ class TestGenerationNode:
         )
 
         def _fail_if_called(*args, **kwargs):
-            raise AssertionError("generate_image must not be called for a video-phrased question")
+            raise AssertionError("generate_image must not be called for a video kind")
 
         monkeypatch.setattr(media_gen, "generate_image", _fail_if_called)
         monkeypatch.setattr(
@@ -515,15 +701,16 @@ class TestGenerationNode:
             ),
         )
 
-        result = generation_node({"question": "animate the growth in spend over the year"})
-        assert result["generation_result"]["status"] == "succeeded"
-        assert result["generation_result"]["media_type"] == "video"
+        result = orchestrator_nodes.execute_generation(
+            "animate the growth in spend over the year", "video", settings
+        )
+        assert result["status"] == "succeeded"
+        assert result["media_type"] == "video"
 
     def test_provider_failure_surfaces_as_clean_message(self, monkeypatch):
         """A rejection/error from IMA (e.g. insufficient credits, an
         invalid key, no model available for the account) must become a
-        clean generation_result, never an uncaught exception reaching the
-        orchestrator graph."""
+        clean MediaGenerationResult, never an uncaught exception."""
         settings = _settings(enable_media_generation=True, ima_api_key=SecretStr("ima_x"))
         monkeypatch.setattr(orchestrator_nodes, "get_settings", lambda: settings)
         import media_gen
@@ -536,9 +723,11 @@ class TestGenerationNode:
                 status="failed", error="IMA API error 404 on POST /v1/images/generate: ..."
             ),
         )
-        result = generation_node({"question": "generate a picture of a cat"})
-        assert result["generation_result"]["status"] == "failed"
-        assert "Image generation failed" in result["generation_result"]["answer"]
+        result = orchestrator_nodes.execute_generation(
+            "generate a picture of a cat", "image", settings
+        )
+        assert result["status"] == "failed"
+        assert "Image generation failed" in result["answer"]
 
     def test_rate_limit_blocks_after_the_configured_number_of_calls(self, monkeypatch):
         """Confirms the sliding-window limiter is actually checked before
@@ -564,17 +753,19 @@ class TestGenerationNode:
             media_gen, "download_media_bytes", lambda url, timeout=30.0: (b"bytes", "image/png")
         )
 
-        first = generation_node({"question": "generate a picture of a cat"})
-        second = generation_node({"question": "generate a picture of a dog"})
+        first = orchestrator_nodes.execute_generation(
+            "generate a picture of a cat", "image", settings
+        )
+        second = orchestrator_nodes.execute_generation(
+            "generate a picture of a dog", "image", settings
+        )
 
-        assert first["generation_result"]["status"] == "succeeded"
-        assert second["generation_result"]["status"] == "failed"
-        assert "too many" in second["generation_result"]["answer"].lower()
+        assert first["status"] == "succeeded"
+        assert second["status"] == "failed"
+        assert "too many" in second["answer"].lower()
         assert call_count["n"] == 1  # the second call never reached media_gen at all
 
-    def test_basic_prompt_safety_check_rejects_before_any_api_call(self, monkeypatch):
-        settings = _settings(enable_media_generation=True, ima_api_key=SecretStr("ima_x"))
-        monkeypatch.setattr(orchestrator_nodes, "get_settings", lambda: settings)
+    def test_safety_check_rejects_before_any_api_call(self, monkeypatch):
         import media_gen
 
         def _fail_if_called(*args, **kwargs):
@@ -582,9 +773,11 @@ class TestGenerationNode:
 
         monkeypatch.setattr(media_gen, "generate_image", _fail_if_called)
 
-        result = generation_node({"question": "generate an explicit image of X"})
-        assert result["generation_result"]["status"] == "failed"
-        assert "content policy" in result["generation_result"]["answer"].lower()
+        result = orchestrator_nodes.execute_generation(
+            "generate an explicit image of X", "image", _settings()
+        )
+        assert result["status"] == "failed"
+        assert "content policy" in result["answer"].lower()
 
 
 class TestSynthesisNode:

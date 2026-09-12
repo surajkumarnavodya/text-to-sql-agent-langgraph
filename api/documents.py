@@ -9,10 +9,11 @@ second implementation of ingestion, storage, or the sensitivity gate.
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile, status
 from fastapi.responses import Response
 
 from api.auth import verify_api_key
+from api.rate_limit import enforce_api_action_rate_limit
 from api.schemas import DocumentListResponse, DocumentOut, DocumentUploadResponse
 from config.settings import get_settings
 from rag.ingestion import ingest_pdf
@@ -78,22 +79,47 @@ def list_documents_route(collection: Collection | None = None) -> DocumentListRe
 
 @router.post("/documents", response_model=DocumentUploadResponse)
 async def upload_document(
+    request: Request,
     file: UploadFile = File(...),
     collection: Collection = Form(...),
     sensitivity_category: SensitivityCategory = Form(default=None),
 ) -> DocumentUploadResponse:
     """Ingests one PDF into the "documents" or "policies" collection --
     mirrors the Knowledge Sources page's upload form, including the
-    optional sensitivity-category selector used for "policies" uploads."""
+    optional sensitivity-category selector used for "policies" uploads.
+
+    Rate-limited per client IP (`enforce_api_action_rate_limit`) -- PDF
+    ingestion (extract, chunk, embed) is real, non-trivial work. Reads at
+    most `max_document_upload_mb + 1` bytes regardless of how large the
+    actual upload claims to be (rather than `file.read()`'s previous
+    unbounded read), and rejects anything not actually PDF-shaped by magic
+    bytes -- previously the only "validation" was `pypdf` failing to parse
+    non-PDF content after the fact.
+    """
+    settings = get_settings()
+    enforce_api_action_rate_limit(request, "document_upload", settings)
     _require_collection_configured(collection)
-    file_bytes = await file.read()
+
+    max_bytes = settings.max_document_upload_mb * 1024 * 1024
+    file_bytes = await file.read(max_bytes + 1)
+    if len(file_bytes) > max_bytes:
+        raise HTTPException(
+            status_code=status.HTTP_413_CONTENT_TOO_LARGE,
+            detail=f"File exceeds the {settings.max_document_upload_mb}MB upload limit.",
+        )
+    if not file_bytes.startswith(b"%PDF-"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Only PDF files are supported (the uploaded file isn't PDF-shaped).",
+        )
+
     try:
         result = ingest_pdf(
             file_bytes,
             file.filename or "upload.pdf",
             collection,
             sensitivity_category=sensitivity_category,
-            settings=get_settings(),
+            settings=settings,
         )
     except RagStoreNotConfiguredError as exc:
         raise HTTPException(
@@ -113,13 +139,17 @@ async def upload_document(
 
 
 @router.delete("/documents/{document_id}", status_code=status.HTTP_204_NO_CONTENT)
-def delete_document_route(document_id: str) -> None:
+def delete_document_route(document_id: str, request: Request) -> None:
     """Deletes a document and its chunks -- mirrors the management page's
     unconditional delete button (this page's admin surface is already
     fully-privileged/no-per-user-authorization, same as the Streamlit one;
-    see CLAUDE.md's "Document/policy agentic RAG" section)."""
+    see CLAUDE.md's "Document/policy agentic RAG" section). Rate-limited
+    per client IP (`enforce_api_action_rate_limit`) -- an irreversible,
+    previously-unrated action."""
+    settings = get_settings()
+    enforce_api_action_rate_limit(request, "document_delete", settings)
     try:
-        engine = get_rag_engine(get_settings())
+        engine = get_rag_engine(settings)
     except RagStoreNotConfiguredError as exc:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)

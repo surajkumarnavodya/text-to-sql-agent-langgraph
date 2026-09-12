@@ -67,6 +67,16 @@ def _mock_settings(monkeypatch):
     return _BASE_SETTINGS
 
 
+@pytest.fixture(autouse=True)
+def _reset_api_action_limiters():
+    """See test_api_execute.py's fixture of the same name/reasoning."""
+    import api.rate_limit as api_rate_limit
+
+    api_rate_limit._limiters.clear()
+    yield
+    api_rate_limit._limiters.clear()
+
+
 @pytest.fixture
 def client() -> TestClient:
     return TestClient(api_main.app)
@@ -171,6 +181,71 @@ class TestUploadDocument:
         assert response.status_code == 422
         assert not called
 
+    def test_non_pdf_content_is_rejected_by_magic_bytes(self, monkeypatch, client):
+        """SEC-09: previously the only "validation" was `pypdf` failing to
+        parse non-PDF content after the fact -- confirm `ingest_pdf` is
+        never even reached for content that isn't PDF-shaped."""
+
+        def _fail_if_called(*a, **k):
+            raise AssertionError("ingest_pdf must not be called for non-PDF content")
+
+        monkeypatch.setattr("api.documents.ingest_pdf", _fail_if_called)
+
+        response = client.post(
+            "/documents",
+            files={"file": ("not-a-pdf.pdf", b"<html>fake</html>", "application/pdf")},
+            data={"collection": "documents"},
+        )
+
+        assert response.status_code == 400
+        assert "PDF" in response.json()["detail"]
+
+    def test_oversized_upload_is_rejected_before_ingestion(self, monkeypatch, client):
+        """SEC-09: previously `file.read()` had no cap at all -- confirm
+        an upload past `max_document_upload_mb` is rejected, not silently
+        read in full."""
+
+        def _fail_if_called(*a, **k):
+            raise AssertionError("ingest_pdf must not be called for an oversized upload")
+
+        monkeypatch.setattr("api.documents.ingest_pdf", _fail_if_called)
+        settings = Settings(**{**_BASE_SETTINGS.__dict__, "max_document_upload_mb": 1})
+        monkeypatch.setattr("api.documents.get_settings", lambda: settings)
+
+        oversized = b"%PDF-1.4" + (b"a" * (2 * 1024 * 1024))  # 2MB, over the 1MB cap
+        response = client.post(
+            "/documents",
+            files={"file": ("big.pdf", oversized, "application/pdf")},
+            data={"collection": "documents"},
+        )
+
+        assert response.status_code == 413
+
+    def test_upload_rate_limit_trip_returns_429(self, monkeypatch, client):
+        """SEC-08: /documents (upload) previously had no rate limit at all."""
+        settings = Settings(**{**_BASE_SETTINGS.__dict__, "api_action_rate_limit_per_minute": 1})
+        monkeypatch.setattr("api.documents.get_settings", lambda: settings)
+        monkeypatch.setattr(
+            "api.documents.ingest_pdf",
+            lambda file_bytes, filename, collection, sensitivity_category=None, settings=None: (
+                IngestionResult(
+                    document_id="doc-x", filename=filename, status="ready", chunk_count=1
+                )
+            ),
+        )
+
+        def _upload():
+            return client.post(
+                "/documents",
+                files={"file": ("f.pdf", b"%PDF-1.4", "application/pdf")},
+                data={"collection": "documents"},
+            )
+
+        first = _upload()
+        second = _upload()
+        assert first.status_code == 200
+        assert second.status_code == 429
+
 
 class TestDeleteDocument:
     def test_deletes_and_returns_204(self, monkeypatch, client):
@@ -184,6 +259,19 @@ class TestDeleteDocument:
 
         assert response.status_code == 204
         assert called["document_id"] == "doc-1"
+
+    def test_delete_rate_limit_trip_returns_429(self, monkeypatch, client):
+        """SEC-08: /documents/{id} (delete) previously had no rate limit
+        at all -- an irreversible action."""
+        settings = Settings(**{**_BASE_SETTINGS.__dict__, "api_action_rate_limit_per_minute": 1})
+        monkeypatch.setattr("api.documents.get_settings", lambda: settings)
+        monkeypatch.setattr("api.documents.delete_document", lambda engine, document_id: None)
+
+        first = client.delete("/documents/doc-1")
+        second = client.delete("/documents/doc-2")
+
+        assert first.status_code == 204
+        assert second.status_code == 429
 
 
 class TestDownloadDocument:

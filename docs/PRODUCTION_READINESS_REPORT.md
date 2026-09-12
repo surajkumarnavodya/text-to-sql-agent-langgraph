@@ -27,6 +27,27 @@ below.
 > `scripts/run_benchmark.py` against the current code is the way to get an
 > updated score; this addendum intentionally doesn't guess one.
 
+> **Second addendum (2026-09-13, not re-scored):** a dedicated Agentic-AI
+> security audit covered the multi-source orchestrator, RAG, web search,
+> and media generation — all added after this report's 2026-09-01 Security
+> sub-score (15/20) was set, and none of it was in scope for that number.
+> The audit found the newer surface had none of the SQL pipeline's
+> authorization/approval/audit patterns and closed what was safely fixable
+> without a larger identity/authorization rebuild: an SSRF gap in the media
+> download path, a missing human-approval gate before media generation's
+> real-money provider calls, rate limits on four previously-unrated API
+> routes, an upload size/type cap, a session-scoped expensive-source cost
+> ceiling, audit-log parity for the orchestrator, Docker hardening (digest
+> pin, localhost-only port binds), and a report-only CI dependency scan
+> (which surfaced a real 65-advisory backlog across 10 pinned packages,
+> not triaged in this pass). Deliberately **not** attempted: a real per-user
+> identity/authorization layer (`docs/RISK_REGISTER.md`'s R-008) — the same
+> "real architectural project, not a hardening task" reasoning this
+> report's own R-001 already gave for the SQL pipeline's equivalent gap.
+> The test suite grew from 767 to 788 passing tests. See
+> `docs/security-changelog.md`'s 2026-09-13 entry for the full list and
+> `docs/RISK_REGISTER.md`'s R-008 through R-011 for what's still open.
+
 ---
 
 ## Score: 69 / 100

@@ -8,6 +8,7 @@ import type {
   ExecuteResponse,
   GoldenExampleFeedbackRequest,
   HealthResponse,
+  MediaGenerationResult,
   SchemaRefreshResponse,
   SensitivityCategory,
   TablesResponse,
@@ -59,6 +60,18 @@ export function askQuestion(payload: AskRequest): Promise<AskResponse> {
 
 export function executeSql(payload: ExecuteRequest): Promise<ExecuteResponse> {
   return request<ExecuteResponse>('/execute', { method: 'POST', body: JSON.stringify(payload) })
+}
+
+/** The human-approval confirmation step for media generation -- the
+ * "generation" source equivalent of `executeSql` above. `question` is
+ * normally the exact text that produced the `status: 'pending_approval'`
+ * proposal (see MediaResultCard.tsx); the server re-infers image-vs-video
+ * from it and only then makes the real, metered IMA Studio call. */
+export function confirmGeneration(question: string): Promise<MediaGenerationResult> {
+  return request<MediaGenerationResult>('/generate/confirm', {
+    method: 'POST',
+    body: JSON.stringify({ question }),
+  })
 }
 
 export function submitGoldenExampleFeedback(

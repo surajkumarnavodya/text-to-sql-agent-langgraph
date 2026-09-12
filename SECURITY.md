@@ -316,6 +316,54 @@ this code path runs at all.
   knowing if "no data leaves the machine" was part of why you chose this
   project — it's no longer true once `ENABLE_WEB_SEARCH` is on.
 
+## Media generation (image/video, optional, off by default)
+
+Same `ENABLE_MULTI_SOURCE_ROUTER=true` gate as above, plus its own
+`ENABLE_MEDIA_GENERATION`/`IMA_API_KEY`. Distinct from every other source
+here in one way that matters: a successful generation spends real, metered
+third-party (IMA Studio) credit, not just compute — it gets controls the
+others don't need.
+
+- **Human approval before any provider call, by default
+  (`REQUIRE_GENERATION_APPROVAL=true`).** The router picking "generation"
+  no longer means IMA gets called — `generation_node` only proposes what
+  would be generated (no charge, nothing downloaded/cached) until a human
+  explicitly confirms via `POST /generate/confirm` or the matching UI
+  button (React and Streamlit both). This mirrors "Confirm and Run" for
+  SQL, applied to the one source here that costs real money. Set
+  `false` only for a trusted automation context that has already reviewed
+  this tradeoff.
+- **The generated asset's provider URL never reaches the LLM, the API
+  response, or the client.** `generation_node` downloads the bytes once
+  server-side and caches them under an opaque id
+  (`media_gen/cache.py`); everything downstream (`answer` text, the API
+  schema, both UIs) only ever carries that id, fetched back via
+  `GET /media/{media_id}`.
+- **The download step is SSRF-hardened.** The provider's response URL is
+  not trusted blindly before this app's own server fetches it — HTTPS-only,
+  and the resolved address is rejected if it falls in a private/loopback/
+  link-local/reserved range (`media_gen/download.py::_validate_download_url`).
+  Closes a real path for a compromised/malicious provider response to make
+  this server reach internal infrastructure.
+- **Content-policy check is a heuristic, not real moderation** — say so
+  plainly rather than implying otherwise. `_basic_prompt_safety_check`
+  blocks a broadened-but-still-partial keyword list (explicit/sexual
+  content, minors, graphic violence, self-harm, deepfake requests); a
+  synonym, a non-English phrasing, or an indirect description gets past
+  it. See `docs/RESPONSIBLE_AI.md`'s media-generation section for the full
+  disclosure.
+- **Three independent rate/cost limits, not one.** The existing process-wide
+  `MEDIA_GEN_RATE_LIMIT`/`_WINDOW_SECONDS`; a new per-client-IP limit on
+  `POST /generate/confirm` itself (`API_ACTION_RATE_LIMIT_PER_MINUTE`,
+  `api/rate_limit.py`); and a new session-scoped ceiling on combined
+  `generation`+`web` invocations (`SESSION_EXPENSIVE_SOURCE_LIMIT`/
+  `_WINDOW_SECONDS`) — a single question can trigger both sources at once,
+  and nothing previously capped how many times one session could keep
+  doing that. That last one is a cost-control speed bump keyed on an
+  unauthenticated `session_id` correlation token, not an access-control
+  boundary — see `docs/RISK_REGISTER.md`'s R-011 for the honest limit of
+  what it actually guarantees.
+
 ## Resource exhaustion / abuse protections
 
 Two independent, deliberately simple protections guard against both
@@ -426,6 +474,19 @@ real per-user authentication; see `docs/API.md`'s "Auth" section and
 `docs/RISK_REGISTER.md`'s R-001. Anything reachable beyond a trusted local
 network, UI or API, needs a real authenticating reverse proxy in front of
 it — see `docs/DEPLOYMENT.md`.
+
+**2026-09-13 addition:** `POST /execute`, `POST /schema/refresh`, and the
+mutating `/documents` routes previously had no rate limit at all (only
+`/ask` did). All four now go through a shared per-client-IP limiter
+(`api/rate_limit.py::enforce_api_action_rate_limit`,
+`API_ACTION_RATE_LIMIT_PER_MINUTE`) — the same limitation as the existing
+per-IP question limiter applies (evadable by changing IP; a soft control
+appropriate for this app's single-user/local-trust posture, not a
+substitute for the authenticating reverse proxy above). `POST /documents`
+also gained a hard upload-size cap (`MAX_DOCUMENT_UPLOAD_MB`, default 25)
+and a magic-byte check rejecting non-PDF content before parsing —
+previously the entire upload was read into memory unbounded, and "not a
+PDF" was only ever discovered by `pypdf` failing partway through.
 
 ## Bottom line
 

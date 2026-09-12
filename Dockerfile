@@ -9,7 +9,18 @@
 # Python-version note); the pinned driver versions in requirements.txt were
 # chosen for 3.14 wheel availability on that dev machine and have not been
 # independently verified against 3.11 here -- see docs/RISK_REGISTER.md.
-FROM python:3.11-slim AS base
+#
+# Digest-pinned (not just the floating `3.11-slim` tag) -- the tag can be
+# silently repointed at a different image by the upstream maintainer at any
+# time; the digest can't. This is the manifest-*list* digest (multi-arch),
+# verified against Docker Hub's own registry API at the time this was
+# pinned (`docker-content-digest` response header for
+# `python:3.11-slim`), not guessed -- resolves per-architecture at pull
+# time exactly like the tag did, just immutably. Re-verify and update this
+# digest deliberately (a real, reviewed bump), not automatically, the same
+# change-controlled treatment `docs/GOVERNANCE.md` already gives other
+# security-relevant config.
+FROM python:3.11-slim@sha256:9534e5a8e315485d4061ed659af0fd78a284c015f9b73661b41d6bab25604534 AS base
 
 # unixodbc-dev: build/runtime headers pyodbc needs for DB_TYPE=mssql (see
 # requirements.txt's pyodbc pin). Does NOT include Microsoft's ODBC Driver

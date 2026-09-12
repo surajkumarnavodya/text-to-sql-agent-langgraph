@@ -154,11 +154,18 @@ incidental side effect of an unrelated commit:
 - The sensitivity/classification config (`config/sensitive_columns.yaml`
   — see above).
 - Rate limits (`QUESTION_RATE_LIMIT_PER_MINUTE`,
-  `LLM_CALL_RATE_LIMIT_PER_MINUTE` — `agent/rate_limit.py`,
-  `config/settings.py`).
+  `LLM_CALL_RATE_LIMIT_PER_MINUTE`, `API_ACTION_RATE_LIMIT_PER_MINUTE`,
+  `MEDIA_GEN_RATE_LIMIT`/`_WINDOW_SECONDS`,
+  `SESSION_EXPENSIVE_SOURCE_LIMIT`/`_WINDOW_SECONDS` — `agent/rate_limit.py`,
+  `api/rate_limit.py`, `config/settings.py`).
 - Cost-estimation thresholds (`COST_MODERATE_ROW_THRESHOLD`,
   `COST_HIGH_ROW_THRESHOLD`, `COST_ESTIMATION_ENABLED` —
   `db/query_cost.py`, `config/settings.py`).
+- The media-generation content-policy check
+  (`agent.orchestrator.nodes._DISALLOWED_PROMPT_SUBSTRINGS`) and the
+  human-approval gate in front of it (`REQUIRE_GENERATION_APPROVAL` —
+  added 2026-09-13, since generation is the one orchestrator source that
+  spends real, metered money).
 
 Every such change gets a dated entry in
 [`security-changelog.md`](security-changelog.md), separate from ordinary

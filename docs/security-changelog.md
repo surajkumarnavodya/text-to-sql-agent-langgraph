@@ -10,9 +10,13 @@ it from `git log` across unrelated commits.
 (`agent/sql_validator.py`), the column-sensitivity classification config
 (once it exists — see `GOVERNANCE.md`'s data classification policy),
 rate limits (`QUESTION_RATE_LIMIT_PER_MINUTE`,
-`LLM_CALL_RATE_LIMIT_PER_MINUTE`), or cost-estimation thresholds
-(`COST_MODERATE_ROW_THRESHOLD`, `COST_HIGH_ROW_THRESHOLD`,
-`COST_ESTIMATION_ENABLED`).
+`LLM_CALL_RATE_LIMIT_PER_MINUTE`, `API_ACTION_RATE_LIMIT_PER_MINUTE`,
+`MEDIA_GEN_RATE_LIMIT`/`_WINDOW_SECONDS`,
+`SESSION_EXPENSIVE_SOURCE_LIMIT`/`_WINDOW_SECONDS`), cost-estimation
+thresholds (`COST_MODERATE_ROW_THRESHOLD`, `COST_HIGH_ROW_THRESHOLD`,
+`COST_ESTIMATION_ENABLED`), the media-generation content-policy check
+(`agent.orchestrator.nodes._DISALLOWED_PROMPT_SUBSTRINGS`), or the
+media-generation human-approval gate (`REQUIRE_GENERATION_APPROVAL`).
 
 **Entry format:** date, what changed (old → new), why, and whether it's a
 permanent change or a time-boxed exception (cross-reference the matching
@@ -245,6 +249,87 @@ test_aggregate_nesting_error_retries_via_generate_sql`,
 `tests/test_agent_nodes.py::TestPlanQueryNode`,
 `tests/test_agent_nodes.py::TestReviewSqlNode`,
 `tests/test_llm_client_planning.py`, `tests/test_complexity.py`.
+
+---
+
+## 2026-09-13 — Agentic-AI security audit: media-generation hardening + new cost/rate-limit controls
+
+**Change:** A security audit specifically covering the multi-source
+orchestrator, RAG, web search, and media generation (all added since the
+2026-09-01 audit this changelog/register originally scored) found and
+closed several gaps, all in change-controlled surfaces:
+
+1. **SSRF fix, `media_gen/download.py`.** `download_media_bytes` fetched
+   whatever URL IMA's API response contained with no validation at all.
+   Now HTTPS-only, and the resolved address is rejected if it falls in a
+   private/loopback/link-local/reserved range (`_validate_download_url`)
+   — closes a real path for a compromised/malicious provider response to
+   make this server fetch internal infrastructure.
+2. **Human-in-the-loop approval gate for media generation,
+   `REQUIRE_GENERATION_APPROVAL` (new setting, default `true`).**
+   Generation is the only orchestrator source that spends real, metered
+   money — it previously fired the instant the router picked it, with no
+   confirmation step, unlike the SQL pipeline's "Confirm and Run" gate.
+   `generation_node` now only proposes (`status="pending_approval"`, no
+   provider call, no charge) until a human confirms via the new
+   `POST /generate/confirm` (`api/generation.py`) or Streamlit's matching
+   "Generate" button — both call the newly-extracted `execute_generation`,
+   the one function that actually calls IMA.
+3. **Strengthened (still heuristic) content-policy check,
+   `agent.orchestrator.nodes._DISALLOWED_PROMPT_SUBSTRINGS`.** Broadened
+   from 2 substrings to explicit categories (explicit/sexual content,
+   minors, graphic violence, self-harm, deepfake requests). Still
+   explicitly documented as a keyword heuristic, not real ML-based
+   moderation — see `docs/RESPONSIBLE_AI.md`'s new media-generation
+   section for the full honesty disclosure.
+4. **New rate limits closing previously-unrated routes.**
+   `API_ACTION_RATE_LIMIT_PER_MINUTE` (new setting) now gates `POST
+   /execute`, `POST /schema/refresh`, and the mutating `/documents` routes
+   (`api/rate_limit.py`, a new shared per-client-IP limiter) — none of
+   these had any rate limit before. `POST /generate/confirm` gets the same
+   treatment plus the existing process-wide `MEDIA_GEN_RATE_LIMIT`.
+5. **Session-scoped expensive-source cost ceiling,
+   `SESSION_EXPENSIVE_SOURCE_LIMIT`/`_WINDOW_SECONDS` (new settings).**
+   A single question can fan out to both `generation` and `web` at once
+   (observed, real router behavior); nothing previously capped how many
+   times one session could keep doing that across many questions.
+   `router_node` now drops those two sources from a turn's routing once a
+   session's budget is spent, falling back to `sql` (see
+   `docs/RISK_REGISTER.md`'s R-011 for this control's own honestly-disclosed
+   limit — it's a cost control keyed on an unauthenticated correlation
+   token, not an access-control boundary).
+6. **Upload hardening, `api/documents.py`.** `POST /documents` previously
+   read an unbounded upload into memory with no type check beyond `pypdf`
+   failing to parse non-PDF content. Now capped at
+   `MAX_DOCUMENT_UPLOAD_MB` (new setting, default 25) and magic-byte
+   checked (`%PDF-`) before any parsing is attempted.
+7. **Audit-log parity for the orchestrator.** `router_node`/`generation_node`
+   previously used only plain module logging; security-relevant events
+   (generation routed, rejected, rate-limited, succeeded/failed, the new
+   session-ceiling trip) now also go through `security.audit_log
+   .log_security_event`, matching the SQL pipeline's existing pattern.
+8. **Docker hardening.** The base image is now digest-pinned (verified
+   against Docker Hub's own registry API at pin time, not guessed — see
+   `Dockerfile`'s own comment), and `docker-compose.yml`'s port mappings
+   default to `127.0.0.1` (`APP_BIND_HOST`/`API_BIND_HOST`, new, optional
+   overrides) instead of binding every host interface.
+9. **CI dependency scanning, report-only.** `.github/workflows/ci.yml`
+   gained a `pip-audit` step (`continue-on-error: true` — see
+   `docs/RISK_REGISTER.md`'s new R-010 for why it isn't a hard gate yet).
+
+**Why:** The new agentic-routing/RAG/media-generation surface added after
+the 2026-09-01 audit had none of the authorization/approval/audit patterns
+already established for the SQL pipeline — this pass closed the gaps that
+were safely closeable without a larger identity/authorization-layer
+rebuild (tracked separately as `docs/RISK_REGISTER.md`'s R-008, deliberately
+not attempted in this pass).
+
+**Status:** Permanent (all of the above). New regression coverage across
+`tests/test_media_gen.py` (SSRF), `tests/test_orchestrator.py`
+(`TestGenerationNode`'s approval-gate tests, `TestExecuteGeneration`,
+`TestRouterNode`'s session-ceiling tests), `tests/test_api_documents.py`,
+`tests/test_api_execute.py`, and new `tests/test_api_generation.py`/
+`tests/test_api_rate_limit.py`.
 
 ---
 

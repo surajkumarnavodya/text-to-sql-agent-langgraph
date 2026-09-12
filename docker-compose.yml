@@ -13,7 +13,14 @@ services:
     build: .
     image: text-to-sql-dashboard:latest
     ports:
-      - "8501:8501"
+      # Bound to 127.0.0.1 by default -- secure by default, since an
+      # unqualified "8501:8501" mapping binds all host interfaces (reachable
+      # from the whole network the host is on, not just localhost). Set
+      # APP_BIND_HOST=0.0.0.0 in .env (or your actual reverse-proxy-facing
+      # interface) if you deliberately want this reachable beyond the host
+      # itself -- see docs/DEPLOYMENT.md for the recommended
+      # authenticating-reverse-proxy pattern before doing that.
+      - "${APP_BIND_HOST:-127.0.0.1}:8501:8501"
     env_file:
       - .env
     extra_hosts:
@@ -45,7 +52,9 @@ services:
         "8000",
       ]
     ports:
-      - "8000:8000"
+      # Same reasoning as `app`'s port mapping above -- localhost-only by
+      # default; override with API_BIND_HOST in .env if intentional.
+      - "${API_BIND_HOST:-127.0.0.1}:8000:8000"
     env_file:
       - .env
     extra_hosts:

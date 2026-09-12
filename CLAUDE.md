@@ -622,29 +622,48 @@ clone never spends real IMA credits without the operator deliberately
 opting in. Two design points worth knowing if you touch this:
 
 - **Image vs. video is a cheap keyword heuristic, not a second LLM call**
-  (`generation_node._infer_media_kind`, mirroring `agent/complexity.py`'s
+  (`generation_node.infer_media_kind`, mirroring `agent/complexity.py`'s
   own regex-heuristic style) — a question containing "video"/"clip"/
   "animate"/"animation"/"footage"/"motion" gets `generate_video`, else
   `generate_image`. `generate_audio` is built and tested but not
   auto-routed here (nothing in this feature's scope asks for audio).
 - **Generated media is served through this app, never the provider's raw
-  CDN URL.** `generation_node` downloads the bytes once
-  (`media_gen.download.download_media_bytes`) and stores them under an
-  opaque id in a bounded, process-lifetime in-memory cache
-  (`media_gen.cache.MediaCache`, FIFO eviction past 100 entries, not
-  persisted — a restart loses in-flight generated media, an accepted
-  tradeoff same as this app's other process-global caches). Neither
-  `MediaGenerationResult.answer` nor the API's `MediaGenerationResultOut`
-  ever carries the raw URL — only `media_id`. The React frontend fetches
-  the bytes via the new authenticated `GET /media/{media_id}`
-  (`api/media.py`, mirroring `api/documents.py`'s PDF download route) and
-  renders an `<img>`/`<video>` from a blob object URL
-  (`MediaResultCard.tsx`); `ui/app.py` runs `run_orchestrated` in-process
-  and reads the cache directly (`_render_generation_result`), no HTTP round
-  trip needed. This was chosen over persisting to a DB column (bigger
-  lift, no real need yet) or passing the provider's URL straight through
-  (simpler, but the link can expire and there's no server-side
-  re-inspection of the bytes before display).
+  CDN URL.** `execute_generation` (the function that actually calls IMA —
+  see "Human-in-the-loop approval gate" below) downloads the bytes once
+  (`media_gen.download.download_media_bytes`, SSRF-hardened — see its own
+  module docstring) and stores them under an opaque id in a bounded,
+  process-lifetime in-memory cache (`media_gen.cache.MediaCache`, FIFO
+  eviction past 100 entries, not persisted — a restart loses in-flight
+  generated media, an accepted tradeoff same as this app's other
+  process-global caches). Neither `MediaGenerationResult.answer` nor the
+  API's `MediaGenerationResultOut` ever carries the raw URL — only
+  `media_id`. The React frontend fetches the bytes via the authenticated
+  `GET /media/{media_id}` (`api/media.py`, mirroring `api/documents.py`'s
+  PDF download route) and renders an `<img>`/`<video>` from a blob object
+  URL (`MediaResultCard.tsx`); `ui/app.py` runs `run_orchestrated`
+  in-process and reads the cache directly (`_render_generation_result`),
+  no HTTP round trip needed. This was chosen over persisting to a DB
+  column (bigger lift, no real need yet) or passing the provider's URL
+  straight through (simpler, but the link can expire and there's no
+  server-side re-inspection of the bytes before display).
+- **Human-in-the-loop approval gate before any provider call
+  (`Settings.require_generation_approval`, default `true`).** Generation
+  is the only orchestrator source that spends real, metered money —
+  `generation_node` only *proposes* what would be generated
+  (`status="pending_approval"`, no `media_id`, nothing charged) until a
+  human explicitly confirms via `POST /generate/confirm`
+  (`api/generation.py`) or the matching "Generate" button in both UIs.
+  `execute_generation` (extracted out of the old `generation_node` body)
+  is the one function both the confirm endpoint and the
+  approval-disabled path call — it re-runs its own safety/rate-limit
+  checks regardless of which caller reaches it, since it has two
+  independent entry points. Mirrors the SQL pipeline's own "Confirm and
+  Run" gate, applied to the one source here that costs real money — see
+  `SECURITY.md`'s "Media generation" section for the full security
+  rationale (added 2026-09-13, alongside SSRF hardening, a strengthened
+  content-policy check, new rate limits, and a session-scoped
+  expensive-source cost ceiling — `docs/security-changelog.md`'s matching
+  entry has the complete list).
 - The router's `classify_sources` prompt carries explicit few-shot
   examples distinguishing a genuine "create new media" request from a
   plain "show me the data" one that merely mentions a picture/video in

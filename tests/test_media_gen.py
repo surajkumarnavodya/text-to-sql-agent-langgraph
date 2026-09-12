@@ -313,7 +313,15 @@ class TestGenerateVideo:
             assert result.url == "https://cdn.example/video.mp4"
 
 
+_PUBLIC_ADDRINFO = [(2, 1, 6, "", ("93.184.216.34", 0))]  # a real, public IPv4 (example.com)
+
+
 class TestDownloadMediaBytes:
+    """`_validate_download_url` resolves the hostname for real (see its own
+    docstring for why -- SSRF defense) before ever reaching `requests.get`,
+    so every test here mocks `socket.getaddrinfo` to a fixed public address
+    rather than depending on live DNS for a fake `cdn.example` host."""
+
     def test_success_returns_bytes_and_content_type(self):
         from media_gen.download import download_media_bytes
 
@@ -322,7 +330,10 @@ class TestDownloadMediaBytes:
             (),
             {"status_code": 200, "headers": {"Content-Type": "image/png"}, "content": b"abc"},
         )()
-        with patch("requests.get", return_value=mock_response):
+        with (
+            patch("socket.getaddrinfo", return_value=_PUBLIC_ADDRINFO),
+            patch("requests.get", return_value=mock_response),
+        ):
             data, content_type = download_media_bytes("https://cdn.example/img.png")
         assert data == b"abc"
         assert content_type == "image/png"
@@ -332,6 +343,7 @@ class TestDownloadMediaBytes:
 
         mock_response = type("Resp", (), {"status_code": 404, "headers": {}, "content": b""})()
         with (
+            patch("socket.getaddrinfo", return_value=_PUBLIC_ADDRINFO),
             patch("requests.get", return_value=mock_response),
             pytest.raises(MediaGenerationError, match="404"),
         ):
@@ -343,10 +355,60 @@ class TestDownloadMediaBytes:
         from media_gen.download import download_media_bytes
 
         with (
+            patch("socket.getaddrinfo", return_value=_PUBLIC_ADDRINFO),
             patch("requests.get", side_effect=requests.ConnectionError("boom")),
             pytest.raises(MediaGenerationError, match="Network error"),
         ):
             download_media_bytes("https://cdn.example/img.png")
+
+    def test_rejects_non_https_scheme(self):
+        from media_gen.download import download_media_bytes
+
+        with pytest.raises(MediaGenerationError, match="non-HTTPS"):
+            download_media_bytes("http://cdn.example/img.png")
+
+    def test_rejects_url_with_no_hostname(self):
+        from media_gen.download import download_media_bytes
+
+        with pytest.raises(MediaGenerationError, match="no hostname"):
+            download_media_bytes("https:///img.png")
+
+    def test_rejects_unresolvable_host(self):
+        import socket as socket_module
+
+        from media_gen.download import download_media_bytes
+
+        with (
+            patch("socket.getaddrinfo", side_effect=socket_module.gaierror("nope")),
+            pytest.raises(MediaGenerationError, match="Could not resolve"),
+        ):
+            download_media_bytes("https://does-not-exist.invalid/img.png")
+
+    @pytest.mark.parametrize(
+        "ip",
+        [
+            "127.0.0.1",  # loopback
+            "10.0.0.5",  # RFC1918 private
+            "169.254.169.254",  # cloud metadata endpoint
+            "192.168.1.1",  # RFC1918 private
+            "::1",  # IPv6 loopback
+        ],
+    )
+    def test_rejects_private_and_internal_addresses(self, ip):
+        from media_gen.download import download_media_bytes
+
+        family = 10 if ":" in ip else 2
+        with (
+            patch("socket.getaddrinfo", return_value=[(family, 1, 6, "", (ip, 0))]),
+            pytest.raises(MediaGenerationError, match="private/internal address"),
+        ):
+            download_media_bytes(f"https://malicious.example/{ip}")
+
+    def test_allows_a_genuinely_public_address(self):
+        from media_gen.download import _validate_download_url
+
+        with patch("socket.getaddrinfo", return_value=_PUBLIC_ADDRINFO):
+            _validate_download_url("https://cdn.example/img.png")  # must not raise
 
 
 class TestGenerateAudio:

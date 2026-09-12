@@ -47,7 +47,9 @@ from agent.sql_validator import enforce_row_limit, qualify_table_schema, validat
 from agent.state import ConversationExchange
 from api.auth import verify_api_key
 from api.documents import router as documents_router
+from api.generation import router as generation_router
 from api.media import router as media_router
+from api.rate_limit import enforce_api_action_rate_limit
 from api.schemas import (
     AskRequest,
     AskResponse,
@@ -145,6 +147,7 @@ app = FastAPI(
 )
 app.include_router(documents_router)
 app.include_router(media_router)
+app.include_router(generation_router)
 
 # No-op when Settings.cors_allowed_origins is empty (the default) -- a
 # same-origin deployment (the built React app served by this same FastAPI
@@ -483,7 +486,10 @@ def ask(payload: AskRequest, request: Request) -> AskResponse:
 
     try:
         final_state = run_orchestrated(
-            payload.question, conversation_history, enable_insight=payload.enable_insight
+            payload.question,
+            conversation_history,
+            enable_insight=payload.enable_insight,
+            session_id=session_id,
         )
     except AgentError as exc:
         # A source (schema retrieval today; document/policy RAG or web
@@ -507,7 +513,7 @@ def ask(payload: AskRequest, request: Request) -> AskResponse:
 
 
 @app.post("/execute", response_model=ExecuteResponse, dependencies=[Depends(verify_api_key)])
-def execute(payload: ExecuteRequest) -> ExecuteResponse:
+def execute(payload: ExecuteRequest, request: Request) -> ExecuteResponse:
     """Validates and executes a specific SQL string read-only -- the exact
     `validate_sql` -> `enforce_row_limit` -> `qualify_table_schema` ->
     `execute_readonly_sql` sequence `ui/app.py`'s "Confirm and Run" button
@@ -515,8 +521,12 @@ def execute(payload: ExecuteRequest) -> ExecuteResponse:
     "SQL is untrusted output, always" rule applied at this layer too: `sql`
     is always re-validated and re-executed exactly as supplied, never
     trusted because it happens to look like something `/ask` returned.
+
+    Rate-limited per client IP (`enforce_api_action_rate_limit`) -- unlike
+    `/ask`, this route previously had no rate limit of its own at all.
     """
     settings = get_settings()
+    enforce_api_action_rate_limit(request, "execute", settings)
     if not settings.databases:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="No database configured."
@@ -604,14 +614,21 @@ def feedback_golden_example(payload: GoldenExampleFeedbackRequest) -> GoldenExam
 @app.post(
     "/schema/refresh", response_model=SchemaRefreshResponse, dependencies=[Depends(verify_api_key)]
 )
-def schema_refresh() -> SchemaRefreshResponse:
+def schema_refresh(request: Request) -> SchemaRefreshResponse:
     """Re-introspects and re-embeds every configured database's schema --
     the same `refresh_all_schema_indexes` call the Streamlit sidebar's
     "Refresh Schema" button makes. Skips re-embedding a database whose
     schema fingerprint hasn't changed (see that function's docstring), so
     calling this when nothing changed is cheap.
+
+    Rate-limited per client IP (`enforce_api_action_rate_limit`) -- this
+    route previously had no rate limit of its own at all, despite
+    re-introspecting/re-embedding every configured database being real
+    work.
     """
-    results = refresh_all_schema_indexes(get_settings())
+    settings = get_settings()
+    enforce_api_action_rate_limit(request, "schema_refresh", settings)
+    results = refresh_all_schema_indexes(settings)
     return SchemaRefreshResponse(
         databases=[
             SchemaRefreshResult(database=db_name, table_count=len(tables))

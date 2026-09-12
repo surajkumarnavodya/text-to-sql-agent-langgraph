@@ -32,11 +32,16 @@ from agent.orchestrator.state import (
     RouteDecision,
     SourceAnswer,
 )
-from agent.rate_limit import MEDIA_GENERATION_LIMIT_MESSAGE, get_media_generation_limiter
+from agent.rate_limit import (
+    MEDIA_GENERATION_LIMIT_MESSAGE,
+    get_media_generation_limiter,
+    get_session_expensive_source_limiter,
+)
 from config.settings import Settings, get_settings
 from rag.graph import Citation
 from rag.store import RagStoreNotConfiguredError
 from search.web_search import WebSearchNotConfiguredError
+from security.audit_log import log_security_event
 
 logger = logging.getLogger(__name__)
 
@@ -199,6 +204,14 @@ def classify_sources(
     return picked, f"classified from question intent: {response!r}"
 
 
+# The two sources that either cost real money (generation) or make an
+# outbound call to a paid third-party API per question (web) -- see
+# router_node's session-level ceiling below. Neither "sql"/"documents"/
+# "policy" belongs here: they run against infrastructure this deployment
+# already owns, with no per-call third-party cost.
+_EXPENSIVE_SOURCES = ("generation", "web")
+
+
 def router_node(state: OrchestratorState) -> dict[str, Any]:
     """Decides which source(s) this question should be routed to.
 
@@ -211,6 +224,20 @@ def router_node(state: OrchestratorState) -> dict[str, Any]:
     Logged under its own `agent.orchestrator.nodes` category (distinct from
     the SQL pipeline's own per-node logs) so routing decisions are
     inspectable on their own -- see CLAUDE.md's Part 1 step 3.
+
+    SECURITY (session-level cost ceiling): a single question can already
+    fan out to both "generation" and "web" at once (real, observed router
+    behavior), and each has its own per-call rate limiter, but nothing
+    previously capped how many times *one session* could keep triggering
+    either or both across many questions. If `state["session_id"]` is set
+    and the session has exceeded `Settings.session_expensive_source_limit`
+    within `session_expensive_source_window_seconds`
+    (`agent.rate_limit.get_session_expensive_source_limiter`), any
+    "generation"/"web" picks are dropped from this turn's route, falling
+    back to whatever non-expensive source(s) remain (or "sql" alone, which
+    is always available, if nothing else was picked) -- never a hard
+    failure, since the SQL/document/policy path should keep working even
+    once a session's expensive-source budget is spent.
     """
     settings = get_settings()
     available = get_available_sources(settings)
@@ -221,6 +248,27 @@ def router_node(state: OrchestratorState) -> dict[str, Any]:
     else:
         sources, reasoning = classify_sources(state["question"], available, settings)
         short_circuited = False
+
+    session_id = state.get("session_id")
+    expensive_picked = [s for s in sources if s in _EXPENSIVE_SOURCES]
+    if session_id and expensive_picked:
+        limiter = get_session_expensive_source_limiter(
+            session_id,
+            settings.session_expensive_source_limit,
+            settings.session_expensive_source_window_seconds,
+        )
+        limit_result = limiter.check()
+        if not limit_result.allowed:
+            log_security_event(
+                "session_expensive_source_limit_tripped",
+                "warning",
+                "A session exceeded its expensive-source (generation/web) budget; "
+                "those source(s) were dropped from this turn's routing.",
+                session_id=session_id,
+                dropped_sources=expensive_picked,
+            )
+            sources = [s for s in sources if s not in _EXPENSIVE_SOURCES] or ["sql"]
+            reasoning += f" (session expensive-source limit reached -- dropped {expensive_picked})"
 
     route_decision: RouteDecision = {
         "sources": sources,
@@ -234,6 +282,20 @@ def router_node(state: OrchestratorState) -> dict[str, Any]:
         route_decision["short_circuited"],
         reasoning,
     )
+    if "generation" in sources:
+        # A real, metered third-party API call is about to be proposed (or,
+        # if Settings.require_generation_approval is off, fired
+        # immediately) -- this is exactly the class of event
+        # security.audit_log exists for, distinct from the ordinary
+        # per-node prose logging above. See generation_node's docstring
+        # for the propose/confirm split this routes into.
+        log_security_event(
+            "generation_routed",
+            "info",
+            "A question was routed to the media-generation source.",
+            sources=sources,
+            short_circuited=short_circuited,
+        )
     return {"route_decision": route_decision}
 
 
@@ -425,17 +487,45 @@ def web_search_node(state: OrchestratorState) -> dict[str, Any]:
     }
 
 
-# Placeholder-only safety check on outgoing generation prompts -- exactly
-# what it looks like, not a real moderation system. Replace with a genuine
-# moderation-API call before this is ever enabled for real use; kept here
-# only to mark *where* that check belongs in the call path, same honesty
-# standard as the reference implementation this was adapted from.
-_DISALLOWED_PROMPT_SUBSTRINGS = ("nsfw", "explicit")
+# A keyword heuristic, deliberately broadened from the original two-word
+# list -- still NOT a real moderation system, and still trivially bypassed
+# by a synonym, a non-English phrasing, or an indirect description (this
+# is a documented, known limitation, not a claim of completeness -- see
+# docs/RESPONSIBLE_AI.md's media-generation section). Categories:
+# explicit/sexual content, depictions of minors in a sexualized context,
+# graphic violence/gore, and content designed to impersonate a real,
+# identifiable person without consent (deepfake-style requests) -- the
+# categories a real moderation API call should eventually replace this
+# with, not an exhaustive list. Replace with a genuine moderation-API call
+# (many image/video providers, including IMA, expose one) before this
+# feature is exposed to untrusted users at scale.
+_DISALLOWED_PROMPT_SUBSTRINGS = (
+    "nsfw",
+    "explicit",
+    "porn",
+    "pornographic",
+    "hentai",
+    "nude",
+    "naked",
+    "sexual",
+    "erotic",
+    "fetish",
+    "child sexual",
+    "csam",
+    "underage",
+    "loli",
+    "gore",
+    "graphic violence",
+    "beheading",
+    "self-harm",
+    "suicide method",
+    "deepfake",
+)
 
 
 def _basic_prompt_safety_check(text: str) -> str | None:
-    """Returns a rejection reason if `text` fails the (placeholder) content
-    policy check, else None."""
+    """Returns a rejection reason if `text` fails the (still heuristic, see
+    the constant above) content policy check, else None."""
     lowered = text.lower()
     for bad in _DISALLOWED_PROMPT_SUBSTRINGS:
         if bad in lowered:
@@ -453,7 +543,7 @@ def _basic_prompt_safety_check(text: str) -> str | None:
 _VIDEO_INTENT_KEYWORDS = ("video", "clip", "animate", "animation", "footage", "motion")
 
 
-def _infer_media_kind(question: str) -> Literal["image", "video"]:
+def infer_media_kind(question: str) -> Literal["image", "video"]:
     """Decides whether a generation request wants an image or a video,
     from the question's own phrasing -- image is the default when no
     video-shaped keyword is present."""
@@ -472,11 +562,19 @@ def _failed_media_result(answer: str, media_type: str | None = None) -> MediaGen
     )
 
 
-def generation_node(state: OrchestratorState) -> dict[str, Any]:
-    """Generates an image or video via IMA Studio for a question that
-    explicitly asked to create/generate new media -- see `media_gen/` for
-    the client, and `_infer_media_kind` above for the image-vs-video
-    decision.
+def execute_generation(
+    question: str, kind: Literal["image", "video"], settings: Settings
+) -> MediaGenerationResult:
+    """Actually performs media generation -- the real, metered IMA Studio
+    API call. This is the ONLY function in the codebase that ever calls
+    `generate_image`/`generate_video`, and it re-runs the safety and rate
+    limit checks itself regardless of what a caller already saw, because
+    it has two independent entry points: `generation_node` below (when
+    `Settings.require_generation_approval` is off) and
+    `api.generation.confirm_generation` (`POST /generate/confirm`, the
+    human-approval confirmation endpoint) -- neither is allowed to assume
+    the other already validated the request. See `generation_node`'s
+    docstring for why the propose/confirm split exists at all.
 
     Image generation is confirmed working end-to-end against a real IMA
     account (a live text-to-image call succeeded: generation, download,
@@ -486,16 +584,17 @@ def generation_node(state: OrchestratorState) -> dict[str, Any]:
     confirmed with a live call yet. Either way, a provider failure or a
     misconfigured key still fails closed into a clean `MediaGenerationResult`
     (`status="failed"`), exactly like every other source here -- never an
-    uncaught exception reaching the orchestrator graph.
+    uncaught exception reaching the caller.
 
     On success, the generated asset's bytes are downloaded once
-    (`media_gen.download.download_media_bytes`) and cached under an opaque
-    id (`media_gen.cache.get_media_cache`) -- `answer`/`MediaGenerationResult
-    .media_id` never carry the provider's raw CDN URL, so nothing the LLM
-    could echo back or the API could return ever exposes it. If the
-    download itself fails after a successful generation, the whole result
-    is reported as failed rather than falling back to the raw URL -- see
-    `MediaGenerationResult.media_id`'s docstring for why.
+    (`media_gen.download.download_media_bytes`, itself SSRF-hardened) and
+    cached under an opaque id (`media_gen.cache.get_media_cache`) --
+    `answer`/`MediaGenerationResult.media_id` never carry the provider's
+    raw CDN URL, so nothing the LLM could echo back or the API could
+    return ever exposes it. If the download itself fails after a
+    successful generation, the whole result is reported as failed rather
+    than falling back to the raw URL -- see `MediaGenerationResult
+    .media_id`'s docstring for why.
 
     `generate_audio` is built and tested but not auto-routed here (nothing
     in this feature's scope asks for audio); call it directly if needed.
@@ -510,15 +609,10 @@ def generation_node(state: OrchestratorState) -> dict[str, Any]:
         get_media_cache,
     )
 
-    settings = get_settings()
-    question = state["question"]
-
     safety_rejection = _basic_prompt_safety_check(question)
     if safety_rejection:
-        return {
-            "generation_result": _failed_media_result(safety_rejection),
-            "sources_used": ["generation"],
-        }
+        log_security_event("generation_rejected", "warning", safety_rejection, media_type=kind)
+        return _failed_media_result(safety_rejection, media_type=kind)
 
     limiter = get_media_generation_limiter(
         settings.media_gen_rate_limit, settings.media_gen_rate_window_seconds
@@ -526,56 +620,137 @@ def generation_node(state: OrchestratorState) -> dict[str, Any]:
     limit_result = limiter.check()
     if not limit_result.allowed:
         logger.warning("[generation] rate limit tripped: %s", MEDIA_GENERATION_LIMIT_MESSAGE)
-        return {
-            "generation_result": _failed_media_result(MEDIA_GENERATION_LIMIT_MESSAGE),
-            "sources_used": ["generation"],
-        }
+        log_security_event(
+            "generation_rate_limited",
+            "info",
+            MEDIA_GENERATION_LIMIT_MESSAGE,
+            media_type=kind,
+            retry_after_seconds=round(limit_result.retry_after_seconds, 1),
+        )
+        return _failed_media_result(MEDIA_GENERATION_LIMIT_MESSAGE, media_type=kind)
 
     try:
         client = get_ima_client(settings)
     except MediaGenerationNotConfiguredError as exc:
         logger.error("[generation] not configured: %s", exc)
-        return {
-            "generation_result": _failed_media_result(str(exc)),
-            "sources_used": ["generation"],
-        }
+        return _failed_media_result(str(exc), media_type=kind)
 
-    kind = _infer_media_kind(question)
     generate = generate_video if kind == "video" else generate_image
     result = generate(client, prompt=question)
     if not result.ok:
         logger.warning("[generation] %s generation failed: %s", kind, result.error)
-        return {
-            "generation_result": _failed_media_result(
-                f"{kind.capitalize()} generation failed: {result.error or 'unknown error'}",
-                media_type=kind,
-            ),
-            "sources_used": ["generation"],
-        }
+        log_security_event(
+            "generation_provider_failed",
+            "warning",
+            result.error or "unknown error",
+            media_type=kind,
+        )
+        return _failed_media_result(
+            f"{kind.capitalize()} generation failed: {result.error or 'unknown error'}",
+            media_type=kind,
+        )
 
     try:
         data, content_type = download_media_bytes(result.url)  # type: ignore[arg-type]
     except MediaGenerationError as exc:
         logger.warning("[generation] %s generated but download failed: %s", kind, exc)
-        return {
-            "generation_result": _failed_media_result(
-                f"{kind.capitalize()} generation succeeded but the result could not be "
-                "retrieved.",
-                media_type=kind,
-            ),
-            "sources_used": ["generation"],
-        }
+        log_security_event("generation_download_failed", "warning", str(exc), media_type=kind)
+        return _failed_media_result(
+            f"{kind.capitalize()} generation succeeded but the result could not be " "retrieved.",
+            media_type=kind,
+        )
 
     media_id = get_media_cache().put(data, content_type)
     logger.info("[generation] %s generated: model=%s media_id=%s", kind, result.model, media_id)
+    log_security_event(
+        "generation_succeeded",
+        "info",
+        "A media-generation request completed and produced a real, metered provider call.",
+        media_type=kind,
+        model=result.model,
+    )
+    return MediaGenerationResult(
+        answer=f"{kind.capitalize()} generated successfully.",
+        citations=[],
+        status="succeeded",
+        media_id=media_id,
+        media_type=kind,
+        model=result.model,
+    )
+
+
+def generation_node(state: OrchestratorState) -> dict[str, Any]:
+    """Handles a question routed to the "generation" source -- see
+    `execute_generation` above for what actually calls IMA.
+
+    SECURITY (human-in-the-loop for a real-money action): unlike every
+    other source here, a successful generation spends real, metered
+    provider credit -- the only source in this orchestrator with that
+    property. When `Settings.require_generation_approval` is true (the
+    default -- secure by default), this node does NOT call
+    `execute_generation` at all. It only runs the (free) safety check and
+    kind inference, then returns a `status="pending_approval"` result with
+    no `media_id` -- nothing has been generated, downloaded, or charged
+    yet. The actual provider call only happens when a human explicitly
+    confirms via `POST /generate/confirm` (`api/generation.py`), which
+    calls `execute_generation` itself -- mirroring the SQL pipeline's own
+    "Confirm and Run" gate (`ui/app.py`, `POST /execute`) applied to this
+    source. Setting `require_generation_approval=false` restores the
+    previous fully-autonomous behavior (e.g. for a trusted automation
+    context that has already reviewed this tradeoff) -- opt-in, not the
+    default.
+
+    Even in the approval-required path, a misconfigured/missing IMA key is
+    still surfaced immediately here (not just at confirm time) -- checking
+    it is free (no network call, just reading config), and there's no
+    reason to make a human click "confirm" only to learn generation was
+    never going to work at all.
+    """
+    settings = get_settings()
+    question = state["question"]
+
+    if not settings.require_generation_approval:
+        return {
+            "generation_result": execute_generation(question, infer_media_kind(question), settings),
+            "sources_used": ["generation"],
+        }
+
+    safety_rejection = _basic_prompt_safety_check(question)
+    if safety_rejection:
+        log_security_event("generation_rejected", "warning", safety_rejection)
+        return {
+            "generation_result": _failed_media_result(safety_rejection),
+            "sources_used": ["generation"],
+        }
+
+    from media_gen import MediaGenerationNotConfiguredError, get_ima_client
+
+    try:
+        get_ima_client(settings)
+    except MediaGenerationNotConfiguredError as exc:
+        return {
+            "generation_result": _failed_media_result(str(exc)),
+            "sources_used": ["generation"],
+        }
+
+    kind = infer_media_kind(question)
+    log_security_event(
+        "generation_pending_approval",
+        "info",
+        "A generation request is awaiting human confirmation before any provider call is made.",
+        media_type=kind,
+    )
     return {
         "generation_result": MediaGenerationResult(
-            answer=f"{kind.capitalize()} generated successfully.",
+            answer=(
+                f'This will generate a new {kind} for: "{question}". Confirm to proceed '
+                "-- nothing has been generated yet."
+            ),
             citations=[],
-            status="succeeded",
-            media_id=media_id,
+            status="pending_approval",
+            media_id=None,
             media_type=kind,
-            model=result.model,
+            model=None,
         ),
         "sources_used": ["generation"],
     }

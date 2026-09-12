@@ -1,5 +1,11 @@
 import { create } from 'zustand'
-import { ApiError, askQuestion as apiAskQuestion, executeSql, submitGoldenExampleFeedback } from '@/lib/api'
+import {
+  ApiError,
+  askQuestion as apiAskQuestion,
+  confirmGeneration as apiConfirmGeneration,
+  executeSql,
+  submitGoldenExampleFeedback,
+} from '@/lib/api'
 import {
   buildConversationHistory,
   newHistoryEntry,
@@ -7,6 +13,7 @@ import {
   replaceEntry,
   withConfirmedError,
   withConfirmedResult,
+  withGenerationResult,
   type QueryHistoryEntry,
 } from '@/lib/history'
 import type { AskResponse } from '@/lib/types'
@@ -25,6 +32,7 @@ interface ChatState {
   queryHistory: QueryHistoryEntry[]
   pendingQuestion: PendingQuestion | null
   confirmingEntryId: string | null
+  confirmingGenerationEntryId: string | null
   goldenFeedbackGiven: Set<string>
   enableInsight: boolean
   nlQuestionCache: Map<string, AskResponse>
@@ -33,6 +41,7 @@ interface ChatState {
   setEditableSql: (entryId: string, sql: string) => void
   askQuestion: (question: string) => Promise<void>
   confirmAndRun: (entryId: string) => Promise<void>
+  confirmGeneration: (entryId: string) => Promise<void>
   rerunEntry: (entryId: string) => Promise<void>
   clearHistory: () => void
   giveGoldenFeedback: (entryId: string, thumbsUp: boolean) => Promise<void>
@@ -75,6 +84,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
   queryHistory: [],
   pendingQuestion: null,
   confirmingEntryId: null,
+  confirmingGenerationEntryId: null,
   goldenFeedbackGiven: new Set(),
   enableInsight: true,
   nlQuestionCache: new Map(),
@@ -150,13 +160,44 @@ export const useChatStore = create<ChatState>((set, get) => ({
     }
   },
 
+  confirmGeneration: async (entryId) => {
+    const entry = get().queryHistory.find((item) => item.entryId === entryId)
+    if (!entry) return
+    set({ confirmingGenerationEntryId: entryId })
+    try {
+      const result = await apiConfirmGeneration(entry.question)
+      set((state) => ({
+        queryHistory: replaceEntry(state.queryHistory, entryId, withGenerationResult(entry, result)),
+      }))
+    } catch (error) {
+      const message = error instanceof ApiError ? error.message : 'Generation failed unexpectedly.'
+      const priorType = entry.finalState.generation_result?.media_type ?? null
+      const updated = withGenerationResult(entry, {
+        answer: message,
+        status: 'failed',
+        media_id: null,
+        media_type: priorType,
+        model: null,
+      })
+      set((state) => ({ queryHistory: replaceEntry(state.queryHistory, entryId, updated) }))
+    } finally {
+      set({ confirmingGenerationEntryId: null })
+    }
+  },
+
   rerunEntry: async (entryId) => {
     const entry = get().queryHistory.find((item) => item.entryId === entryId)
     if (!entry) return
     await get().askQuestion(entry.question)
   },
 
-  clearHistory: () => set({ queryHistory: [], pendingQuestion: null, confirmingEntryId: null }),
+  clearHistory: () =>
+    set({
+      queryHistory: [],
+      pendingQuestion: null,
+      confirmingEntryId: null,
+      confirmingGenerationEntryId: null,
+    }),
 
   giveGoldenFeedback: async (entryId, thumbsUp) => {
     const entry = get().queryHistory.find((item) => item.entryId === entryId)

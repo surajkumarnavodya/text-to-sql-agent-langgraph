@@ -97,7 +97,7 @@ export function TurnCard({ entry, isMultiDb }: { entry: QueryHistoryEntry; isMul
         )}
 
         {state.attempt_history.length > 0 && <RetryTimeline attempts={state.attempt_history} />}
-        <SourcesUsedPanel state={state} />
+        <SourcesUsedPanel state={state} entryId={entry.entryId} />
         {isMultiDb && showSqlPanel && state.database && (
           <p className="text-xs text-[var(--muted-foreground)]">
             🧭 Routed to database: <strong>{state.database}</strong>

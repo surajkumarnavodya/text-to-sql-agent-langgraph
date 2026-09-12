@@ -192,6 +192,99 @@ single-user, single-process usage.
 user, or if `ENABLE_QUERY_PLANNING` usage patterns suggest LLM load from
 this path is material — whichever comes first.
 
+### R-008 — No independent authorization layer between agent routing decisions and execution
+
+**Severity:** Critical (for a multi-tenant/multi-user deployment) · **Status:** Open
+
+Seeded from a 2026-09-13 Agentic-AI-focused security audit covering the
+multi-source orchestrator (`agent/orchestrator/`), RAG, web search, and
+media generation added since the 2026-09-01 audit this register was
+originally drawn from. `agent.orchestrator.nodes.classify_sources`'s LLM
+output is trusted directly by `router_node`/`route_after_router` to decide
+which subgraph(s) actually execute — the only gate is
+`get_available_sources`, a *global*, operator-set config flag checked once,
+never a per-request/per-user authorization decision. In this app's current
+single-user/local-trust posture that's an accepted design boundary (same
+reasoning as R-001), but it is the structural root cause of R-009 below
+and would need a real policy-evaluation step (independent of the LLM's own
+reasoning) before this could safely serve more than one trust tier of
+caller.
+
+**Mitigation today:** none at the authorization layer specifically — bounded
+only by the same `enable_*` flags and rate limiters everything else in
+this register already describes. `require_generation_approval` (see
+`config/settings.py`) adds a *human*-in-the-loop gate specifically for the
+one source that spends real money (media generation), which narrows this
+risk's most costly instance without being a general fix.
+
+**Review date:** revisit alongside R-001, if/when real multi-user identity
+is ever built.
+
+### R-009 — No per-user authorization on RAG document management
+
+**Severity:** High (for a multi-tenant deployment) · **Status:** Open
+
+`api/documents.py`'s upload/delete routes are gated only by the same
+shared `API_AUTH_TOKEN` (or nothing, if unset — see R-001) as every other
+route — there is no ownership check, no per-user scoping, and delete is
+unconditional and irreversible. Pre-existing since this router was built;
+named explicitly here following the 2026-09-13 audit rather than left
+implicit inside R-001.
+
+**Mitigation today:** none beyond the shared token. Same posture as the
+Knowledge Sources Streamlit page this API mirrors (already disclosed in
+`SECURITY.md`'s "Multi-source RAG and web search" section).
+
+**Review date:** alongside R-001 — this is a real, separate fix once
+per-user identity exists (scope delete/upload to the uploading user or an
+explicit content-admin role), not automatically solved by R-001's fix alone.
+
+### R-010 — Dependency vulnerability backlog (pip-audit)
+
+**Severity:** Medium · **Status:** Open
+
+A `pip-audit -r requirements.txt` run on 2026-09-13 (added to CI as a
+report-only step, `continue-on-error: true` — see
+`.github/workflows/ci.yml`) found 65 known advisories across 10 pinned
+packages, most transitive/tooling rather than this app's own code
+(`chromadb`, `langgraph`/`langgraph-checkpoint`/`langgraph-sdk`,
+`streamlit`, `langchain-core`, `pillow`, `python-dotenv`, `pytest`,
+`black`). Not triaged individually as part of that pass — several fixes
+are major-version bumps (e.g. `pillow` 11→12, `langgraph` 0.2→1.0) with
+their own regression risk, and `requirements.txt`'s exact pins already
+have an open, related gap (R-004: verified against Python 3.14, not 3.11).
+
+**Mitigation today:** none beyond visibility — the CI step surfaces the
+current list on every run so it can't silently grow unnoticed, but nothing
+blocks a merge on it yet.
+
+**Review date:** before the next dependency-bump pass; flip
+`continue-on-error` off once the backlog is triaged and pins updated.
+
+### R-011 — Session-scoped expensive-source cost ceiling is a cost control, not an access-control boundary
+
+**Severity:** Low · **Status:** Mitigated (partially)
+
+`agent.rate_limit.get_session_expensive_source_limiter` (added
+2026-09-13, see `docs/security-changelog.md`) caps combined
+`generation`/`web` source invocations per `session_id` within a rolling
+window (`SESSION_EXPENSIVE_SOURCE_LIMIT`/`_WINDOW_SECONDS`). `session_id`
+is a real per-conversation correlation token, but it's client-supplied and
+unauthenticated (same posture as `AskRequest.session_id` generally) — a
+caller can always reset their own budget by minting a fresh one, exactly
+like the existing per-IP API rate limiters (`api/rate_limit.py`) can be
+evaded by changing IP. This is a genuine speed bump against accidental/
+casual repeated cost, not a hard ceiling against a deliberate, motivated
+caller.
+
+**Mitigation today:** the per-source limiters (`media_gen_rate_limit`,
+Tavily's own per-call cost) still apply process-wide underneath this one
+regardless of session_id — a fresh session can reset its *own* budget but
+not the process-wide ones.
+
+**Review date:** alongside R-001/R-008 — a real fix requires session_id to
+be tied to actual authenticated identity, not just a correlation token.
+
 ---
 
 ## Accepted exceptions

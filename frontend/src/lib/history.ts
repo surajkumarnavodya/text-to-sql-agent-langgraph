@@ -1,4 +1,11 @@
-import type { AgentStatus, AskResponse, Citation, ConversationExchange, PlotlyFigure } from './types'
+import type {
+  AgentStatus,
+  AskResponse,
+  Citation,
+  ConversationExchange,
+  MediaGenerationResult,
+  PlotlyFigure,
+} from './types'
 
 /** One full chat turn -- question + everything about its answer. Holds its
  * own editable-SQL/confirmed-result state (rather than a single global
@@ -75,6 +82,21 @@ export function withConfirmedResult(
     confirmedChart: chart,
     confirmedDurationMs: durationMs,
     confirmedError: null,
+  }
+}
+
+/** Replaces this turn's `generation_result` after `POST /generate/confirm`
+ * completes -- the "generation" source equivalent of `withConfirmedResult`
+ * above, applied to `finalState` directly (media generation has no
+ * separate `confirmed*` field set, unlike SQL's editable-box pattern,
+ * since there's nothing to hand-edit before confirming). */
+export function withGenerationResult(
+  entry: QueryHistoryEntry,
+  result: MediaGenerationResult,
+): QueryHistoryEntry {
+  return {
+    ...entry,
+    finalState: { ...entry.finalState, generation_result: result },
   }
 }
 
