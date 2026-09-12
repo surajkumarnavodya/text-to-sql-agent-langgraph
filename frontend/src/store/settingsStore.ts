@@ -39,7 +39,7 @@ export const useSettingsStore = create<SettingsState>()(
     (set, get) => ({
       themeMode: 'light',
       accent: 'indigo',
-      font: 'inter',
+      font: 'system',
       language: 'en',
       collapsedSections: {},
       sidebarCollapsed: false,

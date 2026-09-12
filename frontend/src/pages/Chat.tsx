@@ -1,6 +1,5 @@
 import { useTranslation } from 'react-i18next'
 import { ChatInput } from '@/components/chat/ChatInput'
-import { PendingTurnCard } from '@/components/chat/PendingTurnCard'
 import { TurnCard } from '@/components/chat/TurnCard'
 import { Badge } from '@/components/ui/badge'
 import { useHealth, useSchemaTables } from '@/hooks/queries'
@@ -53,7 +52,6 @@ export function Chat() {
             {queryHistory.map((entry) => (
               <TurnCard key={entry.entryId} entry={entry} isMultiDb={isMultiDb} />
             ))}
-            {pendingQuestion && <PendingTurnCard pending={pendingQuestion} />}
           </div>
         </div>
       </div>

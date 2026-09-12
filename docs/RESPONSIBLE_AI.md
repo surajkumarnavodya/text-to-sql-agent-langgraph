@@ -79,7 +79,7 @@ open gaps.
 
 - **Fully local by design.** Ollama runs on the user's own machine; no
   question, schema, or result data leaves it for LLM inference (`README.md`'s
-  "why I built this"). No hosted-API key, no third-party data processor in
+  "Why this project"). No hosted-API key, no third-party data processor in
   the LLM path.
 - **Schema retrieval is scoped, not exhaustive.** Only the top-k relevant
   tables are ever put in a prompt (`SCHEMA_TOP_K`), not the whole schema —

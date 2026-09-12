@@ -2,6 +2,7 @@ import { BookOpen, MessageSquare, PanelLeft } from 'lucide-react'
 import { useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { NavLink, Outlet } from 'react-router-dom'
+import { ThinkingOverlay } from '@/components/chat/ThinkingOverlay'
 import { Button } from '@/components/ui/button'
 import { cn } from '@/lib/utils'
 import { useSettingsStore } from '@/store/settingsStore'
@@ -73,8 +74,13 @@ export function AppShell() {
             full width (edge-to-edge, scrollbar flush against the browser
             edge) with its content centered inside via its own max-w
             wrapper -- the ChatGPT layout pattern. */}
-        <main className="min-h-0 min-w-0 flex-1 overflow-hidden">
+        {/* `relative` scopes ThinkingOverlay's `absolute inset-0` to just
+            this content pane -- header and sidebar stay visible/usable the
+            whole time a question is in flight, only the answer area itself
+            takes over while waiting. */}
+        <main className="relative min-h-0 min-w-0 flex-1 overflow-hidden">
           <Outlet />
+          <ThinkingOverlay />
         </main>
       </div>
     </div>

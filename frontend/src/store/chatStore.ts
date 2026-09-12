@@ -11,11 +11,11 @@ import {
 } from '@/lib/history'
 import type { AskResponse } from '@/lib/types'
 
-/** The question currently in flight, rendered as a "Thinking Ns" card
- * directly below the user's message -- see components/chat/PendingTurnCard.tsx
- * and TimingBadge.tsx. `startedAt` is a `performance.now()` timestamp, not
- * wall-clock, so the live counter is immune to system clock changes
- * mid-request. */
+/** The question currently in flight -- drives the full-screen centered
+ * "Thinking Ns" takeover (see components/chat/ThinkingOverlay.tsx and
+ * TimingBadge.tsx), not an inline chat bubble. `startedAt` is a
+ * `performance.now()` timestamp, not wall-clock, so the live counter is
+ * immune to system clock changes mid-request. */
 export interface PendingQuestion {
   question: string
   startedAt: number

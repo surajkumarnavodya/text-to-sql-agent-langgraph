@@ -1,4 +1,4 @@
-import type { AgentStatus, AskResponse, ConversationExchange, PlotlyFigure } from './types'
+import type { AgentStatus, AskResponse, Citation, ConversationExchange, PlotlyFigure } from './types'
 
 /** One full chat turn -- question + everything about its answer. Holds its
  * own editable-SQL/confirmed-result state (rather than a single global
@@ -139,18 +139,68 @@ export function statusLabel(entry: QueryHistoryEntry): { icon: string; label: st
   return STATUS_DISPLAY[entry.agentStatus] ?? { icon: '❓', label: entry.agentStatus }
 }
 
+/** Renders one source's citations as a "Sources" markdown bullet list --
+ * same dedup (by document_id, falling back to filename) and same
+ * URL-vs-plain-text distinction as SourceAnswerCard.tsx's own rendering, so
+ * the exported markdown (PDF/copy) matches what's shown on screen. A web
+ * citation's `filename` is the page URL itself (see
+ * agent/orchestrator/nodes.py::web_search_node), so it renders as a real
+ * markdown link; a document/policy filename has nothing to link to in a
+ * static export (no click handler survives into a PDF or clipboard paste),
+ * so it's listed as plain text. Returns '' when there's nothing to show. */
+function citationsMarkdown(citations: Citation[]): string {
+  const seen = new Set<string>()
+  const unique = citations.filter((citation) => {
+    const key = citation.document_id || citation.filename
+    if (seen.has(key)) return false
+    seen.add(key)
+    return true
+  })
+  if (unique.length === 0) return ''
+  const lines = unique.map((citation) =>
+    /^https?:\/\//i.test(citation.filename)
+      ? `- [${citation.filename}](${citation.filename})`
+      : `- ${citation.filename}`,
+  )
+  return ['**Sources:**', ...lines].join('\n')
+}
+
 /** Assembles a plain-markdown export of everything textual about one turn
- * (synthesized/per-source answer, insight, the SQL that ran) -- what the
- * "Download answer" button saves to a .md file. */
+ * (synthesized/per-source answer, its cited sources, insight, the SQL that
+ * ran) -- what the "Download answer" (PDF) and "Copy answer" buttons both
+ * build from. Sources are appended right after the answer text they belong
+ * to, mirroring SourceAnswerCard.tsx's on-screen answer-then-sources
+ * layout, so a combined (synthesized) answer gets one combined sources
+ * list pooled from every source that actually fired, and a single-source
+ * answer gets just that source's own list. */
 export function buildAnswerMarkdown(entry: QueryHistoryEntry): string {
   const parts: string[] = []
   const state = entry.finalState
   if (state.synthesized_answer) {
     parts.push(state.synthesized_answer)
+    const pooledCitations = [
+      ...(state.document_result?.citations ?? []),
+      ...(state.policy_result?.citations ?? []),
+      ...(state.web_result?.citations ?? []),
+    ]
+    const sources = citationsMarkdown(pooledCitations)
+    if (sources) parts.push(sources)
   } else {
-    if (state.document_result) parts.push(`**Documents**: ${state.document_result.answer}`)
-    if (state.policy_result) parts.push(`**Policy**: ${state.policy_result.answer}`)
-    if (state.web_result) parts.push(`**Web**: ${state.web_result.answer}`)
+    if (state.document_result) {
+      parts.push(`**Documents**: ${state.document_result.answer}`)
+      const sources = citationsMarkdown(state.document_result.citations)
+      if (sources) parts.push(sources)
+    }
+    if (state.policy_result) {
+      parts.push(`**Policy**: ${state.policy_result.answer}`)
+      const sources = citationsMarkdown(state.policy_result.citations)
+      if (sources) parts.push(sources)
+    }
+    if (state.web_result) {
+      parts.push(`**Web**: ${state.web_result.answer}`)
+      const sources = citationsMarkdown(state.web_result.citations)
+      if (sources) parts.push(sources)
+    }
   }
   if (state.insight) parts.push(`**Insight**: ${state.insight}`)
   const sql = entry.confirmedSql ?? entry.sql

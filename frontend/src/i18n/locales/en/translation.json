@@ -36,7 +36,9 @@
     "view": "View",
     "rerun": "Re-run",
     "sources": "Answered using",
-    "followingUpOn": "Following up on"
+    "followingUpOn": "Following up on",
+    "sourcesLabel": "Sources",
+    "words": "words"
   },
   "sql": {
     "title": "Generated SQL",
@@ -85,10 +87,14 @@
     "thinking": "Thinking",
     "answeredIn": "Answered in {{seconds}}s",
     "downloadAnswer": "Download answer",
+    "copyAnswer": "Copy answer",
+    "copied": "Copied!",
     "exportCsv": "Export CSV",
     "search": "Search...",
     "rowsPerPage": "Rows per page",
     "noResults": "No matching rows.",
+    "showMore": "Show more",
+    "showLess": "Show less",
     "of": "of"
   }
 }

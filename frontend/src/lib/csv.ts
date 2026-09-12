@@ -27,7 +27,3 @@ function downloadBlob(content: string, filename: string, mimeType: string): void
 export function downloadCsv(csv: string, filename: string): void {
   downloadBlob(csv, filename, 'text/csv;charset=utf-8;')
 }
-
-export function downloadMarkdown(markdown: string, filename: string): void {
-  downloadBlob(markdown, filename, 'text/markdown;charset=utf-8;')
-}

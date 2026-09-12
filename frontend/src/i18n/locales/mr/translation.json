@@ -36,7 +36,9 @@
     "view": "पहा",
     "rerun": "पुन्हा चालवा",
     "sources": "यांच्या मदतीने उत्तर दिले",
-    "followingUpOn": "याचा पाठपुरावा"
+    "followingUpOn": "याचा पाठपुरावा",
+    "sourcesLabel": "स्रोत",
+    "words": "शब्द"
   },
   "sql": {
     "title": "तयार केलेले SQL",
@@ -85,10 +87,14 @@
     "thinking": "विचार करत आहे",
     "answeredIn": "{{seconds}} सेकंदात उत्तर दिले",
     "downloadAnswer": "उत्तर डाउनलोड करा",
+    "copyAnswer": "उत्तर कॉपी करा",
+    "copied": "कॉपी झाले!",
     "exportCsv": "CSV निर्यात करा",
     "search": "शोधा...",
     "rowsPerPage": "प्रति पान ओळी",
     "noResults": "जुळणारी कोणतीही ओळ नाही.",
+    "showMore": "अधिक पाहा",
+    "showLess": "कमी पाहा",
     "of": "पैकी"
   }
 }

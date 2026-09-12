@@ -27,12 +27,16 @@ export interface FontOption {
 }
 
 export const FONT_OPTIONS: FontOption[] = [
-  { id: 'inter', label: 'Inter (default)', stack: "'Inter', ui-sans-serif, system-ui, sans-serif" },
+  // First entry is the default (see useSettingsStore's `font` initial
+  // value and applyFont's fallback below) -- System UI renders instantly
+  // with each OS's own native font and needs no web-font download, unlike
+  // Inter.
   {
     id: 'system',
-    label: 'System UI',
+    label: 'System UI (default)',
     stack: "ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif",
   },
+  { id: 'inter', label: 'Inter', stack: "'Inter', ui-sans-serif, system-ui, sans-serif" },
   { id: 'roboto', label: 'Roboto', stack: "'Roboto', ui-sans-serif, system-ui, sans-serif" },
   {
     id: 'merriweather',

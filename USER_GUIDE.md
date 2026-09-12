@@ -77,8 +77,8 @@ in this guide works identically either way.
 
 ## 1. Starting the application
 
-Once installed and configured (see [`README.md`](README.md)'s Setup
-section), start the app with:
+Once installed and configured (see [`README.md`](README.md)'s Getting
+Started section), start the app with:
 
 ```bash
 streamlit run ui/app.py

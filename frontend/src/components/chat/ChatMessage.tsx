@@ -1,3 +1,5 @@
+import { ExpandableText } from '@/components/ui/expandable-text'
+
 export interface ChatMessageData {
   role: 'user' | 'assistant'
   content: string
@@ -19,7 +21,14 @@ export function ChatMessage({ message }: { message: ChatMessageData }) {
             : 'border border-[var(--border)] bg-[var(--card)]'
         }`}
       >
-        <p className="whitespace-pre-wrap">{message.content}</p>
+        {/* Long pasted questions collapse to a few lines with a "Show
+            more" toggle (ChatGPT/Perplexity's treatment) instead of
+            pushing the rest of the conversation down by default. */}
+        <ExpandableText
+          text={message.content}
+          maxLines={5}
+          fadeToColor={isUser ? 'var(--accent)' : 'var(--card)'}
+        />
       </div>
     </div>
   )

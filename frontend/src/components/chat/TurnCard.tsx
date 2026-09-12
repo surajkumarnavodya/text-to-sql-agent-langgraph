@@ -9,6 +9,7 @@ import { Markdown } from '@/components/ui/markdown'
 import { buildAnswerMarkdown, type QueryHistoryEntry } from '@/lib/history'
 import { useChatStore } from '@/store/chatStore'
 import { ChatMessage } from './ChatMessage'
+import { CopyAnswerButton } from './CopyAnswerButton'
 import { DownloadAnswerButton } from './DownloadAnswerButton'
 import { QueryPlanPanel } from './QueryPlanPanel'
 import { RetryTimeline } from './RetryTimeline'
@@ -54,7 +55,12 @@ export function TurnCard({ entry, isMultiDb }: { entry: QueryHistoryEntry; isMul
       <div className="flex flex-col gap-3 pl-10">
         <div className="flex flex-wrap items-center gap-2">
           <TimingBadge mode="done" durationMs={entry.answerDurationMs} />
-          {answerMarkdown && <DownloadAnswerButton question={entry.question} answer={answerMarkdown} />}
+          {answerMarkdown && (
+            <>
+              <CopyAnswerButton answer={answerMarkdown} />
+              <DownloadAnswerButton question={entry.question} answer={answerMarkdown} />
+            </>
+          )}
         </div>
 
         {state.followup_classification === 'followup' && state.followup_resolved_against && (

@@ -36,7 +36,9 @@
     "view": "Ver",
     "rerun": "Volver a ejecutar",
     "sources": "Respondido usando",
-    "followingUpOn": "Continuando con"
+    "followingUpOn": "Continuando con",
+    "sourcesLabel": "Fuentes",
+    "words": "palabras"
   },
   "sql": {
     "title": "SQL generado",
@@ -85,10 +87,14 @@
     "thinking": "Pensando",
     "answeredIn": "Respondido en {{seconds}}s",
     "downloadAnswer": "Descargar respuesta",
+    "copyAnswer": "Copiar respuesta",
+    "copied": "¡Copiado!",
     "exportCsv": "Exportar CSV",
     "search": "Buscar...",
     "rowsPerPage": "Filas por página",
     "noResults": "No hay filas coincidentes.",
+    "showMore": "Mostrar más",
+    "showLess": "Mostrar menos",
     "of": "de"
   }
 }

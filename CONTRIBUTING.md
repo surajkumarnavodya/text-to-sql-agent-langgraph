@@ -5,7 +5,7 @@ suggestions, and bug reports are welcome.
 
 ## Dev environment setup
 
-Follow the **Setup** section in [`README.md`](README.md) — clone, create a
+Follow the **Getting Started** section in [`README.md`](README.md) — clone, create a
 venv, `pip install -r requirements.txt`, copy `.env.example` to `.env` and
 point it at a real (ideally read-only, non-production) database. The
 mocked `pytest` suite doesn't need a real database or Ollama; the benchmark
