@@ -422,6 +422,88 @@ and file-system safety instead.
   collection), so this is a generous DoS/abuse guard, not a cost-control
   gate like media generation's dedicated limiter.
 
+## Content moderation gate (mandatory whenever media search or document/policy RAG is on)
+
+Both content-ingestion pipelines — media search's images/video
+(`media/ingest.py`) and document/policy RAG's PDFs (`rag/ingestion.py`) —
+now run every chunk of every file through a pre-ingestion moderation gate
+(`moderation/`) before anything is ever embedded or stored. This is
+**mandatory, not a feature flag**: there is deliberately no
+`ENABLE_CONTENT_MODERATION` toggle that could disable it while leaving
+either ingestion pipeline on. Missing provider/store configuration fails
+ingestion closed with a clear error (`ModerationNotConfiguredError`),
+mirroring `RagStoreNotConfiguredError`'s existing pattern, rather than
+silently skipping the check.
+
+- **Chunked, not scanned as a whole.** A moderation classifier has input
+  limits, and checking only a whole asset can miss a problem buried in one
+  part of it. An image is one chunk (tiled into a grid above
+  `MEDIA_IMAGE_TILE_THRESHOLD_PX`, so a classifier's own internal
+  downsampling can't shrink away a small region of concern in a very large
+  image); a video is chunked per already-detected scene segment (reusing
+  the same segmentation media search already builds); a PDF is chunked per
+  page's text plus per embedded image — closing a real gap the
+  pre-moderation ingestion pipeline had (it only ever *warned* about a
+  likely-scanned page, never actually OCR'd it; now it's rasterized via
+  `pymupdf` and OCR'd via the existing `media.ocr.extract_text`, reused
+  as-is, before the gate runs).
+- **A hard-reject on any chunk rejects the entire asset — never a partial
+  ingestion.** `moderation/gate.py::moderate_chunks` checks every chunk
+  (it doesn't short-circuit on the first hit, so the audit trail is
+  complete), then rejects the whole file if any chunk triggered a
+  hard-reject category. Nothing from a rejected file is ever embedded or
+  stored anywhere — not in Chroma, not in `rag.documents`/`rag.chunks`.
+  `rag/ingestion.py` was specifically reordered for this: the
+  pre-moderation flow called `rag/store.py::insert_document` (which can
+  itself persist the file's raw bytes, if `ENABLE_PDF_DOWNLOAD` is on)
+  *before* any content check ran — a real gap where a rejected file's
+  bytes could already be sitting in the store ahead of the rejection being
+  known. Now nothing touches `rag/store.py` until moderation has passed.
+- **The taxonomy, and its honest limits.** Azure AI Content Safety (the
+  only provider implemented, `moderation/provider.py`) checks real harm
+  categories — Hate, SelfHarm, Sexual, Violence — over its REST API
+  (`httpx`, no vendor SDK dependency, matching this project's other
+  external-API integrations). Azure has no dedicated "weapons," "drugs,"
+  or "synthetic/AI-generated media" category: weapons are covered by a
+  coarse Violence-category proxy for imagery plus a custom text blocklist
+  (`config/moderation_blocklist.yaml`) against OCR/caption/transcript/
+  extracted text; drugs have no visual signal at all, text-mentions only.
+  Synthetic/manipulated ("deepfake") media is a **disclosed placeholder**
+  — every image/video chunk is recorded as `"not_checked"` for this
+  category rather than silently omitted or falsely presented as covered,
+  since no mainstream API reliably detects this today. This category is
+  deliberately a soft-flag, never a hard-reject, even once a real detector
+  is eventually plugged in — see `docs/RISK_REGISTER.md`'s R-014.
+- **A real, disclosed exception to "fully local."** Unlike voice mode/media
+  search's own on-device embedding path, this gate calls a third-party
+  cloud API for every chunk of every ingested file — see
+  `docs/RISK_REGISTER.md`'s R-013. The provider is pluggable
+  (`moderation.provider.SUPPORTED_MODERATION_PROVIDERS`, shaped like
+  `search/web_search.py`'s own provider map), so this is a deliberate,
+  named tradeoff, not an unexamined one.
+- **Audit trail carries metadata, never content.** A rejection is logged
+  via `security.audit_log.log_security_event` with the asset's content
+  hash, which category triggered it, and the chunk index — never the
+  chunk's actual text or image bytes. A rejected asset's own database row
+  (`moderation.media_assets`) is the same: hash, media type, timestamp, and
+  category — `vector_ids` is always `NULL` for a rejected asset, since
+  nothing was ever embedded for it.
+- **Dedupe is a real performance control, not just a cache.** Every file's
+  content hash is checked against `moderation.media_assets` before any
+  extraction/moderation/embedding work starts — a previously-seen hash
+  (whether it passed or was rejected) short-circuits immediately. A
+  rejected file is never re-submitted to the moderation provider on a
+  repeat upload attempt.
+- **No per-item classification for the media search library — a
+  separate, already-disclosed gap.** This moderation gate checks content
+  *safety* (is this the kind of thing that should never be ingested
+  anywhere); it is not the same thing as `docs/RISK_REGISTER.md`'s R-012
+  (no sensitivity/access classification for otherwise-legitimate media
+  library content, the way policy RAG has). A file can cleanly pass
+  moderation and still be something a deployment would want restricted to
+  certain viewers — this app still has no per-user authorization system to
+  enforce that, for media any more than for the database.
+
 ## Resource exhaustion / abuse protections
 
 Two independent, deliberately simple protections guard against both
