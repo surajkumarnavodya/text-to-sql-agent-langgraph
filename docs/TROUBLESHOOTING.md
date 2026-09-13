@@ -128,19 +128,19 @@ installed driver name (`"ODBC Driver 17 for SQL Server"`,
   extending the base image with Microsoft's ODBC driver package — it's not
   included by default.
 
-## Streamlit crashes / "Connection error" popup after a query with a date column
+## API process crashes after a query with a date column
 
 A real, observed segfault: `pandas==2.2.3` predates real Python 3.14
 wheels and crashes (`Windows fatal exception: access violation` deep in
 `pandas.core.arrays.datetimes._construct_from_dt64_naive`) building a
 `DataFrame` from *any* row data containing a raw `datetime.datetime`
 value — i.e. any query result with a date/datetime column, via
-`ui/app.py`'s `pd.DataFrame(rows, columns=columns)`. This kills the whole
-Streamlit process (not a catchable Python exception), which is what the
-browser shows as a generic "Connection error / is Streamlit still
-running?" toast. **Fixed** by pinning `pandas==2.3.3` in
-`requirements.txt` (see its own comment) — if you see this exact crash
-shape after touching dependency pins, check that pin hasn't regressed.
+`api/main.py`'s `pd.DataFrame(rows, columns=columns)`. This kills the
+whole API process (not a catchable Python exception), which is what the
+browser shows as a failed/dropped `/execute` request. **Fixed** by pinning
+`pandas==2.3.3` in `requirements.txt` (see its own comment) — if you see
+this exact crash shape after touching dependency pins, check that pin
+hasn't regressed.
 Reproduces in two lines with no app code involved:
 ```python
 import datetime, pandas as pd

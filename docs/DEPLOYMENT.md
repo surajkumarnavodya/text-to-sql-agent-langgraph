@@ -1,10 +1,9 @@
 # Deployment
 
 How to run this project outside a developer's local `pip install` +
-`streamlit run` workflow — Docker/Compose, environment configuration,
-connecting containers to an external Ollama and database, and what's
-deliberately **not** included (Kubernetes, a bundled database, a bundled
-LLM server).
+`uvicorn` workflow — Docker/Compose, environment configuration, connecting
+containers to an external Ollama and database, and what's deliberately
+**not** included (Kubernetes, a bundled database, a bundled LLM server).
 
 Read [`SECURITY.md`](../SECURITY.md) and
 [`docs/PRODUCTION_CHECKLIST.md`](PRODUCTION_CHECKLIST.md) before deploying
@@ -13,10 +12,12 @@ this anywhere beyond your own machine — this document covers *how*, not
 
 ## What's provided, and what isn't
 
-- **Provided:** a `Dockerfile` (single image, non-root, pinned deps,
-  health-checked) and a `docker-compose.yml` running two services from
-  that image — the Streamlit UI (`app`) and the REST API
-  (`api`, [`docs/API.md`](API.md)).
+- **Provided:** a multi-stage `Dockerfile` (a Node stage builds the React
+  dashboard, a Python stage — non-root, pinned deps, health-checked —
+  serves both the REST API and that build) and a `docker-compose.yml`
+  running one `api` service from that image ([`docs/API.md`](API.md)).
+  A separate Streamlit UI container used to ship alongside the API; it's
+  gone now that the React dashboard is served directly by the API process.
 - **Not provided, by design:** Ollama and the target database as
   containers. Both are external/user-provided per this project's own
   architecture (config-driven "connect to your own database," a fully
@@ -25,7 +26,7 @@ this anywhere beyond your own machine — this document covers *how*, not
   LLM server it has no reason to own.
 - **Not provided:** Kubernetes manifests. A single Compose deployment is
   the right scale for this project today (single-region, no need for
-  autoscaling beyond stateless UI/API replicas) — see this document's
+  autoscaling beyond stateless API replicas) — see this document's
   "If you outgrow this" section for when that might change, and
   `docs/PRODUCTION_READINESS_REPORT.md`'s V2 roadmap for the reasoning.
 
@@ -40,10 +41,10 @@ docker compose build
 docker compose up -d
 
 # One-time (and after any real schema change):
-docker compose exec app python scripts/build_embeddings.py
+docker compose exec api python scripts/build_embeddings.py
 
-# UI:  http://localhost:8501
-# API: http://localhost:8000/health
+# Dashboard: http://localhost:8000/
+# API:       http://localhost:8000/health
 ```
 
 `docker compose config` will render your actual `.env` values into its
@@ -52,7 +53,7 @@ careful running it in a shared terminal/CI log.
 
 ## Connecting to Ollama running on the host
 
-Both services declare `extra_hosts: ["host.docker.internal:host-gateway"]`
+The `api` service declares `extra_hosts: ["host.docker.internal:host-gateway"]`
 in `docker-compose.yml`. Set in `.env`:
 
 ```
@@ -95,15 +96,15 @@ don't carry that extra weight — see `Dockerfile`'s own comment on this.
 ## Persistent vector storage
 
 The Chroma schema index lives in a named Docker volume (`chroma_index`,
-mounted at `/app/embeddings/.chroma` in both services) so it survives
-container restarts/recreates without needing `build_embeddings.py` re-run
-every time. Rebuilding the image does **not** clear this volume; only
+mounted at `/app/embeddings/.chroma`) so it survives container
+restarts/recreates without needing `build_embeddings.py` re-run every
+time. Rebuilding the image does **not** clear this volume; only
 `docker compose down -v` or an explicit `docker volume rm` does.
 
 After a real schema change:
 
 ```bash
-docker compose exec app python scripts/build_embeddings.py
+docker compose exec api python scripts/build_embeddings.py
 ```
 
 (Cheap to run when nothing changed — `embeddings.schema_indexer.build_index`
@@ -131,8 +132,6 @@ Nothing Docker-specific here either if you turn these on
 
 ## Health checks
 
-- **`app`** (Streamlit): Docker `HEALTHCHECK` hits Streamlit's own built-in
-  `/_stcore/health` endpoint — no app code needed for this.
 - **`api`**: `docker-compose.yml`'s `healthcheck` hits `GET /health`
   ([`docs/API.md`](API.md)), which actually verifies the database, Ollama,
   and the Chroma index are all reachable — a real dependency check, not
@@ -140,30 +139,30 @@ Nothing Docker-specific here either if you turn these on
 
 ## Reverse proxy and auth
 
-Neither the UI nor the API has real authentication (see
+Neither the dashboard nor the API has real authentication (see
 [`docs/RISK_REGISTER.md`](RISK_REGISTER.md)'s R-001,
 [`docs/API.md`](API.md)'s "Auth" section). For anything beyond
 local/trusted-network use, put an authenticating reverse proxy in front of
-both — e.g. `oauth2-proxy`, or your platform's managed auth/ingress layer.
-Neither service needs to know this exists; point the proxy at
-`app:8501`/`api:8000` and terminate TLS + auth there. The API's optional
+it — e.g. `oauth2-proxy`, or your platform's managed auth/ingress layer.
+The service needs no code to know this exists; point the proxy at
+`api:8000` and terminate TLS + auth there. The API's optional
 `API_AUTH_TOKEN` shared-secret check can layer underneath this (defense in
 depth) but should never be the *only* layer for anything but a single
 trusted caller.
 
-`docker-compose.yml`'s port mappings are bound to `127.0.0.1` by default
-(`${APP_BIND_HOST:-127.0.0.1}:8501:8501` / `${API_BIND_HOST:-127.0.0.1}:8000:8000`)
-— an unqualified `"8501:8501"` mapping binds every host interface, reachable
-from the whole network the host sits on, not just the host itself. Set
-`APP_BIND_HOST`/`API_BIND_HOST` in `.env` (e.g. to `0.0.0.0`, or the specific
-interface your reverse proxy connects from) only once that proxy is
-actually in place — the localhost-only default is what makes "put a
-reverse proxy in front of it" a real boundary rather than something a
-network-reachable port mapping already bypassed.
+`docker-compose.yml`'s port mapping is bound to `127.0.0.1` by default
+(`${API_BIND_HOST:-127.0.0.1}:8000:8000`) — an unqualified `"8000:8000"`
+mapping binds every host interface, reachable from the whole network the
+host sits on, not just the host itself. Set `API_BIND_HOST` in `.env`
+(e.g. to `0.0.0.0`, or the specific interface your reverse proxy connects
+from) only once that proxy is actually in place — the localhost-only
+default is what makes "put a reverse proxy in front of it" a real
+boundary rather than something a network-reachable port mapping already
+bypassed.
 
 ## Horizontal scaling considerations
 
-- **`app`/`api` are effectively stateless per-request** (LangGraph rebuilds
+- **`api` is effectively stateless per-request** (LangGraph rebuilds
   the graph per call; the DB engine is a pooled, reused connection) —
   running multiple replicas behind a load balancer is safe for the request
   path itself.
@@ -183,7 +182,7 @@ network-reachable port mapping already bypassed.
 - **Ollama itself is the actual bottleneck** for concurrent load in
   practice (one local model, `p95_latency_seconds` ≈ 80s in the latest
   benchmark run — see `docs/EVALUATION.md`), not this app's own code.
-  Scaling app/API replicas doesn't help if they're all waiting on the same
+  Scaling API replicas doesn't help if they're all waiting on the same
   single Ollama instance; a real concurrent-user deployment needs either a
   more capable Ollama host or a pool of them behind their own load
   balancer, which this project's `OLLAMA_HOST` config doesn't currently
@@ -220,7 +219,10 @@ solves none of that on its own.
 ## Reproducible builds
 
 `requirements.txt` is fully version-pinned (see its own header comment).
-The `Dockerfile`'s base image tag (`python:3.11-slim`) is not
-digest-pinned — for a stricter reproducibility guarantee, pin it to a
-specific digest (`python:3.11-slim@sha256:...`) once you've settled on a
-base image you don't want to drift.
+Both base images the `Dockerfile` uses — `python:3.11-slim` (the final
+application image) and `node:22-slim` (the frontend-build stage) — are
+digest-pinned (`@sha256:...`), not just tag-pinned: a floating tag can be
+silently repointed at a different image by the upstream maintainer at any
+time, the digest can't. Re-verify and update either digest deliberately (a
+real, reviewed bump), not automatically — see each `FROM` line's own
+comment in the `Dockerfile` for how the digest was obtained.

@@ -12,10 +12,9 @@
 
 </div>
 
-> **Alpha — actively evolving.** Two interfaces currently ship side by side:
-> a newer React dashboard (`frontend/`) and the original Streamlit app
-> (`ui/app.py`) it's intended to eventually replace once fully signed off.
-> Both call the identical LangGraph agent. See [Project status](#-project-status).
+> **Alpha — actively evolving.** The React dashboard (`frontend/`) is now
+> the only UI this project ships; the original Streamlit app has been
+> removed. See [Project status](#-project-status).
 
 <a id="news-and-updates"></a>
 
@@ -23,17 +22,17 @@
 
 <!-- Newest first, sourced from real commit history. Keep no more than the three most recent entries. -->
 
+- **2026-09-13** — Added optional voice mode — local speech-to-text (faster-whisper) and text-to-speech (Piper), schema-aware transcription, off by default
+- **2026-09-13** — Removed the Streamlit UI now that the React dashboard has full feature parity; the FastAPI app serves the dashboard directly (single container, single port)
 - **2026-09-13** — [Security hardening pass on the agentic orchestrator (media generation, RAG, rate limits)](https://github.com/surajkumarnavodya/text-to-sql-agent-langgraph/commit/ec91b96)
-- **2026-09-13** — [Image/video generation with intent detection and inline media display](https://github.com/surajkumarnavodya/text-to-sql-agent-langgraph/commit/319075a)
-- **2026-09-12** — [Replace Streamlit UI with an installable React dashboard, extend the API to support it](https://github.com/surajkumarnavodya/text-to-sql-agent-langgraph/commit/a29e917)
 
 <a id="example-usage"></a>
 
 ## 💻 Example Usage
 
 The REST API (`api/`, FastAPI) is a thin wrapper over the same LangGraph
-agent every UI in this repo calls — `POST /ask` works standalone, with or
-without either UI running:
+agent the React dashboard calls — `POST /ask` works standalone, with or
+without the dashboard built/running:
 
 ```bash
 curl -X POST http://localhost:8000/ask \
@@ -98,13 +97,14 @@ host, or schema anywhere in the codebase.
 
 | Interface | Status | Run it |
 |---|---|---|
-| **React dashboard** (`frontend/`) | Newer, actively developed — theme/accent/font/language pickers, installable as a PWA, feature-parity-checked against Streamlit | `npm run build` in `frontend/`, then `uvicorn api.main:app` serves it at `http://localhost:8000/` |
-| **Streamlit app** (`ui/app.py`) | The original interface. Still fully functional; scheduled for removal once the React app is fully signed off (not yet done — both exist today) | `streamlit run ui/app.py` → `http://localhost:8501/` |
+| **React dashboard** (`frontend/`) | The only UI this project ships — theme/accent/font/language pickers, installable as a PWA, chat history | `npm run build` in `frontend/`, then `uvicorn api.main:app` serves it at `http://localhost:8000/` |
 | **REST API** (`api/`) | No UI — for scripts, notebooks, or your own frontend | `uvicorn api.main:app` → see [`docs/API.md`](docs/API.md) |
 
-All three drive the identical `agent.graph.run_agent` (or, with multi-source
+Both drive the identical `agent.graph.run_agent` (or, with multi-source
 routing enabled, `agent.orchestrator.graph.run_orchestrated`) — no logic is
-duplicated per interface.
+duplicated per interface. A Streamlit app used to ship alongside the React
+dashboard; it was removed once the dashboard reached full feature parity
+(history note, like the earlier bundled-DuckDB removal — see CLAUDE.md).
 
 <a id="why-this-project"></a>
 
@@ -142,20 +142,34 @@ duplicated per interface.
   human confirmation before anything is actually generated — the same
   "Confirm and Run" philosophy the SQL pipeline already applies, extended
   to this source.
+- **Voice mode** (on by default) — press the mic, speak a question (local
+  `faster-whisper` transcription, schema-aware so real table/column names
+  are recognized correctly, with live word-by-word captions as you talk),
+  it's submitted automatically once you stop talking, and the answer is
+  read back automatically (local Piper text-to-speech) — then it resets to
+  the normal composer, one question and one spoken answer per press,
+  matching Google Assistant/ChatGPT's "press to talk" turn shape.
+  Transcription and synthesis are fully local, same as the LLM itself — no
+  cloud speech API, no data leaving the machine for either — and a typed
+  question never triggers spoken output. (Live captions are the one
+  disclosed exception: they use the browser's own built-in speech
+  recognition, which in Chromium browsers is cloud-backed; the actual
+  submitted transcript still comes from local Whisper.)
 - **Grounded insights, not free-form narration.** An optional plain-English
   summary sentence is checked against the actual result data before it's
   shown; an unsupported number is silently dropped rather than displayed as
   if verified.
 - **Fully local LLM stack.** Ollama runs on your machine — no data leaves
-  it for SQL generation (the one opt-in exception is live web search,
-  disabled by default).
+  it for SQL generation (the opt-in exceptions are live web search and
+  voice mode, both disabled by default and both fully local when voice
+  mode is the one enabled).
 
 <details>
 <summary>Full agent graph (11 nodes)</summary>
 
 ```mermaid
 flowchart TD
-    U[User] --> ENTRY{"React dashboard, Streamlit,<br/>or REST API"}
+    U[User] --> ENTRY{"React dashboard<br/>or REST API"}
     ENTRY --> SI["sanitize_input<br/>length cap, Unicode normalization,<br/>prompt-injection pre-filter"]
     SI -->|rejected| STOP1(["Rejected"])
     SI --> CF["classify_followup<br/>standalone / follow-up / ambiguous"]
@@ -202,8 +216,9 @@ walkthrough and retry-routing table.
 - **A database to connect to** — PostgreSQL, MySQL, SQL Server, or Oracle
   (see [Supported models & databases](#-supported-models--databases) below).
   No sample database is bundled.
-- **Node.js + npm** (a recent LTS) — only needed if you want to build the
-  React dashboard; the Streamlit UI and the REST API don't require it.
+- **Node.js + npm** (a recent LTS) — needed to build the React dashboard
+  (the only UI this project ships); the REST API on its own doesn't
+  require it.
 
 ### Clone, install, configure
 
@@ -229,18 +244,24 @@ python scripts/build_embeddings.py
 
 ### Run it
 
-**React dashboard (recommended):**
+**Build and serve the React dashboard (recommended):**
 ```bash
 cd frontend && npm install && npm run build && cd ..
 uvicorn api.main:app --host 0.0.0.0 --port 8000
 ```
-Open `http://localhost:8000/`.
+Open `http://localhost:8000/` — the same FastAPI process serves both the
+API and the dashboard's built static files (see `api/main.py`'s
+`StaticFiles` mount).
 
-**Streamlit app:**
+**Frontend hot-reload during active frontend development:** run the API
+as above in one terminal, then in a second terminal:
 ```bash
-streamlit run ui/app.py
+cd frontend && npm run dev
 ```
-Open `http://localhost:8501/`.
+Open `http://localhost:5173/` — Vite proxies `/ask`, `/execute`,
+`/documents`, `/schema`, `/feedback`, `/health`, `/media`, and `/generate`
+to the API on port 8000 (see `frontend/vite.config.ts`), so no CORS setup
+is needed either way.
 
 **REST API only** (no UI): `uvicorn api.main:app --host 0.0.0.0 --port 8000` —
 see [`docs/API.md`](docs/API.md).
@@ -263,15 +284,12 @@ on GitHub Actions.
 cp .env.example .env   # then edit .env as above
 docker compose build
 docker compose up -d
-docker compose exec app python scripts/build_embeddings.py
+docker compose exec api python scripts/build_embeddings.py
 ```
 
-This starts the Streamlit app (`http://localhost:8501`) and the API
-(`http://localhost:8000`) as two containers from one image. The Dockerfile
-does **not** install Node.js or build the frontend — if you want the API
-container to also serve the React dashboard, run
-`npm run build` inside `frontend/` on the host **before** `docker compose
-build`, so `frontend/dist` exists to be copied into the image. See
+This builds the React dashboard (a Node build stage) and bakes it into the
+same image as the API (a Python stage) — one container, serving both the
+REST API and the dashboard at `http://localhost:8000`. See
 [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) for external Ollama/database
 connectivity and reverse-proxy placement.
 
@@ -333,11 +351,11 @@ vulnerability rather than filing a public issue.
 
 ## 🧪 Project status
 
-This project is **alpha** and evolving quickly. Two UIs coexist today: the
-React dashboard has reached feature parity with Streamlit, but Streamlit
-hasn't been removed yet — both are maintained. See
-[Known limitations](#known-limitations) below for the honest current state
-of accuracy and production-readiness, not a marketing claim.
+This project is **alpha** and evolving quickly. The React dashboard is now
+the only UI — a previous Streamlit app was removed once the dashboard
+reached full feature parity with it. See [Known limitations](#known-limitations)
+below for the honest current state of accuracy and production-readiness,
+not a marketing claim.
 
 <a id="known-limitations"></a>
 
@@ -357,13 +375,20 @@ of accuracy and production-readiness, not a marketing claim.
 - **Document/policy RAG requires SQL Server 2025+ or Azure SQL**
   specifically (native `VECTOR` column type), separate from the four
   `DB_TYPE`s the core SQL pipeline supports.
-- **Two UIs coexist.** The React dashboard has reached feature parity with
-  Streamlit, but Streamlit hasn't been removed yet.
 - **Image/video generation (`ENABLE_MEDIA_GENERATION`, off by default)
   uses real, metered IMA Studio credits when enabled.** Image generation is
   confirmed working end-to-end against a live account; video generation
   shares the same code path but hasn't been separately confirmed with a
   live call yet.
+- **Voice mode (`ENABLE_VOICE_MODE`, on by default) needs a one-time
+  Piper voice download** (`python scripts/download_voice_model.py`) before
+  spoken answers work — `POST /voice/synthesize` returns a clean error
+  until that's done. Transcription accuracy depends on the Whisper model
+  size (`STT_MODEL_SIZE`, default `base`) and your microphone/environment,
+  same caveats as any local speech-to-text setup. Live captions use the
+  browser's own speech recognition, so they need a Chromium-based browser
+  and, in that browser, are not fully local (see `CLAUDE.md`'s "Voice
+  mode" section).
 
 <a id="contributing"></a>
 

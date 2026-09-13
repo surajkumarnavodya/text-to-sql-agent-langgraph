@@ -17,7 +17,7 @@ This codebase optimizes for being explainable, not just working — see
 [`CLAUDE.md`](CLAUDE.md) for the full design rationale. In short:
 
 - Type hints and a docstring on every public function.
-- No `print()` outside `ui/app.py` and the standalone CLI scripts in
+- No `print()` outside the standalone CLI scripts in
   `scripts/` — everything else uses the `logging` module.
 - Never log a connection string, password, or full result row — log
   `DB_TYPE`/`DB_NAME`/table names/row counts only. This is a real security

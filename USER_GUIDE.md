@@ -18,13 +18,20 @@ is like to use it and how it actually works. This guide has two parts:
   references, which Part 2 links to throughout for anyone who wants to go
   deeper.
 
-This guide describes the Streamlit app (`streamlit run ui/app.py`); if
-your organization exposes the [REST API](docs/API.md) instead, the
-underlying behavior described in both parts is identical, but there's no
-chat window — see that document for the programmatic equivalent.
+This guide describes the React dashboard (`frontend/`, served at
+`http://localhost:8000/` once built — see `README.md`'s "Getting
+Started"); if your organization exposes the [REST API](docs/API.md)
+instead, the underlying behavior described in both parts is identical, but
+there's no chat window — see that document for the programmatic
+equivalent. **Note:** this guide was originally written against an earlier
+Streamlit interface; Part 1's underlying behavior and Part 2's architecture
+are current, but some section-by-section UI descriptions (exact button
+labels, panel names) may not perfectly match the current dashboard's
+layout everywhere — the dashboard's own tooltips and labels are the
+source of truth if the two ever disagree.
 
 **Quick start:** type a question in the chat box → review the SQL the AI
-proposes (nothing has run yet) → click **"▶ Confirm and Run"** → read the
+proposes (nothing has run yet) → click **"Confirm and Run"** → read the
 results. Part 1 explains what happens at each of those steps and what to
 do when something doesn't go as expected; Part 2 explains why it behaves
 that way.
@@ -78,22 +85,23 @@ in this guide works identically either way.
 ## 1. Starting the application
 
 Once installed and configured (see [`README.md`](README.md)'s Getting
-Started section), start the app with:
+Started section), build and start the app with:
 
 ```bash
-streamlit run ui/app.py
+cd frontend && npm install && npm run build && cd ..
+uvicorn api.main:app --host 0.0.0.0 --port 8000
 ```
 
 Or, if it's running via Docker (see
 [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md)), just open
-`http://localhost:8501` in a browser — everything described below is
+`http://localhost:8000` in a browser — everything described below is
 identical either way; only how the app is *started* differs.
 
-It opens in your browser automatically. The page title is **"Text-to-SQL
-Dashboard"**, with a tagline: *"Ask a question in plain English — get
-validated, read-only SQL, a live result table, and an auto-picked chart."*
-Three badges under the header show the active model, the connected
-database, and how many tables were discovered.
+Open `http://localhost:8000` in your browser. The header shows the
+product name and a gear icon (opens the chat history panel from the
+right). Before you've asked anything, the main panel shows a heading
+("Ask your data anything"), a short explanation, and a few example
+questions you can click to try immediately.
 
 **If the database can't be reached**, the app stops at a single screen —
 *"⚠️ Database Connection Required"* — showing the connection error and a
@@ -473,12 +481,14 @@ through the system, including every retry, is something you can read off
 the graph definition, not something that only emerges at runtime inside
 one large, opaque model call. §22 walks through every node.
 
-**Two interfaces, one engine.** The Streamlit UI (`ui/app.py`) and the
-optional REST API (`api/main.py`) both call the exact same
+**One engine, one server process.** The React dashboard (`frontend/`) and
+the REST API it calls (`api/main.py`) are, at the network level, the same
+process — `api/main.py` serves both. Both ultimately call the exact same
 `agent.graph.run_agent()` function — neither contains any question-
 answering logic of its own. Every safety guarantee and behavior described
 in Part 1 (validation, retries, row caps, rate limits) applies identically
-regardless of which interface a question came through.
+regardless of whether a question came through the dashboard or a direct
+API call.
 
 **Fully local by default, with two named exceptions.** The language model
 runs locally via [Ollama](https://ollama.com) — no API key, no network
@@ -498,7 +508,7 @@ and nothing else does.
 | SQL validation | sqlglot — AST-based parsing and allowlist checking, see §24 |
 | Document/policy storage | SQL Server 2025+/Azure SQL native `VECTOR` columns, see §28 |
 | Web search | Pluggable provider, Tavily implemented today |
-| UI | Streamlit + Plotly |
+| UI | React + Vite + Tailwind (`frontend/`), served by the API process |
 | API | FastAPI, a thin wrapper with no logic of its own |
 
 ## 22. The question-answering pipeline, step by step
@@ -770,9 +780,10 @@ schema anywhere in the codebase; see
 [`docs/CONFIGURATION.md`](docs/CONFIGURATION.md) for every variable and
 its default.
 
-The app runs either as a plain Python process (`streamlit run ui/app.py`,
-or `uvicorn` for the API) or via the included `Dockerfile`/
-`docker-compose.yml` — see [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) for
+The app runs either as a plain Python process (`uvicorn api.main:app`,
+which serves the built dashboard alongside the API) or via the included
+`Dockerfile`/`docker-compose.yml` — see
+[`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) for
 both paths, including the reverse-proxy-authentication pattern recommended
 for anything reachable beyond a trusted local network (§19/§30).
 

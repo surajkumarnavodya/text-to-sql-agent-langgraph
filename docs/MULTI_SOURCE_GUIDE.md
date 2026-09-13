@@ -14,7 +14,7 @@ decisions behind it.
 ENABLE_MULTI_SOURCE_ROUTER=true
 ```
 
-With this off, `ui/app.py`/`api/main.py` call `agent.graph.run_agent`
+With this off, `api/main.py` calls `agent.graph.run_agent`
 directly — nothing below matters. With it on and nothing else configured,
 the router still only ever sees `sql` as available and short-circuits to
 it with zero added latency or LLM calls — turning this on by itself
@@ -38,9 +38,8 @@ RAG_STORE_CONNECTION_STRING=<see step 4>
 ```
 
 Once both are set and the app is restarted, go to the **Knowledge Sources**
-page (appears automatically in the Streamlit sidebar — it's
-`ui/pages/1_Knowledge_Sources.py`, Streamlit's native multipage
-convention), the **📄 Documents** tab, and upload a PDF. You'll see a
+page (`frontend/src/pages/KnowledgeSources.tsx`, linked from the header
+nav), the **📄 Documents** tab, and upload a PDF. You'll see a
 progress bar, then a success/failure summary per file (chunk count, or the
 error and any "may need OCR" warnings for near-empty pages). The document
 appears in the management table below, status `ready` once indexed —

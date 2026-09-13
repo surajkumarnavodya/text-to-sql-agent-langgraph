@@ -103,12 +103,12 @@ that pass, not a separate "what's new" list bolted on top.
   worse than the risk it's guarding against), but it gives an operator
   visibility into whether the *content itself* is actively being used to
   try to prompt-inject the model, not just whether a typed question was.
-  Database identifiers rendered in the Streamlit UI (the sidebar's table
-  list, the "Retrieved schema context" panel) are markdown-escaped
-  (`ui/column_formatting.py::escape_markdown`) for the same
-  untrusted-content reason, even though neither call site sets
-  `unsafe_allow_html` (so this is about markdown-syntax spoofing, not
-  script execution).
+  Database identifiers rendered in the React dashboard (the schema
+  browser's table list, the "Retrieved schema context" panel) are
+  markdown-escaped server-side (`db/column_formatting.py::escape_markdown`)
+  before being sent to the frontend's markdown renderer, for the same
+  untrusted-content reason — this is about markdown-syntax spoofing (fake
+  bold text, a spoofed link), not script execution.
 - Every rejection, validator safety violation, rate-limit trip, and
   RAG-poisoning-scan hit is additionally logged as one structured event
   (`security/audit_log.py`, on a dedicated `security.audit` logger) — not a
@@ -192,12 +192,14 @@ that pass, not a separate "what's new" list bolted on top.
   safeguard sized for one local user, not a substitute for real
   multi-tenant rate limiting (a distributed store, per-user identity,
   coordinated limits across processes) if this were ever deployed for more
-  than one person at a time. `ui/app.py`'s query-result cache (`st.
-  cache_data`, which is process-wide in Streamlit, not per-session by
-  default) is scoped with a per-session token specifically so this
-  single-user posture doesn't quietly become a cross-user data leak the
-  moment more than one person points a browser at the same running
-  process — see that function's own docstring.
+  than one person at a time. The dashboard's own repeated-question cache
+  (`frontend/src/store/chatStore.ts`'s `nlQuestionCache`) is a plain
+  client-side `Map` in that browser tab's own memory, never sent to or
+  shared by the server — a strictly weaker, but also strictly safer,
+  version of a concern that used to apply to the removed Streamlit UI's
+  server-side, process-wide query-result cache (which needed an explicit
+  per-session scoping token to avoid a cross-user leak; no server-side
+  equivalent cache exists today, so that specific risk no longer applies).
 - **The LLM-call rate limiter is process-wide, not per-session**, unlike
   the question-submission limiter, which genuinely is per-session (see
   "Resource exhaustion / abuse protections" below for why). For this
@@ -303,7 +305,7 @@ this code path runs at all.
   chunks, not business data, and vice versa.
 - **The Knowledge Sources upload page has no access control of its own** —
   same posture as the rest of this app (see "Not designed for multi-tenant
-  or production deployment" below): anyone who can reach the Streamlit UI
+  or production deployment" below): anyone who can reach the dashboard
   can upload to either collection, including the sensitivity-gated one
   (they just can't get the LLM to summarize sensitive content back to them
   afterward). Put this behind the same authenticating reverse proxy you'd
@@ -328,8 +330,8 @@ others don't need.
   (`REQUIRE_GENERATION_APPROVAL=true`).** The router picking "generation"
   no longer means IMA gets called — `generation_node` only proposes what
   would be generated (no charge, nothing downloaded/cached) until a human
-  explicitly confirms via `POST /generate/confirm` or the matching UI
-  button (React and Streamlit both). This mirrors "Confirm and Run" for
+  explicitly confirms via `POST /generate/confirm` or the matching
+  "Generate" button in the dashboard. This mirrors "Confirm and Run" for
   SQL, applied to the one source here that costs real money. Set
   `false` only for a trusted automation context that has already reviewed
   this tradeoff.
@@ -377,9 +379,9 @@ enforced" above; none of this replaces those).
   counter, no external store, resets on every app restart. Two separate
   limits, at different scope and strictness:
   - **Question submissions** (default 10/minute, `QUESTION_RATE_LIMIT_PER_MINUTE`):
-    genuinely per Streamlit session, checked in `ui/app.py` before
-    `run_agent()` is ever called — including for the sidebar's "Re-run"
-    button, which costs exactly as much as retyping the question.
+    per client IP, checked in `api/main.py` before `run_orchestrated()` is
+    ever called — including for the dashboard's "Re-run" action, which
+    costs exactly as much as retyping the question.
   - **LLM generation calls** (default 20/minute, stricter,
     `LLM_CALL_RATE_LIMIT_PER_MINUTE`): process-wide, checked inside
     `generate_sql_node` before *every* attempt, including retries within

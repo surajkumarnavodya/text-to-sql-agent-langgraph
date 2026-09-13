@@ -100,8 +100,9 @@ this model on this dataset, not edge cases to hand-wave past.
 
 ### A concrete failure mode worth knowing about
 
-`eval/results/streamlit_run.log` captured one question ("Show total sales
-by year and product name") retrying the full `MAX_RETRIES` budget (4
+A real captured trace (from a run against the now-removed Streamlit app,
+since deleted along with it) recorded one question ("Show total sales by
+year and product name") retrying the full `MAX_RETRIES` budget (4
 attempts) and generating **byte-identical SQL on attempts 2, 3, and 4**
 despite the error-feedback prompt changing each time. `agent/llm_client.py`
 runs generation at `temperature=0.0` (deterministic) — a real tension with

@@ -4,11 +4,12 @@ This is the detailed technical walkthrough — the README's diagram is the
 30-second version. This document covers three things: the LangGraph node
 design, the retry/self-correction logic, and the schema-retrieval pipeline.
 
-Two interfaces sit on top of everything described here: `ui/app.py`
-(Streamlit, the primary surface) and `api/main.py` (a thin FastAPI wrapper
-added for programmatic access — see [`docs/API.md`](API.md)). Both call
-the exact same `agent.graph.run_agent` entry point below — the graph
-design, not either interface, is the architectural core.
+One interface sits on top of everything described here: `api/main.py`
+(FastAPI), which serves both the REST API and the React dashboard
+(`frontend/`, the primary human-facing surface — see
+[`docs/API.md`](API.md)). It calls the exact same `agent.graph.run_agent`
+entry point below — the graph design, not the interface, is the
+architectural core.
 
 ## 1. The LangGraph state machine
 
@@ -500,7 +501,7 @@ re-embed on every build even though nothing schema-*shaped* had changed.
 
 Optional, off by default (`ENABLE_MULTI_SOURCE_ROUTER=false`). When off,
 `agent.orchestrator.graph.run_orchestrated` — the one entry point
-`ui/app.py`/`api/main.py` call — is a pure pass-through to
+`api/main.py` calls — is a pure pass-through to
 `agent.graph.run_agent`: the orchestrator graph below is never even
 constructed, so everything in sections 1–3 above is exactly as accurate for
 a plain SQL-only setup with the flag on as with it off. See
@@ -588,7 +589,7 @@ The only genuinely new fields are `route_decision`, `sources_used`
 
 ### UI rendering: gated on whether SQL was actually a source
 
-`ui/app.py`'s SQL-specific rendering (schema context expander, the
+The React dashboard's SQL-specific rendering (schema context expander, the
 editable SQL box, Confirm and Run, the results table/chart) only renders
 when `"sql" in state.get("sources_used", ["sql"])` — the default
 (`["sql"]`) covers the router-off path, where `sources_used` doesn't exist

@@ -1,22 +1,25 @@
 # API
 
-A minimal REST API (`api/`, FastAPI) over the same LangGraph agent the
-Streamlit UI drives. **Not a replacement for `ui/app.py`** — the UI remains
-the primary, human-facing surface (SQL review, retry timeline, schema
-browser, charts). This exists for programmatic/scripted access and as the
+A REST API (`api/`, FastAPI) over the LangGraph agent. This same process
+also serves the React dashboard (`frontend/`), the primary human-facing
+surface (SQL review, retry timeline, schema browser, charts) — see
+`api/main.py`'s `StaticFiles` mount. The API remains fully usable on its
+own for programmatic/scripted access and as the
 interface `docs/DEPLOYMENT.md`'s reverse-proxy/container guidance sits in
 front of.
 
 ## Why this is safe: no second implementation
 
-`POST /ask` calls `agent.graph.run_agent` directly — the exact function
-`ui/app.py` calls. Every safety layer described in `SECURITY.md` (input
-guard, SQL validator's SELECT-only allowlist, row cap, query timeout, the
-process-wide LLM-call rate limiter, sensitive-column blocking) governs this
-endpoint identically, because it's the same graph execution, not a
-parallel code path that could drift out of sync or be weaker. `GET
-/schema/tables` similarly reuses `db.schema_introspection.introspect_schema`
-— the same metadata-only introspection the UI's schema browser and
+`POST /ask` calls `agent.orchestrator.graph.run_orchestrated` directly —
+which itself is a pure pass-through to `agent.graph.run_agent` unless
+`ENABLE_MULTI_SOURCE_ROUTER` is set. Every safety layer described in
+`SECURITY.md` (input guard, SQL validator's SELECT-only allowlist, row
+cap, query timeout, the process-wide LLM-call rate limiter,
+sensitive-column blocking) governs this endpoint identically, because it's
+the same graph execution, not a parallel code path that could drift out of
+sync or be weaker. `GET /schema/tables` similarly reuses
+`db.schema_introspection.introspect_schema` — the same metadata-only
+introspection the dashboard's schema browser and
 `scripts/build_embeddings.py` use.
 
 ## Running it
@@ -26,9 +29,10 @@ uvicorn api.main:app --host 0.0.0.0 --port 8000
 ```
 
 Or via Docker Compose — see `docs/DEPLOYMENT.md` (`docker compose up api`).
-It reads the same `.env` as the Streamlit UI (same `config/settings.py`,
-same database/Ollama/Chroma configuration) — there is nothing API-specific
-to configure beyond the optional `API_AUTH_TOKEN` described below.
+It reads the same `.env` the React dashboard's backend calls into (same
+`config/settings.py`, same database/Ollama/Chroma configuration) — there
+is nothing API-specific to configure beyond the optional `API_AUTH_TOKEN`
+described below.
 
 ## Endpoints
 
@@ -81,7 +85,7 @@ it server-side from `ui/session_history.py`'s session state), must be
 resent by the caller each request — the API has no server-side session of
 its own. `enable_insight` defaults to `true`.
 
-Response (mirrors what `ui/app.py` renders — see `agent.state.AgentState`):
+Response (mirrors what the React dashboard renders — see `agent.state.AgentState`):
 
 ```json
 {
@@ -183,7 +187,7 @@ real auth.
 authenticating reverse proxy** (e.g. `oauth2-proxy`, your platform's
 managed auth) regardless of whether `API_AUTH_TOKEN` is set — see
 `docs/DEPLOYMENT.md`. This mirrors the same posture `SECURITY.md` already
-states for the Streamlit UI: this project is not designed for multi-user
+states for the whole app: this project is not designed for multi-user
 authorization, and adding a shared token doesn't change that.
 
 ## Correlation IDs

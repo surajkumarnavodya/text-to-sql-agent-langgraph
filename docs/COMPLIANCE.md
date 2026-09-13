@@ -17,7 +17,7 @@ just read off a design doc.
 | Risk | Status | Where |
 |---|---|---|
 | LLM01: Prompt Injection | Layered, not eliminated | `agent/input_guard.py` (pre-filter regex), the system prompt's untrusted-data framing (`agent/llm_client.py`), and — the actual backstop — `agent/sql_validator.py`'s SELECT-only allowlist plus a read-only DB role. `SECURITY.md`'s "What is explicitly not guaranteed" is explicit that the regex layer is beatable; the SQL validator is what bounds the consequences. |
-| LLM02: Insecure Output Handling | Addressed | Generated SQL is never executed without passing `agent/sql_validator.py`'s AST-based allowlist first — every time, including hand-edited SQL in the UI (`ui/app.py`'s "Confirm and Run" re-validates). Not treated as trusted output at any point. |
+| LLM02: Insecure Output Handling | Addressed | Generated SQL is never executed without passing `agent/sql_validator.py`'s AST-based allowlist first — every time, including hand-edited SQL in the dashboard ("Confirm and Run" re-validates via `POST /execute`). Not treated as trusted output at any point. |
 | LLM03: Training Data Poisoning | Not applicable | No model training/fine-tuning happens in this project; `llama3.1:8b` is used as-shipped via Ollama. |
 | LLM04: Model Denial of Service | Partially addressed | `agent/rate_limit.py` (question + LLM-call limits), `LLM_MAX_TOKENS`/`INSIGHT_MAX_TOKENS`/`QUERY_PLAN_MAX_TOKENS`/`SQL_REVIEW_MAX_TOKENS` caps, `QUERY_TIMEOUT_SECONDS`, `db/query_cost.py`'s pre-execution cost gate. The process-wide LLM-call limiter covers `generate_sql_node` but not the newer `plan_query_node`/`review_sql_node` calls (`docs/RISK_REGISTER.md`'s R-007) or sustained Ollama failure generally (R-006). **2026-09-13 addition:** media generation (a real, metered third-party call, not an LLM call, but the same "denial of wallet" risk class) has its own process-wide limiter (`MEDIA_GEN_RATE_LIMIT`) plus a new session-scoped ceiling on combined generation/web invocations (`SESSION_EXPENSIVE_SOURCE_LIMIT` — R-011 discloses this control's own honest limit); `/execute`, `/schema/refresh`, and the mutating `/documents` routes gained rate limiting they previously lacked entirely (`API_ACTION_RATE_LIMIT_PER_MINUTE`, `api/rate_limit.py`). |
 | LLM05: Supply Chain Vulnerabilities | Addressed | `requirements.txt` fully version-pinned (no unpinned/range deps); dependency-Python-version verification gap tracked as `docs/RISK_REGISTER.md`'s R-004. |
@@ -104,7 +104,7 @@ outside the high-risk categories entirely, closer to a limited-risk/general
 AI-system profile:
 
 - **Transparency:** Users see the generated SQL and can review it before
-  results are shown (`ui/app.py`'s "Confirm and Run" gate) — the system
+  results are shown (the dashboard's "Confirm and Run" gate) — the system
   does not present LLM output as ground truth without a human-visible,
   human-editable intermediate artifact.
 - **Human oversight:** The manual confirmation step is exactly this — no

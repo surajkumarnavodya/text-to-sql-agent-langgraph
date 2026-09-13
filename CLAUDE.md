@@ -6,15 +6,16 @@ before making changes.
 ## What this project is
 
 A Text-to-SQL dashboard connected to one or more real, user-configured
-databases. A user types a natural-language question in Streamlit, a
-LangGraph agent turns it into SQL against the configured database (schema
-retrieved via ChromaDB, embedded from **live schema introspection** — not a
-hardcoded sample — so only relevant tables are shown to the LLM), the SQL is
-validated (SELECT-only allowlist), executed read-only, and the result is
-rendered as a table + auto-picked Plotly chart. The LLM runs locally via
-Ollama — no network calls for the LLM, no API keys required for that part.
-Database connectivity is fully config-driven via `.env`; there is no
-hardcoded connection string, host, or schema anywhere in the codebase.
+databases. A user types a natural-language question in a React dashboard
+(`frontend/`), a LangGraph agent turns it into SQL against the configured
+database (schema retrieved via ChromaDB, embedded from **live schema
+introspection** — not a hardcoded sample — so only relevant tables are
+shown to the LLM), the SQL is validated (SELECT-only allowlist), executed
+read-only, and the result is rendered as a table + auto-picked chart. The
+LLM runs locally via Ollama — no network calls for the LLM, no API keys
+required for that part. Database connectivity is fully config-driven via
+`.env`; there is no hardcoded connection string, host, or schema anywhere
+in the codebase.
 
 **Multiple databases:** `DB_CONNECTIONS` in `.env` can list more than one
 named connection (`config.settings.DatabaseConnectionConfig`, one full
@@ -36,8 +37,25 @@ only to a real database via SQLAlchemy. If you see references to DuckDB,
 stale comments), they're leftover from that phase and should be treated as
 wrong, not as a parallel supported mode.
 
+**History note:** the project also originally shipped a Streamlit app
+(`ui/app.py` + `ui/pages/1_Knowledge_Sources.py` + `ui/theme.py`) alongside
+the newer React dashboard while the two were being brought to feature
+parity. Once parity was confirmed, the Streamlit app was fully removed (by
+explicit user decision) — the React dashboard (`frontend/`) is now the
+only UI. Two small, genuinely non-UI modules that used to live under `ui/`
+were relocated rather than deleted, since real code outside the old UI
+still depended on them: `ui/session_history.py` → `eval/history.py`
+(trimmed to what `eval/runner.py`/`scripts/run_eval.py` actually use — the
+Streamlit-only state-mutation helpers and the `status_label` display
+helper were dropped as genuinely dead code once nothing rendered them
+anymore), and `ui/column_formatting.py` → `db/column_formatting.py`
+(still used by `scripts/profile_pipeline.py`, mirrored on the frontend by
+`frontend/src/lib/columnFormatting.ts`). If you see a reference to
+`ui/app.py`, `ui.session_history`, or `ui.column_formatting` anywhere
+(docs, old branches, stale comments), it's leftover from that phase.
+
 **Multi-source (optional, off by default):** `ENABLE_MULTI_SOURCE_ROUTER=true`
-switches `ui/app.py`/`api/main.py` from calling `agent.graph.run_agent`
+switches `api/main.py` from calling `agent.graph.run_agent`
 directly to calling `agent.orchestrator.graph.run_orchestrated`, which adds
 a router in front of the SQL pipeline and can fan a question out to up to
 three more sources: an "documents" and a separate, more access-sensitive
@@ -58,7 +76,7 @@ below, and `docs/MULTI_SOURCE_GUIDE.md` for how to configure each source.
 | SQL parsing/validation | sqlglot — parses generated SQL and checks statement type against an allowlist, in the dialect matching `DB_TYPE` |
 | Document/policy RAG | SQL Server 2025+/Azure SQL native `VECTOR` column type (`rag/store.py`) — a dedicated connection (`RAG_STORE_CONNECTION_STRING`), separate from `DB_CONNECTIONS`. Optional, off by default (`ENABLE_DOCUMENT_RAG`/`ENABLE_POLICY_RAG`) |
 | Web search | Configurable provider (`search/web_search.py`), Tavily implemented today. Optional, off by default (`ENABLE_WEB_SEARCH` + `WEB_SEARCH_API_KEY`) |
-| UI | Streamlit + Plotly. `ui/app.py` (chat) + `ui/pages/1_Knowledge_Sources.py` (PDF upload/management, Streamlit's native multipage convention) |
+| UI | React + Vite + Tailwind (`frontend/`) — the only UI this project ships (a Streamlit app used to ship alongside it; removed once feature parity was confirmed, see the "History note" above). Built with `npm run build`, served directly by the FastAPI process (`api/main.py`'s `StaticFiles` mount) in production, or via Vite's dev server (proxying to the API) during frontend development. Charting is Plotly-figure-JSON-in, chart.js-rendering-out (`agent/result_charting.py` builds it, `frontend/src/lib/chartAdapter.ts` renders it) |
 | Python | 3.11 is the target per project spec. **This machine only has 3.14 installed** (no 3.11 on PATH via `py -0p`) — the venv was created against 3.14. If a future session hits a wheel-availability issue for a pinned dependency, that's why (see "Python 3.14 gotchas" below for two real ones already hit and fixed). Re-run `py -0p` to check if 3.11 has since been installed and consider recreating `.venv` against it if so. |
 
 ### Python 3.14 gotchas already hit (fixed, but worth knowing about)
@@ -69,7 +87,7 @@ below, and `docs/MULTI_SOURCE_GUIDE.md` for how to configure each source.
   in two lines with no app code involved) — this predates real Python 3.14
   wheels. Fixed by pinning `pandas==2.3.3` (see `requirements.txt`'s
   comment). If a future dependency bump reintroduces an old pandas pin,
-  this is the symptom to watch for: the Streamlit process dies with
+  this is the symptom to watch for: the API process dies with
   `Segmentation fault`/`Windows fatal exception: access violation` right
   after a query with a date/datetime column succeeds, not a normal Python
   exception.
@@ -114,9 +132,9 @@ below, and `docs/MULTI_SOURCE_GUIDE.md` for how to configure each source.
   that output for Chroma cache invalidation. `execution.py` owns read-only
   SQL execution mechanics (`execute_readonly_sql` — background-thread
   timeout enforcement plus a `fetchmany()` row cap), shared by
-  `agent.nodes.execute_sql_node` and `ui/app.py`'s "Confirm and Run" path —
-  a pure database-execution concern with no LangGraph dependency, so it
-  lives here rather than in `agent/`.
+  `agent.nodes.execute_sql_node` and `api/main.py`'s `POST /execute`
+  ("Confirm and Run") path — a pure database-execution concern with no
+  LangGraph dependency, so it lives here rather than in `agent/`.
 - `embeddings/` — `schema_indexer.py`'s `build_index(tables, db_name, ...)`
   takes already-introspected `TableSchemaInfo` objects (not a file, not an
   engine) and embeds them into **that database's own Chroma collection**
@@ -126,7 +144,7 @@ below, and `docs/MULTI_SOURCE_GUIDE.md` for how to configure each source.
   settings, force)` is the single introspect → sample → embed pipeline for
   one database; `refresh_all_schema_indexes(settings, force)` runs it for
   every configured database and is what `scripts/build_embeddings.py` and
-  `ui/app.py`'s schema initialization actually call. `retriever.py`'s
+  `api/main.py`'s startup/`POST /schema/refresh` actually call. `retriever.py`'s
   `retrieve_relevant_schema(question, db_name, ...)` does top-k similarity
   search over one database's table-level DDL chunks — unchanged in shape
   from before, just explicitly scoped to one database's collection now.
@@ -161,8 +179,8 @@ below, and `docs/MULTI_SOURCE_GUIDE.md` for how to configure each source.
   `web_search_node`; `synthesis_node`, a pure pass-through unless 2+ sources
   actually fired), `state.py` (`OrchestratorState` *extends* `AgentState`,
   never replaces it — see "Multi-source orchestration" below), `graph.py`
-  (`run_orchestrated`, the single entry point `ui/app.py`/`api/main.py`
-  call in place of `agent.graph.run_agent` directly).
+  (`run_orchestrated`, the single entry point `api/main.py` calls in place
+  of `agent.graph.run_agent` directly).
 - `rag/` — document/policy agentic RAG, one implementation shared by both
   the "documents" and "policies" collections (parameterized by collection
   name, not two near-duplicate modules): `store.py` (SQL Server native
@@ -182,63 +200,60 @@ below, and `docs/MULTI_SOURCE_GUIDE.md` for how to configure each source.
   function dict (`SUPPORTED_SEARCH_PROVIDERS`), shaped exactly like
   `db.connection.SUPPORTED_DB_TYPES` — swapping `WEB_SEARCH_PROVIDER` is a
   `.env` change, not a code change. Only `tavily` is implemented today.
-- `ui/app.py` — the only file that imports Streamlit for the chat page. It
-  imports `agent.orchestrator.graph.run_orchestrated` and calls it (which
-  is itself a pure pass-through to `agent.graph.run_agent` unless
-  `ENABLE_MULTI_SOURCE_ROUTER` is set); it does not contain any agent logic
-  itself. Manual "Confirm and Run" button gates *displayed* execution — see
-  "SQL is untrusted output, always" below for the nuance around the agent's
-  own internal self-correction executions; it validates and executes
-  against whichever database the displayed SQL was actually routed to
-  (`state["selected_database"]`), not a re-guessed one. Every SQL-specific
-  render (schema context, editable SQL box, Confirm and Run, results table)
-  is gated on `"sql"` actually being one of `state["sources_used"]` (or
-  that key being absent entirely, which implies the router is off) — a
-  pure web/document/policy answer renders through a separate path instead
-  (`_render_sources_used`/`_render_source_answer`), never through the
-  SQL-specific one. On startup, `test_connection()` is checked for every
-  configured database; a setup screen and `st.stop()` only happen if *all*
-  of them fail (one down database doesn't block the others). The sidebar
-  exposes per-database connection status, a manual re-test, a manual schema
-  refresh (all databases), a schema browser grouped by database, and which
-  database the most recent question was routed to.
-- `ui/theme.py` — the dark/light theme system shared by both Streamlit
-  pages (multipage apps don't share a layout wrapper, so each page calls
-  this independently rather than duplicating CSS). `render_theme_toggle()`
-  (a sidebar `st.toggle`) writes `st.session_state.theme_mode`, which
-  persists across page navigation within a session;
-  `inject_theme_css()` reads it back (via `get_theme_mode()`, defaulting
-  to `"light"` — flipping the toggle never changes the default experience
-  for anyone who doesn't touch it) and emits the matching `<style>` block.
-  Server-side conditional CSS, not a client-side JS switch — Streamlit
-  reruns the whole script on the toggle click, so the next render just
-  picks the other variable set. Deliberately doesn't touch
-  `.streamlit/config.toml` (loaded once at server startup, can't be
-  flipped per-session at runtime) — instead overrides Streamlit's actual
-  rendered surfaces directly via `data-testid` selectors, the same
-  technique the original light-only styling already used. Known,
-  disclosed gap: Streamlit's own built-in chrome (the top header bar, its
-  native hamburger "Settings" menu) isn't reachable by this CSS and won't
-  flip with the toggle.
-- `ui/pages/1_Knowledge_Sources.py` — PDF upload + management for the
-  "documents"/"policies" collections (Streamlit's native multipage
-  convention: any script under `ui/pages/` becomes its own page
-  automatically, no change to `ui/app.py` needed). Two tabs, each showing a
-  clear "not configured" message rather than a broken upload form if its
-  `ENABLE_*_RAG` flag or `RAG_STORE_CONNECTION_STRING` isn't set. A policy
-  upload gets an optional sensitivity-category selector (compensation/
-  disciplinary/legal/none — see `rag/store.py`'s `SensitivityCategory`).
-- `api/` — `main.py`'s FastAPI app is the programmatic/scripted-access
-  surface alongside the Streamlit UI, same underlying graph either way (see
-  "Multi-source orchestration" above). A `lifespan` context manager warms
+- `frontend/` — the React + Vite + TypeScript + Tailwind dashboard, the
+  only UI this project ships (see the "History note" near the top of this
+  file for the Streamlit app it replaced). `src/pages/Chat.tsx` is the main
+  chat page; `src/pages/KnowledgeSources.tsx` is PDF upload/management for
+  the "documents"/"policies" collections (Vite/react-router's equivalent of
+  a second page, mirroring what used to be a separate Streamlit multipage
+  script). `src/store/chatStore.ts` (Zustand) owns conversation state —
+  `queryHistory` is the array of turns for whichever conversation is
+  currently on screen, and `conversations` is every conversation started
+  this session (keyed by id), auto-saved as `queryHistory` changes
+  (`commitQueryHistory`); switching conversations swaps which one
+  `queryHistory` points at. This is in-memory/session-only, same as the
+  Streamlit app's own history was — a page reload clears it, by design, not
+  as a regression. `src/components/layout/AppShell.tsx` is the full-
+  viewport shell: a compact header (product mark, nav, theme toggle, and a
+  single gear icon) and a right-side `HistoryDrawer.tsx` that the gear
+  toggles open/closed — hidden by default, no other control opens or
+  closes it. `HistorySettingsSection.tsx` (nested inside the drawer) holds
+  everything that used to live in the Streamlit sidebar and isn't chat
+  history itself: appearance (theme/accent/font/language, `src/lib/
+  theme.ts`), per-database connection status, a manual re-test, a manual
+  schema refresh, a schema browser grouped by database, and the "Generate
+  AI insight" toggle. `src/components/chat/TurnCard.tsx` renders one
+  question+answer turn — schema context and the generated SQL are both
+  collapsible (`src/components/ui/expander.tsx`), and technical metadata
+  (which database a question was routed to) sits inside a collapsed
+  "Query information" panel rather than as a always-visible label. Every
+  SQL-specific render (schema context, editable SQL box, Confirm and Run,
+  results table) is gated on `"sql"` actually being one of
+  `state.sources_used` (or that key being absent entirely, which implies
+  the router is off) — a pure web/document/policy answer renders through a
+  separate path instead (`SourcesUsedPanel.tsx`), never through the
+  SQL-specific one. `POST /execute` (`api/main.py`) re-validates and
+  re-executes the *current* SQL text fresh every time "Confirm and Run" is
+  clicked — see "SQL is untrusted output, always" below for the nuance
+  around the agent's own internal self-correction executions, which are
+  never shown to the user. In development, `vite.config.ts`'s
+  `BACKEND_ROUTES` proxies `/ask`/`/execute`/`/documents`/`/schema`/
+  `/feedback`/`/health`/`/media`/`/generate` to the API on port 8000 so the
+  browser never needs CORS; in production, `npm run build`'s output
+  (`frontend/dist`) is served by that same API process (`api/main.py`'s
+  `StaticFiles` mount) at the same paths, so the frontend's own fetch calls
+  never need an `/api` prefix or environment-specific base URL.
+- `api/` — `main.py`'s FastAPI app is the REST surface every UI action
+  goes through, and (once `frontend/dist` exists) also the process that
+  serves the React dashboard itself. A `lifespan` context manager warms
   every process-lifetime singleton at startup rather than on whichever
   request happens to arrive first — every configured database's read-only
   engine, the cached Ollama client, and the compiled SQL/orchestrator
   LangGraph graph(s) — and stashes them on `app.state` for
   discoverability, though request handling itself still reaches them
-  through the same cached module-level functions `ui/app.py`/
-  `eval/runner.py` use, not through `app.state` (see "Process-lifetime
-  singletons" below). Two global exception handlers
+  through the same cached module-level functions `eval/runner.py` uses,
+  not through `app.state` (see "Process-lifetime singletons" below). Two
+  global exception handlers
   (`@app.exception_handler(AgentError)` /
   `@app.exception_handler(Exception)`) are the last-resort net ensuring no
   response body ever contains a raw internal exception string — every
@@ -389,19 +404,18 @@ per-question prompt block already has. Fails open exactly like
 unreachable/empty store, or a lookup error all resolve to "no examples,"
 never a reason a question can't be answered.
 
-Examples are added only via the UI's explicit thumbs-up feedback
-(`ui/app.py`, `st.feedback("thumbs")`, shown once a "Confirm and Run"
-result is genuinely confirmed successful) — never automatically, and
-never from the API today (a natural, easy follow-up, not built yet). The
-SQL saved is `QueryHistoryEntry.confirmed_sql` (the *exact* SQL actually
-executed), not the agent's original draft — the user may have edited the
-SQL box before confirming, and the corrected version is exactly what's
-worth remembering. Saved with a deterministic id
+Examples are added only via the dashboard's explicit thumbs-up feedback
+(`frontend/src/components/sql/GoldenFeedbackWidget.tsx`, calling
+`POST /feedback`, shown once a "Confirm and Run" result is genuinely
+confirmed successful) — never automatically. The SQL saved is the *exact*
+SQL actually executed, not the agent's original draft — the user may have
+edited the SQL box before confirming, and the corrected version is exactly
+what's worth remembering. Saved with a deterministic id
 (`embeddings.golden_examples._example_id`, a hash of database+question+SQL)
 so re-clicking the widget upserts the same document rather than
-accumulating duplicates. Both the UI and the API benefit from retrieval
-automatically, since both call the same underlying `agent.graph.run_agent`
-graph.
+accumulating duplicates. Every caller (the React dashboard, the REST API
+used standalone, `eval/runner.py`) benefits from retrieval automatically,
+since they all call the same underlying `agent.graph.run_agent` graph.
 
 ### Nested-aggregate detection (validator + execution backstop)
 A real, reproduced failure: a local model asked for something like
@@ -459,8 +473,9 @@ The one retry path that re-enters `retrieve_schema` (`execute_sql`'s
 targeting the same database attempt 1 already generated/executed SQL
 against. Every downstream dialect/engine resolution
 (`validate_sql_node`, `estimate_query_cost_node`, `execute_sql_node`, and
-`ui/app.py`'s "Confirm and Run") reads `db.connection.get_connection(settings,
-state["selected_database"])` rather than a single global `Settings.db_type`.
+`api/main.py`'s `POST /execute` "Confirm and Run" route) reads
+`db.connection.get_connection(settings, state["selected_database"])`
+rather than a single global `Settings.db_type`.
 
 Two things deliberately left alone by this design (documented, not
 silently ignored): the eval benchmark's per-case `database:` label (see the
@@ -482,8 +497,8 @@ separately testable and inspectable rather than folded into one model's
 implicit tool-selection reasoning.
 
 `agent.orchestrator.graph.run_orchestrated` is the one entry point
-`ui/app.py`/`api/main.py` call, and it is deliberately a **two-path
-function, not a graph with one trivial branch**:
+`api/main.py` calls, and it is deliberately a **two-path function, not a
+graph with one trivial branch**:
 
 - Flag off (the default): `run_orchestrated` calls `agent.graph.run_agent`
   directly and returns its result completely unwrapped — not "the
@@ -512,9 +527,9 @@ function, not a graph with one trivial branch**:
 - `OrchestratorState` (`agent/orchestrator/state.py`) *extends* `AgentState`
   rather than replacing it — `sql_subgraph_node`'s full `run_agent()` result
   merges into it under the exact same keys (`status`, `sql`, `result_rows`,
-  ...), which is why every existing `ui/app.py` read site keeps working
-  whether a question went through `run_agent` directly or through the
-  orchestrator. `synthesis_node` is a pure pass-through when only one
+  ...), which is why every existing `api/schemas.py`/frontend read site
+  keeps working whether a question went through `run_agent` directly or
+  through the orchestrator. `synthesis_node` is a pure pass-through when only one
   source fired (that source's own answer stands unedited, no LLM call
   spent restating something already complete); with 2+, each source's
   contribution is shown under its own labeled heading, never blended into
@@ -578,8 +593,9 @@ column (`rag/store.py::ensure_schema` migrates an existing table
 automatically — an idempotent `ALTER TABLE ... ADD` guard, the one schema
 migration this module has needed) and served on demand
 (`get_document_bytes`) from a chat answer's citation
-(`ui/app.py::_render_source_answer`) or the Knowledge Sources management
-page, never fetched into a listing/search query itself — both
+(`frontend/src/components/chat/SourceAnswerCard.tsx`) or the Knowledge
+Sources management page, never fetched into a listing/search query itself
+— both
 `list_documents` and `similarity_search` project a cheap `has_pdf_bytes`
 boolean instead. Before this existed, ingestion discarded the raw bytes
 right after text extraction, so **only documents uploaded after this
@@ -627,6 +643,19 @@ opting in. Two design points worth knowing if you touch this:
   "animate"/"animation"/"footage"/"motion" gets `generate_video`, else
   `generate_image`. `generate_audio` is built and tested but not
   auto-routed here (nothing in this feature's scope asks for audio).
+- **Video clip length is a real model-capability ceiling, not a config
+  restriction this app imposes.** `Settings.media_gen_video_duration_seconds`
+  (optional) overrides the video model's own default "duration" form field
+  via `create_and_poll`'s new `form_overrides` param — but verified live
+  against a real IMA account (a read-only, no-cost `GET /open/v1/product/list
+  ?category=text_to_video` call): the auto-selected model ("Seedance 2.0")
+  only accepts an integer 4-15 (its own declared `form_config` min/max),
+  default 5. No IMA video model on this account, or as far as this project
+  has confirmed offered by IMA at all, supports a single multi-minute
+  generation — current text-to-video models generally cap in the 5-15
+  second range per call. An out-of-range value is rejected by IMA itself as
+  a clean provider failure, not pre-validated against the live per-model
+  range here.
 - **Generated media is served through this app, never the provider's raw
   CDN URL.** `execute_generation` (the function that actually calls IMA —
   see "Human-in-the-loop approval gate" below) downloads the bytes once
@@ -640,9 +669,7 @@ opting in. Two design points worth knowing if you touch this:
   `media_id`. The React frontend fetches the bytes via the authenticated
   `GET /media/{media_id}` (`api/media.py`, mirroring `api/documents.py`'s
   PDF download route) and renders an `<img>`/`<video>` from a blob object
-  URL (`MediaResultCard.tsx`); `ui/app.py` runs `run_orchestrated`
-  in-process and reads the cache directly (`_render_generation_result`),
-  no HTTP round trip needed. This was chosen over persisting to a DB
+  URL (`MediaResultCard.tsx`). This was chosen over persisting to a DB
   column (bigger lift, no real need yet) or passing the provider's URL
   straight through (simpler, but the link can expire and there's no
   server-side re-inspection of the bytes before display).
@@ -683,6 +710,136 @@ opting in. Two design points worth knowing if you touch this:
   not the image/video itself. Single-source generation (the realistic
   case) is unaffected.
 
+### Voice mode (speech input/output) (`voice/`)
+Optional, **on by default** (`ENABLE_VOICE_MODE=true`) — unlike media
+generation, this feature spends no money and makes no external network
+call once its one-time local model downloads are done, so there's no
+cost-control reason to make it opt-in the way `ENABLE_MEDIA_GENERATION`
+is. Spoken questions are transcribed via `faster-whisper`
+(CTranslate2-based Whisper), spoken answers synthesized via Piper. Both
+run fully local inference (no torch
+pulled in by either — `faster-whisper` uses `ctranslate2`, Piper uses
+`onnxruntime`, already a transitive dep via chromadb), matching this
+project's "Ollama, not a hosted LLM" posture: no cloud API, no data
+leaving the machine, no API key required for voice mode either.
+`voice/stt.py`/`voice/tts.py` each wrap their backend behind a single
+`transcribe()`/`synthesize()` call so either could be swapped later
+(whisper.cpp, Coqui TTS) without touching `api/voice.py`.
+
+**A transcribed question is never treated specially.** `POST
+/voice/transcribe`'s result is submitted through the exact same `POST
+/ask` path a typed question uses — `agent.input_guard.check_input`
+therefore applies unconditionally, with no separate code path for voice
+input to bypass.
+
+**One voice turn, then back to normal, not a continuous loop or a
+click-record-stop-transcribe-review cycle.**
+`frontend/src/hooks/useVoiceConversation.ts` drives a single
+listen → transcribe → ask → speak cycle (`idle` → `listening` →
+`transcribing` → `thinking` → `speaking` → back to `idle`) per mic-button
+click, matching Google Assistant/ChatGPT's "press to talk, get one
+spoken answer" turn shape rather than either the original single-shot
+"record once, review the transcript in the composer, then press Send"
+design, or a continuously-listening loop. There is deliberately no
+review step: the transcribed question is submitted automatically the
+moment an utterance ends, the answer is spoken automatically once it
+comes back, and the turn then resets itself (`useVoiceConversation`'s
+`reset()`) back to the normal typing composer — the user clicks the mic
+again to ask another question rather than the app re-listening on its
+own. `VoiceConversationBar.tsx` replaces the entire composer only while
+that one turn is in flight (`ChatInput.tsx` swaps it in for the
+textarea); the hook itself is owned by `ChatInput` (not by the bar
+component) so its `MediaRecorder`/`SpeechRecognition` handles survive
+the active/inactive transition rather than being torn down every turn.
+A failed turn (mic denied, transcription error) also resets to idle
+immediately rather than lingering on `VoiceConversationBar` — the error
+message is threaded through to `ChatInput`'s normal (non-voice) view
+instead, since that's what's on screen by the time the reset completes.
+
+**Autoplay warm-up for the very first spoken answer.** The gap between
+the mic-button click and the actual `<audio>.play()` call in
+`playAnswer` can be several seconds (recording + local transcription +
+the agent's own LLM round trip), which is long enough that some
+browsers no longer treat that later, code-triggered play as tied to the
+original click and silently block it. `start()` works around this by
+calling `.play()` synchronously inside the click handler itself, on a
+~0-byte silent WAV (`SILENT_AUDIO_SRC`), on the same `<audio>` element
+`playAnswer` reuses — a real, gesture-attributed play call that "warms
+up" audio for that tab before the actual spoken answer is ready.
+
+**Live captions are a disclosed, deliberate exception to "fully local."**
+While listening, `frontend/src/hooks/useSpeechRecognition.ts` wraps the
+browser's built-in `SpeechRecognition`/`webkitSpeechRecognition` Web
+Speech API purely to show word-by-word interim captions as the user
+talks ("typing itself simultaneously"). In Chromium-based browsers this
+API sends microphone audio to the browser vendor's own cloud speech
+service — a real, narrow exception to this feature's otherwise-local
+STT/TTS design, chosen deliberately (offered to and picked by the user
+over a laggier fully-local chunked-transcription alternative) because no
+local model can produce true instant word-by-word captions from a
+streaming batch architecture like `faster-whisper`'s. The caption is
+**never** what gets submitted — the local Whisper result from `POST
+/voice/transcribe`, run once the browser detects end-of-utterance,
+remains the sole authoritative transcript; the live caption is discarded
+the moment it comes back. `continuous: false` on the recognizer is what
+ends listening automatically (the browser's own `onend` fires on
+detected silence) without a manual stop button. Browsers without this API
+(`useSpeechRecognition().isSupported === false`) get no live caption and
+no auto-stop signal — `VoiceConversationBar` falls back to a manual
+"Done speaking" button in that case; local transcription and TTS playback
+are unaffected either way.
+
+**Schema-aware transcription accuracy.** `voice.stt._build_vocabulary_hint`
+introspects every configured database's table/column names (reusing
+`db.connection`/`db.schema_introspection`, no new engine) and feeds a
+short, deduped, length-capped (`Settings.stt_vocabulary_max_chars`)
+comma-joined string to Whisper's `initial_prompt` — biases recognition
+toward real schema terms ("branch_id", "dispute") instead of
+similar-sounding common words. Computed fresh per call rather than cached,
+since introspection is already cheap and this isn't a hot path; fails
+open (returns `""`, logs a warning) on any introspection error, the same
+fail-open posture `agent.llm_client._build_golden_examples_block` already
+has for its own accuracy-only aid.
+
+**Security.** A recorded upload is capped by both size
+(`Settings.voice_max_upload_mb`, enforced the same read-and-reject-if-over
+way `api/documents.py::upload_document` caps a PDF) and duration
+(`Settings.voice_max_duration_seconds`, checked by cheaply probing the
+decoded audio's length via PyAV *before* running the comparatively
+expensive Whisper model, not after). `POST /voice/synthesize`'s input
+text is capped by the existing `Settings.max_question_length`, reused
+rather than duplicated.
+
+**What gets spoken back.** A voice-originated turn that succeeds gets a
+spoken answer, in priority order: `state.insight` (SQL path, if the
+insight feature produced one) → `state.synthesized_answer`/the relevant
+per-source answer (multi-source path) → a row-count fallback ("Found N
+rows.") — never silent on success. Origin tracking is a plain boolean
+(`QueryHistoryEntry.originatedFromVoice` in `frontend/src/lib/history.ts`,
+set only by `useVoiceConversation`'s submit path, never by typing) so a
+typed question can never trigger `POST /voice/synthesize` at all — not a
+runtime check, a structural guarantee. Playback itself happens once,
+automatically, via `useVoiceConversation`'s own `<audio>` element as part
+of the hands-free loop; `TurnCard.tsx` renders the same
+`entry.spokenAudioUrl` afterward with `controls` only (no `autoPlay`) so
+the user can manually replay it without hearing it spoken twice.
+
+**Piper voice models are a separate one-time download**, same shape as
+`ollama pull` — `scripts/download_voice_model.py` (calls
+`piper.download_voices.download_voice` directly) fetches
+`<voice>.onnx`/`<voice>.onnx.json` from the public `rhasspy/piper-voices`
+repo into `voice/models/` (gitignored, like `embeddings/.chroma/`).
+Faster-whisper's own model needs no such step — it auto-downloads from
+Hugging Face Hub on first use and caches on disk.
+
+**Capability discovery.** `GET /health` carries a `voice_enabled` field
+(`Settings.enable_voice_mode`); the React dashboard only shows the mic
+button and its own settings toggle
+(`HistorySettingsSection.tsx`/`settingsStore.voiceModeEnabled`, persisted
+like theme/accent) when the server says the feature is actually
+available — the "all-or-nothing infra flag, plus a per-session UI switch"
+shape.
+
 ### SQL is untrusted output, always
 The LLM's SQL is never trusted at face value. `agent/sql_validator.py`
 parses it with `sqlglot` (in the dialect matching `DB_TYPE`) and rejects
@@ -700,8 +857,8 @@ and via forced connection-abort otherwise (SQL Server, Oracle — see
 including after the user hand-edits the SQL box in the UI — an edit is
 exactly as untrusted as an LLM generation.
 
-One nuance worth knowing if you're reading `ui/app.py`: the LangGraph
-agent's own internal retry loop *does* execute candidate SQL automatically
+One nuance worth knowing if you're reading `api/main.py`/the frontend: the
+LangGraph agent's own internal retry loop *does* execute candidate SQL automatically
 (that's how it detects and self-corrects runtime errors like an unknown
 column) — those internal executions are safe (read-only, validated,
 row-capped, timed out) but are never shown to the user. Nothing is rendered
@@ -876,12 +1033,12 @@ since the cached function body simply wouldn't re-run.
   matches. The UI's "Refresh Schema" button re-introspects and calls
   `build_index()` normally (not forced) — the skip-if-unchanged behavior is
   what makes clicking it cheap when nothing's actually changed.
-- Streamlit: `@st.cache_resource` for settings, the startup connection
-  check, and the introspection+embedding step (cleared and re-run
-  explicitly by the "Refresh Schema" button); `@st.cache_data` for query
-  results keyed by SQL text; a simple in-memory dict cache in `session_state`
+- Frontend: `@tanstack/react-query` (`src/hooks/queries.ts`) for
+  `getHealth`/`getSchemaTables`, invalidated explicitly by the "Refresh
+  Schema" button's mutation; `chatStore.ts`'s `nlQuestionCache` (a plain
+  `Map`, keyed by `nlCacheKey(question, priorQuestions, enableInsight)`)
   for repeated identical NL questions within a session, to skip redundant
-  LLM calls.
+  `/ask` round-trips.
 - Process-lifetime singletons (DB engine, Ollama client, compiled LangGraph
   graph) — see "Process-lifetime singletons" above.
 
@@ -895,8 +1052,14 @@ ollama pull llama3.1:8b
 # fill in .env with your real DB connection details first
 python scripts\test_db_connection.py
 python scripts\build_embeddings.py
-streamlit run ui\app.py
+cd frontend; npm install; npm run build; cd ..
+uvicorn api.main:app --host 127.0.0.1 --port 8000
 ```
+
+Open `http://localhost:8000/` — the API process also serves the built
+React dashboard. For frontend hot-reload during active frontend work, run
+`npm run dev` inside `frontend/` in a second terminal instead (Vite
+proxies API calls to the `uvicorn` process above).
 
 ## How to run tests / lint
 
@@ -952,11 +1115,11 @@ manual, real-DB-required script; it is never run by `pytest` or CI.
 
 - Type hints and docstrings on every public function — this codebase is meant
   to be interview-explainable, not just working.
-- No `print()` for anything other than the Streamlit UI's own display logic
-  and the standalone CLI scripts (`scripts/test_db_connection.py`,
-  `scripts/integration_test.py`, which are meant to be read as terminal
-  output, not logged) — everything else uses the `logging` module (see
-  `config/settings.py` for level config, overridable via `LOG_LEVEL` in
+- No `print()` for anything other than the standalone CLI scripts
+  (`scripts/test_db_connection.py`, `scripts/integration_test.py`, which
+  are meant to be read as terminal output, not logged) — everything else
+  uses the `logging` module (see `config/settings.py` for level config,
+  overridable via `LOG_LEVEL` in
   `.env`). The agent nodes log each state transition (node entered, retry
   count, validation result) so the terminal shows the agent's reasoning
   steps live. **Never log the connection string, password, or full result

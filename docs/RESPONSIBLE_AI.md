@@ -10,24 +10,27 @@ open gaps.
 ## Transparency
 
 - **The generated SQL is always shown, never hidden behind a summarized
-  answer.** `ui/app.py` renders the SQL text in an editable box before any
-  result is shown; `api/main.py`'s `/ask` response includes `sql` alongside
-  `result_rows`. A user (or API caller) can always see exactly what query
-  produced an answer.
+  answer.** The React dashboard (`frontend/src/components/chat/TurnCard.tsx`)
+  renders the SQL text in an editable box before any result is shown;
+  `api/main.py`'s `/ask` response includes `sql` alongside `result_rows`.
+  A user (or API caller) can always see exactly what query produced an
+  answer.
 - **The retry/self-correction process is visible, not black-boxed.** Every
   attempt — successful or not — is recorded in `attempt_history` and
-  rendered as a "Retry timeline" in the UI (`ui/app.py::_render_attempt_timeline`).
-  This was a deliberate architectural choice (`docs/ARCHITECTURE.md`'s "§1
-  The LangGraph state machine": "a small, explicit `StateGraph`... not a
+  rendered as a "Retry timeline" in the dashboard
+  (`frontend/src/components/chat/RetryTimeline.tsx`). This was a
+  deliberate architectural choice (`docs/ARCHITECTURE.md`'s "§1 The
+  LangGraph state machine": "a small, explicit `StateGraph`... not a
   free-form ReAct-style agent") specifically so this trail is inspectable.
 - **The agent's own plan, when it makes one, is shown too — not just the
   final SQL.** For a question judged non-trivial (top-N-per-group,
   year-over-year growth, several metrics at once), `plan_query_node`'s
   up-front plan and `review_sql_node`'s plan-conformance check are the same
   kind of "reasoning step," made visible rather than happening invisibly
-  inside one opaque generation call — the UI's "🧭 Query plan" expander
-  (`ui/app.py`) shows the plan itself, and a plan-conformance retry appears
-  in the same "Retry timeline" as any other self-correction attempt
+  inside one opaque generation call — the dashboard's "Query plan" expander
+  (`frontend/src/components/chat/QueryPlanPanel.tsx`) shows the plan
+  itself, and a plan-conformance retry appears in the same "Retry
+  timeline" as any other self-correction attempt
   (`outcome="plan_not_satisfied"`), not as a separate, hidden mechanism.
 - **Real accuracy numbers are published, including the unflattering ones.**
   `docs/EVALUATION.md` reports the actual latest benchmark run (35% final
@@ -44,8 +47,8 @@ open gaps.
 
 - **Nothing executes without a human-visible intermediate step.** The
   agent's own internal retry-loop executions are real but never shown; the
-  UI's "Confirm and Run" button is the actual gate before a human sees a
-  result, and it re-validates whatever SQL text is currently in the box —
+  dashboard's "Confirm and Run" button is the actual gate before a human
+  sees a result, and it re-validates whatever SQL text is currently in the box —
   including hand-edits — rather than trusting the agent's last internal
   attempt (`CLAUDE.md`'s "SQL is untrusted output, always").
 - **The API path preserves the same property structurally**, even though
@@ -61,8 +64,8 @@ open gaps.
   Run." `Settings.require_generation_approval` (default `true`) closes
   this: `generation_node` only proposes what would be generated
   (`status="pending_approval"`, nothing charged) until a human explicitly
-  confirms (`POST /generate/confirm`, or the matching UI button in both
-  the React dashboard and Streamlit). **Content-safety honesty note:** the
+  confirms (`POST /generate/confirm`, or the matching "Generate" button in
+  the React dashboard). **Content-safety honesty note:** the
   check gating what may be generated at all
   (`agent.orchestrator.nodes._basic_prompt_safety_check`) is a keyword
   heuristic — broadened in scope during this pass, but still explicitly

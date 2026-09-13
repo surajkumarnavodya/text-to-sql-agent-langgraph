@@ -84,7 +84,7 @@ distributed multi-tenant rate limiter. See `SECURITY.md`,
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `QUESTION_RATE_LIMIT_PER_MINUTE` | `10` | Max question submissions/minute — per Streamlit session in the UI, per client IP in the API (`api/main.py`). |
+| `QUESTION_RATE_LIMIT_PER_MINUTE` | `10` | Max question submissions/minute, per client IP (`api/main.py`). |
 | `LLM_CALL_RATE_LIMIT_PER_MINUTE` | `20` | Max LLM *generation* calls/minute, process-wide — stricter, since retries can multiply calls. |
 
 ## Query cost estimation
@@ -141,6 +141,25 @@ for how the router/subgraphs work internally.
 | `WEB_SEARCH_PROVIDER` | `tavily` | Selects the provider (`search/web_search.py::SUPPORTED_SEARCH_PROVIDERS`). Only `tavily` is implemented today. |
 | `WEB_SEARCH_API_KEY` | *(unset)* | API key for the configured provider. Get a Tavily key at [tavily.com](https://tavily.com). `SecretStr`-wrapped. |
 | `WEB_SEARCH_MAX_RESULTS` | `5` | Max results requested per search call. |
+
+### Voice mode (optional, on by default)
+
+Local speech-to-text/text-to-speech — no cloud API, same posture as
+Ollama; unlike media generation, this feature spends no money and calls
+no external API once its one-time local model downloads are done, so it
+ships enabled. See `CLAUDE.md`'s "Voice mode" section for the full
+design.
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `ENABLE_VOICE_MODE` | `true` | Whether the mic button/settings toggle appear at all (`GET /health`'s `voice_enabled`). |
+| `STT_MODEL_SIZE` | `base` | `faster-whisper` model size (`tiny`/`base`/`small`/`medium`/`large-v3`). Auto-downloaded from Hugging Face Hub on first use. |
+| `STT_DEVICE` | `cpu` | `cpu` or `cuda`. Only set `cuda` on a machine with a confirmed working CUDA + cuDNN setup — nothing in this project's Docker image assumes a GPU. |
+| `STT_VOCABULARY_MAX_CHARS` | `200` | Caps the schema-derived vocabulary hint fed to Whisper's `initial_prompt` (`voice/stt.py::_build_vocabulary_hint`). |
+| `VOICE_MAX_UPLOAD_MB` | `10` | Max size of one recorded-question upload to `POST /voice/transcribe`. |
+| `VOICE_MAX_DURATION_SECONDS` | `30` | Max recording duration, checked before transcription runs. |
+| `TTS_VOICE` | `en_US-lessac-medium` | Piper voice name — download it once with `python scripts/download_voice_model.py`. |
+| `TTS_VOICE_MODEL_PATH` | *(unset)* | Override for the `.onnx`/`.onnx.json` location, if not the default `voice/models/<TTS_VOICE>.onnx`. |
 
 ## Validation behavior worth knowing
 

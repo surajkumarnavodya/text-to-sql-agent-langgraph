@@ -33,8 +33,8 @@ maintainer (`GOVERNANCE.md`'s "Ownership").
 
 **Severity:** Critical (if deployed beyond single-user/local use) · **Status:** Open
 
-Neither the Streamlit UI nor the API (`api/`) has a login, session
-identity, or per-user authorization model. `api/auth.py`'s optional
+Neither the React dashboard (`frontend/`) nor the API (`api/`) has a login,
+session identity, or per-user authorization model. `api/auth.py`'s optional
 `API_AUTH_TOKEN` is one shared secret, not per-user identity (see
 `docs/API.md`'s "Auth: a lightweight hook, not a full auth system"). This
 is a deliberate, documented scope boundary (`SECURITY.md`: "Not designed
@@ -232,8 +232,9 @@ named explicitly here following the 2026-09-13 audit rather than left
 implicit inside R-001.
 
 **Mitigation today:** none beyond the shared token. Same posture as the
-Knowledge Sources Streamlit page this API mirrors (already disclosed in
-`SECURITY.md`'s "Multi-source RAG and web search" section).
+Knowledge Sources page (`frontend/src/pages/KnowledgeSources.tsx`) this
+API mirrors (already disclosed in `SECURITY.md`'s "Multi-source RAG and
+web search" section).
 
 **Review date:** alongside R-001 — this is a real, separate fix once
 per-user identity exists (scope delete/upload to the uploading user or an
@@ -249,9 +250,14 @@ report-only step, `continue-on-error: true` — see
 packages, most transitive/tooling rather than this app's own code
 (`chromadb`, `langgraph`/`langgraph-checkpoint`/`langgraph-sdk`,
 `streamlit`, `langchain-core`, `pillow`, `python-dotenv`, `pytest`,
-`black`). Not triaged individually as part of that pass — several fixes
-are major-version bumps (e.g. `pillow` 11→12, `langgraph` 0.2→1.0) with
-their own regression risk, and `requirements.txt`'s exact pins already
+`black`). `streamlit` was removed from `requirements.txt` on 2026-09-13
+(the app it backed was deleted — see `README.md`'s News and Updates),
+which should reduce this backlog by whatever advisories were specific to
+it, but the count above hasn't been re-verified with a fresh `pip-audit`
+run since — treat 65/10 as the last-measured figure, not a live one. Not
+triaged individually as part of that pass — several fixes are
+major-version bumps (e.g. `pillow` 11→12, `langgraph` 0.2→1.0) with their
+own regression risk, and `requirements.txt`'s exact pins already
 have an open, related gap (R-004: verified against Python 3.14, not 3.11).
 
 **Mitigation today:** none beyond visibility — the CI step surfaces the

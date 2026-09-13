@@ -1,10 +1,10 @@
 # Text-to-SQL Dashboard — React frontend
 
-A modern, installable (PWA) replacement for the Streamlit chat UI
-(`ui/app.py`), talking to the same FastAPI backend (`api/main.py`) that
-already served it. Streamlit is kept running side by side until this
-frontend has full verified feature parity (see the repo's `CLAUDE.md`) —
-this is not yet the only UI the project ships.
+A modern, installable (PWA) dashboard talking to the FastAPI backend
+(`api/main.py`), which also serves this app's own build output in
+production. This is the only UI the project ships — an earlier Streamlit
+app was removed once this dashboard reached full feature parity with it
+(see the repo's `CLAUDE.md`).
 
 ## Stack
 
@@ -14,8 +14,9 @@ this is not yet the only UI the project ships.
   hand-built, Radix-based UI primitives (`src/components/ui/`) rather than
   a full component-library dependency
 - **Zustand** for client state (`src/store/`) — settings (theme/accent/
-  font/language/sidebar) persisted to `localStorage`; chat/query history is
-  session-only, matching the original Streamlit app's own behavior
+  font/language) persisted to `localStorage`; chat/query history
+  (`chatStore.ts`'s `conversations`) is session-only, cleared on a full
+  page reload by design, not a regression
 - **TanStack Query** for server state, **TanStack Table** for the results
   datatable (sorting/filtering/pagination)
 - **Chart.js** (`react-chartjs-2`) for result charts — the backend
@@ -33,7 +34,8 @@ this is not yet the only UI the project ships.
 ```bash
 npm install
 npm run dev      # Vite dev server, proxies /ask, /execute, /documents,
-                  # /schema, /feedback, /health to localhost:8000
+                  # /schema, /feedback, /health, /media, /generate to
+                  # localhost:8000 (see vite.config.ts's BACKEND_ROUTES)
 npm run build    # outputs to dist/ -- api/main.py serves this directly
                   # in production (same origin, no CORS needed)
 npm run lint     # oxlint
