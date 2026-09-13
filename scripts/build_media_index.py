@@ -93,9 +93,18 @@ def main() -> None:
     if not settings.media_library_path:
         logger.error("MEDIA_LIBRARY_PATH is not set -- nothing to walk.")
         sys.exit(1)
-    if not settings.media_library_path.is_dir():
-        logger.error("MEDIA_LIBRARY_PATH (%s) is not a directory.", settings.media_library_path)
-        sys.exit(1)
+
+    # Gracefully handle missing media library: create it if it doesn't exist
+    media_path = settings.media_library_path
+    if not media_path.is_dir():
+        logger.info("MEDIA_LIBRARY_PATH (%s) does not exist -- creating it.", media_path)
+        try:
+            media_path.mkdir(parents=True, exist_ok=True)
+            logger.info("Created media library directory at %s. Add media files (images/videos) and re-run this script.", media_path)
+            return
+        except OSError as exc:
+            logger.error("Failed to create MEDIA_LIBRARY_PATH (%s): %s", media_path, exc)
+            sys.exit(1)
 
     # Pre-flight: fail fast with one clear message rather than the same
     # ModerationNotConfiguredError repeated once per file once the loop

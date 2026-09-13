@@ -887,8 +887,8 @@ class Settings(BaseSettings):
     voice_max_duration_seconds: int = Field(default=30, gt=0)
     tts_voice: str = "en_US-lessac-medium"
     tts_voice_model_path: Path | None = None
-    enable_media_search: bool = False
-    media_library_path: Path | None = None
+    enable_media_search: bool = True
+    media_library_path: Path | None = Path("./media_library")
     media_embedding_provider: Literal["local_clip"] = "local_clip"
     media_clip_model_name: str = "clip-ViT-B-32"
     media_vision_model: str = ""

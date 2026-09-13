@@ -41,9 +41,13 @@ export function MediaSearch() {
         <div className="mx-auto max-w-4xl px-4 py-6">
           <h1 className="text-xl font-bold">🖼️ Media Search</h1>
           <p className="mt-4 text-sm text-[var(--muted-foreground)]">
-            Media search is disabled. Enable it in your .env configuration (ENABLE_MEDIA_SEARCH,
-            MEDIA_LIBRARY_PATH), then run <code>python scripts/build_media_index.py</code>.
+            Media search is not yet ready. Make sure your media library is indexed:
           </p>
+          <ol className="mt-3 list-inside list-decimal space-y-2 text-sm text-[var(--muted-foreground)]">
+            <li>Place images/videos in your configured <code className="rounded bg-[var(--muted)] px-1">MEDIA_LIBRARY_PATH</code> (default: <code className="rounded bg-[var(--muted)] px-1">./media_library</code>)</li>
+            <li>Run <code className="rounded bg-[var(--muted)] px-1">python scripts/build_media_index.py</code></li>
+            <li>Refresh this page once indexing completes</li>
+          </ol>
         </div>
       </div>
     )
