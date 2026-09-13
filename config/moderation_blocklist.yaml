@@ -1,0 +1,40 @@
+# Text-term blocklist for the two restricted categories Azure Content
+# Safety has no dedicated harm category for -- see moderation/taxonomy.py's
+# module docstring for why "weapons" and "drugs" are covered this way
+# (text-signal only for drugs; a coarse Violence-category proxy plus this
+# blocklist for weapons imagery/mentions).
+#
+# Checked against OCR text, video captions/transcripts, and extracted PDF
+# text by moderation/gate.py -- never against raw image/video bytes
+# directly (that's the provider's job). Case-insensitive, whole-word
+# matching (see config/moderation_blocklist.py).
+#
+# *** STARTER LIST, NOT EXHAUSTIVE -- extend for your own deployment. ***
+# A term list can only ever be as complete as what's named in it (the same
+# honest caveat agent/sql_validator.py's own dangerous-function denylist
+# states about itself). Review and extend this for your organization's
+# actual risk profile before relying on it as a real control -- this ships
+# as a reasonable, illustrative starting point, not a vetted, complete list.
+#
+# Format:
+#   weapons: [term, term, ...]
+#   drugs: [term, term, ...]
+
+weapons:
+  - firearm
+  - handgun
+  - rifle
+  - shotgun
+  - assault rifle
+  - ammunition
+  - grenade
+  - explosive device
+  - pipe bomb
+
+drugs:
+  - cocaine
+  - heroin
+  - methamphetamine
+  - fentanyl
+  - lsd
+  - ecstasy
