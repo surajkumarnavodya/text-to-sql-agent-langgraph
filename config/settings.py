@@ -671,6 +671,97 @@ class Settings(BaseSettings):
             questions are already bounded by `/ask`'s own limiter, the
             same reasoning document/policy RAG have no dedicated limiter
             of their own either.
+        moderation_provider: Which content-moderation backend
+            `moderation/provider.py` uses to check a chunk before it's ever
+            embedded/stored. Only `azure_content_safety` is implemented
+            today -- structured the same `SUPPORTED_..._PROVIDERS`-dict
+            pattern as `web_search_provider`/`media_embedding_provider` so
+            a second provider is a new dict entry, not a redesign. This
+            gate is mandatory (not a feature flag) whenever
+            `enable_media_search` or `enable_document_rag`/
+            `enable_policy_rag` is on -- there is deliberately no
+            `ENABLE_CONTENT_MODERATION` toggle that could silently disable
+            it while leaving content ingestion on; missing provider/store
+            config fails closed at first ingestion attempt
+            (`moderation.exceptions.ModerationNotConfiguredError`), the
+            same "fail at point of use" posture
+            `rag.store.RagStoreNotConfiguredError` already has.
+        azure_content_safety_endpoint: The Content Safety resource's REST
+            endpoint (e.g. `https://<resource>.cognitiveservices.azure.com`).
+            Called directly via `httpx` (`.../contentsafety/image:analyze`,
+            `.../contentsafety/text:analyze`) -- no `azure-ai-contentsafety`
+            SDK dependency, matching how `search/web_search.py` (Tavily)
+            and `media_gen/client.py` (IMA) both call their provider's REST
+            API directly rather than pulling in a vendor SDK.
+        azure_content_safety_key: Subscription key for the endpoint above.
+            A `SecretStr` for the same reason `ima_api_key`/
+            `web_search_api_key` are.
+        moderation_severity_threshold: Minimum Azure Content Safety
+            severity (0/2/4/6 on its standard four-level scale) for the
+            Hate/SelfHarm/Sexual/Violence categories that triggers a
+            hard-reject. Verify this against your specific Content Safety
+            API version before relying on it -- Azure has more than one
+            severity-scale revision across API versions.
+        moderation_blocklist_path: Override for the weapons/drugs text-term
+            blocklist YAML `moderation/gate.py` checks OCR/caption/
+            transcript/extracted text against -- mirrors
+            `config.sensitive_columns`'s `path` override, mainly for tests.
+            `None` (the default) uses `config/moderation_blocklist.yaml`.
+            Azure Content Safety has no dedicated "weapons"/"drugs" harm
+            category (only Hate/SelfHarm/Sexual/Violence) -- this blocklist
+            plus the `Violence` category (a coarse proxy for weapons
+            imagery specifically) is how those two are covered; drug
+            imagery has no visual signal in this implementation at all,
+            text-mentions only.
+        moderation_store_connection_string: Full SQLAlchemy connection
+            string for the moderation decision/metadata store
+            (`moderation/store.py`'s `moderation.media_assets` table) -- a
+            SQL Server database, deliberately a *separate*, dedicated
+            connection from both `DB_CONNECTIONS` and
+            `rag_store_connection_string` (not reused, even though this
+            table also covers PDF assets): media search is independently
+            toggleable from document/policy RAG, and naming the shared
+            setting after RAG specifically would be confusing when
+            media-only search needs it too. Point both connection strings
+            at the same physical database if you want one metadata store --
+            that's a deployment choice, not a code-level coupling. None
+            (default, unset) means ingestion for either pipeline fails
+            closed with `ModerationNotConfiguredError`.
+        moderation_store_odbc_driver: ODBC driver name for the moderation
+            store connection, same meaning as `db_odbc_driver`.
+        moderation_store_pool_size: `QueuePool`'s `pool_size` for the
+            moderation store engine (`moderation/store.py`). Explicit here
+            (unlike `db/connection.py`/`rag/store.py`, which both rely on
+            SQLAlchemy's default of 5) because ingestion can run many
+            concurrent DB writes -- sized against `media_ingest_workers`
+            below plus normal concurrent PDF-upload request traffic sharing
+            this same pool.
+        moderation_store_max_overflow: `QueuePool`'s `max_overflow` for the
+            same engine -- the burst ceiling above `moderation_store_pool_size`
+            before a caller waits for a connection.
+        moderation_store_pool_recycle_seconds: Seconds before a pooled
+            connection is discarded and replaced, regardless of use --
+            SQL Server (and many firewalls/load balancers) silently drop
+            idle connections after some timeout; this should be set below
+            whatever timeout your SQL Server instance/network enforces.
+            1800 matches the value `db/connection.py`/`rag/store.py` both
+            hardcode, now made configurable specifically for this
+            higher-write-volume connection.
+        media_ingest_workers: Max concurrent worker threads
+            `scripts/build_media_index.py` uses to ingest files (each doing
+            moderation + embedding + DB writes) -- this repo's first use of
+            `concurrent.futures.ThreadPoolExecutor`; previously a plain
+            sequential loop. I/O-bound work (moderation API calls, DB
+            writes) benefits from threads despite the GIL. Sized alongside
+            `moderation_store_pool_size` above -- a worker count exceeding
+            the pool's real capacity just serializes ingestion behind pool
+            exhaustion instead of the sequential loop it replaced.
+        media_image_tile_threshold_px: An ingested image wider or taller
+            than this (pixels) is split into a grid of tiles before
+            moderation, on the theory that a moderation classifier's own
+            internal downsampling could otherwise shrink away a small
+            region of concern in a very large image. Images at or under
+            this size are moderated as a single chunk.
         session_expensive_source_limit: Max combined "generation"/"web"
             source invocations allowed per `session_id` within
             `session_expensive_source_window_seconds`, checked in
@@ -804,6 +895,18 @@ class Settings(BaseSettings):
     media_max_file_mb: int = Field(default=200, gt=0)
     media_search_top_k: int = Field(default=5, gt=0)
     media_scene_detect_threshold: float = Field(default=27.0, gt=0)
+    moderation_provider: Literal["azure_content_safety"] = "azure_content_safety"
+    azure_content_safety_endpoint: str = ""
+    azure_content_safety_key: SecretStr | None = None
+    moderation_severity_threshold: int = Field(default=4, ge=0, le=7)
+    moderation_blocklist_path: Path | None = None
+    moderation_store_connection_string: SecretStr | None = None
+    moderation_store_odbc_driver: str = "ODBC Driver 17 for SQL Server"
+    moderation_store_pool_size: int = Field(default=10, gt=0)
+    moderation_store_max_overflow: int = Field(default=20, ge=0)
+    moderation_store_pool_recycle_seconds: int = Field(default=1800, gt=0)
+    media_ingest_workers: int = Field(default=4, gt=0)
+    media_image_tile_threshold_px: int = Field(default=2048, gt=0)
     session_expensive_source_limit: int = Field(default=10, gt=0)
     session_expensive_source_window_seconds: float = Field(default=3600.0, gt=0)
     cors_allowed_origins: tuple[str, ...] = Field(

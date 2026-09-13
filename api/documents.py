@@ -16,6 +16,7 @@ from api.auth import verify_api_key
 from api.rate_limit import enforce_api_action_rate_limit
 from api.schemas import DocumentListResponse, DocumentOut, DocumentUploadResponse
 from config.settings import get_settings
+from moderation.exceptions import ModerationNotConfiguredError
 from rag.ingestion import ingest_pdf
 from rag.store import (
     Collection,
@@ -121,7 +122,7 @@ async def upload_document(
             sensitivity_category=sensitivity_category,
             settings=settings,
         )
-    except RagStoreNotConfiguredError as exc:
+    except (RagStoreNotConfiguredError, ModerationNotConfiguredError) as exc:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)
         ) from exc

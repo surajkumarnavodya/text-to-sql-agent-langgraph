@@ -57,8 +57,10 @@ def _clear_process_singleton_caches() -> None:
     from agent.llm_client import _get_ollama_client
     from agent.orchestrator.graph import build_orchestrator_graph
     from embeddings.schema_indexer import _cached_chroma_client
+    from moderation.store import _cached_moderation_engine
 
     build_graph.cache_clear()
     build_orchestrator_graph.cache_clear()
     _get_ollama_client.cache_clear()
     _cached_chroma_client.cache_clear()
+    _cached_moderation_engine.cache_clear()
