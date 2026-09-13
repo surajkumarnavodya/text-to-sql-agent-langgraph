@@ -3,19 +3,23 @@
     PowerShell task runner for this project (Windows equivalent of the Makefile).
 
 .USAGE
-    .\tasks.ps1 setup     # create .venv, install deps, copy .env.example -> .env
-    .\tasks.ps1 check-db  # verify the DB_* connection settings in .env work
-    .\tasks.ps1 embed     # introspect the live schema + build/refresh the Chroma index
-    .\tasks.ps1 run       # check-db + embed + streamlit run
-    .\tasks.ps1 test      # pytest
-    .\tasks.ps1 lint      # ruff check + black --check + mypy
-    .\tasks.ps1 format    # black + ruff --fix
-    .\tasks.ps1 clean     # remove caches
+    .\tasks.ps1 setup            # create .venv, install deps, copy .env.example -> .env
+    .\tasks.ps1 check-db         # verify the DB_* connection settings in .env work
+    .\tasks.ps1 embed            # introspect the live schema + build/refresh the Chroma index
+    .\tasks.ps1 run              # check-db + embed + start the FastAPI server (also serves
+                                  # the built React dashboard, if frontend-build has been run)
+    .\tasks.ps1 frontend-install # npm install in frontend/
+    .\tasks.ps1 frontend-build   # npm run build in frontend/ (production static files)
+    .\tasks.ps1 frontend-dev     # npm run dev in frontend/ (hot-reload, proxies to `run`)
+    .\tasks.ps1 test             # pytest
+    .\tasks.ps1 lint             # ruff check + black --check + mypy
+    .\tasks.ps1 format           # black + ruff --fix
+    .\tasks.ps1 clean            # remove caches
 #>
 
 param(
     [Parameter(Position = 0)]
-    [ValidateSet("setup", "check-db", "embed", "run", "test", "lint", "format", "clean")]
+    [ValidateSet("setup", "check-db", "embed", "run", "frontend-install", "frontend-build", "frontend-dev", "test", "lint", "format", "clean")]
     [string]$Task = "run"
 )
 
@@ -54,7 +58,27 @@ function Invoke-Embed {
 function Invoke-Run {
     Invoke-CheckDb
     Invoke-Embed
-    & $VenvPython -m streamlit run "ui\app.py"
+    # Also serves the React dashboard's built static files (frontend/dist)
+    # from this same process/port if Invoke-FrontendBuild has been run --
+    # see api/main.py's StaticFiles mount. For frontend hot-reload during
+    # active frontend development, run `.\tasks.ps1 frontend-dev` in a
+    # separate terminal instead (Vite proxies API calls to this server).
+    & $VenvPython -m uvicorn api.main:app --host 127.0.0.1 --port 8000
+}
+
+function Invoke-FrontendInstall {
+    Push-Location frontend
+    try { npm install } finally { Pop-Location }
+}
+
+function Invoke-FrontendBuild {
+    Push-Location frontend
+    try { npm run build } finally { Pop-Location }
+}
+
+function Invoke-FrontendDev {
+    Push-Location frontend
+    try { npm run dev } finally { Pop-Location }
 }
 
 function Invoke-Test {
@@ -81,12 +105,15 @@ function Invoke-Clean {
 }
 
 switch ($Task) {
-    "setup"    { Invoke-Setup }
-    "check-db" { Invoke-CheckDb }
-    "embed"    { Invoke-Embed }
-    "run"      { Invoke-Run }
-    "test"     { Invoke-Test }
-    "lint"     { Invoke-Lint }
-    "format"   { Invoke-Format }
-    "clean"    { Invoke-Clean }
+    "setup"            { Invoke-Setup }
+    "check-db"         { Invoke-CheckDb }
+    "embed"            { Invoke-Embed }
+    "run"              { Invoke-Run }
+    "frontend-install" { Invoke-FrontendInstall }
+    "frontend-build"   { Invoke-FrontendBuild }
+    "frontend-dev"     { Invoke-FrontendDev }
+    "test"             { Invoke-Test }
+    "lint"             { Invoke-Lint }
+    "format"           { Invoke-Format }
+    "clean"            { Invoke-Clean }
 }

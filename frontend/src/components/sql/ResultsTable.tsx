@@ -8,7 +8,16 @@ import {
   type ColumnDef,
   type SortingState,
 } from '@tanstack/react-table'
-import { ArrowDown, ArrowUp, ArrowUpDown, ChevronLeft, ChevronRight, Download, Search } from 'lucide-react'
+import {
+  ArrowDown,
+  ArrowUp,
+  ArrowUpDown,
+  ChevronLeft,
+  ChevronRight,
+  Download,
+  Search,
+  Table2,
+} from 'lucide-react'
 import { useMemo, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { Button } from '@/components/ui/button'
@@ -96,8 +105,9 @@ export function ResultsTable({ columns, rows }: { columns: string[]; rows: unkno
   return (
     <div className="flex flex-col gap-2">
       <div className="flex flex-wrap items-center justify-between gap-2">
-        <h3 className="text-sm font-semibold">
-          📊 {t('results.title')} ({filteredRowCount} {t('common.rows')})
+        <h3 className="flex items-center gap-1.5 text-sm font-semibold">
+          <Table2 className="h-4 w-4 text-[var(--muted-foreground)]" />
+          {t('results.title')} ({filteredRowCount} {t('common.rows')})
         </h3>
         <div className="flex items-center gap-3">
           <label className="flex items-center gap-1.5 text-xs text-[var(--muted-foreground)]">

@@ -154,8 +154,8 @@ class TestGetSqlglotDialect:
 
 class TestGetConnection:
     """`get_connection`/`list_connection_names` -- how multi-database-aware
-    code (embeddings.retriever.select_database, agent/nodes.py, the
-    Streamlit sidebar) turns a database *name* back into its full
+    code (embeddings.retriever.select_database, agent/nodes.py, the React
+    dashboard) turns a database *name* back into its full
     `DatabaseConnectionConfig`. See `Settings.databases`'s docstring."""
 
     def test_single_database_setup_has_one_default_connection(self):

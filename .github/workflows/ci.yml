@@ -40,15 +40,44 @@ jobs:
         # Report-only for now (continue-on-error) -- a first run against
         # this project's actual pinned versions found real advisories
         # across several packages (mostly transitive/tooling -- chromadb,
-        # langgraph, streamlit, pillow, and others; see docs/RISK_REGISTER.md's
-        # R-008). Flipping this to a hard gate immediately would break CI
-        # for pre-existing reasons this pass didn't introduce and wasn't
-        # scoped to fix -- upgrading that backlog is a real, separate
-        # effort with its own regression risk (several are major-version
-        # bumps). This step exists to make the backlog visible in every CI
-        # run from now on, not to hide it -- remove `continue-on-error`
-        # once that backlog is triaged and the pinned versions are updated.
+        # langgraph, pillow, and others; see docs/RISK_REGISTER.md's R-008).
+        # Flipping this to a hard gate immediately would break CI for
+        # pre-existing reasons this pass didn't introduce and wasn't scoped
+        # to fix -- upgrading that backlog is a real, separate effort with
+        # its own regression risk (several are major-version bumps). This
+        # step exists to make the backlog visible in every CI run from now
+        # on, not to hide it -- remove `continue-on-error` once that
+        # backlog is triaged and the pinned versions are updated.
         run: |
           pip install pip-audit
           pip-audit -r requirements.txt --desc
         continue-on-error: true
+
+  frontend:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Lint (oxlint)
+        run: npm run lint
+
+      - name: Type check (tsc)
+        run: npx tsc -b --noEmit
+
+      # Also verifies api/main.py's StaticFiles mount has something real to
+      # find -- see the Dockerfile's frontend-build stage, which runs the
+      # exact same command.
+      - name: Build
+        run: npm run build

@@ -4,8 +4,8 @@
 `media_gen/download.py`) and puts them here, keyed by an opaque id -- never
 the provider's raw CDN URL, which is never exposed to the LLM's answer text
 or the API response (see `agent.orchestrator.state.MediaGenerationResult
-.media_id`). `api/media.py`'s `GET /media/{media_id}` and `ui/app.py`'s
-Streamlit renderer both read back through this same module.
+.media_id`). `api/media.py`'s `GET /media/{media_id}` reads back through
+this same module, and the React dashboard renders the bytes it returns.
 
 Process-lifetime only, not persisted -- same accepted tradeoff as this
 project's other process-global caches (`db.connection._cached_engine`,
@@ -28,8 +28,7 @@ _MAX_ITEMS = 100
 @dataclass(frozen=True)
 class MediaCacheEntry:
     """One stored asset's raw bytes and its content type (for the
-    `Content-Type` header both `api/media.py` and `ui/app.py`'s renderer
-    need to serve/display it correctly)."""
+    `Content-Type` header `api/media.py` needs to serve it correctly)."""
 
     data: bytes
     content_type: str

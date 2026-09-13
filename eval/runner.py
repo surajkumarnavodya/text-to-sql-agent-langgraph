@@ -28,9 +28,9 @@ from eval.evaluators import (
     evaluate_sql_exact_match,
     evaluate_sql_structure,
 )
+from eval.history import QueryHistoryEntry, build_conversation_history, new_history_entry
 from eval.schema import BenchmarkCase, BenchmarkDataset, CaseRunResult, FollowUpTurn
 from observability.llm_timing_capture import capture_llm_timings
-from ui.session_history import QueryHistoryEntry, build_conversation_history, new_history_entry
 
 logger = logging.getLogger(__name__)
 
@@ -186,7 +186,7 @@ def run_followup_case(
 ) -> list[CaseRunResult]:
     """Runs and grades one multi-turn `FollowUpCase`, turn by turn, through
     the real `build_conversation_history`/`run_agent` path -- identical to
-    how `ui/app.py` and the legacy `scripts/run_eval.py` exercise follow-ups."""
+    how the legacy `scripts/run_eval.py` exercises follow-ups."""
     history: list[QueryHistoryEntry] = []
     results: list[CaseRunResult] = []
     for turn_index, turn in enumerate(case.turns):

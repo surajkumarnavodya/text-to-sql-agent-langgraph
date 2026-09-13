@@ -154,6 +154,7 @@ export interface HealthResponse {
   status: 'ok' | 'degraded'
   databases: DatabaseHealth[]
   ollama: ComponentHealth
+  voice_enabled: boolean
 }
 
 export interface ColumnOut {
@@ -204,4 +205,9 @@ export interface DocumentUploadResponse {
 export interface ApiErrorBody {
   detail: string
   correlation_id?: string
+}
+
+export interface TranscribeResponse {
+  text: string
+  stt_duration_ms: number
 }

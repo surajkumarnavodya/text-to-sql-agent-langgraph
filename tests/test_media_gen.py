@@ -312,6 +312,52 @@ class TestGenerateVideo:
             assert result.ok
             assert result.url == "https://cdn.example/video.mp4"
 
+    def test_duration_seconds_is_passed_as_a_form_override(self, client):
+        """Settings.media_gen_video_duration_seconds flows through to the
+        real create-task payload as a `duration` form override -- verified
+        live against a real IMA account: the auto-selected video model
+        declares `duration` as an integer 4-15 form field, so this is what
+        actually changes clip length within that model's real range."""
+        with patch("media_gen.video.create_and_poll") as mock_create_and_poll:
+            mock_create_and_poll.return_value = (
+                {"url": "https://cdn.example/video.mp4"},
+                "Seedance 2.0",
+            )
+            generate_video(client, prompt="a crane lifting a beam", duration_seconds=10)
+            assert mock_create_and_poll.call_args.kwargs["form_overrides"] == {"duration": 10}
+
+    def test_no_duration_means_no_override(self, client):
+        with patch("media_gen.video.create_and_poll") as mock_create_and_poll:
+            mock_create_and_poll.return_value = (
+                {"url": "https://cdn.example/video.mp4"},
+                "Seedance 2.0",
+            )
+            generate_video(client, prompt="a crane lifting a beam")
+            assert mock_create_and_poll.call_args.kwargs["form_overrides"] is None
+
+
+class TestCreateAndPollFormOverrides:
+    def test_form_overrides_replace_the_models_own_default(self, client):
+        """The model's own `form_config` default ("duration": 5, in this
+        codebase's real verified case) must be overridable, not just
+        additive -- confirms `.update()` semantics, not append/merge that
+        could leave a stale default key alongside the override."""
+        leaf = {**_SAMPLE_LEAF, "form_config": [{"field": "duration", "value": 5}]}
+        with (
+            patch.object(client, "get_product_list", return_value=[leaf]),
+            patch.object(client, "create_task", return_value="task_123") as mock_create,
+            patch.object(
+                client,
+                "poll_task",
+                return_value={"resource_status": 1, "url": "https://cdn.example/v.mp4"},
+            ),
+        ):
+            create_and_poll(
+                client, task_type="text_to_video", prompt="x", form_overrides={"duration": 10}
+            )
+            sent_payload = mock_create.call_args[0][0]
+            assert sent_payload["parameters"][0]["parameters"]["duration"] == 10
+
 
 _PUBLIC_ADDRINFO = [(2, 1, 6, "", ("93.184.216.34", 0))]  # a real, public IPv4 (example.com)
 

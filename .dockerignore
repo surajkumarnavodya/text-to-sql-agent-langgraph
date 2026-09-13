@@ -27,6 +27,18 @@ __pycache__/
 # not something that should be baked into the image or shipped stale ---
 embeddings/.chroma/
 
+# --- Downloaded Piper voice model -- see docs/DEPLOYMENT.md for the
+# equivalent one-time `docker compose exec` step voice mode needs ---
+voice/models/
+
+# --- Frontend build artifacts -- the frontend-build stage installs its own
+# node_modules and produces its own dist/ inside the image; the host's
+# copies (if any, from running `npm install`/`npm run dev` locally) must
+# never be sent as build context -- they're often huge and would silently
+# shadow what `npm ci` inside the image actually installs. ---
+frontend/node_modules/
+frontend/dist/
+
 # --- Docs/misc not needed inside the running container ---
 docs/User_Guide.pdf
 eval/results/

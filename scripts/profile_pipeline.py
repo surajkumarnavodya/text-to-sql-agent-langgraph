@@ -30,13 +30,13 @@ import pandas as pd  # noqa: E402
 from agent.graph import run_agent  # noqa: E402
 from agent.state import AgentState  # noqa: E402
 from config.settings import configure_logging, get_settings  # noqa: E402
-from db.connection import get_read_only_engine  # noqa: E402
-from db.schema_introspection import introspect_schema  # noqa: E402
-from ui.column_formatting import (
+from db.column_formatting import (
     format_column_label,
     get_display_columns,
     get_key_column_names,
 )  # noqa: E402
+from db.connection import get_read_only_engine  # noqa: E402
+from db.schema_introspection import introspect_schema  # noqa: E402
 
 # Spans easy -> hard, per the profiling request: a trivial single-table
 # count, a 2-table join, a 3-table join, a 3+ table hierarchy join, and a
@@ -56,11 +56,11 @@ _STAGES = ["retrieve_schema", "generate_sql", "validate_sql", "execute_sql"]
 def _time_result_formatting(columns: list[str], rows: list[tuple], key_columns: set[str]) -> float:
     """Approximates the UI-side (non-agent) cost: DataFrame + column formatting + a chart.
 
-    This is the Python-only slice of what ui/app.py does after execute_sql
-    returns -- it does NOT include actual browser rendering or Streamlit's
-    own diffing/websocket cost, which can't be measured from a headless
-    script. Included because the profiling request explicitly names
-    "result formatting/rendering" as a stage to account for.
+    This is the Python-only slice of what the `/execute` API endpoint does
+    after execute_sql returns -- it does NOT include actual browser
+    rendering cost, which can't be measured from a headless script.
+    Included because the profiling request explicitly names "result
+    formatting/rendering" as a stage to account for.
     """
     start = time.perf_counter()
     df = pd.DataFrame(rows, columns=columns)

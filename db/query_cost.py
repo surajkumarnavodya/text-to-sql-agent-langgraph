@@ -72,7 +72,7 @@ class CostEstimate(BaseModel):
     A `pydantic.BaseModel` (unlike `_RawPlanInfo` below, a plain dataclass)
     because this type crosses a real boundary -- returned from
     `estimate_query_cost()` into `agent.nodes.estimate_query_cost_node`
-    and, via `state["cost_estimate"]`, potentially into `ui/app.py` --
+    and, via `state["cost_estimate"]`, potentially into the API response --
     where `severity`'s `Literal["low", "moderate", "high"]` type is worth
     Pydantic actually validating rather than just documenting.
 

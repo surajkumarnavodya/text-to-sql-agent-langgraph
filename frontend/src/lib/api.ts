@@ -12,6 +12,7 @@ import type {
   SchemaRefreshResponse,
   SensitivityCategory,
   TablesResponse,
+  TranscribeResponse,
 } from './types'
 
 export class ApiError extends Error {
@@ -26,7 +27,7 @@ export class ApiError extends Error {
 
 // Set at build time (VITE_API_AUTH_TOKEN) only if the backend is configured
 // with API_AUTH_TOKEN -- most local/single-user deployments leave both
-// unset, matching ui/app.py's own no-auth default (see api/auth.py).
+// unset (see api/auth.py's own no-auth default).
 const API_TOKEN = import.meta.env.VITE_API_AUTH_TOKEN as string | undefined
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
@@ -143,6 +144,36 @@ export async function fetchMediaBlobUrl(mediaId: string): Promise<string> {
   const response = await fetch(`/media/${mediaId}`, { headers })
   if (!response.ok) {
     throw new ApiError('Could not load the generated media.', response.status)
+  }
+  const blob = await response.blob()
+  return URL.createObjectURL(blob)
+}
+
+/** Uploads one recorded question for local transcription (`voice/stt.py`).
+ * The returned text is plain, untrusted input -- callers must submit it
+ * back through `askQuestion` like any typed question, never treat it as
+ * pre-validated. */
+export function transcribeAudio(audio: Blob): Promise<TranscribeResponse> {
+  const form = new FormData()
+  form.append('audio', audio, 'question.webm')
+  return request<TranscribeResponse>('/voice/transcribe', { method: 'POST', body: form })
+}
+
+/** Synthesizes an answer to speech (`voice/tts.py`) and returns a blob
+ * object URL suitable for an `<audio>` `src` -- same reasoning as
+ * `fetchMediaBlobUrl` above (the endpoint needs an Authorization header a
+ * plain `<audio src="...">` can't send). Callers must
+ * `URL.revokeObjectURL` the result once playback is done. */
+export async function synthesizeSpeechUrl(text: string): Promise<string> {
+  const headers = new Headers({ 'Content-Type': 'application/json' })
+  if (API_TOKEN) headers.set('Authorization', `Bearer ${API_TOKEN}`)
+  const response = await fetch('/voice/synthesize', {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({ text }),
+  })
+  if (!response.ok) {
+    throw new ApiError('Could not synthesize speech.', response.status)
   }
   const blob = await response.blob()
   return URL.createObjectURL(blob)

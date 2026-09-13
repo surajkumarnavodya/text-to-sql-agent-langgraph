@@ -21,15 +21,15 @@ the database") fans out to two (or more) subgraphs in the same graph step,
 not one after another (confirmed against this project's pinned LangGraph
 version before this was built, not assumed).
 
-`run_orchestrated` is the single public entry point `ui/app.py` and
-`api/main.py` call in place of `agent.graph.run_agent` directly. It is
-deliberately a two-path function, not a graph with one trivial branch:
+`run_orchestrated` is the single public entry point `api/main.py` calls
+in place of `agent.graph.run_agent` directly. It is deliberately a
+two-path function, not a graph with one trivial branch:
 
   - `Settings.enable_multi_source_router` is False (the default -- see
     `.env.example`): `run_orchestrated` calls `agent.graph.run_agent`
     directly and returns its result completely unwrapped. This is not "the
     orchestrator graph with one destination" -- it is the exact same
-    function call `ui/app.py` made before this package existed, so a fresh
+    function call the API made before this package existed, so a fresh
     clone with today's `.env` behaves identically to today's app, per
     CLAUDE.md's Part 7 constraint. `eval/runner.py` and the standalone
     scripts also keep calling `run_agent` directly and are entirely

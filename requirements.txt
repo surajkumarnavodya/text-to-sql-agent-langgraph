@@ -29,16 +29,17 @@ chromadb==1.5.9
 # pure-Python, no system dependency (unlike e.g. poppler-based extractors).
 pypdf==6.18.0
 
-# UI
-streamlit==1.41.1
+# Result formatting/charting (agent/result_charting.py, db/column_formatting.py) --
+# consumed by the /execute API endpoint, whose chart JSON the React
+# dashboard renders via chart.js (frontend/src/lib/chartAdapter.ts).
 plotly==5.24.1
 # pandas==2.2.3 predates Python 3.14 and segfaults (access violation deep in
 # pandas.core.arrays.datetimes._construct_from_dt64_naive) building a
 # DataFrame from any row data containing a raw datetime.datetime value --
-# i.e. any query result with a datetime/date column, via ui/app.py's
+# i.e. any query result with a datetime/date column, via api/main.py's
 # pd.DataFrame(rows, columns=columns). Reproduces in two lines outside the
-# app entirely (not caused by anything in ui/app.py's own code), and is
-# fixed by 2.3.3, the first pandas release with real Python 3.14 wheels.
+# app entirely, and is fixed by 2.3.3, the first pandas release with real
+# Python 3.14 wheels.
 pandas==2.3.3
 
 # Pydantic itself was already present transitively (via fastapi/langgraph/
@@ -60,6 +61,17 @@ fastapi==0.141.1
 # Required by FastAPI to parse multipart/form-data -- api/documents.py's
 # POST /documents (PDF upload) is the only route that needs it.
 python-multipart==0.0.32
+
+# --- Voice mode (optional, on by default -- see voice/, ENABLE_VOICE_MODE) ---
+# Both are local/offline inference, no cloud API, matching this project's
+# "Ollama not a hosted LLM" posture. Neither pulls in torch (confirmed
+# before pinning): faster-whisper uses ctranslate2 (CPU-friendly by
+# default); piper-tts uses onnxruntime (already a transitive dep via
+# chromadb). faster-whisper auto-downloads its model from Hugging Face Hub
+# on first use, cached locally; piper-tts's voice model is a separate
+# one-time download -- see scripts/download_voice_model.py.
+faster-whisper==1.2.1
+piper-tts==1.8.0
 
 # Config
 python-dotenv==1.0.1

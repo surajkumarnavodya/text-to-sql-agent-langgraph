@@ -7,21 +7,60 @@
     "chat": "Chat",
     "knowledgeSources": "Fuentes de conocimiento"
   },
+  "header": {
+    "openHistory": "Abrir historial de chat",
+    "closeHistory": "Cerrar historial de chat",
+    "envIndicator": "Espacio de trabajo de IA SQL"
+  },
+  "history": {
+    "title": "Historial de chat",
+    "searchPlaceholder": "Buscar conversaciones...",
+    "newChat": "Nuevo chat",
+    "empty": "Aún no hay conversaciones. Empieza haciendo una pregunta.",
+    "noResults": "Ninguna conversación coincide con tu búsqueda.",
+    "today": "Hoy",
+    "yesterday": "Ayer",
+    "previous7Days": "Últimos 7 días",
+    "older": "Anteriores",
+    "rename": "Cambiar nombre",
+    "delete": "Eliminar"
+  },
+  "workspace": {
+    "heading": "Pregunta lo que quieras sobre tus datos",
+    "subheading": "Haz preguntas en lenguaje natural y obtén SQL validado, de solo lectura, con resultados en vivo.",
+    "promptRevenue": "Muestra las ventas totales por mes",
+    "promptTopProducts": "¿Qué productos tuvieron mejor rendimiento?",
+    "promptRegion": "Compara los ingresos por región",
+    "promptDeclining": "Encuentra clientes con pedidos en declive"
+  },
+  "details": {
+    "title": "Información de la consulta",
+    "database": "Base de datos"
+  },
+  "voice": {
+    "settingsLabel": "Modo de voz",
+    "startConversation": "Iniciar conversación de voz",
+    "listening": "Escuchando…",
+    "transcribing": "Transcribiendo…",
+    "thinking": "Pensando…",
+    "speaking": "Hablando…",
+    "doneSpeaking": "Terminé de hablar",
+    "stopConversation": "Detener conversación",
+    "unsupportedCaption": "Grabando... habla ahora y luego pulsa \"Terminé de hablar\".",
+    "transcribeFailed": "No se pudo transcribir esa grabación. Inténtalo de nuevo o escribe tu pregunta.",
+    "micDenied": "Se denegó el acceso al micrófono o no está disponible."
+  },
   "sidebar": {
     "connectionStatus": "Estado de la conexión",
     "testConnection": "Probar conexión",
     "refreshSchema": "Actualizar esquema",
     "discoveredTables": "Tablas detectadas",
     "generateInsight": "Generar análisis con IA",
-    "history": "Historial",
-    "clearHistory": "Borrar historial",
-    "routedTo": "Última pregunta dirigida a",
     "appearance": "Apariencia",
     "theme": "Tema",
     "accentColor": "Color de acento",
     "font": "Fuente",
     "language": "Idioma",
-    "noHistory": "Aún no se ha hecho ninguna pregunta.",
     "installApp": "Instalar aplicación",
     "updateAvailable": "Hay una nueva versión disponible.",
     "reload": "Recargar"

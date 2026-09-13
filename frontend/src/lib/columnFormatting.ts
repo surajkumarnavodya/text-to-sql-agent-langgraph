@@ -1,16 +1,16 @@
 /**
- * Ports ui/column_formatting.py's display-only transforms (human-readable
- * column labels, hiding surrogate key columns by default) so the React
- * results table matches the Streamlit one. Pure display logic -- never
- * touches the SQL that ran or the raw result data.
+ * Ports db/column_formatting.py's display-only transforms (human-readable
+ * column labels, hiding surrogate key columns by default) so this table
+ * matches the same choices the Python side makes. Pure display logic --
+ * never touches the SQL that ran or the raw result data.
  *
  * Known, deliberate gap vs. the Python original: `is_probable_surrogate_key`
  * there also checks foreign-key constrained columns (via live schema
  * introspection); `/schema/tables` today only exposes each column's
  * `is_primary_key` flag, not FK info, so this port only uses the PK signal
  * plus the same name-suffix fallback. A column that's an FK but not a PK
- * anywhere may show up as "technical" here when it wouldn't in Streamlit --
- * a minor display-only discrepancy, not a data-safety one.
+ * anywhere may show up as "technical" here when it wouldn't on the Python
+ * side -- a minor display-only discrepancy, not a data-safety one.
  */
 
 const ABBREVIATION_EXPANSIONS: Record<string, string> = {

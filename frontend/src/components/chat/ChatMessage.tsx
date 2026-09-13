@@ -1,3 +1,4 @@
+import { Database, User } from 'lucide-react'
 import { ExpandableText } from '@/components/ui/expandable-text'
 
 export interface ChatMessageData {
@@ -5,14 +6,12 @@ export interface ChatMessageData {
   content: string
 }
 
-const AVATARS: Record<ChatMessageData['role'], string> = { user: '🧑', assistant: '🗄️' }
-
 export function ChatMessage({ message }: { message: ChatMessageData }) {
   const isUser = message.role === 'user'
   return (
     <div className={`flex gap-2.5 ${isUser ? 'flex-row-reverse' : ''}`}>
-      <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-[var(--muted)] text-base">
-        {AVATARS[message.role]}
+      <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-[var(--muted)] text-[var(--muted-foreground)]">
+        {isUser ? <User className="h-4 w-4" /> : <Database className="h-4 w-4" />}
       </span>
       <div
         className={`max-w-[85%] rounded-2xl px-3.5 py-2 text-sm ${

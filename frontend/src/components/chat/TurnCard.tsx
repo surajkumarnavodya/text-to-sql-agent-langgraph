@@ -1,3 +1,4 @@
+import { AlertTriangle, Loader2, Play, Sparkles } from 'lucide-react'
 import { lazy, Suspense } from 'react'
 import { useTranslation } from 'react-i18next'
 import { GoldenFeedbackWidget } from '@/components/sql/GoldenFeedbackWidget'
@@ -5,6 +6,7 @@ import { ResultsTable } from '@/components/sql/ResultsTable'
 import { SqlEditor } from '@/components/sql/SqlEditor'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
+import { Expander } from '@/components/ui/expander'
 import { Markdown } from '@/components/ui/markdown'
 import { buildAnswerMarkdown, type QueryHistoryEntry } from '@/lib/history'
 import { useChatStore } from '@/store/chatStore'
@@ -61,6 +63,18 @@ export function TurnCard({ entry, isMultiDb }: { entry: QueryHistoryEntry; isMul
               <DownloadAnswerButton question={entry.question} answer={answerMarkdown} />
             </>
           )}
+          {entry.spokenAudioUrl && (
+            // Playback itself already happened once, automatically, via
+            // `useVoiceConversation`'s own `<audio>` element as part of the
+            // hands-free conversation loop -- this is a manual-replay
+            // control only (no `autoPlay`, or the answer would be spoken
+            // twice: once here, once by the hook). Kept small and visible
+            // so the user can replay/pause/mute it. Deliberately not
+            // revoked on unmount: switching conversations and back must
+            // not break replay, and one blob URL per voice turn is a
+            // bounded, accepted cost for the life of the tab.
+            <audio src={entry.spokenAudioUrl} controls className="h-8 max-w-[200px]" />
+          )}
         </div>
 
         {state.followup_classification === 'followup' && state.followup_resolved_against && (
@@ -99,9 +113,11 @@ export function TurnCard({ entry, isMultiDb }: { entry: QueryHistoryEntry; isMul
         {state.attempt_history.length > 0 && <RetryTimeline attempts={state.attempt_history} />}
         <SourcesUsedPanel state={state} entryId={entry.entryId} />
         {isMultiDb && showSqlPanel && state.database && (
-          <p className="text-xs text-[var(--muted-foreground)]">
-            🧭 Routed to database: <strong>{state.database}</strong>
-          </p>
+          <Expander title={t('details.title')}>
+            <p className="text-xs text-[var(--muted-foreground)]">
+              {t('details.database')}: <strong>{state.database}</strong>
+            </p>
+          </Expander>
         )}
 
         {showSqlPanel && (
@@ -109,23 +125,29 @@ export function TurnCard({ entry, isMultiDb }: { entry: QueryHistoryEntry; isMul
             <SchemaContextPanel tables={state.schema_tables} />
             <QueryPlanPanel plan={state.query_plan} />
 
-            <div className="flex flex-col gap-2">
-              <h3 className="text-sm font-semibold">🛠️ {t('sql.title')}</h3>
-              <p className="text-xs text-[var(--muted-foreground)]">{t('sql.hint')}</p>
-              <SqlEditor value={entry.editableSql} onChange={(sql) => setEditableSql(entry.entryId, sql)} />
-              {state.cost_notice && entry.editableSql === state.sql && (
-                <p className="text-xs text-[var(--warning)]">⏳ {state.cost_notice}</p>
-              )}
-              <div>
-                <Button
-                  variant="primary"
-                  onClick={() => void confirmAndRun(entry.entryId)}
-                  disabled={isConfirming}
-                >
-                  ▶ {t('sql.confirmAndRun')}
-                </Button>
+            <Expander title={t('sql.title')} defaultOpen>
+              <div className="flex flex-col gap-2">
+                <p className="text-xs text-[var(--muted-foreground)]">{t('sql.hint')}</p>
+                <SqlEditor value={entry.editableSql} onChange={(sql) => setEditableSql(entry.entryId, sql)} />
+                {state.cost_notice && entry.editableSql === state.sql && (
+                  <p className="text-xs text-[var(--warning)]">{state.cost_notice}</p>
+                )}
+                <div>
+                  <Button
+                    variant="primary"
+                    onClick={() => void confirmAndRun(entry.entryId)}
+                    disabled={isConfirming}
+                  >
+                    {isConfirming ? (
+                      <Loader2 className="h-4 w-4 animate-spin" />
+                    ) : (
+                      <Play className="h-4 w-4" />
+                    )}
+                    {t('sql.confirmAndRun')}
+                  </Button>
+                </div>
               </div>
-            </div>
+            </Expander>
 
             {entry.confirmedError && (
               <p className="rounded-md border border-[var(--danger)]/30 bg-[var(--danger)]/10 p-3 text-sm text-[var(--danger)]">
@@ -142,11 +164,14 @@ export function TurnCard({ entry, isMultiDb }: { entry: QueryHistoryEntry; isMul
                 )}
                 <GoldenFeedbackWidget entryId={entry.entryId} />
                 {state.low_confidence_notice && entry.editableSql === state.sql && (
-                  <p className="text-xs text-[var(--warning)]">⚠️ {state.low_confidence_notice}</p>
+                  <p className="flex items-center gap-1.5 text-xs text-[var(--warning)]">
+                    <AlertTriangle className="h-3.5 w-3.5 shrink-0" />
+                    {state.low_confidence_notice}
+                  </p>
                 )}
                 {state.insight && entry.editableSql === state.sql && (
-                  <div className="rounded-lg border-l-4 border-[var(--accent)] bg-[var(--accent-soft)] p-3 text-sm">
-                    <span className="mr-2">✨</span>
+                  <div className="flex gap-2 rounded-lg border-l-4 border-[var(--accent)] bg-[var(--accent-soft)] p-3 text-sm">
+                    <Sparkles className="mt-0.5 h-4 w-4 shrink-0" />
                     <Markdown className="inline">{state.insight}</Markdown>
                   </div>
                 )}

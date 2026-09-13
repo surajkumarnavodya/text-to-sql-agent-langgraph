@@ -8,12 +8,11 @@
 @custom-variant dark (&:where([data-theme='dark'] *));
 
 /*
- * Design tokens, mirroring the palette structure ui/theme.py established
- * for the Streamlit app (light = clean neutral, dark = violet/near-black
- * glass, both sharing one indigo accent family) -- extended here so the
- * accent hue and font are independently user-configurable on top of the
- * light/dark/system choice, via useSettingsStore writing these same CSS
- * variables at runtime (see src/lib/theme.ts).
+ * Design tokens (light = clean neutral, dark = violet/near-black glass,
+ * both sharing one indigo accent family) -- the accent hue and font are
+ * independently user-configurable on top of the light/dark/system choice,
+ * via useSettingsStore writing these same CSS variables at runtime (see
+ * src/lib/theme.ts).
  */
 :root {
   --background: #f8fafc;
@@ -130,6 +129,21 @@ body {
 
 ::selection {
   background: var(--accent-soft);
+}
+
+/* Respects the OS-level "reduce motion" preference across every animated
+   surface in the app (drawer slide, gear rotation, workspace padding
+   shift, skeletons) -- a single global override rather than remembering
+   to add `motion-reduce:` to every individual transition utility. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+    scroll-behavior: auto !important;
+  }
 }
 
 /* Ties the typography plugin's rendered-markdown palette to our own

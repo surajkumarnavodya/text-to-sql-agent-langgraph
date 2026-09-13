@@ -177,8 +177,9 @@ def build_index(
 
     Takes `tables` rather than a database engine/connection: this function's
     only responsibility is embedding, not introspection -- callers (`scripts
-    /build_embeddings.py`, `ui/app.py`) run `db.schema_introspection
-    .introspect_schema()` first and pass the result in. That keeps this
+    /build_embeddings.py`, `api/main.py`'s schema refresh) run
+    `db.schema_introspection.introspect_schema()` first and pass the
+    result in. That keeps this
     module testable without mocking a database connection.
 
     Args:
@@ -281,8 +282,8 @@ def refresh_schema_index(
     """Introspects, samples, and (re)indexes one configured database's schema.
 
     Single source of truth for the introspect -> sample -> embed pipeline --
-    previously duplicated between `scripts/build_embeddings.py` and
-    `ui/app.py`'s schema initialization. The fingerprint used for cache
+    shared by `scripts/build_embeddings.py` and `api/main.py`'s schema
+    refresh route. The fingerprint used for cache
     invalidation is computed from the pre-value-sampling tables (see
     `build_index`'s `fingerprint_tables` parameter), so incidental data
     changes in a sampled column don't force a re-embed on their own.
@@ -300,8 +301,8 @@ def refresh_schema_index(
             changed since the last build.
 
     Returns:
-        The sample-value-enriched tables (same shape `ui/app.py`'s "Discovered
-        tables" panel and `_build_chart`'s key-column lookup expect).
+        The sample-value-enriched tables (same shape the dashboard's schema
+        browser and `_build_chart`'s key-column lookup expect).
 
     Raises:
         ValueError: if the database has no tables to index (see `build_index`).
@@ -320,7 +321,7 @@ def refresh_all_schema_indexes(
     """Introspects, samples, and (re)indexes every configured database's schema.
 
     The single shared orchestration point for "refresh everything" --
-    `scripts/build_embeddings.py`, `ui/app.py`'s schema initialization, and
+    `scripts/build_embeddings.py`, `api/main.py`'s schema refresh route, and
     `scripts/integration_test.py` all call this rather than looping over
     `Settings.databases` themselves. A failure introspecting/indexing one
     database does not stop the others -- it's logged and that database is

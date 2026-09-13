@@ -1,10 +1,10 @@
 """FastAPI router for Knowledge Sources document management.
 
-The API equivalent of `ui/pages/1_Knowledge_Sources.py`'s upload/list/
-delete/download UI. Mounted onto `api/main.py`'s `app` as a thin, additive
+Backs `frontend/src/pages/KnowledgeSources.tsx`'s upload/list/delete/
+download UI. Mounted onto `api/main.py`'s `app` as a thin, additive
 extension -- every route here calls the exact same `rag.ingestion`/
-`rag.store` functions the Streamlit page already calls, so there is no
-second implementation of ingestion, storage, or the sensitivity gate.
+`rag.store` functions directly, so there is no second implementation of
+ingestion, storage, or the sensitivity gate.
 """
 
 from __future__ import annotations
@@ -142,10 +142,10 @@ async def upload_document(
 def delete_document_route(document_id: str, request: Request) -> None:
     """Deletes a document and its chunks -- mirrors the management page's
     unconditional delete button (this page's admin surface is already
-    fully-privileged/no-per-user-authorization, same as the Streamlit one;
-    see CLAUDE.md's "Document/policy agentic RAG" section). Rate-limited
-    per client IP (`enforce_api_action_rate_limit`) -- an irreversible,
-    previously-unrated action."""
+    fully-privileged/no-per-user-authorization; see CLAUDE.md's
+    "Document/policy agentic RAG" section). Rate-limited per client IP
+    (`enforce_api_action_rate_limit`) -- an irreversible, previously-
+    unrated action."""
     settings = get_settings()
     enforce_api_action_rate_limit(request, "document_delete", settings)
     try:

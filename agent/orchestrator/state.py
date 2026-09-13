@@ -4,7 +4,7 @@
 it: when the SQL subgraph runs, its full result (`status`, `sql`,
 `result_rows`, `error_history`, ...) is merged straight into this state under
 the exact same keys `AgentState` already uses. That's what lets every
-existing `ui/app.py` read site (`state["status"]`, `state["sql"]`, the retry
+existing read site (`state["status"]`, `state["sql"]`, the retry
 timeline, ...) keep working unchanged regardless of whether a question went
 through `agent.graph.run_agent` directly or through the orchestrator -- see
 `agent/orchestrator/graph.py::run_orchestrated`.
@@ -65,10 +65,8 @@ class MediaGenerationResult(SourceAnswer):
     # An opaque `media_gen.cache.MediaCache` id, never the provider's raw
     # CDN URL -- `generation_node` downloads the bytes once and stores them
     # under this id (see `media_gen/cache.py`/`media_gen/download.py`).
-    # Fetch the actual bytes via `GET /media/{media_id}`
-    # (`api/media.py`) or, in-process from `ui/app.py`,
-    # `media_gen.cache.get_media_cache().get(media_id)`. None whenever
-    # `status != "succeeded"`.
+    # Fetch the actual bytes via `GET /media/{media_id}` (`api/media.py`).
+    # None whenever `status != "succeeded"`.
     media_id: str | None
     media_type: str | None
     model: str | None

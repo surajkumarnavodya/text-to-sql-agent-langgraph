@@ -374,9 +374,24 @@ def create_and_poll(
     prompt: str,
     poll_interval_seconds: float = 5.0,
     poll_timeout_seconds: float = 600.0,
+    form_overrides: dict | None = None,
 ) -> tuple[dict, str]:
     """High-level helper: discover a model for `task_type`, create the
     task, poll to completion. Returns `(media, model_name)`.
+
+    `form_overrides` replaces specific `form_config` field values on top of
+    the model's own defaults (e.g. `{"duration": 10}` for a video model
+    that exposes a "duration" field) -- see `generate_video`'s
+    `duration_seconds` parameter for the concrete use case this exists
+    for. Applied after `_extract_model_params` builds the default
+    `form_params`, so an override always wins over the model's own
+    default; an override for a field the selected model doesn't actually
+    have is simply added as an extra parameter IMA will itself reject if
+    it isn't recognized -- this function does not validate overrides
+    against the model's real `form_config` options/min/max (that would
+    need the full product-list response threaded through here; today's
+    only caller validates its own input range instead, see
+    `Settings.media_gen_video_duration_seconds`'s docstring).
 
     Raises `MediaGenerationError` if no model is available for `task_type`
     on this account, or on any create/poll failure -- never silently
@@ -390,6 +405,8 @@ def create_and_poll(
         )
 
     model_params = _extract_model_params(leaf)
+    if form_overrides:
+        model_params["form_params"].update(form_overrides)
     payload = build_create_payload(task_type, model_params, prompt)
     task_id = client.create_task(payload)
     media = client.poll_task(

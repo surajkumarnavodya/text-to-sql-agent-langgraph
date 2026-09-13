@@ -8,8 +8,8 @@ entirely rather than running it with one trivial destination.
 
 `sql_subgraph_node` is the only node that touches the existing SQL pipeline,
 and it touches it only through `agent.graph.run_agent` -- the already-
-compiled, already-tested eight-node graph, called exactly as
-`ui/app.py`/`api/main.py` always have. `document_rag_node`/`policy_rag_node`
+compiled, already-tested eight-node graph, called exactly as `api/main.py`
+always has. `document_rag_node`/`policy_rag_node`
 call `rag.graph.run_rag` (itself its own compiled subgraph -- see that
 module); `web_search_node` calls `search.web_search.web_search`;
 `generation_node` calls `media_gen.generate_image`/`generate_video`
@@ -338,7 +338,7 @@ def sql_subgraph_node(state: OrchestratorState) -> dict[str, Any]:
 
     Calls `agent.graph.run_agent` as an opaque function -- not a
     reimplementation, not a LangGraph subgraph embedded node-for-node, just
-    the same call `ui/app.py` and `api/main.py` have always made. Its full
+    the same call `api/main.py` has always made. Its full
     return value (`status`, `sql`, `result_rows`, `error_history`,
     `attempt_history`, ...) is merged directly into `OrchestratorState` under
     the same keys, which is what keeps every existing state-reading call site
@@ -635,8 +635,12 @@ def execute_generation(
         logger.error("[generation] not configured: %s", exc)
         return _failed_media_result(str(exc), media_type=kind)
 
-    generate = generate_video if kind == "video" else generate_image
-    result = generate(client, prompt=question)
+    if kind == "video":
+        result = generate_video(
+            client, prompt=question, duration_seconds=settings.media_gen_video_duration_seconds
+        )
+    else:
+        result = generate_image(client, prompt=question)
     if not result.ok:
         logger.warning("[generation] %s generation failed: %s", kind, result.error)
         log_security_event(
@@ -694,7 +698,7 @@ def generation_node(state: OrchestratorState) -> dict[str, Any]:
     yet. The actual provider call only happens when a human explicitly
     confirms via `POST /generate/confirm` (`api/generation.py`), which
     calls `execute_generation` itself -- mirroring the SQL pipeline's own
-    "Confirm and Run" gate (`ui/app.py`, `POST /execute`) applied to this
+    "Confirm and Run" gate (`POST /execute`) applied to this
     source. Setting `require_generation_approval=false` restores the
     previous fully-autonomous behavior (e.g. for a trusted automation
     context that has already reviewed this tradeoff) -- opt-in, not the
@@ -807,9 +811,8 @@ def synthesis_node(state: OrchestratorState) -> dict[str, Any]:
     `synthesized_answer`, even when it's one of several sources that fired
     (e.g. the router picking `["generation", "web"]` for a plain "generate
     an image of X" question -- it does this often enough in practice that
-    the UI must handle it, not just the common single-source case). Both
-    UIs (`ui/app.py`'s `_render_sources_used`, the React
-    `SourcesUsedPanel.tsx`) always render the actual generated image/video
+    the UI must handle it, not just the common single-source case). The
+    React dashboard (`SourcesUsedPanel.tsx`) always renders the actual generated image/video
     from `generation_result` as its own component *in addition to*
     `synthesized_answer`'s text, regardless of how many other sources also
     fired -- folding a "Generated image successfully" sentence into the
@@ -836,12 +839,32 @@ def synthesis_node(state: OrchestratorState) -> dict[str, Any]:
     if "sql" in sources_used:
         status_update: dict[str, Any] = {}
     else:
-        found_any = any(
-            (result := cast("SourceAnswer | None", state.get(_SOURCE_RESULT_KEYS.get(source, ""))))
-            and result.get("status") in ("succeeded", "restricted")
+        source_results = [
+            cast("SourceAnswer | None", state.get(_SOURCE_RESULT_KEYS.get(source, "")))
             for source in sources_used
+        ]
+        found_any = any(
+            result and result.get("status") in ("succeeded", "restricted")
+            for result in source_results
         )
-        status_update = {"status": "succeeded" if found_any else "failed"}
+        # A generation result awaiting human confirmation
+        # (Settings.require_generation_approval) is neither a success nor
+        # a failure -- nothing has actually happened yet. Without this
+        # check it would fall into the "else" branch below and the run
+        # would be reported as `status="failed"`, showing a misleading
+        # "agent could not produce a working query" banner before the user
+        # has even had a chance to confirm or decline. Leaving `status`
+        # untouched here keeps it at `run_orchestrated`'s initial
+        # "pending" -- not a claim of success, just "not resolved yet."
+        pending_any = any(
+            result and result.get("status") == "pending_approval" for result in source_results
+        )
+        if found_any:
+            status_update = {"status": "succeeded"}
+        elif pending_any:
+            status_update = {}
+        else:
+            status_update = {"status": "failed"}
 
     if len(sources_used) <= 1:
         return status_update

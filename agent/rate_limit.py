@@ -7,9 +7,9 @@ coordination, resets on every app restart. Two independent limiters are
 built from the same `SlidingWindowRateLimiter` class, at different scopes:
 
   - **Question submissions** (`Settings.question_rate_limit_per_minute`,
-    default 10/min): genuinely per Streamlit session -- the UI
-    (`ui/app.py`) owns an instance in `st.session_state` and checks it
-    before ever calling `agent.graph.run_agent`. Protects against a human
+    default 10/min): per client IP -- `api/main.py` owns one instance per
+    caller and checks it before ever calling
+    `agent.orchestrator.graph.run_orchestrated`. Protects against a human
     (or a script) hammering the chat box faster than the pipeline can
     reasonably keep up.
   - **LLM generation calls** (`Settings.llm_call_rate_limit_per_minute`,
@@ -83,8 +83,9 @@ class SlidingWindowRateLimiter:
     if fewer than `max_events` remain. Intentionally the simplest correct
     approach for this scale -- no token buckets, no external store, safe to
     share across threads only in the loose sense the GIL provides (fine for
-    this app's actual concurrency profile: a handful of Streamlit script
-    reruns, not a real multi-threaded server).
+    this app's actual concurrency profile: a single-instance FastAPI
+    process with a handful of concurrent requests, not a real distributed
+    multi-tenant server).
     """
 
     def __init__(self, max_events: int, window_seconds: float, name: str) -> None:

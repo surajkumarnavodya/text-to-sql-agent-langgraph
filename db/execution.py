@@ -1,9 +1,9 @@
 """Read-only SQL execution mechanics: timeout enforcement + row-cap fetch.
 
 Shared by `agent.nodes.execute_sql_node` (the agent's internal self-correction
-loop) and `ui/app.py`'s manual "Confirm and Run" path, so both go through the
+loop) and `POST /execute`'s manual "Confirm and Run" path, so both go through the
 exact same connection reuse, timeout, and read-only enforcement -- neither the
-agent nor the UI gets its own, separately-maintained execution logic. Lives in
+agent nor the API gets its own, separately-maintained execution logic. Lives in
 `db/` (not `agent/`) because it is purely a database-execution concern with no
 LangGraph/state dependency -- every other piece of DB-facing logic
 (`db/connection.py`'s engine lifecycle, `db/query_cost.py`'s plan estimation)
@@ -130,9 +130,9 @@ def execute_readonly_sql(
     """Executes already-validated, already row-limited SQL read-only.
 
     Shared by `agent.nodes.execute_sql_node` (the agent's internal
-    self-correction loop) and `ui/app.py`'s manual "Confirm and Run" path, so
+    self-correction loop) and `POST /execute`'s manual "Confirm and Run" path, so
     both go through the exact same connection reuse, timeout, and read-only
-    enforcement -- the UI does not get its own, separately-maintained
+    enforcement -- the API does not get its own, separately-maintained
     execution logic.
 
     Args:

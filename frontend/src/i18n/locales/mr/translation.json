@@ -7,21 +7,60 @@
     "chat": "चॅट",
     "knowledgeSources": "ज्ञान स्रोत"
   },
+  "header": {
+    "openHistory": "चॅट इतिहास उघडा",
+    "closeHistory": "चॅट इतिहास बंद करा",
+    "envIndicator": "AI SQL वर्कस्पेस"
+  },
+  "history": {
+    "title": "चॅट इतिहास",
+    "searchPlaceholder": "संभाषणे शोधा...",
+    "newChat": "नवीन चॅट",
+    "empty": "अद्याप कोणतेही संभाषण नाही. प्रश्न विचारून सुरुवात करा.",
+    "noResults": "तुमच्या शोधाशी जुळणारे कोणतेही संभाषण नाही.",
+    "today": "आज",
+    "yesterday": "काल",
+    "previous7Days": "मागील 7 दिवस",
+    "older": "जुने",
+    "rename": "नाव बदला",
+    "delete": "हटवा"
+  },
+  "workspace": {
+    "heading": "तुमच्या डेटाबद्दल काहीही विचारा",
+    "subheading": "सोप्या भाषेत प्रश्न विचारा आणि सत्यापित, केवळ-वाचनीय SQL तसेच थेट निकाल मिळवा.",
+    "promptRevenue": "महिन्यानुसार एकूण विक्री दाखवा",
+    "promptTopProducts": "कोणती उत्पादने सर्वोत्तम कामगिरी करणारी होती?",
+    "promptRegion": "प्रदेशानुसार महसूलाची तुलना करा",
+    "promptDeclining": "घटत्या ऑर्डर असलेले ग्राहक शोधा"
+  },
+  "details": {
+    "title": "क्वेरी माहिती",
+    "database": "डेटाबेस"
+  },
+  "voice": {
+    "settingsLabel": "व्हॉइस मोड",
+    "startConversation": "व्हॉइस संभाषण सुरू करा",
+    "listening": "ऐकत आहे…",
+    "transcribing": "ट्रान्सक्राइब करत आहे…",
+    "thinking": "विचार करत आहे…",
+    "speaking": "बोलत आहे…",
+    "doneSpeaking": "बोलणं पूर्ण झालं",
+    "stopConversation": "संभाषण थांबवा",
+    "unsupportedCaption": "रेकॉर्डिंग सुरू आहे... आता बोला, नंतर \"बोलणं पूर्ण झालं\" वर क्लिक करा.",
+    "transcribeFailed": "ती रेकॉर्डिंग ट्रान्सक्राइब करता आली नाही. पुन्हा प्रयत्न करा किंवा तुमचा प्रश्न टाइप करा.",
+    "micDenied": "मायक्रोफोन अ‍ॅक्सेस नाकारला गेला किंवा उपलब्ध नाही."
+  },
   "sidebar": {
     "connectionStatus": "कनेक्शन स्थिती",
     "testConnection": "कनेक्शन तपासा",
     "refreshSchema": "स्कीमा रिफ्रेश करा",
     "discoveredTables": "सापडलेल्या तक्त्या",
     "generateInsight": "AI विश्लेषण तयार करा",
-    "history": "इतिहास",
-    "clearHistory": "इतिहास साफ करा",
-    "routedTo": "शेवटचा प्रश्न पाठवला गेला",
     "appearance": "स्वरूप",
     "theme": "थीम",
     "accentColor": "अ‍ॅक्सेंट रंग",
     "font": "फॉन्ट",
     "language": "भाषा",
-    "noHistory": "अद्याप कोणताही प्रश्न विचारलेला नाही.",
     "installApp": "अ‍ॅप इंस्टॉल करा",
     "updateAvailable": "नवीन आवृत्ती उपलब्ध आहे.",
     "reload": "पुन्हा लोड करा"

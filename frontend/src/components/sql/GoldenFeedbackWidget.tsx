@@ -3,8 +3,8 @@ import { useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { useChatStore } from '@/store/chatStore'
 
-/** Mirrors ui/app.py's golden-example thumbs feedback widget: only shown
- * for a confirmed (executed) result, once per history entry per session. */
+/** Golden-example thumbs feedback widget: only shown for a confirmed
+ * (executed) result, once per history entry per session. */
 export function GoldenFeedbackWidget({ entryId }: { entryId: string }) {
   const { t } = useTranslation()
   const giveGoldenFeedback = useChatStore((state) => state.giveGoldenFeedback)

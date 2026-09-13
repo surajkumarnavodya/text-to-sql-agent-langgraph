@@ -1,7 +1,11 @@
-import { Send } from 'lucide-react'
+import { Loader2, Mic, Send } from 'lucide-react'
 import { useRef, useState, type ChangeEvent, type KeyboardEvent } from 'react'
 import { useTranslation } from 'react-i18next'
 import { Button } from '@/components/ui/button'
+import { useHealth } from '@/hooks/queries'
+import { useVoiceConversation } from '@/hooks/useVoiceConversation'
+import { useSettingsStore } from '@/store/settingsStore'
+import { VoiceConversationBar } from './VoiceConversationBar'
 
 const MAX_WORDS = 250
 // Caps how tall the box can grow before it scrolls internally instead --
@@ -22,13 +26,24 @@ function resizeToFitContent(el: HTMLTextAreaElement): void {
 export function ChatInput({
   onSubmit,
   disabled,
+  isLoading,
 }: {
   onSubmit: (question: string) => void
   disabled?: boolean
+  isLoading?: boolean
 }) {
   const { t } = useTranslation()
   const [value, setValue] = useState('')
   const textareaRef = useRef<HTMLTextAreaElement>(null)
+  const health = useHealth()
+  const voiceModeEnabled = useSettingsStore((state) => state.voiceModeEnabled)
+  const showVoiceButton = Boolean(health.data?.voice_enabled) && voiceModeEnabled
+  // Owned here (not inside VoiceConversationBar) so the hook -- and the
+  // MediaRecorder/SpeechRecognition handles it holds -- survives the
+  // active/inactive transition; a hook living inside a component that
+  // itself only mounts while active would tear its own state down the
+  // moment a turn ends and it flips back to idle.
+  const voice = useVoiceConversation()
 
   const submit = () => {
     const trimmed = value.trim()
@@ -64,8 +79,12 @@ export function ChatInput({
 
   const wordCount = countWords(value)
 
+  if (showVoiceButton && voice.isActive) {
+    return <VoiceConversationBar voice={voice} />
+  }
+
   return (
-    <div className="flex flex-col gap-1 border-t border-[var(--border)] bg-[var(--card)] p-3">
+    <div className="flex flex-col gap-1 rounded-2xl border border-[var(--border)] bg-[var(--card)] p-3 shadow-sm transition-shadow focus-within:border-[var(--accent)] focus-within:shadow-md">
       <div className="flex items-end gap-2">
         <textarea
           ref={textareaRef}
@@ -75,19 +94,50 @@ export function ChatInput({
           placeholder={t('chat.placeholder')}
           disabled={disabled}
           rows={1}
-          className="min-h-10 max-h-60 flex-1 resize-none overflow-y-auto rounded-md border border-[var(--border)] bg-[var(--input)] px-3 py-2.5 text-sm leading-normal focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--accent)]"
+          className="min-h-10 max-h-60 flex-1 resize-none overflow-y-auto bg-transparent px-1 py-1.5 text-sm leading-normal focus-visible:outline-none"
         />
-        <Button variant="primary" size="icon" onClick={submit} disabled={disabled || !value.trim()}>
-          <Send className="h-4 w-4" />
+        {showVoiceButton && (
+          <Button
+            variant="secondary"
+            size="icon"
+            onClick={voice.start}
+            disabled={disabled}
+            aria-label={t('voice.startConversation')}
+            title={t('voice.startConversation')}
+            className="rounded-xl"
+          >
+            <Mic className="h-4 w-4" />
+          </Button>
+        )}
+        <Button
+          variant="primary"
+          size="icon"
+          onClick={submit}
+          disabled={disabled || !value.trim()}
+          aria-label={t('chat.placeholder')}
+          className="rounded-xl"
+        >
+          {isLoading ? <Loader2 className="h-4 w-4 animate-spin" /> : <Send className="h-4 w-4" />}
         </Button>
       </div>
-      <span
-        className={`self-end text-[11px] ${
-          wordCount >= MAX_WORDS ? 'text-[var(--danger)]' : 'text-[var(--muted-foreground)]'
-        }`}
-      >
-        {wordCount} / {MAX_WORDS} {t('chat.words')}
-      </span>
+      <div className="flex items-center justify-between">
+        {voice.error ? (
+          // Surfaced here (not only in VoiceConversationBar) because a
+          // failed turn returns to this normal view immediately -- see
+          // useVoiceConversation's `reset(clearError)` -- so this is the
+          // only place a mic-denied/transcription error is still visible.
+          <span className="text-[11px] text-[var(--danger)]">{t(voice.error)}</span>
+        ) : (
+          <span />
+        )}
+        <span
+          className={`text-[11px] ${
+            wordCount >= MAX_WORDS ? 'text-[var(--danger)]' : 'text-[var(--muted-foreground)]'
+          }`}
+        >
+          {wordCount} / {MAX_WORDS} {t('chat.words')}
+        </span>
+      </div>
     </div>
   )
 }

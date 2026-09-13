@@ -13,8 +13,8 @@ const SOURCE_CHIP_LABELS: Record<string, string> = {
   generation: 'Generated Media',
 }
 
-/** Mirrors ui/app.py's _render_sources_used: shows which source(s)
- * contributed, and either the synthesized combined answer or each
+/** Shows which source(s) contributed, and either the synthesized combined
+ * answer or each
  * non-SQL source's own card -- never both, and never a "not found in X"
  * aside once another source already answered (see agent/orchestrator/
  * nodes.py::synthesis_node, which already filters that out server-side).

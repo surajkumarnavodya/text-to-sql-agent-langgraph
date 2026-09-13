@@ -11,9 +11,7 @@ import type {
  * own editable-SQL/confirmed-result state (rather than a single global
  * "current turn" the app used to keep) so every previously-asked question
  * stays fully rendered, adjacent to its own answer, for the life of the
- * session -- not just the latest one. Mirrors ui/session_history.py's
- * QueryHistoryEntry, extended with the fields that per-entry rendering and
- * timing display need. */
+ * session -- not just the latest one. */
 export interface QueryHistoryEntry {
   entryId: string
   question: string
@@ -36,6 +34,93 @@ export interface QueryHistoryEntry {
   confirmedSql: string | null
   confirmedChart: PlotlyFigure | null
   confirmedDurationMs: number | null
+  /** True only when this question was asked via the hands-free voice
+   * conversation loop (`useVoiceConversation`) -- the sole signal
+   * `chatStore.askQuestion` uses to decide whether to synthesize and play
+   * back the answer. A typed question always leaves this false, so it can
+   * never trigger audio output. */
+  originatedFromVoice: boolean
+  /** Blob object URL for this turn's spoken-answer audio, set once
+   * synthesis completes for a voice-originated turn. `TurnCard` plays it
+   * and must revoke it on unmount/replacement. */
+  spokenAudioUrl: string | null
+}
+
+/** One saved chat session for the history drawer -- a conversation is just
+ * a named, addressable snapshot of a `queryHistory` array at a point in
+ * time, kept in the same in-memory-only store as everything else in
+ * chatStore (no backend/localStorage persistence exists for chat state
+ * today, so a full page reload still clears it -- consistent with the
+ * app's existing session-only behavior, not a new limitation). */
+export interface ConversationSummary {
+  id: string
+  title: string
+  updatedAt: string
+  entries: QueryHistoryEntry[]
+}
+
+/** First question, trimmed and capped, so a conversation reads like a real
+ * title instead of a raw id -- mirrors how most chat products derive a
+ * thread name from its opening message. */
+export function deriveConversationTitle(question: string): string {
+  const trimmed = question.trim().replace(/\s+/g, ' ')
+  return trimmed.length > 60 ? `${trimmed.slice(0, 57)}…` : trimmed
+}
+
+export type ConversationGroupKey = 'today' | 'yesterday' | 'previous7Days' | 'older'
+
+/** Buckets conversations by recency (today / yesterday / previous 7 days /
+ * older), newest-first within each bucket -- the grouping every modern
+ * chat history panel (ChatGPT, Claude, Perplexity) uses. */
+export function groupConversationsByRecency(
+  conversations: ConversationSummary[],
+): { key: ConversationGroupKey; items: ConversationSummary[] }[] {
+  const now = new Date()
+  const startOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate())
+  const startOfYesterday = new Date(startOfToday)
+  startOfYesterday.setDate(startOfYesterday.getDate() - 1)
+  const sevenDaysAgo = new Date(startOfToday)
+  sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 7)
+
+  const buckets: Record<ConversationGroupKey, ConversationSummary[]> = {
+    today: [],
+    yesterday: [],
+    previous7Days: [],
+    older: [],
+  }
+
+  const sorted = [...conversations].sort(
+    (a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime(),
+  )
+  for (const conversation of sorted) {
+    const updated = new Date(conversation.updatedAt)
+    if (updated >= startOfToday) buckets.today.push(conversation)
+    else if (updated >= startOfYesterday) buckets.yesterday.push(conversation)
+    else if (updated >= sevenDaysAgo) buckets.previous7Days.push(conversation)
+    else buckets.older.push(conversation)
+  }
+
+  return (['today', 'yesterday', 'previous7Days', 'older'] as const)
+    .map((key) => ({ key, items: buckets[key] }))
+    .filter((group) => group.items.length > 0)
+}
+
+/** Compact "3m ago"/"Yesterday"-style timestamp for a history item --
+ * deliberately never the raw ISO string or a full date+time, which would
+ * read as a technical/internal detail rather than a normal chat product
+ * timestamp. */
+export function formatRelativeTime(iso: string): string {
+  const then = new Date(iso).getTime()
+  const diffSeconds = Math.max(0, Math.round((Date.now() - then) / 1000))
+  if (diffSeconds < 60) return 'Just now'
+  const diffMinutes = Math.round(diffSeconds / 60)
+  if (diffMinutes < 60) return `${diffMinutes}m ago`
+  const diffHours = Math.round(diffMinutes / 60)
+  if (diffHours < 24) return `${diffHours}h ago`
+  const diffDays = Math.round(diffHours / 24)
+  if (diffDays === 1) return 'Yesterday'
+  if (diffDays < 7) return `${diffDays}d ago`
+  return new Date(iso).toLocaleDateString(undefined, { month: 'short', day: 'numeric' })
 }
 
 export const MAX_FOLLOWUP_EXCHANGES = 3
@@ -44,6 +129,7 @@ export function newHistoryEntry(
   question: string,
   finalState: AskResponse,
   answerDurationMs: number,
+  originatedFromVoice = false,
 ): QueryHistoryEntry {
   return {
     entryId: crypto.randomUUID(),
@@ -63,7 +149,15 @@ export function newHistoryEntry(
     confirmedSql: null,
     confirmedChart: null,
     confirmedDurationMs: null,
+    originatedFromVoice,
+    spokenAudioUrl: null,
   }
+}
+
+/** Attaches the synthesized-speech blob URL for a voice-originated turn's
+ * answer -- see `chatStore.askQuestion`'s post-success TTS call. */
+export function withSpokenAudio(entry: QueryHistoryEntry, audioUrl: string): QueryHistoryEntry {
+  return { ...entry, spokenAudioUrl: audioUrl }
 }
 
 export function withConfirmedResult(
@@ -230,7 +324,26 @@ export function buildAnswerMarkdown(entry: QueryHistoryEntry): string {
   return parts.join('\n\n')
 }
 
-/** Same cache-key shape as ui/app.py's nl_question_cache. */
+/** Picks the one thing worth reading aloud for a voice-originated turn --
+ * plain, spoken-style text, not `buildAnswerMarkdown`'s markdown-formatted
+ * export. Priority: a grounded insight (SQL path) > a synthesized/
+ * per-source answer (multi-source path) > a row-count fallback -- never
+ * silent on a successful turn, since the user asked out loud and should
+ * hear *something* back. */
+export function buildSpokenAnswerText(entry: QueryHistoryEntry): string {
+  const state = entry.finalState
+  if (state.insight) return state.insight
+  if (state.synthesized_answer) return state.synthesized_answer
+  if (state.document_result?.answer) return state.document_result.answer
+  if (state.policy_result?.answer) return state.policy_result.answer
+  if (state.web_result?.answer) return state.web_result.answer
+  if (entry.rowCount !== null) {
+    return entry.rowCount === 1 ? 'Found 1 row.' : `Found ${entry.rowCount} rows.`
+  }
+  return 'Done.'
+}
+
+/** Same cache-key shape this app's own `/ask` question-deduplication uses. */
 export function nlCacheKey(
   question: string,
   priorQuestions: string[],

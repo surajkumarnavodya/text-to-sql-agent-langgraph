@@ -40,8 +40,8 @@ logger = logging.getLogger("security.audit")
 # `anyio.to_thread.run_sync`, which explicitly copies the calling context
 # into that thread -- a plain `threading.local` would not see the value set
 # by the middleware, which runs in the event loop's own async context.
-# Outside a request (a CLI script, a test, the Streamlit UI), this simply
-# stays unset and `log_security_event` omits the field, exactly as before.
+# Outside a request (a CLI script, a test), this simply stays unset and
+# `log_security_event` omits the field, exactly as before.
 _correlation_id: ContextVar[str | None] = ContextVar("correlation_id", default=None)
 
 

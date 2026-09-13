@@ -1,10 +1,10 @@
 """Pydantic request/response models for `api/main.py`.
 
 Deliberately thin: these mirror the subset of `agent.state.AgentState` the
-Streamlit UI already renders (`ui/app.py`), not a new data model. Nothing
-here re-decides what's safe to return -- the agent graph itself is what
-already gates what ends up in `AgentState` (validated SQL only, row-capped
-results, redacted errors).
+React dashboard renders, not a new data model. Nothing here re-decides
+what's safe to return -- the agent graph itself is what already gates what
+ends up in `AgentState` (validated SQL only, row-capped results, redacted
+errors).
 """
 
 from __future__ import annotations
@@ -19,9 +19,9 @@ from agent.state import AgentStatus
 class ConversationExchangeIn(BaseModel):
     """One prior turn, for follow-up reference resolution -- same shape as
     `agent.state.ConversationExchange`, accepted from an API caller instead
-    of being built from `ui/session_history.py`'s server-side session
-    state (the API has no server-side session of its own; the caller is
-    responsible for resending recent turns each request)."""
+    of being built from server-side session state (the API has no
+    server-side session of its own; the caller is responsible for
+    resending recent turns each request)."""
 
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
 
@@ -78,7 +78,7 @@ class AttemptRecordOut(BaseModel):
 
 class SchemaTableOut(BaseModel):
     """One retrieved-schema table entry -- mirrors `agent.state.TableSchema`,
-    used by `ui/app.py`'s "Retrieved schema context" expander."""
+    used by the dashboard's "Retrieved schema context" expander."""
 
     model_config = ConfigDict(frozen=True)
 
@@ -146,9 +146,9 @@ class ConversationExchangeOut(BaseModel):
 
 
 class AskResponse(BaseModel):
-    """Mirrors the fields of `agent.state.AgentState` that `ui/app.py`
-    already surfaces to a human -- see that module for the reference
-    rendering this response shape is kept consistent with."""
+    """Mirrors the fields of `agent.state.AgentState` that the React
+    dashboard surfaces to a human -- see its `TurnCard.tsx` for the
+    reference rendering this response shape is kept consistent with."""
 
     model_config = ConfigDict(frozen=True)
 
@@ -215,8 +215,8 @@ class AskResponse(BaseModel):
 
 
 class ExecuteRequest(BaseModel):
-    """Validate-and-execute a specific SQL string -- the API equivalent of
-    `ui/app.py`'s "Confirm and Run" button. Typically `sql` is a value taken
+    """Validate-and-execute a specific SQL string -- backs the dashboard's
+    "Confirm and Run" button. Typically `sql` is a value taken
     from a prior `AskResponse.sql` (verbatim, or hand-edited by the caller)
     and `database` is that same response's `database` field, so execution
     targets the database the SQL was actually generated against."""
@@ -228,7 +228,7 @@ class ExecuteRequest(BaseModel):
         default=None,
         description=(
             "Settings.databases[i].name to execute against. Omit to use the "
-            "first configured database (matches ui/app.py's own fallback "
+            "first configured database (the same fallback used "
             "when no prior selected_database is available)."
         ),
     )
@@ -279,8 +279,8 @@ class ExecuteResponse(BaseModel):
 
 
 class GoldenExampleFeedbackRequest(BaseModel):
-    """Records a human-approved (question, SQL) pair -- the API equivalent
-    of `ui/app.py`'s thumbs-up golden-example feedback widget."""
+    """Records a human-approved (question, SQL) pair -- backs the
+    dashboard's thumbs-up golden-example feedback widget."""
 
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
 
@@ -333,6 +333,7 @@ class HealthResponse(BaseModel):
     status: Literal["ok", "degraded"]
     databases: list[DatabaseHealth]
     ollama: ComponentHealth
+    voice_enabled: bool
 
 
 class ColumnOut(BaseModel):
@@ -393,3 +394,26 @@ class DocumentUploadResponse(BaseModel):
     chunk_count: int
     warnings: list[str] = Field(default_factory=list)
     error_message: str | None = None
+
+
+class TranscribeResponse(BaseModel):
+    """Output of `POST /voice/transcribe`. `text` is plain, untrusted text
+    -- the caller is expected to submit it back through `POST /ask` like
+    any typed question, not treat it as pre-validated."""
+
+    model_config = ConfigDict(frozen=True)
+
+    text: str
+    stt_duration_ms: float
+
+
+class SynthesizeRequest(BaseModel):
+    """Input to `POST /voice/synthesize`. `text` length is capped by
+    `Settings.max_question_length` at the route level, the same cap
+    `AskRequest.question` already relies on -- not duplicated here as a
+    schema-level `Field(max_length=...)` for the same reason
+    `AskRequest.question` doesn't either."""
+
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    text: str = Field(..., min_length=1)

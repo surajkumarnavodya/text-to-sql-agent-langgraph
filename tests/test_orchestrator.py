@@ -696,7 +696,7 @@ class TestExecuteGeneration:
         monkeypatch.setattr(
             media_gen,
             "generate_video",
-            lambda client, prompt: media_gen.MediaResult(
+            lambda client, prompt, duration_seconds=None: media_gen.MediaResult(
                 status="completed", url="https://cdn.example/video.mp4", model="wan-2.6"
             ),
         )
@@ -706,6 +706,32 @@ class TestExecuteGeneration:
         )
         assert result["status"] == "succeeded"
         assert result["media_type"] == "video"
+
+    def test_video_duration_setting_is_passed_through(self, monkeypatch):
+        settings = _settings(
+            enable_media_generation=True,
+            ima_api_key=SecretStr("ima_x"),
+            media_gen_video_duration_seconds=10,
+        )
+        monkeypatch.setattr(orchestrator_nodes, "get_settings", lambda: settings)
+        import media_gen
+
+        monkeypatch.setattr(media_gen, "get_ima_client", lambda settings: object())
+        monkeypatch.setattr(
+            media_gen, "download_media_bytes", lambda url, timeout=30.0: (b"bytes", "video/mp4")
+        )
+        captured: dict[str, object] = {}
+
+        def _capture(client, prompt, duration_seconds=None):
+            captured["duration_seconds"] = duration_seconds
+            return media_gen.MediaResult(
+                status="completed", url="https://cdn.example/video.mp4", model="seedance-2.0"
+            )
+
+        monkeypatch.setattr(media_gen, "generate_video", _capture)
+
+        orchestrator_nodes.execute_generation("animate the growth over the year", "video", settings)
+        assert captured["duration_seconds"] == 10
 
     def test_provider_failure_surfaces_as_clean_message(self, monkeypatch):
         """A rejection/error from IMA (e.g. insufficient credits, an
@@ -803,6 +829,47 @@ class TestSynthesisNode:
             },
         }
         assert synthesis_node(state) == {"status": "succeeded"}
+
+    def test_pending_approval_generation_does_not_report_status_failed(self):
+        """Regression test for a real reported bug: a generation request
+        awaiting human confirmation (Settings.require_generation_approval)
+        was incorrectly reported as `status="failed"`, showing a
+        misleading "agent could not produce a working query" banner in
+        both UIs before the user had even had a chance to confirm or
+        decline. Nothing has failed -- status must stay untouched
+        (run_orchestrated's initial "pending"), not "succeeded" either."""
+        state = {
+            "sources_used": ["generation"],
+            "generation_result": {
+                "answer": 'This will generate a new image for: "a cat". Confirm to proceed.',
+                "citations": [],
+                "status": "pending_approval",
+                "media_id": None,
+                "media_type": "image",
+                "model": None,
+            },
+        }
+        assert synthesis_node(state) == {}
+
+    def test_pending_approval_alongside_another_empty_source_still_not_failed(self):
+        state = {
+            "sources_used": ["generation", "web"],
+            "generation_result": {
+                "answer": 'This will generate a new image for: "a cat". Confirm to proceed.',
+                "citations": [],
+                "status": "pending_approval",
+                "media_id": None,
+                "media_type": "image",
+                "model": None,
+            },
+            "web_result": {
+                "answer": "No web results found for this question.",
+                "citations": [],
+                "status": "insufficient_information",
+            },
+        }
+        result = synthesis_node(state)
+        assert "status" not in result
 
     def test_sets_status_failed_when_the_single_non_sql_source_found_nothing(self):
         state = {

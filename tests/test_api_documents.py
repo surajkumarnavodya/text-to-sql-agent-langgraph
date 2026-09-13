@@ -1,6 +1,5 @@
-"""Unit tests for the /documents routes (api/documents.py) -- the API
-equivalent of `ui/pages/1_Knowledge_Sources.py`'s upload/list/delete/
-download UI.
+"""Unit tests for the /documents routes (api/documents.py) -- backs the
+React dashboard's Knowledge Sources upload/list/delete/download UI.
 
 Fully mocked: `rag.ingestion.ingest_pdf` and every `rag.store` function are
 patched at the `api.documents` module they're looked up from, mirroring

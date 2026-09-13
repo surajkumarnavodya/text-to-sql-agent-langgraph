@@ -79,7 +79,7 @@ from agent.graph import run_agent  # noqa: E402
 from agent.insight import is_insight_grounded  # noqa: E402
 from agent.state import AgentState  # noqa: E402
 from config.settings import configure_logging  # noqa: E402
-from ui.session_history import (  # noqa: E402
+from eval.history import (  # noqa: E402
     QueryHistoryEntry,
     build_conversation_history,
     new_history_entry,
@@ -153,8 +153,8 @@ def _evaluate_two_turn_case(case: dict) -> list[tuple[bool, AgentState]]:
     """Runs a two-turn conversation, turn by turn, through the real follow-up path.
 
     Turn 2 (and beyond) is run with `conversation_history` built from turn
-    1's actual result via `ui.session_history.build_conversation_history` --
-    the same function the UI uses -- so this exercises the real
+    1's actual result via `eval.history.build_conversation_history` -- the
+    same function `eval/runner.py` uses -- so this exercises the real
     classify-then-resolve path, not a hand-constructed shortcut.
 
     Returns:

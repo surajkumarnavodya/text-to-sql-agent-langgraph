@@ -1,6 +1,6 @@
 """Stores and retrieves the "golden dataset" -- human-approved (question,
-SQL) pairs a user explicitly saved via the UI's thumbs-up feedback (see
-`ui/app.py`'s "Confirm and Run" flow) -- and turns the best-matching ones
+SQL) pairs a user explicitly saved via the dashboard's thumbs-up feedback
+(after its "Confirm and Run" flow) -- and turns the best-matching ones
 into few-shot examples injected into the SQL-generation prompt (see
 `agent.nodes.retrieve_golden_examples_node` and
 `agent.llm_client._build_golden_examples_block`).
@@ -72,9 +72,9 @@ def get_golden_examples_collection(
 def _example_id(db_name: str, question: str, sql: str) -> str:
     """Deterministic id for one (db_name, question, sql) triple.
 
-    Re-saving the exact same pair (e.g. a user clicking thumbs-up twice, or
-    a Streamlit rerun re-firing the same click) upserts the same document
-    rather than accumulating duplicates -- see `save_golden_example`.
+    Re-saving the exact same pair (e.g. a user clicking thumbs-up twice)
+    upserts the same document rather than accumulating duplicates -- see
+    `save_golden_example`.
     """
     digest_input = f"{db_name}\x00{question}\x00{sql}".encode()
     return hashlib.sha256(digest_input).hexdigest()

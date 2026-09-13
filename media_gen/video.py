@@ -21,8 +21,27 @@ def generate_video(
     prompt: str,
     poll_interval_seconds: float = _DEFAULT_POLL_INTERVAL_SECONDS,
     poll_timeout_seconds: float = _DEFAULT_POLL_TIMEOUT_SECONDS,
+    duration_seconds: int | None = None,
 ) -> MediaResult:
-    """Submit a text-to-video job and wait for it to finish."""
+    """Submit a text-to-video job and wait for it to finish.
+
+    `duration_seconds`, if given, overrides the selected model's own
+    default "duration" form field (`Settings.media_gen_video_duration_seconds`
+    is the config-driven source of this). This does NOT mean any length is
+    achievable -- verified live against this account's actual auto-selected
+    model (`GET /open/v1/product/list?category=text_to_video`, read-only,
+    no cost): "Seedance 2.0" exposes `duration` as an integer 4-15 (its own
+    `form_config` entry's `config: {"minimum": 4, "maximum": 15}`), default
+    5. There is no IMA video model on this account (or, as far as this
+    project has confirmed, offered by IMA at all) capable of a single
+    multi-minute generation -- current text-to-video models generally
+    cap in the 5-15 second range per call, a real model-capability limit,
+    not a configuration restriction this app imposes. A value outside the
+    selected model's real range is rejected by IMA itself (a business
+    error, surfaced as a clean `MediaResult(status="failed")` like any
+    other provider rejection) -- this function does not pre-validate
+    against the live per-model min/max.
+    """
     try:
         media, model_name = create_and_poll(
             client,
@@ -30,6 +49,7 @@ def generate_video(
             prompt=prompt,
             poll_interval_seconds=poll_interval_seconds,
             poll_timeout_seconds=poll_timeout_seconds,
+            form_overrides={"duration": duration_seconds} if duration_seconds is not None else None,
         )
     except MediaGenerationError as exc:
         return MediaResult(status="failed", error=str(exc))

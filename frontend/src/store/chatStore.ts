@@ -5,15 +5,20 @@ import {
   confirmGeneration as apiConfirmGeneration,
   executeSql,
   submitGoldenExampleFeedback,
+  synthesizeSpeechUrl,
 } from '@/lib/api'
 import {
   buildConversationHistory,
+  buildSpokenAnswerText,
+  deriveConversationTitle,
   newHistoryEntry,
   nlCacheKey,
   replaceEntry,
   withConfirmedError,
   withConfirmedResult,
   withGenerationResult,
+  withSpokenAudio,
+  type ConversationSummary,
   type QueryHistoryEntry,
 } from '@/lib/history'
 import type { AskResponse } from '@/lib/types'
@@ -37,14 +42,70 @@ interface ChatState {
   enableInsight: boolean
   nlQuestionCache: Map<string, AskResponse>
 
+  /** The conversation currently shown on the Chat page. Every conversation
+   * ever started this session (including the active one) lives in
+   * `conversations`, keyed by id -- the history drawer reads that map,
+   * `queryHistory` above is just "whichever one is on screen right now". */
+  activeConversationId: string
+  conversations: Record<string, ConversationSummary>
+
   setEnableInsight: (value: boolean) => void
   setEditableSql: (entryId: string, sql: string) => void
-  askQuestion: (question: string) => Promise<void>
+  /** Returns the finished entry (including `spokenAudioUrl`, if speech
+   * synthesis for a voice-originated turn succeeded) so a caller that
+   * needs to react to the *result* -- `useVoiceConversation`'s hands-free
+   * loop, specifically -- can `await` it directly instead of subscribing
+   * to `queryHistory` and diffing for the new entry itself. */
+  askQuestion: (
+    question: string,
+    options?: { originatedFromVoice?: boolean },
+  ) => Promise<QueryHistoryEntry>
   confirmAndRun: (entryId: string) => Promise<void>
   confirmGeneration: (entryId: string) => Promise<void>
   rerunEntry: (entryId: string) => Promise<void>
-  clearHistory: () => void
   giveGoldenFeedback: (entryId: string, thumbsUp: boolean) => Promise<void>
+
+  startNewChat: () => void
+  loadConversation: (id: string) => void
+  renameConversation: (id: string, title: string) => void
+  deleteConversation: (id: string) => void
+}
+
+/** Every mutation to `queryHistory` goes through this so the active entry
+ * in `conversations` never drifts out of sync with what's on screen --
+ * the history drawer and the Chat page are reading two different fields
+ * pointed at the same data, not two independently-updated copies of it. */
+function commitQueryHistory(
+  state: Pick<ChatState, 'activeConversationId' | 'conversations'>,
+  queryHistory: QueryHistoryEntry[],
+): Pick<ChatState, 'queryHistory' | 'conversations'> {
+  if (queryHistory.length === 0) return { queryHistory, conversations: state.conversations }
+  const existing = state.conversations[state.activeConversationId]
+  return {
+    queryHistory,
+    conversations: {
+      ...state.conversations,
+      [state.activeConversationId]: {
+        id: state.activeConversationId,
+        title: existing?.title ?? deriveConversationTitle(queryHistory[0].question),
+        updatedAt: new Date().toISOString(),
+        entries: queryHistory,
+      },
+    },
+  }
+}
+
+function freshConversationState(): Pick<
+  ChatState,
+  'activeConversationId' | 'queryHistory' | 'pendingQuestion' | 'confirmingEntryId' | 'confirmingGenerationEntryId'
+> {
+  return {
+    activeConversationId: crypto.randomUUID(),
+    queryHistory: [],
+    pendingQuestion: null,
+    confirmingEntryId: null,
+    confirmingGenerationEntryId: null,
+  }
 }
 
 function emptyAskResponse(message: string): AskResponse {
@@ -88,17 +149,20 @@ export const useChatStore = create<ChatState>((set, get) => ({
   goldenFeedbackGiven: new Set(),
   enableInsight: true,
   nlQuestionCache: new Map(),
+  activeConversationId: crypto.randomUUID(),
+  conversations: {},
 
   setEnableInsight: (value) => set({ enableInsight: value }),
 
   setEditableSql: (entryId, sql) =>
-    set((state) => ({
-      queryHistory: state.queryHistory.map((entry) =>
-        entry.entryId === entryId ? { ...entry, editableSql: sql } : entry,
+    set((state) =>
+      commitQueryHistory(
+        state,
+        state.queryHistory.map((entry) => (entry.entryId === entryId ? { ...entry, editableSql: sql } : entry)),
       ),
-    })),
+    ),
 
-  askQuestion: async (question) => {
+  askQuestion: async (question, options) => {
     const { queryHistory, enableInsight, nlQuestionCache } = get()
     const startedAt = performance.now()
     set({ pendingQuestion: { question, startedAt } })
@@ -122,13 +186,37 @@ export const useChatStore = create<ChatState>((set, get) => ({
     }
 
     const answerDurationMs = performance.now() - startedAt
-    const entry = newHistoryEntry(question, finalState, answerDurationMs)
+    const entry = newHistoryEntry(
+      question,
+      finalState,
+      answerDurationMs,
+      options?.originatedFromVoice ?? false,
+    )
 
     set((state) => ({
-      queryHistory: [...state.queryHistory, entry],
+      ...commitQueryHistory(state, [...state.queryHistory, entry]),
       pendingQuestion: null,
       nlQuestionCache: cached ? state.nlQuestionCache : new Map(state.nlQuestionCache).set(cacheKey, finalState),
     }))
+
+    // Spoken answer synthesis: only ever for a voice-originated turn that
+    // actually succeeded -- a typed question never reaches this branch,
+    // so it can never trigger audio output (see QueryHistoryEntry
+    // .originatedFromVoice's docstring). A failure here leaves the
+    // (already-shown) text answer as the only output, never blocks or
+    // fails the turn itself -- the caller still gets `entry` back either way.
+    let finalEntry = entry
+    if (entry.originatedFromVoice && finalState.status === 'succeeded') {
+      try {
+        const audioUrl = await synthesizeSpeechUrl(buildSpokenAnswerText(entry))
+        finalEntry = withSpokenAudio(entry, audioUrl)
+        set((state) => commitQueryHistory(state, replaceEntry(state.queryHistory, entry.entryId, finalEntry)))
+      } catch {
+        // No spoken playback for this turn; the text answer already
+        // rendered is sufficient, so this is a silent, non-fatal miss.
+      }
+    }
+    return finalEntry
   },
 
   confirmAndRun: async (entryId) => {
@@ -150,11 +238,11 @@ export const useChatStore = create<ChatState>((set, get) => ({
               durationMs,
             )
           : withConfirmedError(entry, response.error ?? 'Execution failed.')
-      set((state) => ({ queryHistory: replaceEntry(state.queryHistory, entryId, updated) }))
+      set((state) => commitQueryHistory(state, replaceEntry(state.queryHistory, entryId, updated)))
     } catch (error) {
       const message = error instanceof ApiError ? error.message : 'Execution failed unexpectedly.'
       const updated = withConfirmedError(entry, message)
-      set((state) => ({ queryHistory: replaceEntry(state.queryHistory, entryId, updated) }))
+      set((state) => commitQueryHistory(state, replaceEntry(state.queryHistory, entryId, updated)))
     } finally {
       set({ confirmingEntryId: null })
     }
@@ -166,9 +254,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
     set({ confirmingGenerationEntryId: entryId })
     try {
       const result = await apiConfirmGeneration(entry.question)
-      set((state) => ({
-        queryHistory: replaceEntry(state.queryHistory, entryId, withGenerationResult(entry, result)),
-      }))
+      set((state) => commitQueryHistory(state, replaceEntry(state.queryHistory, entryId, withGenerationResult(entry, result))))
     } catch (error) {
       const message = error instanceof ApiError ? error.message : 'Generation failed unexpectedly.'
       const priorType = entry.finalState.generation_result?.media_type ?? null
@@ -179,7 +265,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
         media_type: priorType,
         model: null,
       })
-      set((state) => ({ queryHistory: replaceEntry(state.queryHistory, entryId, updated) }))
+      set((state) => commitQueryHistory(state, replaceEntry(state.queryHistory, entryId, updated)))
     } finally {
       set({ confirmingGenerationEntryId: null })
     }
@@ -191,14 +277,6 @@ export const useChatStore = create<ChatState>((set, get) => ({
     await get().askQuestion(entry.question)
   },
 
-  clearHistory: () =>
-    set({
-      queryHistory: [],
-      pendingQuestion: null,
-      confirmingEntryId: null,
-      confirmingGenerationEntryId: null,
-    }),
-
   giveGoldenFeedback: async (entryId, thumbsUp) => {
     const entry = get().queryHistory.find((item) => item.entryId === entryId)
     set((state) => ({ goldenFeedbackGiven: new Set(state.goldenFeedbackGiven).add(entryId) }))
@@ -209,4 +287,30 @@ export const useChatStore = create<ChatState>((set, get) => ({
       database: entry.finalState.database ?? 'default',
     })
   },
+
+  startNewChat: () => set(freshConversationState()),
+
+  loadConversation: (id) =>
+    set((state) => {
+      const conversation = state.conversations[id]
+      if (!conversation) return state
+      return { ...freshConversationState(), activeConversationId: id, queryHistory: conversation.entries }
+    }),
+
+  renameConversation: (id, title) =>
+    set((state) => {
+      const conversation = state.conversations[id]
+      if (!conversation) return state
+      const trimmed = title.trim()
+      if (!trimmed) return state
+      return { conversations: { ...state.conversations, [id]: { ...conversation, title: trimmed } } }
+    }),
+
+  deleteConversation: (id) =>
+    set((state) => {
+      const remaining = { ...state.conversations }
+      delete remaining[id]
+      if (state.activeConversationId !== id) return { conversations: remaining }
+      return { ...freshConversationState(), conversations: remaining }
+    }),
 }))

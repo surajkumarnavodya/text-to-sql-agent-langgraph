@@ -1,6 +1,6 @@
 """PDF extraction -> chunking -> embedding -> storage pipeline.
 
-The full "upload a PDF" path (`ui/pages/1_Knowledge_Sources.py` calls
+The full "upload a PDF" path (`api/documents.py`'s upload route calls
 `ingest_pdf` directly) -- extraction and chunking are pure functions
 (`extract_pdf_pages`/`chunk_pages`), independently testable without a real
 database or embedding model, and `ingest_pdf` wires them together with

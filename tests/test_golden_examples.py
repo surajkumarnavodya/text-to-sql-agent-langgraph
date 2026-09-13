@@ -69,9 +69,9 @@ class TestSaveGoldenExample:
         assert kwargs["metadatas"] == [{"sql": "SELECT COUNT(*) FROM orders"}]
 
     def test_re_saving_the_same_pair_is_idempotent(self, monkeypatch):
-        """Re-clicking the feedback widget (or a Streamlit rerun re-firing
-        the same click) must upsert the same document, never accumulate a
-        second one -- see save_golden_example's docstring."""
+        """Re-clicking the feedback widget must upsert the same document,
+        never accumulate a second one -- see save_golden_example's
+        docstring."""
         mock_collection = MagicMock()
         monkeypatch.setattr(
             "embeddings.golden_examples.get_chroma_client", lambda settings: MagicMock()

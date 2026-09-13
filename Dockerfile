@@ -1,8 +1,22 @@
-# Single-stage image serving both the Streamlit UI and the FastAPI layer
-# (api/) from the same codebase -- docker-compose.yml runs two containers
-# from this one image with different CMDs, rather than maintaining two
-# images for what is otherwise identical code + dependencies.
+# ---- Frontend build stage ----
+# Builds the React dashboard (frontend/) into static files that the final
+# image serves directly from the FastAPI process (see api/main.py's
+# StaticFiles mount under `if _frontend_dist.is_dir():`) -- single origin,
+# no separate web server/container, no CORS configuration needed in
+# production. This replaced a separate Streamlit UI container that used to
+# ship alongside the API; the API now serves the UI itself.
 #
+# Digest-pinned for the same reason the Python base image below is (see its
+# comment) -- verified against Docker Hub's registry API at pin time
+# (`docker-content-digest` for `node:22-slim`), not guessed.
+FROM node:22-slim@sha256:83f487e0a63425e5b4d146fb5e5be574bcbe1b7b843d3ebafdd95eaf7767a7e5 AS frontend-build
+WORKDIR /frontend
+COPY frontend/package.json frontend/package-lock.json ./
+RUN npm ci
+COPY frontend/ .
+RUN npm run build
+
+# ---- Python application image ----
 # Base matches this project's actual target Python (pyproject.toml's
 # `requires-python = ">=3.11"`, CI's python-version: "3.11") -- NOT the
 # 3.14 this project's own dev machine happens to run (see CLAUDE.md's
@@ -51,6 +65,10 @@ RUN pip install --no-cache-dir --upgrade pip \
     && pip install --no-cache-dir -r requirements.txt
 
 COPY . .
+# Overlays the frontend build stage's output onto the source copied above --
+# frontend/dist is gitignored (build output, not source), so this is the
+# only place it exists in the image.
+COPY --from=frontend-build /frontend/dist ./frontend/dist
 
 # embeddings/.chroma is where the schema index persists -- created here
 # (and owned by `app`) so it exists as a valid mount point even before
@@ -59,14 +77,11 @@ RUN mkdir -p embeddings/.chroma && chown -R app:app /app
 
 USER app
 
-# Streamlit's own built-in health endpoint (no app code needed) -- used by
-# docker-compose.yml's `app` service. The `api` service overrides this
-# with its own HEALTHCHECK hitting GET /health (see docker-compose.yml).
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
-    CMD curl -f http://localhost:8501/_stcore/health || exit 1
+    CMD curl -f http://localhost:8000/health || exit 1
 
-EXPOSE 8501 8000
+EXPOSE 8000
 
-# Default: the Streamlit UI. docker-compose.yml's `api` service overrides
-# this CMD to run `uvicorn api.main:app` instead, from the same image.
-CMD ["streamlit", "run", "ui/app.py", "--server.address=0.0.0.0", "--server.port=8501"]
+# Serves both the REST API and the built React dashboard (see the
+# StaticFiles mount this comment points to above) from the same process.
+CMD ["uvicorn", "api.main:app", "--host", "0.0.0.0", "--port", "8000"]

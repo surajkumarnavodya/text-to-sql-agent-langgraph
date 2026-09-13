@@ -9,7 +9,7 @@ come from.
 
 Security model: this app only ever needs read access. `get_read_only_engine()`
 is the single entry point every query-executing code path (`agent/nodes.py`,
-`ui/app.py`) must use. It does not *itself* strip write privileges -- no
+`api/main.py`) must use. It does not *itself* strip write privileges -- no
 generic, cross-database way to do that exists at the SQLAlchemy layer -- so
 the real enforcement is layered:
   1. `agent/sql_validator.py` rejects any non-SELECT statement before it is
@@ -356,9 +356,9 @@ def test_connection(settings: DbConnectionLike | None = None) -> ConnectionTestR
     """Performs a lightweight round-trip (`SELECT 1`) against the configured database.
 
     This is the single source of truth both `scripts/test_db_connection.py`
-    and the Streamlit UI's "Test Connection" button and startup check use --
-    they render `ConnectionTestResult` differently, but never re-implement
-    the classification logic.
+    and the React dashboard's "Test Connection" button and startup check
+    (via `GET /health`) use -- they render `ConnectionTestResult`
+    differently, but never re-implement the classification logic.
 
     Args:
         settings: `Settings` (the legacy default connection), one specific
@@ -561,7 +561,7 @@ def get_connection(settings: Settings, name: str) -> DatabaseConnectionConfig:
     """Looks up one named database connection from `Settings.databases`.
 
     This is how multi-database-aware code (the auto-router in `embeddings.
-    retriever`, `agent/nodes.py`, the Streamlit sidebar, the scripts) turns
+    retriever`, `agent/nodes.py`, the React dashboard, the scripts) turns
     a database *name* (e.g. `state["selected_database"]`) back into the
     `DatabaseConnectionConfig` needed to build an engine or resolve a
     dialect.

@@ -7,21 +7,60 @@
     "chat": "Chat",
     "knowledgeSources": "Sources de connaissances"
   },
+  "header": {
+    "openHistory": "Ouvrir l'historique du chat",
+    "closeHistory": "Fermer l'historique du chat",
+    "envIndicator": "Espace de travail IA SQL"
+  },
+  "history": {
+    "title": "Historique du chat",
+    "searchPlaceholder": "Rechercher des conversations...",
+    "newChat": "Nouveau chat",
+    "empty": "Aucune conversation pour le moment. Commencez par poser une question.",
+    "noResults": "Aucune conversation ne correspond à votre recherche.",
+    "today": "Aujourd'hui",
+    "yesterday": "Hier",
+    "previous7Days": "7 derniers jours",
+    "older": "Plus ancien",
+    "rename": "Renommer",
+    "delete": "Supprimer"
+  },
+  "workspace": {
+    "heading": "Posez n'importe quelle question sur vos données",
+    "subheading": "Posez des questions en langage naturel et obtenez du SQL validé, en lecture seule, avec des résultats en direct.",
+    "promptRevenue": "Afficher les ventes totales par mois",
+    "promptTopProducts": "Quels produits ont le mieux performé ?",
+    "promptRegion": "Comparer les revenus par région",
+    "promptDeclining": "Trouver les clients dont les commandes diminuent"
+  },
+  "details": {
+    "title": "Informations sur la requête",
+    "database": "Base de données"
+  },
+  "voice": {
+    "settingsLabel": "Mode vocal",
+    "startConversation": "Démarrer une conversation vocale",
+    "listening": "Écoute…",
+    "transcribing": "Transcription…",
+    "thinking": "Réflexion…",
+    "speaking": "Parole en cours…",
+    "doneSpeaking": "J'ai fini de parler",
+    "stopConversation": "Arrêter la conversation",
+    "unsupportedCaption": "Enregistrement... parlez maintenant, puis cliquez sur « J'ai fini de parler ».",
+    "transcribeFailed": "Impossible de transcrire cet enregistrement. Réessayez ou tapez votre question.",
+    "micDenied": "L'accès au microphone a été refusé ou n'est pas disponible."
+  },
   "sidebar": {
     "connectionStatus": "État de la connexion",
     "testConnection": "Tester la connexion",
     "refreshSchema": "Actualiser le schéma",
     "discoveredTables": "Tables découvertes",
     "generateInsight": "Générer une analyse IA",
-    "history": "Historique",
-    "clearHistory": "Effacer l'historique",
-    "routedTo": "Dernière question dirigée vers",
     "appearance": "Apparence",
     "theme": "Thème",
     "accentColor": "Couleur d'accent",
     "font": "Police",
     "language": "Langue",
-    "noHistory": "Aucune question posée pour le moment.",
     "installApp": "Installer l'application",
     "updateAvailable": "Une nouvelle version est disponible.",
     "reload": "Recharger"

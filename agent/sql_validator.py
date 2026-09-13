@@ -127,7 +127,7 @@ _DANGEROUS_FUNCTION_RE = re.compile(
 
 # None is sqlglot's own "generic/standard SQL" dialect -- used as the default
 # here so this module has no dependency on which real database is configured.
-# Callers on the actual query path (agent/nodes.py, ui/app.py) resolve and
+# Callers on the actual query path (agent/nodes.py, api/main.py) resolve and
 # pass the real dialect via `db.connection.get_sqlglot_dialect(settings.db_type)`.
 DEFAULT_DIALECT: str | None = None
 
@@ -631,7 +631,7 @@ def qualify_table_schema(
     multi-database note on why).
 
     Applied only to a throwaway copy of the SQL text passed to
-    `db.execution.execute_readonly_sql`, in `execute_sql_node`/`ui/app.py`'s
+    `db.execution.execute_readonly_sql`, in `execute_sql_node`/`POST /execute`'s
     "Confirm and Run" -- `state["sql"]` itself (and everything that reads it:
     the schema-anomaly and restricted-column checks above, `table_descriptions`
     lookups, the UI's editable SQL box, insight generation) is never touched,

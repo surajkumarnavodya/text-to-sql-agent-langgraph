@@ -1,7 +1,7 @@
 [project]
 name = "text-to-sql-dashboard"
 version = "0.1.0"
-description = "Text-to-SQL Gen AI dashboard, connected to your own database (Ollama + LangGraph + ChromaDB + SQLAlchemy + Streamlit)."
+description = "Text-to-SQL Gen AI dashboard, connected to your own database (Ollama + LangGraph + ChromaDB + SQLAlchemy + FastAPI + React)."
 requires-python = ">=3.11"
 
 [tool.black]
@@ -11,7 +11,7 @@ target-version = ["py311"]
 [tool.ruff]
 line-length = 100
 target-version = "py311"
-src = ["agent", "api", "config", "db", "embeddings", "eval", "media_gen", "scripts", "security", "tests", "ui"]
+src = ["agent", "api", "config", "db", "embeddings", "eval", "media_gen", "scripts", "security", "tests"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM"]
@@ -20,7 +20,7 @@ ignore = [
 ]
 
 [tool.ruff.lint.isort]
-known-first-party = ["agent", "api", "config", "db", "embeddings", "eval", "media_gen", "observability", "rag", "scripts", "search", "security", "ui"]
+known-first-party = ["agent", "api", "config", "db", "embeddings", "eval", "media_gen", "observability", "rag", "scripts", "search", "security"]
 
 [tool.ruff.lint.flake8-bugbear]
 # FastAPI's dependency-injection convention requires calling File()/Form()

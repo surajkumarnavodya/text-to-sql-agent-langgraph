@@ -327,9 +327,9 @@ class Settings(BaseSettings):
             check_input` before any normalization or LLM call -- see
             CLAUDE.md's adversarial-input-hardening notes.
         question_rate_limit_per_minute: Max question submissions per minute,
-            per Streamlit session -- see `agent.rate_limit`. A basic,
-            in-memory safeguard for local/single-user use, not a
-            multi-tenant rate limiter (see SECURITY.md).
+            per client IP -- see `agent.rate_limit`. A basic, in-memory
+            safeguard for local/single-user use, not a multi-tenant rate
+            limiter (see SECURITY.md).
         llm_call_rate_limit_per_minute: Max LLM *generation* calls per
             minute, process-wide -- deliberately stricter than and separate
             from `question_rate_limit_per_minute`, since a single
@@ -379,7 +379,7 @@ class Settings(BaseSettings):
             beyond local/trusted-network use should sit behind a real
             authenticating reverse proxy regardless of whether this is set.
             A `SecretStr` for the same reason `db_password` is.
-        enable_multi_source_router: Whether `ui/app.py`/`api/main.py` route
+        enable_multi_source_router: Whether `api/main.py` routes
             questions through `agent.orchestrator.graph.run_orchestrated`
             (the multi-source router) instead of calling
             `agent.graph.run_agent` directly. False by default -- with it
@@ -527,6 +527,23 @@ class Settings(BaseSettings):
             video/audio generation costs meaningfully more per call than a
             text LLM turn.
         media_gen_rate_window_seconds: Window width for the limiter above.
+        media_gen_video_duration_seconds: Overrides the video model's own
+            default "duration" form field (`media_gen.video.generate_video`'s
+            `duration_seconds`) -- `None` (the default) leaves the model's
+            own default alone. IMPORTANT: this is NOT a general "make
+            videos any length" knob -- verified live against this
+            account's actual auto-selected model (a read-only, no-cost
+            `GET /open/v1/product/list?category=text_to_video` call): the
+            current model ("Seedance 2.0") only accepts an integer 4-15
+            (its own declared `form_config` min/max), default 5. No IMA
+            video model available on this account (or, as far as this
+            project has confirmed, offered by IMA at all) supports a
+            single multi-minute generation -- that's a real model-capability
+            ceiling, not a restriction this app imposes. The `le=60` bound
+            here is a generous top-level sanity guard, not a claim that 60
+            is achievable; a value the actual selected model rejects
+            surfaces as a clean provider-failure `MediaGenerationResult`,
+            same as any other IMA business-error rejection.
         require_generation_approval: Whether `agent.orchestrator.nodes
             .generation_node` requires an explicit human confirmation
             (`POST /generate/confirm`) before it actually calls IMA --
@@ -539,6 +556,51 @@ class Settings(BaseSettings):
             nothing charged) until confirmed. Set `false` only for a
             trusted automation context that has already reviewed this
             tradeoff and wants the previous fully-autonomous behavior.
+        enable_voice_mode: Whether voice input/output (`voice/`, spoken
+            questions transcribed via `faster-whisper`, spoken answers
+            synthesized via Piper -- both local, no cloud API, same
+            "fully local" posture as Ollama) is offered at all. True by
+            default -- unlike media generation, this feature spends no
+            money and makes no network call once its one-time local model
+            downloads are done, so there's no cost-control reason to make
+            it opt-in. Exposed to the frontend as `GET /health`'s
+            `voice_enabled` field; the React dashboard only shows the mic
+            button and its own settings toggle when this is true. A
+            transcribed question is never treated specially by the agent
+            -- it reaches `POST /ask` as plain text through the exact same
+            path a typed question does, so `agent.input_guard.check_input`
+            still applies unconditionally.
+        stt_model_size: `faster-whisper` model size (`tiny`/`base`/`small`/
+            `medium`/`large-v3`). `base` is the default accuracy/latency
+            tradeoff for short spoken questions on CPU; auto-downloaded
+            from Hugging Face Hub on first use and cached locally, the
+            same "pull once, run offline after" shape as `ollama pull`.
+        stt_device: `cpu` or `cuda`, passed straight to `WhisperModel`.
+            Defaults to `cpu` -- nothing in this project's deployment
+            (`docker-compose.yml`, `Dockerfile`) assumes a GPU is present;
+            `cuda` is a manual opt-in for a machine already confirmed to
+            have a working CUDA + cuDNN setup for `ctranslate2`.
+        stt_vocabulary_max_chars: Caps the length of the schema-derived
+            vocabulary hint `voice.stt._build_vocabulary_hint` feeds
+            Whisper's `initial_prompt` (table/column names from every
+            configured database, so "branch_id"/"dispute" are less likely
+            to be misheard as similar-sounding common words) -- Whisper's
+            own prompt-biasing works best short, not as a full schema dump.
+        voice_max_upload_mb: Max accepted size of one recorded-question
+            upload to `POST /voice/transcribe`, enforced the same way
+            `max_document_upload_mb` already caps `POST /documents`
+            (read-and-reject-if-over, never trust `Content-Length` alone).
+        voice_max_duration_seconds: Max accepted audio duration, checked
+            by probing the decoded audio's length *before* running the
+            (comparatively expensive) Whisper model, not after -- an
+            oversized recording is rejected cheaply.
+        tts_voice: Piper voice model name (e.g. `en_US-lessac-medium`),
+            downloaded once via `scripts/download_voice_model.py` into
+            `voice/models/` (or `tts_voice_model_path`, if set).
+        tts_voice_model_path: Explicit override for where the Piper
+            `.onnx`/`.onnx.json` pair lives, if not the default
+            `voice/models/<tts_voice>.onnx`. `None` (the default) uses
+            that default location.
         session_expensive_source_limit: Max combined "generation"/"web"
             source invocations allowed per `session_id` within
             `session_expensive_source_window_seconds`, checked in
@@ -568,7 +630,7 @@ class Settings(BaseSettings):
             above stay the single source of truth for a plain
             single-database setup, and `databases` is the one multi-
             database-aware code (`embeddings.retriever.select_database`,
-            the Streamlit sidebar, the scripts) should read instead.
+            the React dashboard, the scripts) should read instead.
             `db.connection.get_connection(settings, name)` looks one up by
             name.
     """
@@ -654,7 +716,16 @@ class Settings(BaseSettings):
     ima_api_base_url: str = "https://api.imastudio.com"
     media_gen_rate_limit: int = Field(default=5, gt=0)
     media_gen_rate_window_seconds: float = Field(default=60.0, gt=0)
+    media_gen_video_duration_seconds: int | None = Field(default=None, gt=0, le=60)
     require_generation_approval: bool = True
+    enable_voice_mode: bool = True
+    stt_model_size: str = "base"
+    stt_device: Literal["cpu", "cuda"] = "cpu"
+    stt_vocabulary_max_chars: int = Field(default=200, gt=0)
+    voice_max_upload_mb: int = Field(default=10, gt=0)
+    voice_max_duration_seconds: int = Field(default=30, gt=0)
+    tts_voice: str = "en_US-lessac-medium"
+    tts_voice_model_path: Path | None = None
     session_expensive_source_limit: int = Field(default=10, gt=0)
     session_expensive_source_window_seconds: float = Field(default=3600.0, gt=0)
     cors_allowed_origins: tuple[str, ...] = Field(
@@ -799,8 +870,9 @@ def get_settings() -> Settings:
     """Return the process-wide Settings instance, built from environment variables.
 
     Cached with `lru_cache` so repeated calls (e.g. from every agent node) do
-    not re-parse the environment; this mirrors Streamlit's own
-    `@st.cache_resource` pattern for one-time setup.
+    not re-parse the environment -- built once per process, same as
+    `api/main.py`'s other process-lifetime singletons (the DB engines, the
+    Ollama client, the compiled agent graph).
 
     Every field is read from the environment automatically by
     `pydantic_settings.BaseSettings` (case-insensitively, so `OLLAMA_HOST`
@@ -826,7 +898,7 @@ def get_settings() -> Settings:
 def configure_logging(level: str | None = None) -> None:
     """Configure root logging once, in a format useful for terminal debugging.
 
-    Called from entry points (scripts, ui/app.py, tests) rather than at
+    Called from entry points (scripts, api/main.py, tests) rather than at
     import time, so importing this module never has the side effect of
     reconfiguring a caller's logging setup.
     """

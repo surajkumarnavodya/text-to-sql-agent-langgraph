@@ -1,26 +1,29 @@
-# Two services from one image (see Dockerfile): the Streamlit UI and the
-# FastAPI layer (api/, docs/API.md). Deliberately does NOT include Ollama
-# or the target database as services here -- both are external/
-# user-provided by this project's own design (config-driven "connect to
-# your own DB", fully local Ollama you already run) -- see
-# docs/DEPLOYMENT.md for how to point these containers at a host-run Ollama
-# and an external database. No Kubernetes: this is the whole deployment
-# footprint for a single-instance production deployment; see
-# docs/PRODUCTION_READINESS_REPORT.md's roadmap for when that might change.
+# One service from one image (see Dockerfile): the FastAPI layer (api/,
+# docs/API.md) also serves the built React dashboard from the same
+# process/port (api/main.py's StaticFiles mount) -- a separate Streamlit UI
+# container used to run alongside this one; it's gone now, and so is the
+# separate port that came with it. Deliberately does NOT include Ollama or
+# the target database as services here -- both are external/user-provided
+# by this project's own design (config-driven "connect to your own DB",
+# fully local Ollama you already run) -- see docs/DEPLOYMENT.md for how to
+# point this container at a host-run Ollama and an external database. No
+# Kubernetes: this is the whole deployment footprint for a single-instance
+# production deployment; see docs/PRODUCTION_READINESS_REPORT.md's roadmap
+# for when that might change.
 
 services:
-  app:
+  api:
     build: .
     image: text-to-sql-dashboard:latest
     ports:
       # Bound to 127.0.0.1 by default -- secure by default, since an
-      # unqualified "8501:8501" mapping binds all host interfaces (reachable
+      # unqualified "8000:8000" mapping binds all host interfaces (reachable
       # from the whole network the host is on, not just localhost). Set
-      # APP_BIND_HOST=0.0.0.0 in .env (or your actual reverse-proxy-facing
+      # API_BIND_HOST=0.0.0.0 in .env (or your actual reverse-proxy-facing
       # interface) if you deliberately want this reachable beyond the host
       # itself -- see docs/DEPLOYMENT.md for the recommended
       # authenticating-reverse-proxy pattern before doing that.
-      - "${APP_BIND_HOST:-127.0.0.1}:8501:8501"
+      - "${API_BIND_HOST:-127.0.0.1}:8000:8000"
     env_file:
       - .env
     extra_hosts:
@@ -32,37 +35,10 @@ services:
       - "host.docker.internal:host-gateway"
     volumes:
       # Named volume, not a bind mount: the Chroma index is regenerated
-      # data (scripts/build_embeddings.py / the UI's "Refresh Schema"
-      # button own its lifecycle), not source you'd want to edit from the
-      # host -- see the volume's own comment below for the schema-change
-      # implication.
-      - chroma_index:/app/embeddings/.chroma
-    restart: unless-stopped
-
-  api:
-    build: .
-    image: text-to-sql-dashboard:latest
-    command:
-      [
-        "uvicorn",
-        "api.main:app",
-        "--host",
-        "0.0.0.0",
-        "--port",
-        "8000",
-      ]
-    ports:
-      # Same reasoning as `app`'s port mapping above -- localhost-only by
-      # default; override with API_BIND_HOST in .env if intentional.
-      - "${API_BIND_HOST:-127.0.0.1}:8000:8000"
-    env_file:
-      - .env
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
-    volumes:
-      # Same named volume as `app` -- both services must see the same
-      # Chroma index (one build_embeddings.py run should serve both), not
-      # two independently-empty ones.
+      # data (scripts/build_embeddings.py / the dashboard's "Refresh
+      # Schema" button own its lifecycle), not source you'd want to edit
+      # from the host -- see the volume's own comment below for the
+      # schema-change implication.
       - chroma_index:/app/embeddings/.chroma
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
@@ -75,6 +51,6 @@ services:
 volumes:
   # Persists the schema embedding index across container restarts/recreates.
   # Rebuilding the image does not clear this -- run
-  # `docker compose exec app python scripts/build_embeddings.py` after a
+  # `docker compose exec api python scripts/build_embeddings.py` after a
   # real schema change, same as the non-Docker README instructs locally.
   chroma_index:

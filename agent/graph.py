@@ -81,7 +81,7 @@ not the normal path (see `agent.exceptions.OffTopicQuestionError`).
 rate_limit.get_llm_call_limiter`) before every attempt, including retries --
 a denial ends the run immediately at `status="rate_limited"` (see
 `route_after_generation`), never retried. This is a separate, stricter
-limit from the question-submission one `ui/app.py` enforces per session
+limit from the question-submission one `api/main.py` enforces per client
 before `run_agent()` is even called; see `agent/rate_limit.py`'s docstring
 for why the retry loop specifically needs its own limiter.
 

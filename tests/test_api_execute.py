@@ -1,11 +1,10 @@
-"""Unit tests for POST /execute (api/main.py) -- the API equivalent of
-`ui/app.py`'s "Confirm and Run" button.
+"""Unit tests for POST /execute (api/main.py) -- the API's "Confirm and Run" route.
 
 Fully mocked, same style as `tests/test_api_ask.py`: `execute_readonly_sql`
 and `get_read_only_engine` are patched at the `api.main` module they're
 looked up from. `validate_sql`/`enforce_row_limit`/`qualify_table_schema`
 are the real functions (not mocked) so this also exercises the actual SQL
-allowlist against real SQL text, exactly like `ui/app.py`'s own flow does.
+allowlist against real SQL text, exactly like the live route's own flow does.
 """
 
 from __future__ import annotations

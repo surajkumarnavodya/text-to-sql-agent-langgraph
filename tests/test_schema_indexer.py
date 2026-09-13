@@ -5,7 +5,7 @@ contacted. `refresh_schema_index` is a thin composition of three already
 independently-owned steps (`introspect_schema`, `attach_sample_values`,
 `build_index`); these tests verify it wires them together in the right order
 with the right arguments, since that wiring used to be duplicated (and
-untested as a unit) in both `scripts/build_embeddings.py` and `ui/app.py`.
+untested as a unit) across multiple call sites.
 """
 
 from __future__ import annotations

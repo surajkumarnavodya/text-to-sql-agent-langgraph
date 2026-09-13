@@ -368,8 +368,8 @@ def get_document_bytes(engine: Engine, document_id: str) -> bytes | None:
     """Fetches one document's original PDF bytes, or None if never stored.
 
     The only place `pdf_bytes` is ever read in full -- called on demand
-    right when a download button needs data (see `ui/app.py`'s and
-    `ui/pages/1_Knowledge_Sources.py`'s cached wrappers around this), never
+    right when a download button needs data (`api/documents.py`'s download
+    route, the dashboard's Knowledge Sources page), never
     as part of a listing/search query.
     """
     with engine.connect() as conn:

@@ -1,9 +1,10 @@
 """Best-effort chart auto-selection for a query result.
 
-Relocated from `ui/app.py` (unchanged logic) so both the Streamlit UI and
-the `/execute` API endpoint can build the exact same chart from the exact
-same heuristic -- a single source of truth rather than two implementations
-that could silently drift apart.
+Used by the `/execute` API endpoint (`api/main.py`), whose Plotly-figure
+JSON the React dashboard renders via chart.js
+(`frontend/src/lib/chartAdapter.ts`) -- a single source of truth for the
+chart-selection heuristic itself, decoupled from how any particular
+frontend actually draws it.
 """
 
 from __future__ import annotations

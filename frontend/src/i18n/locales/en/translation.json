@@ -7,21 +7,60 @@
     "chat": "Chat",
     "knowledgeSources": "Knowledge Sources"
   },
+  "header": {
+    "openHistory": "Open chat history",
+    "closeHistory": "Close chat history",
+    "envIndicator": "AI SQL Workspace"
+  },
+  "history": {
+    "title": "Chat history",
+    "searchPlaceholder": "Search conversations...",
+    "newChat": "New chat",
+    "empty": "No conversations yet. Start by asking a question.",
+    "noResults": "No conversations match your search.",
+    "today": "Today",
+    "yesterday": "Yesterday",
+    "previous7Days": "Previous 7 days",
+    "older": "Older",
+    "rename": "Rename",
+    "delete": "Delete"
+  },
+  "workspace": {
+    "heading": "Ask your data anything",
+    "subheading": "Ask questions in plain English and get validated, read-only SQL with live results.",
+    "promptRevenue": "Show total sales by month",
+    "promptTopProducts": "Which products performed best?",
+    "promptRegion": "Compare revenue by region",
+    "promptDeclining": "Find customers with declining orders"
+  },
+  "details": {
+    "title": "Query information",
+    "database": "Database"
+  },
+  "voice": {
+    "settingsLabel": "Voice mode",
+    "startConversation": "Start voice conversation",
+    "listening": "Listening…",
+    "transcribing": "Transcribing…",
+    "thinking": "Thinking…",
+    "speaking": "Speaking…",
+    "doneSpeaking": "Done speaking",
+    "stopConversation": "Stop conversation",
+    "unsupportedCaption": "Recording... speak now, then click \"Done speaking\".",
+    "transcribeFailed": "Could not transcribe that recording. Please try again or type your question.",
+    "micDenied": "Microphone access was denied or is unavailable."
+  },
   "sidebar": {
     "connectionStatus": "Connection status",
     "testConnection": "Test Connection",
     "refreshSchema": "Refresh Schema",
     "discoveredTables": "Discovered tables",
     "generateInsight": "Generate AI insight",
-    "history": "History",
-    "clearHistory": "Clear history",
-    "routedTo": "Last question routed to",
     "appearance": "Appearance",
     "theme": "Theme",
     "accentColor": "Accent color",
     "font": "Font",
     "language": "Language",
-    "noHistory": "No questions asked yet.",
     "installApp": "Install app",
     "updateAvailable": "A new version is available.",
     "reload": "Reload"

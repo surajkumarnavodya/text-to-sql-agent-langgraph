@@ -12,8 +12,8 @@ that module's docstring promises it never touches table data, only catalog
 metadata. This module is the one place that breaks that abstraction on
 purpose, scoped tightly (read-only, small `SELECT DISTINCT`s, bounded
 cardinality, string columns only) and called explicitly at embedding-build
-time (`scripts/build_embeddings.py`, `ui/app.py`) -- never on the hot query
-path.
+time (`scripts/build_embeddings.py`, `api/main.py`'s schema refresh) --
+never on the hot query path.
 
 Security note: sampled values are the sharpest edge of this whole project's
 prompt-surface, and the one genuinely attacker-writable point (see

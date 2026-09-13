@@ -656,8 +656,8 @@ def generate_sql_node(state: AgentState) -> dict[str, Any]:
     get_llm_call_limiter`) *before* calling Ollama at all. This is what
     actually bounds the retry loop's contribution to LLM load: without it,
     a single question could still burn up to `max_retries + 1` calls no
-    matter how tight the question-submission limit is (see `ui/app.py`'s
-    separate, per-session check on that one). A denial here ends the run
+    matter how tight the question-submission limit is (see `api/main.py`'s
+    separate, per-client-IP check on that one). A denial here ends the run
     immediately at `status="rate_limited"` -- never retried, since retrying
     would just hit the same limiter again for no benefit.
     """

@@ -7,22 +7,23 @@ interface SettingsState {
   accent: string
   font: string
   language: string
-  /** Sidebar section id -> collapsed. Missing id defaults to expanded. */
+  /** Settings-section id -> collapsed. Missing id defaults to expanded. */
   collapsedSections: Record<string, boolean>
-  /** Whether the whole desktop sidebar is hidden (a ChatGPT-style full
-   * collapse toggled from the header) -- distinct from `collapsedSections`,
-   * which only hides individual sections within an already-visible
-   * sidebar, and from the mobile off-canvas drawer, which has its own
-   * open/closed state local to AppShell since it's a transient overlay,
-   * not a layout preference worth persisting. */
-  sidebarCollapsed: boolean
+  /** User's own opt-in, independent of the server's `voice_enabled` infra
+   * flag (`GET /health`) -- both must be true for the mic button/settings
+   * row to actually appear. Defaults to true (voice mode costs nothing and
+   * calls no external API, unlike media generation's approval gate) --
+   * the user can still turn it off per-device via the settings toggle.
+   * Persisted like theme/accent/font (a device preference), not
+   * session-only like `chatStore`'s `enableInsight`. */
+  voiceModeEnabled: boolean
   setThemeMode: (mode: ThemeMode) => void
   setAccent: (accentId: string) => void
   setFont: (fontId: string) => void
   setLanguage: (language: string) => void
+  setVoiceModeEnabled: (enabled: boolean) => void
   toggleSection: (sectionId: string) => void
   isSectionCollapsed: (sectionId: string) => boolean
-  toggleSidebar: () => void
 }
 
 /** Applies the persisted (or default) appearance to the DOM immediately --
@@ -42,8 +43,8 @@ export const useSettingsStore = create<SettingsState>()(
       font: 'system',
       language: 'en',
       collapsedSections: {},
-      sidebarCollapsed: false,
-      toggleSidebar: () => set((state) => ({ sidebarCollapsed: !state.sidebarCollapsed })),
+      voiceModeEnabled: true,
+      setVoiceModeEnabled: (enabled) => set({ voiceModeEnabled: enabled }),
       setThemeMode: (mode) => {
         applyThemeMode(mode)
         set({ themeMode: mode })

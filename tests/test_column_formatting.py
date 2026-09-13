@@ -1,21 +1,21 @@
-"""Unit tests for ui/column_formatting.py: display-label formatting and
+"""Unit tests for db/column_formatting.py: display-label formatting and
 surrogate-key detection for the results table.
 
-Pure functions, no Streamlit/DB involved -- mirrors the style of
+Pure functions, no DB connection involved -- mirrors the style of
 tests/test_schema_introspection.py (constructs TableSchemaInfo/ColumnInfo/
 ForeignKeyInfo directly rather than mocking an Inspector).
 """
 
 from __future__ import annotations
 
-from db.schema_introspection import ColumnInfo, ForeignKeyInfo, TableSchemaInfo
-from ui.column_formatting import (
+from db.column_formatting import (
     escape_markdown,
     format_column_label,
     get_display_columns,
     get_key_column_names,
     is_probable_surrogate_key,
 )
+from db.schema_introspection import ColumnInfo, ForeignKeyInfo, TableSchemaInfo
 
 
 class TestFormatColumnLabel:
@@ -141,7 +141,7 @@ class TestGetDisplayColumns:
 class TestEscapeMarkdown:
     """Regression coverage for a confirmed audit finding: raw (database-
     sourced, therefore untrusted) table/column names were interpolated
-    directly into `st.markdown` calls in ui/app.py without escaping."""
+    directly into markdown-rendered text without escaping."""
 
     def test_ordinary_table_name_is_unchanged(self):
         assert escape_markdown("DimCustomer") == "DimCustomer"

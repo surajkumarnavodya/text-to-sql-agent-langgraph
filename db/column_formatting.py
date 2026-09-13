@@ -1,11 +1,13 @@
-"""Rendering-time transforms for the Streamlit results table: human-readable
+"""Rendering-time transforms for a query result table: human-readable
 column labels and hiding surrogate key columns by default.
 
-Pure functions, no Streamlit imports -- same separation as
-`agent/sql_validator.py` (logic lives here, wiring lives in `ui/app.py`).
+Pure functions, no UI framework imports -- same separation as
+`agent/sql_validator.py` (logic lives here, wiring lives in the caller).
 Nothing here touches the SQL that runs, the DataFrame's real columns, or any
 agent/db/validator code -- nothing produced here is fed back into a query;
-it only decides what gets *displayed* and how it's *labeled*.
+it only decides what gets *displayed* and how it's *labeled*. Mirrored on
+the frontend by `frontend/src/lib/columnFormatting.ts` so the React
+dashboard's own client-side rendering makes the same choices.
 """
 
 from __future__ import annotations
@@ -67,13 +69,13 @@ def get_key_column_names(tables: list[TableSchemaInfo]) -> set[str]:
     """Collects every column name (lowercased) known to be a PK or FK.
 
     Source of truth is live schema introspection (`db.schema_introspection.
-    TableSchemaInfo`, already held by `ui/app.py`'s `discovered_tables`) --
-    not name-pattern guessing. See `is_probable_surrogate_key` for how this
-    combines with the name-pattern fallback for columns that don't trace
-    back to a real schema column (e.g. computed/aliased result columns).
+    TableSchemaInfo`) -- not name-pattern guessing. See
+    `is_probable_surrogate_key` for how this combines with the name-pattern
+    fallback for columns that don't trace back to a real schema column
+    (e.g. computed/aliased result columns).
 
     Args:
-        tables: Introspected tables, e.g. `ui.app.discovered_tables`.
+        tables: Introspected tables for the database a result came from.
 
     Returns:
         Lowercased column names that are a primary key or a foreign key's
@@ -132,18 +134,17 @@ _MARKDOWN_SPECIAL_CHARS_RE = re.compile(r"([\\`*_{}\[\]()#+\-.!|>~])")
 
 
 def escape_markdown(text: str) -> str:
-    """Escapes CommonMark special characters for safe inclusion in `st.markdown`/`st.caption`.
+    """Escapes CommonMark special characters for safe inclusion in rendered markdown.
 
     Table/column names are database-sourced, therefore untrusted input per
     this project's own stated model (see SECURITY.md's "Database content is
     untrusted input too") -- most engines' quoted-identifier rules are
     permissive enough that a malicious table/column name could otherwise
     inject markdown formatting (fake bold text, a spoofed link, a bogus
-    heading) into `ui/app.py`'s sidebar table list or "Retrieved schema
-    context" panel. Neither of those call sites sets `unsafe_allow_html`, so
-    this is about markdown-*syntax* spoofing, not script execution -- but
-    database-sourced text reaching a rendering surface unescaped is worth
-    closing regardless of severity.
+    heading) into a rendered table list or "Retrieved schema context"
+    panel. This is about markdown-*syntax* spoofing, not script execution --
+    but database-sourced text reaching a rendering surface unescaped is
+    worth closing regardless of severity.
     """
     return _MARKDOWN_SPECIAL_CHARS_RE.sub(r"\\\1", text)
 

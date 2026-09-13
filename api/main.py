@@ -1,16 +1,20 @@
-"""FastAPI app: a REST surface over the same LangGraph agent the Streamlit
-UI drives -- see `api/__init__.py`'s module docstring for why `/ask` is a
-thin wrapper around `agent.orchestrator.graph.run_orchestrated`, not a
-second implementation.
+"""FastAPI app: the REST surface over the LangGraph agent, and (once built)
+the process that serves the React dashboard itself -- see
+`api/__init__.py`'s module docstring for why `/ask` is a thin wrapper
+around `agent.orchestrator.graph.run_orchestrated`, not a second
+implementation.
 
 Run with (see `docs/API.md`/`docs/DEPLOYMENT.md` for the full picture):
 
     uvicorn api.main:app --host 0.0.0.0 --port 8000
 
-Never the only interface this project ships -- `ui/app.py` remains the
-primary, human-facing surface. This exists for programmatic/scripted access
-and as the foundation `docs/DEPLOYMENT.md`'s reverse-proxy guidance sits in
-front of.
+This is the only server process this project ships -- the human-facing
+surface (`frontend/`, a React SPA) is either served from this same process
+(the StaticFiles mount near the bottom of this file, once `frontend/dist`
+exists) or proxied to it in development (`frontend/vite.config.ts`'s
+`BACKEND_ROUTES`). It's also the foundation `docs/DEPLOYMENT.md`'s
+reverse-proxy guidance sits in front of, and remains fully usable for
+programmatic/scripted access on its own.
 """
 
 from __future__ import annotations
@@ -33,8 +37,7 @@ from fastapi.responses import JSONResponse
 from sqlalchemy.exc import SQLAlchemyError
 
 # `uvicorn api.main:app` does not guarantee the repo root is on sys.path
-# (unlike running as an installed package) -- same reasoning as
-# ui/app.py's identical sys.path.insert for `streamlit run`.
+# (unlike running as an installed package).
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from agent.exceptions import AgentError
@@ -72,6 +75,7 @@ from api.schemas import (
     TableOut,
     TablesResponse,
 )
+from api.voice import router as voice_router
 from config.settings import ConfigurationError, configure_logging, get_settings
 from db.connection import get_connection, get_read_only_engine, get_sqlglot_dialect, test_connection
 from db.execution import execute_readonly_sql
@@ -104,8 +108,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     debugger or a future admin endpoint, even though every request path
     keeps reaching them the same way it always did -- through the cached
     module-level functions, not by reading `app.state` -- since those
-    functions are also called from `ui/app.py`, `eval/runner.py`, and
-    scripts that never go through this FastAPI app at all.
+    functions are also called from `eval/runner.py` and scripts that never
+    go through this FastAPI app at all.
     """
     settings = get_settings()
     app.state.settings = settings
@@ -148,6 +152,7 @@ app = FastAPI(
 app.include_router(documents_router)
 app.include_router(media_router)
 app.include_router(generation_router)
+app.include_router(voice_router)
 
 # No-op when Settings.cors_allowed_origins is empty (the default) -- a
 # same-origin deployment (the built React app served by this same FastAPI
@@ -216,12 +221,11 @@ async def _unhandled_exception_handler(request: Request, exc: Exception) -> JSON
     )
 
 
-# Per-client-IP question-submission limiter, mirroring ui/app.py's
-# per-Streamlit-session `SlidingWindowRateLimiter` -- the API has no
-# server-side session concept, so client IP is the closest equivalent scope.
-# The stricter, process-wide LLM-*call* limiter (agent.rate_limit's other
+# Per-client-IP question-submission limiter -- the API has no server-side
+# session concept, so client IP is the closest available scope. The
+# stricter, process-wide LLM-*call* limiter (agent.rate_limit's other
 # limiter) already applies automatically inside generate_sql_node -- this
-# one only adds the question-submission-level layer the UI also has.
+# one adds a separate question-submission-level layer on top of it.
 _ip_limiters: dict[str, SlidingWindowRateLimiter] = {}
 
 
@@ -338,7 +342,7 @@ def _ask_response_from_state(state: Mapping[str, Any], session_id: str) -> AskRe
     # return either an AgentState (router off) or an OrchestratorState
     # (router on) -- the latter's extra keys (sources_used, document_result,
     # ...) aren't part of AgentState's declared shape. Same convention
-    # `ui/app.py::_is_sql_result` uses for the identical reason.
+    # the React dashboard's own `isSqlResult` check uses for the identical reason.
     result_rows = state.get("result_rows")
     return AskResponse(
         session_id=session_id,
@@ -445,6 +449,7 @@ def health(response: Response) -> HealthResponse:
         status="ok" if overall_ok else "degraded",
         databases=databases,
         ollama=ollama_health,
+        voice_enabled=settings.enable_voice_mode,
     )
 
 
@@ -452,8 +457,9 @@ def health(response: Response) -> HealthResponse:
 def ask(payload: AskRequest, request: Request) -> AskResponse:
     """Runs one question through the full agent graph -- schema retrieval,
     SQL generation, validation, cost estimation, execution, self-correction
-    -- exactly as `ui/app.py` does via the same
-    `agent.orchestrator.graph.run_orchestrated` call (which itself is a
+    -- via the same
+    `agent.orchestrator.graph.run_orchestrated` call the React dashboard
+    ultimately triggers (which itself is a
     pure pass-through to `agent.graph.run_agent` unless
     `ENABLE_MULTI_SOURCE_ROUTER` is set -- see that module's docstring).
     Every safety layer that governs the UI (input guard, SQL validator, row
@@ -496,7 +502,7 @@ def ask(payload: AskRequest, request: Request) -> AskResponse:
         # search tomorrow, once they're wired into run_orchestrated the
         # same way) failed outside the graph's own internal retry/self-
         # correction handling. Same 200-with-a-"failed"-body shape
-        # ui/app.py uses for the same exceptions, just now built from
+        # returned for every other exception here, built from
         # exc.safe_message rather than str(exc) -- the full detail is
         # logged, never returned. See agent/exceptions.py's module
         # docstring for why both exist on every AgentError.
@@ -516,10 +522,10 @@ def ask(payload: AskRequest, request: Request) -> AskResponse:
 def execute(payload: ExecuteRequest, request: Request) -> ExecuteResponse:
     """Validates and executes a specific SQL string read-only -- the exact
     `validate_sql` -> `enforce_row_limit` -> `qualify_table_schema` ->
-    `execute_readonly_sql` sequence `ui/app.py`'s "Confirm and Run" button
-    already runs, reachable here without a Streamlit session. This is the
-    "SQL is untrusted output, always" rule applied at this layer too: `sql`
-    is always re-validated and re-executed exactly as supplied, never
+    `execute_readonly_sql` sequence the React dashboard's "Confirm and Run"
+    button calls this route to run. This is the "SQL is untrusted output,
+    always" rule applied at this layer too: `sql` is always re-validated
+    and re-executed exactly as supplied, never
     trusted because it happens to look like something `/ask` returned.
 
     Rate-limited per client IP (`enforce_api_action_rate_limit`) -- unlike
@@ -552,7 +558,7 @@ def execute(payload: ExecuteRequest, request: Request) -> ExecuteResponse:
     )
     # Schema-qualifies unqualified table references for this execution only
     # -- see qualify_table_schema's docstring. `normalized_sql` in the
-    # response stays bare-named, matching ui/app.py's editable-SQL-box
+    # response stays bare-named, matching the dashboard's editable-SQL-box
     # convention (the box never shows the schema-qualified form).
     execution_sql = qualify_table_schema(safe_sql, db_config.db_schema, dialect=dialect)
 
@@ -602,7 +608,7 @@ def execute(payload: ExecuteRequest, request: Request) -> ExecuteResponse:
 def feedback_golden_example(payload: GoldenExampleFeedbackRequest) -> GoldenExampleFeedbackResponse:
     """Records a human-approved (question, SQL) pair for future few-shot
     retrieval -- the same `embeddings.golden_examples.save_golden_example`
-    call `ui/app.py` makes when a user thumbs-up's a confirmed result.
+    call the dashboard's thumbs-up widget makes when a user confirms a result.
     `sql` should be the exact SQL that was actually run and confirmed
     correct (e.g. from a prior `/execute` call), not necessarily the
     original `/ask` draft if the caller edited it.
@@ -616,7 +622,7 @@ def feedback_golden_example(payload: GoldenExampleFeedbackRequest) -> GoldenExam
 )
 def schema_refresh(request: Request) -> SchemaRefreshResponse:
     """Re-introspects and re-embeds every configured database's schema --
-    the same `refresh_all_schema_indexes` call the Streamlit sidebar's
+    the same `refresh_all_schema_indexes` call the React dashboard's
     "Refresh Schema" button makes. Skips re-embedding a database whose
     schema fingerprint hasn't changed (see that function's docstring), so
     calling this when nothing changed is cheap.
