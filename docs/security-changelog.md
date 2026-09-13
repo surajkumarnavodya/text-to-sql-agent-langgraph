@@ -252,6 +252,64 @@ test_aggregate_nesting_error_retries_via_generate_sql`,
 
 ---
 
+## 2026-09-13 — Media search: new local-inference dependency, new local-path resolution, new untrusted-content surface
+
+**Change:** An optional, off-by-default (`ENABLE_MEDIA_SEARCH=false`)
+content-based search feature over a local, untagged image/video library
+(`media/`) was added as a new "media_search" orchestrator source
+(`agent.orchestrator.nodes.media_search_node`), plus a standalone
+`POST /search/media` API and `frontend/src/pages/MediaSearch.tsx` page.
+Same "new security-relevant surface, not a threshold change" scope as the
+2026-09-10 multi-source entry above:
+
+1. **A real, new local-inference dependency footprint.** `torch`/
+   `sentence-transformers` (local CLIP embeddings) and `scenedetect`/
+   `opencv-python` (video scene-change detection) are new, pinned
+   dependencies — no hosted embedding API is used by default, so this
+   trades dependency weight for keeping media content and search queries
+   fully on-device (see `CLAUDE.md`'s "Media search" section for why that
+   tradeoff was made deliberately).
+2. **A new local-path resolution surface, defended the same way the
+   existing SSRF fix defends URLs.** `api/media_library.py`'s
+   `GET /media/library/{media_id}` resolves a `media_id` to a file path
+   read from Chroma-stored metadata; before ever opening it, the resolved,
+   absolute path is checked to still be inside the expected root directory
+   (the configured library folder, or the internal thumbnail directory) —
+   a local-path-traversal mitigation for the case a stored path were ever
+   stale or manipulated, applying `media_gen/download.py`'s "never trust a
+   resolved location blindly" principle to disk paths instead of URLs.
+3. **A new untrusted-content surface.** OCR'd on-screen text, ASR
+   transcripts, and generated video captions are all attacker-influenceable
+   (a sign in a photo, or spoken audio, could contain instruction-like
+   text) once they reach the answer-composition prompt — framed as
+   untrusted data, never instructions, the same principle already applied
+   to database content, uploaded documents, and live web results.
+4. **No new secret.** Unlike the 2026-09-10 entry's two new secrets, media
+   search needs no API key by default (`local_clip` is the only implemented
+   embedding provider) — the router-availability check
+   (`get_available_sources`) instead gates on `ENABLE_MEDIA_SEARCH` plus a
+   real `MEDIA_LIBRARY_PATH` being set.
+
+**Not addressed, disclosed instead:** there is no per-item sensitivity
+classification for media library content, unlike policy RAG's
+`SensitivityCategory` gate — see `docs/RISK_REGISTER.md`'s new R-012 and
+`docs/GOVERNANCE.md`'s "Data classification policy" for the honest state
+of that gap.
+
+**Why:** Closes the "no search-existing-media capability" gap named as a
+follow-up when media generation shipped — a router that can create new
+images/video but not find existing ones was an asymmetric, incomplete
+media story.
+
+**Status:** Permanent, off by default. New regression coverage across
+`tests/test_media_*.py` and `tests/test_api_media_*.py` (11 new test
+files, fully mocked — no real library/Ollama/Tesseract required — plus an
+existing `tests/test_media_gen.py` extended), and
+`tests/test_orchestrator.py`'s router-disambiguation and availability
+tests for the new source.
+
+---
+
 ## 2026-09-13 — Agentic-AI security audit: media-generation hardening + new cost/rate-limit controls
 
 **Change:** A security audit specifically covering the multi-source

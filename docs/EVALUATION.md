@@ -150,6 +150,17 @@ explicit about why) — see `CONTRIBUTING.md` for adding new cases.
 current baseline (and, given `--log-file`, a captured run's security-event
 counts) for periodic review — see `docs/GOVERNANCE.md`'s review cadence.
 
+## Media search eval (separate, unpopulated scaffold)
+
+`eval/media_benchmark/` mirrors this benchmark's shape (a dataset loader,
+a schema, a reporting module) for the optional media search feature
+(`ENABLE_MEDIA_SEARCH` — see `CLAUDE.md`'s "Media search" section), run
+via `python scripts/run_media_eval.py`. It ships as an **empty template,
+not a populated dataset** — this repo has no checked-in media library to
+grade against, so there are no measured accuracy numbers for this feature
+the way there are for Text-to-SQL above. See `eval/media_benchmark/dataset.yaml`
+for the format to populate it against your own library.
+
 ## What would move these numbers
 
 Not attempted as part of this pass (would change AI-quality behavior,

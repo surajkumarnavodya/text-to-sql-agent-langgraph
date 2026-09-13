@@ -103,6 +103,24 @@ open gaps.
   question, schema, or result data leaves it for LLM inference (`README.md`'s
   "Why this project"). No hosted-API key, no third-party data processor in
   the LLM path.
+- **Voice mode (on by default) is fully local, with one disclosed, narrow
+  exception.** Both speech-to-text (`faster-whisper`) and text-to-speech
+  (Piper) run entirely on the user's machine — no cloud speech API, no
+  data leaving it for either direction. The exception: live word-by-word
+  captions shown while the user is still talking use the browser's own
+  built-in speech recognition, which in Chromium-based browsers sends
+  audio to that browser vendor's own cloud service purely to render the
+  on-screen caption. The transcript actually submitted to the agent always
+  comes from the local model, never from that caption — the exception is
+  scoped to a UI convenience, not the data path that matters.
+- **Media search (optional, off by default) is fully local, but has no
+  content-sensitivity classification.** Local CLIP embeddings mean no
+  image/video content or search query ever leaves the machine to make
+  this feature work — but unlike policy documents (which have a tested,
+  fail-closed sensitivity gate), there is currently no equivalent
+  mechanism for media library content: whatever's indexed is searchable
+  by anyone who can use the app. Disclosed as `docs/RISK_REGISTER.md`'s
+  R-012, not silently left implicit.
 - **Schema retrieval is scoped, not exhaustive.** Only the top-k relevant
   tables are ever put in a prompt (`SCHEMA_TOP_K`), not the whole schema —
   originally a context-budget decision (`docs/ARCHITECTURE.md`'s "§3
@@ -138,6 +156,12 @@ as adversarial input, at the same trust level, not just the former:
   to the underlying database can write text that ends up inside an LLM
   prompt." Treating only the chat box as adversarial and the database as
   trusted would have been an incomplete threat model.
+- **Media search hit content** (OCR'd on-screen text, ASR transcripts,
+  generated captions) is framed as untrusted data, never instructions, in
+  the answer-composition prompt (`agent.orchestrator.nodes.media_search_node`)
+  — the same principle extended to a third input channel a
+  malicious/mislabeled file in the configured library could exploit,
+  alongside database content and uploaded documents.
 
 ## What this project does not claim
 
@@ -154,6 +178,11 @@ as adversarial input, at the same trust level, not just the former:
   — see "Human oversight" above. Not a claim that generated content is
   screened to any serious standard, only that a human must explicitly
   approve the (metered, real-cost) act of generating it at all.
+- Media search's library content is not reviewed, moderated, or
+  sensitivity-classified in any way — see "Data minimization and privacy"
+  above and `docs/RISK_REGISTER.md`'s R-012. Whatever's placed in the
+  configured folder is treated as safe to index and surface, on the
+  operator's own judgment alone.
 
 ## Cross-references
 

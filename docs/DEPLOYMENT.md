@@ -130,6 +130,85 @@ Nothing Docker-specific here either if you turn these on
   network/firewall policy allows outbound HTTPS from the container before
   relying on this in a locked-down environment.
 
+## Voice mode (on by default)
+
+Nothing Docker-specific to configure — `ENABLE_VOICE_MODE=true` is the
+default, and both `faster-whisper` and Piper run fully inside the
+container. Two one-time model-download steps still apply the same as a
+bare-metal install:
+
+- **Piper voice model**: run once, inside the container, after it's up:
+  ```bash
+  docker compose exec api python scripts/download_voice_model.py
+  ```
+  `POST /voice/synthesize` returns a clean `503` until this has run — not
+  a crash, just an unmet one-time setup step. Persist `voice/models/`
+  as a named volume (mirroring `chroma_index` above) if you don't want to
+  re-run this after every container recreate.
+- **`faster-whisper`'s own model** auto-downloads from Hugging Face Hub on
+  first use and caches on disk — the container needs outbound HTTPS
+  reachability for that first transcription request (or a pre-warmed
+  cache mounted in), same as any other on-first-use model download.
+
+Set `ENABLE_VOICE_MODE=false` if you'd rather not carry either dependency
+in a deployment that has no use for spoken input/output.
+
+## Media generation (optional, off by default)
+
+Turning on `ENABLE_MEDIA_GENERATION` means the container makes outbound
+HTTPS calls to IMA Studio's API carrying question text and (for a
+confirmed generation) real, metered spend — the same "one exception to
+the fully-local posture" consideration as `WEB_SEARCH_API_KEY` above.
+Nothing else is Docker-specific: `IMA_API_KEY` is just another `.env`
+secret (see "Production secrets" below), and generated media is cached
+in-process (`media_gen/cache.py`, 100-entry FIFO) rather than written to a
+volume — a container restart loses any not-yet-fetched generated media,
+an accepted tradeoff, not something to work around with a mount.
+
+## Media search (optional, off by default)
+
+The heaviest optional feature to run in a container, in three ways:
+
+1. **A real dependency-footprint increase.** `ENABLE_MEDIA_SEARCH=true`
+   pulls `torch`/`sentence-transformers` (local CLIP embeddings) and
+   `opencv-python`/`scenedetect` (video scene detection) into the image —
+   meaningfully larger than the rest of this project's dependencies (see
+   `requirements.txt`'s own comments). Leave the flag off for a
+   deployment that doesn't need this feature rather than paying that image
+   size unconditionally.
+2. **Tesseract is not in the base image.** OCR (`media/ocr.py`, via
+   `pytesseract`) needs the system Tesseract binary, the same "extra
+   manual layer" shape as `DB_TYPE=mssql`'s ODBC driver above — it is
+   **not** installed by this project's `Dockerfile`. Add it yourself if
+   you need OCR:
+   ```dockerfile
+   FROM text-to-sql-dashboard:latest
+   USER root
+   RUN apt-get update && apt-get install -y --no-install-recommends tesseract-ocr \
+       && rm -rf /var/lib/apt/lists/*
+   USER app
+   ```
+   Without it, `media/ocr.py` fails open — indexing still succeeds, on-
+   screen text in video frames just isn't part of what's searchable, not
+   a hard failure.
+3. **A real library folder must be mounted into the container.**
+   `MEDIA_LIBRARY_PATH` needs to resolve to something inside the
+   container's filesystem — bind-mount or volume-mount your actual media
+   folder at that path in `docker-compose.yml`, then run indexing the same
+   way schema embeddings are built:
+   ```bash
+   docker compose exec api python scripts/build_media_index.py
+   ```
+   Persist a Chroma-backed media index the same way the schema index is
+   (the `chroma_index` volume already mounted at `/app/embeddings/.chroma`
+   covers this — media search reuses the same `PersistentClient`, no
+   second volume needed).
+
+Captioning (`MEDIA_VISION_MODEL`) reuses your existing Ollama connection —
+no additional container-networking concern beyond what "Connecting to
+Ollama running on the host" above already covers, just an additional
+`ollama pull <model>` on whichever Ollama instance `OLLAMA_HOST` points at.
+
 ## Health checks
 
 - **`api`**: `docker-compose.yml`'s `healthcheck` hits `GET /health`

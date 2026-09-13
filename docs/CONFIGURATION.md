@@ -181,6 +181,31 @@ dependency footprint than this project's other optional features. See
 | `MEDIA_SEARCH_TOP_K` | `5` | Max hits returned per query, across images and video segments combined. |
 | `MEDIA_SCENE_DETECT_THRESHOLD` | `27.0` | `PySceneDetect`'s `ContentDetector` sensitivity — lower detects more (subtler) scene changes. |
 
+### Content moderation gate (mandatory, not a feature flag)
+
+Runs before anything is embedded/stored by **either** media search
+(`ENABLE_MEDIA_SEARCH`) or document/policy RAG (`ENABLE_DOCUMENT_RAG`/
+`ENABLE_POLICY_RAG`) — there is deliberately no flag to disable this while
+either pipeline is on; missing configuration below fails ingestion closed
+with a clear error instead. See `moderation/taxonomy.py`'s module
+docstring for the full category table and `SECURITY.md`'s "Content
+moderation gate" section for the design rationale.
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `MODERATION_PROVIDER` | `azure_content_safety` | Selects the provider (`moderation/provider.py::SUPPORTED_MODERATION_PROVIDERS`). Only Azure AI Content Safety is implemented today. |
+| `AZURE_CONTENT_SAFETY_ENDPOINT` | *(unset)* | Your Content Safety resource's REST endpoint. |
+| `AZURE_CONTENT_SAFETY_KEY` | *(unset)* | Subscription key for the endpoint above. `SecretStr`-wrapped. |
+| `MODERATION_SEVERITY_THRESHOLD` | `4` | Minimum Azure severity (0/2/4/6) that hard-rejects a Hate/SelfHarm/Sexual/Violence category. Verify against your Content Safety API version. |
+| `MODERATION_BLOCKLIST_PATH` | *(blank = `config/moderation_blocklist.yaml`)* | Override for the weapons/drugs text-term blocklist — Azure has no dedicated category for either. |
+| `MODERATION_STORE_CONNECTION_STRING` | *(unset)* | Dedicated SQL Server connection for moderation decisions/dedupe metadata (`moderation.media_assets`) — separate from `DB_CONNECTIONS` **and** `RAG_STORE_CONNECTION_STRING` (point both at the same database if you want one shared store). `SecretStr`-wrapped. |
+| `MODERATION_STORE_ODBC_DRIVER` | `ODBC Driver 17 for SQL Server` | Same meaning as `DB_ODBC_DRIVER`, for this connection. |
+| `MODERATION_STORE_POOL_SIZE` | `10` | `QueuePool` size — explicit here (unlike `DB_CONNECTIONS`/`RAG_STORE_CONNECTION_STRING`, both on SQLAlchemy's default of 5) since ingestion can run many concurrent DB writes. |
+| `MODERATION_STORE_MAX_OVERFLOW` | `20` | `QueuePool` burst ceiling above the pool size. |
+| `MODERATION_STORE_POOL_RECYCLE_SECONDS` | `1800` | Discard/replace a pooled connection after this long, regardless of use — set below your SQL Server/network's idle-connection timeout. |
+| `MEDIA_INGEST_WORKERS` | `4` | Concurrent worker threads `scripts/build_media_index.py` uses (this project's first bounded thread pool — previously a sequential loop). |
+| `MEDIA_IMAGE_TILE_THRESHOLD_PX` | `2048` | An ingested image larger than this (either dimension) is tiled before moderation, so a classifier's own downsampling can't hide a small region of concern. |
+
 ## Validation behavior worth knowing
 
 - **Missing vs. malformed are treated differently.** A missing `DB_HOST`

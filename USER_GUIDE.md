@@ -3,10 +3,10 @@
 A complete walkthrough of the Text-to-SQL Dashboard, covering both what it
 is like to use it and how it actually works. This guide has two parts:
 
-- **Part 1 — Using the application (§1–§20)**: a plain-language
+- **Part 1 — Using the application (§1–§23)**: a plain-language
   walkthrough of what you see, what each button does, and what the
   messages mean. No prior technical knowledge is assumed.
-- **Part 2 — Technical overview (§21–§31)**: how the application is built
+- **Part 2 — Technical overview (§24–§34)**: how the application is built
   — the architecture, the design decisions behind the behavior described
   in Part 1, and the mechanisms underneath it — written for a reader who
   wants real understanding, not just operating instructions (a developer,
@@ -36,12 +36,20 @@ results. Part 1 explains what happens at each of those steps and what to
 do when something doesn't go as expected; Part 2 explains why it behaves
 that way.
 
-Two things described in Part 1 are **optional, admin-configured
-features**, off unless your administrator turned them on: asking about
-more than one database at once (§3), and asking about uploaded documents,
-company policies, or the live web in addition to your database (§16). If
-neither applies to your setup, skip straight past them — everything else
-in this guide works identically either way.
+Several things described in Part 1 are **optional, admin-configured
+features** — skip straight past any section whose intro says it doesn't
+apply to your setup; everything else in this guide works identically
+either way:
+
+- Asking about more than one database at once (§3).
+- Asking about uploaded documents, company policies, or the live web in
+  addition to your database (§16).
+- Talking to the app out loud instead of typing (§17) — this one is **on**
+  by default, so you'll usually see it unless your administrator turned it
+  off.
+- Asking the app to create a new image or video (§18) — off by default.
+- Asking the app to find an existing photo or video in a local media
+  library (§19) — off by default.
 
 ### Contents
 
@@ -63,24 +71,27 @@ in this guide works identically either way.
 14. [Retry and self-correction behavior](#14-retry-and-self-correction-behavior)
 15. [Follow-up questions](#15-follow-up-questions)
 16. [Multi-source knowledge: documents, policies, and web search](#16-multi-source-knowledge-documents-policies-and-web-search)
-17. [Session history](#17-session-history)
-18. [Understanding error and status messages](#18-understanding-error-and-status-messages)
-19. [Security — what this app does and doesn't protect against](#19-security--what-this-app-does-and-doesnt-protect-against)
-20. [Troubleshooting](#20-troubleshooting)
+17. [Voice input and spoken answers](#17-voice-input-and-spoken-answers)
+18. [Generating images and video](#18-generating-images-and-video)
+19. [Searching your media library](#19-searching-your-media-library)
+20. [Session history](#20-session-history)
+21. [Understanding error and status messages](#21-understanding-error-and-status-messages)
+22. [Security — what this app does and doesn't protect against](#22-security--what-this-app-does-and-doesnt-protect-against)
+23. [Troubleshooting](#23-troubleshooting)
 
 **Part 2 — Technical overview**
 
-21. [Architecture overview](#21-architecture-overview)
-22. [The question-answering pipeline, step by step](#22-the-question-answering-pipeline-step-by-step)
-23. [Schema-aware retrieval, technically](#23-schema-aware-retrieval-technically)
-24. [SQL safety architecture](#24-sql-safety-architecture)
-25. [Self-correction and the adaptive retry budget](#25-self-correction-and-the-adaptive-retry-budget)
-26. [Agentic query planning and plan-conformance review](#26-agentic-query-planning-and-plan-conformance-review)
-27. [Multi-database auto-routing, technically](#27-multi-database-auto-routing-technically)
-28. [Multi-source orchestration architecture](#28-multi-source-orchestration-architecture)
-29. [Configuration and deployment](#29-configuration-and-deployment)
-30. [Security model summary](#30-security-model-summary)
-31. [Further technical reading](#31-further-technical-reading)
+24. [Architecture overview](#24-architecture-overview)
+25. [The question-answering pipeline, step by step](#25-the-question-answering-pipeline-step-by-step)
+26. [Schema-aware retrieval, technically](#26-schema-aware-retrieval-technically)
+27. [SQL safety architecture](#27-sql-safety-architecture)
+28. [Self-correction and the adaptive retry budget](#28-self-correction-and-the-adaptive-retry-budget)
+29. [Agentic query planning and plan-conformance review](#29-agentic-query-planning-and-plan-conformance-review)
+30. [Multi-database auto-routing, technically](#30-multi-database-auto-routing-technically)
+31. [Multi-source orchestration architecture](#31-multi-source-orchestration-architecture)
+32. [Configuration and deployment](#32-configuration-and-deployment)
+33. [Security model summary](#33-security-model-summary)
+34. [Further technical reading](#34-further-technical-reading)
 
 ## 1. Starting the application
 
@@ -391,7 +402,113 @@ a partial or hedged answer.
 usually because the question was really two unrelated asks mashed into
 one sentence — try asking each part separately first.
 
-## 17. Session history
+## 17. Voice input and spoken answers
+
+*(On by default — your administrator can turn it off; skip to §18 if you
+don't see a microphone button next to the chat box.)*
+
+Click the microphone icon instead of typing, and speak your question. As
+you talk, word-by-word captions appear so you can see it being recognized
+in real time. The moment you stop talking, your question is submitted
+automatically — there's no separate "review the transcript, then send"
+step — and once the answer comes back, it's read aloud automatically, in
+addition to appearing as normal text/results. After that one exchange, the
+app resets to the ordinary typing box; click the microphone again to ask
+another question by voice. This is a **press-to-talk, one question, one
+spoken answer** pattern, not a continuously-listening assistant.
+
+A voice-submitted question goes through the exact same safety checks,
+retry behavior, and "Confirm and Run" gate as a typed one — nothing about
+how it's answered changes because it arrived by voice.
+
+If your browser doesn't support live captions, you won't see the
+word-by-word preview, and a **"Done speaking"** button appears instead of
+automatic silence detection — everything else works the same. You can
+always replay a spoken answer afterward from the small audio control shown
+under that turn, without it being read aloud a second time automatically.
+
+Transcription and the spoken voice are both produced entirely on your own
+machine — no cloud speech service, no data leaving it for either
+direction. The one disclosed exception is the **live caption text** shown
+while you're still talking: it uses your browser's own built-in speech
+recognition, which in a Chromium-based browser sends your audio to that
+browser vendor's own cloud service purely to draw the caption on screen.
+Your actual submitted question always comes from the local transcription,
+never from that caption. If you'd rather not see the microphone button at
+all, look for a "Voice mode" toggle in the settings panel (gear icon) — it
+hides the control for you without needing your administrator to change
+anything server-side.
+
+## 18. Generating images and video
+
+*(Only relevant if your administrator turned this on — skip to §19
+otherwise.)*
+
+Ask for something to be created, rather than something to be looked up —
+e.g. *"generate an image of monthly spend by category"* or *"create a
+short video of a factory production line."* The app recognizes this as a
+request to make brand-new media, as opposed to an ordinary "show me the
+data" question that merely mentions a picture in passing (which still gets
+answered as a normal table/chart, not an image).
+
+**Nothing is generated, and nothing is charged, until you approve it.**
+Because this is the one feature that spends real, metered credit with an
+outside provider, the app first shows you what it's *about to* create,
+with a button — **"▶ Generate image"** or **"▶ Generate video"** — and
+only calls out to actually create it once you click that. This mirrors the
+SQL pipeline's own "review before it runs" philosophy (§10), applied to a
+source that costs money instead of one that reads your database.
+
+Once generated, the image or video is shown directly in the chat — never
+just a link — served through this app itself rather than pointing you at
+the provider's own site. A question that combines generation with your
+database or another source (e.g. *"generate an image of our top 5
+merchants by dispute count"*) shows each contribution under its own
+labeled heading, the same pattern §16 describes for other multi-source
+answers.
+
+Video clips are short by design — typically 5–15 seconds — a real limit of
+the underlying generation model, not a restriction this app adds on top.
+
+## 19. Searching your media library
+
+*(Only relevant if your administrator turned this on and pointed it at a
+local folder of images/videos — skip to §20 otherwise.)*
+
+This app can search a local, **untagged** collection of photos and videos
+by describing what's in them — no filenames, folders, or manual tags
+required. Two ways to use it:
+
+- **Ask in the main chat**, the same way you'd ask about your database —
+  e.g. *"find the photo of the site inspection from last month"* or *"show
+  me the clip where the crane lifts the beam."* The app tells the
+  difference between this ("find something that already exists") and
+  asking it to generate brand-new media (§18); if in doubt, say "find" or
+  "do we have," not "create" or "make." A matching answer shows a short
+  written summary plus a thumbnail grid of what was found.
+- **A dedicated "🖼️ Media Search" page**, in the navigation bar alongside
+  Chat and Knowledge Sources — type a description, optionally narrow it to
+  images only or videos only, and click **Search**. This works
+  independently of the chat, for quickly browsing the library without
+  starting a conversation.
+
+For a video hit, you'll see a representative frame and a timestamp range
+(e.g. "1:02–1:18") rather than a playable clip — this feature shows you
+*where* in the video to look, not a full video player. Search understands
+on-screen text, spoken audio, and (if your administrator enabled it) an
+automatically generated description of each clip — so a search can match
+something said in a video, written on a sign in a photo, or just what a
+scene visually shows.
+
+Adding new files to the library is an administrator action (running a
+script after dropping files into the configured folder), not something you
+do from this page — if a file you know exists never turns up in search
+results, ask your administrator to confirm the library has been
+re-indexed. Everything about this feature runs on the same machine as the
+rest of the app — your media is never uploaded to a third party to make it
+searchable.
+
+## 20. Session history
 
 The sidebar's **"📜 History"** panel lists every question you've asked
 this session (most recent first), each with a status badge (succeeded,
@@ -408,7 +525,7 @@ timestamp. Two actions per entry:
 it disappears when you refresh the page or restart the app; nothing here
 is saved permanently.
 
-## 18. Understanding error and status messages
+## 21. Understanding error and status messages
 
 | What you see | What it means |
 |---|---|
@@ -420,7 +537,7 @@ is saved permanently.
 | *"Rejected: ..."* (after clicking Confirm and Run) | The SQL currently in the box — likely one you edited — failed the safety check. |
 | *"Execution failed: ..."* (after clicking Confirm and Run) | The query passed safety checks but the database itself returned an error (e.g. a genuine timeout). |
 
-## 19. Security — what this app does and doesn't protect against
+## 22. Security — what this app does and doesn't protect against
 
 - Every query that runs is read-only by construction — the app cannot
   issue `INSERT`/`UPDATE`/`DELETE`/`DROP`, etc., no matter what you type
@@ -436,15 +553,23 @@ is saved permanently.
   authentication in front of it (see
   [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md)).
 - If multi-source knowledge (§16) is on, live web search sends your
-  question text to a third-party search API — the one deliberate exception
-  to this app's otherwise fully-local, nothing-leaves-the-machine design.
-  It's off unless your administrator explicitly turned it on.
+  question text to a third-party search API — off unless your
+  administrator explicitly turned it on.
+- If voice mode (§17, on by default) is on, the live captions shown while
+  you're speaking use your browser's own built-in speech recognition,
+  which in a Chromium-based browser is cloud-backed — the one part of
+  voice mode that isn't fully local. Your actual submitted question always
+  comes from local transcription, never from the caption text.
+- If media search (§19) is on, the content it indexes and searches never
+  leaves your machine — but unlike uploaded documents/policies (§16),
+  there's no sensitivity-tagging step for media library content, so treat
+  anything placed in that folder as visible to anyone who can use this app.
 - The AI's accuracy is not perfect — see
   [`docs/EVALUATION.md`](docs/EVALUATION.md) for real, measured numbers.
   Always read the generated SQL and the results before trusting them for
   anything important.
 
-## 20. Troubleshooting
+## 23. Troubleshooting
 
 See [`docs/TROUBLESHOOTING.md`](docs/TROUBLESHOOTING.md) for the full
 technical reference. The most common day-to-day issues:
@@ -463,10 +588,26 @@ technical reference. The most common day-to-day issues:
   [`SECURITY.md`](SECURITY.md)'s "Reporting a vulnerability" section.
 - **A question that should use documents/policies/web comes back as a
   database answer (or vice versa)** — see §16 and
-  [`docs/MULTI_SOURCE_GUIDE.md`](docs/MULTI_SOURCE_GUIDE.md#7-troubleshooting)
+  [`docs/MULTI_SOURCE_GUIDE.md`](docs/MULTI_SOURCE_GUIDE.md#9-troubleshooting)
   for source-routing specifics.
+- **No microphone button appears** — voice mode is off, or your browser
+  denied microphone permission; check your browser's site permissions and
+  ask your administrator to confirm `ENABLE_VOICE_MODE` if it's still
+  missing after that.
+- **Spoken answers never play, or you see a voice error** — the one-time
+  Piper voice download may not have been run yet on the server; that's an
+  administrator setup step, not something fixable from the browser.
+- **"Generate image/video" never appears, or a generation request is
+  answered as if it were a database question** — media generation is off
+  by default; ask your administrator whether `ENABLE_MEDIA_GENERATION` is
+  set, and try rephrasing with an explicit "generate"/"create" verb.
+- **The "🖼️ Media Search" page says the feature is disabled, or a search
+  never finds a file you know is in the library** — media search is off by
+  default and needs a configured library folder; if it's supposed to be
+  on, ask your administrator to confirm `ENABLE_MEDIA_SEARCH` and that the
+  library has been (re-)indexed after the file was added.
 
-## 21. Architecture overview
+## 24. Architecture overview
 
 Part 1 above describes what you see and do. From here on, this guide
 shifts to *how it works* — the actual system design behind that behavior.
@@ -479,7 +620,7 @@ open-ended, ReAct-style agent that decides what to do next by its own
 free-form reasoning. This is a deliberate choice: every possible path
 through the system, including every retry, is something you can read off
 the graph definition, not something that only emerges at runtime inside
-one large, opaque model call. §22 walks through every node.
+one large, opaque model call. §25 walks through every node.
 
 **One engine, one server process.** The React dashboard (`frontend/`) and
 the REST API it calls (`api/main.py`) are, at the network level, the same
@@ -490,12 +631,16 @@ in Part 1 (validation, retries, row caps, rate limits) applies identically
 regardless of whether a question came through the dashboard or a direct
 API call.
 
-**Fully local by default, with two named exceptions.** The language model
+**Fully local by default, with named exceptions.** The language model
 runs locally via [Ollama](https://ollama.com) — no API key, no network
 call, no data leaving the machine for the core question-answering path.
-The two deliberate exceptions, both off unless explicitly enabled: live
-web search (§16/§28) sends your question text to a third-party search API,
-and nothing else does.
+The deliberate, disclosed exceptions: live web search (§16/§31), off by
+default, sends your question text to a third-party search API; voice
+mode's live captions (§17, on by default) use your browser's own
+cloud-backed speech recognition for the on-screen caption only, never for
+the submitted transcript; and media generation (§18, off by default) calls
+an external provider to actually create an image/video. Media search
+(§19, off by default) and everything else stay fully local.
 
 **Tech stack at a glance:**
 
@@ -503,30 +648,36 @@ and nothing else does.
 |---|---|
 | LLM runtime | Ollama, running a local model (default `llama3.1:8b`, swappable) |
 | Orchestration | LangGraph — an explicit state machine, not a black-box agent |
-| Schema retrieval | ChromaDB, a local vector store — see §23 |
+| Schema retrieval | ChromaDB, a local vector store — see §26 |
 | Database connectivity | SQLAlchemy, config-driven (PostgreSQL, MySQL, SQL Server, or Oracle) |
-| SQL validation | sqlglot — AST-based parsing and allowlist checking, see §24 |
-| Document/policy storage | SQL Server 2025+/Azure SQL native `VECTOR` columns, see §28 |
+| SQL validation | sqlglot — AST-based parsing and allowlist checking, see §27 |
+| Document/policy storage | SQL Server 2025+/Azure SQL native `VECTOR` columns, see §31 |
 | Web search | Pluggable provider, Tavily implemented today |
+| Voice (speech-to-text/text-to-speech) | `faster-whisper` + Piper, both fully local — see §31 |
+| Media generation | IMA Studio (image/video), optional, off by default — see §31 |
+| Media search | Local CLIP embeddings + ChromaDB, `PySceneDetect`/Tesseract/an Ollama vision model for video, optional, off by default — see §31 |
 | UI | React + Vite + Tailwind (`frontend/`), served by the API process |
 | API | FastAPI, a thin wrapper with no logic of its own |
 
-## 22. The question-answering pipeline, step by step
+## 25. The question-answering pipeline, step by step
 
 Every question passes through the same sequence of nodes. Most run in a
 fixed order every time; a few only do real work for certain questions
 (noted below), and a failure at several points can route back to an
-earlier node rather than simply failing — see §25 for the retry logic.
+earlier node rather than simply failing — see §28 for the retry logic.
+(This is the SQL pipeline specifically; when voice mode, media generation,
+or media search are involved, an outer router sits in front of it — see
+§31.)
 
 | Node | What it does |
 |---|---|
 | `sanitize_input` | The true entry point. Length cap, Unicode normalization (closing a homoglyph-substitution gap plain normalization leaves open), and a regex pre-filter for common prompt-injection phrasings — before anything else touches the question. |
 | `classify_followup` | A cheap heuristic (no model call) deciding whether the question is standalone, a follow-up to your last exchange, or too ambiguous to tell — see §15. |
-| `retrieve_schema` | Embeds the question and retrieves the most relevant tables from ChromaDB (§23). Also where multi-database auto-routing happens, on a database's first pass (§27). |
-| `plan_query` | Only for a question judged non-trivial (§25/§26) — an up-front LLM call sketching the steps the SQL needs to implement, before any SQL is written. |
+| `retrieve_schema` | Embeds the question and retrieves the most relevant tables from ChromaDB (§26). Also where multi-database auto-routing happens, on a database's first pass (§30). |
+| `plan_query` | Only for a question judged non-trivial (§28/§29) — an up-front LLM call sketching the steps the SQL needs to implement, before any SQL is written. |
 | `generate_sql` | Calls the local model with the schema context, the plan (if any), and — on a retry — the previous attempt's error, to produce candidate SQL. |
-| `review_sql` | Only when a plan exists — a second LLM call checking whether the generated SQL actually implements it (§26). |
-| `validate_sql` | Parses the candidate SQL and checks it against a read-only allowlist (§24) — nothing reaches the database without passing this, no exceptions. |
+| `review_sql` | Only when a plan exists — a second LLM call checking whether the generated SQL actually implements it (§29). |
+| `validate_sql` | Parses the candidate SQL and checks it against a read-only allowlist (§27) — nothing reaches the database without passing this, no exceptions. |
 | `estimate_cost` | A non-executing plan-cost estimate; a query that looks extremely expensive is never run at all. |
 | `execute_sql` | Runs the validated SQL against a read-only connection, with a row cap and timeout. |
 | `generate_insight` | Only after a successful execution — an optional, fact-checked plain-English summary sentence (§12). |
@@ -547,7 +698,7 @@ about `validate_sql`'s behavior entirely in terms of "given this SQL text,
 what does it accept or reject," without needing to know anything about how
 `generate_sql` produced that text.
 
-## 23. Schema-aware retrieval, technically
+## 26. Schema-aware retrieval, technically
 
 **Live introspection, never a hardcoded schema.** On startup (and on every
 "Refresh Schema" click), the app reads your database's real structure
@@ -587,7 +738,7 @@ structure hasn't changed since the last build (checked via a hash of the
 introspected structure, not the sampled values) — so clicking "Refresh
 Schema" costs nothing when nothing actually changed.
 
-## 24. SQL safety architecture
+## 27. SQL safety architecture
 
 **An allowlist on parsed structure, not a blocklist on keywords.** Every
 candidate query — AI-generated or hand-edited — is parsed into a real
@@ -640,9 +791,9 @@ mistranslated query that lacks a working `LIMIT` still can't pull an
 unbounded result set into memory. A query timeout is enforced by
 force-closing the connection if it's still running past the configured
 limit. None of this replaces the need for the configured database account
-to genuinely be read-only — see §30.
+to genuinely be read-only — see §33.
 
-## 25. Self-correction and the adaptive retry budget
+## 28. Self-correction and the adaptive retry budget
 
 When a query fails — at review, validation, cost-estimation, or
 execution — the graph doesn't just give up. It routes back to
@@ -667,12 +818,12 @@ period comparison ("year-over-year growth"), running/cumulative
 calculations, or several distinct metrics requested in one question. A
 question matching one or more of these signals gets extra attempts, up to
 a configured cap; an ordinary question gets the plain default. This is the
-same judgment that decides whether query planning (§26) engages at all.
+same judgment that decides whether query planning (§29) engages at all.
 
-## 26. Agentic query planning and plan-conformance review
+## 29. Agentic query planning and plan-conformance review
 
-Two extra steps in the pipeline (`plan_query` and `review_sql`, see §22)
-target the same class of question §25 identifies as non-trivial — a
+Two extra steps in the pipeline (`plan_query` and `review_sql`, see §25)
+target the same class of question §28 identifies as non-trivial — a
 "decompose, then check the decomposition was followed" pattern that
 complements, rather than replaces, the error-driven retry loop above.
 
@@ -682,14 +833,14 @@ columns to group by, which numbers to compute, and — critically — whether
 the result needs per-group ranking (which requires a window function, not
 a plain row limit combined with grouping) or a period-over-period
 comparison (which requires comparing pre-aggregated values across periods,
-never one aggregate nested inside another — see §24). This plan is then
+never one aggregate nested inside another — see §27). This plan is then
 included in every subsequent SQL-generation attempt for that question.
 
 **Checking the SQL actually followed the plan.** After SQL is generated, a
 second LLM call checks it against that same plan and returns a pass/fail
 judgment. A failure is treated exactly like any other retryable mistake —
 the specific critique becomes guidance for the next attempt, sharing the
-same bounded retry budget as §25, not a second, separate, open-ended loop.
+same bounded retry budget as §28, not a second, separate, open-ended loop.
 
 **Zero cost for the common case, and fails open.** An ordinary question
 that matches no complexity signal never triggers either call — no added
@@ -702,11 +853,11 @@ become a new reason a question can't be answered. An administrator can
 also disable it globally regardless of question complexity
 (`ENABLE_QUERY_PLANNING=false`).
 
-## 27. Multi-database auto-routing, technically
+## 30. Multi-database auto-routing, technically
 
 Each configured database gets its own, separate ChromaDB collection —
 schemas are never mixed into one shared index. This matters for two
-reasons: the FK-adjacency bridging in §23 only makes sense within one
+reasons: the FK-adjacency bridging in §26 only makes sense within one
 database's own foreign-key graph, and a shared collection would risk a
 table-name collision between two unrelated databases that happen to share
 a table name.
@@ -720,15 +871,15 @@ question's full retrieval and every downstream step (SQL dialect,
 connection, engine).
 
 A retry that re-enters schema retrieval (the "missing reference" case in
-§25) reuses the already-selected database rather than re-running this
+§28) reuses the already-selected database rather than re-running this
 comparison — a retry must keep targeting the same database the failed
 attempt already generated SQL against, not silently jump to a different
 one mid-question.
 
-## 28. Multi-source orchestration architecture
+## 31. Multi-source orchestration architecture
 
 When the multi-source router is off (the default), the app *is* the SQL
-pipeline described in §21–§27 — the orchestrator graph below is never even
+pipeline described in §24–§30 — the orchestrator graph below is never even
 constructed, so nothing in this section changes anything about a
 SQL-only setup.
 
@@ -741,7 +892,10 @@ call to decide which apply. That call falls back to *every* available
 source — never zero — if its response can't be confidently parsed, since
 silently dropping a question is worse than one or two extra source calls.
 With zero or one source available, this is a free, instant decision (no
-model call at all).
+model call at all). Media generation (§18) and media search (§19) are two
+more sources this same router can pick, alongside documents/policy/web —
+the router is what disambiguates "generate a picture of X" (§18) from
+"find the existing picture of X" (§19) when both are configured.
 
 **Parallel fan-out, not sequential.** A question needing more than one
 source (e.g. "compare our leave policy with what's in the database") is
@@ -770,7 +924,38 @@ database content and uploaded documents — and the final answer text always
 identifies itself as coming from a live web search, never presented as if
 it came from the company's own systems.
 
-## 29. Configuration and deployment
+**Media generation.** The one source that spends real, metered money —
+`Settings.require_generation_approval` (default `true`) means a proposal
+(`status="pending_approval"`) is created but nothing is actually generated
+or charged until a human explicitly confirms via `POST /generate/confirm`
+or the dashboard's "▶ Generate" button (§18), mirroring the SQL pipeline's
+own "Confirm and Run" gate applied to a source that costs money instead of
+one that reads your database. A downloaded asset's bytes are served
+through this app's own `GET /media/{media_id}` route, never the
+provider's raw URL — the router never even sees a video-vs-image choice
+made by the caller; `infer_media_kind` re-derives it from the question
+text server-side every time.
+
+**Media search.** Unlike every other source, this one runs entirely
+on-device by default: `media/embedding.py`'s local CLIP model embeds both
+the search query and every indexed image/video keyframe into one shared
+vector space (the same model embeds both, which is what makes them
+comparable at all), stored in two more ChromaDB collections alongside the
+schema index. A video is pre-processed once, at index time
+(`scripts/build_media_index.py`), into scene-detected segments, each
+transcribed (reusing the same local Whisper model voice mode uses),
+OCR'd, and optionally captioned by a local Ollama vision model — a blank
+vision-model setting or a captioning failure just means that segment is
+still searchable via its transcript/OCR text alone (fails open, the same
+philosophy as the golden-examples/query-planning features). Retrieved
+captions/transcripts/OCR text are framed as untrusted data in the
+answer-composition prompt, never as instructions, the same treatment
+§31's web-search paragraph above already describes for live search
+results — a sign in a photo or a spoken phrase in audio is exactly as
+attacker-influenceable as any other externally-sourced text reaching a
+prompt.
+
+## 32. Configuration and deployment
 
 Everything that varies between environments — database connections, the
 model name, timeouts, every feature flag described throughout this
@@ -785,7 +970,7 @@ which serves the built dashboard alongside the API) or via the included
 `Dockerfile`/`docker-compose.yml` — see
 [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) for
 both paths, including the reverse-proxy-authentication pattern recommended
-for anything reachable beyond a trusted local network (§19/§30).
+for anything reachable beyond a trusted local network (§22/§33).
 
 Every layer logs through structured logging — deliberately never the
 connection string, password, or raw result rows, only shape (row/column
@@ -793,33 +978,37 @@ counts, table names) — and the API exposes a `/health` endpoint that
 checks the database connection(s), Ollama's reachability, and the schema
 index in one call, useful for container orchestration health checks.
 
-## 30. Security model summary
+## 33. Security model summary
 
-A technical summary of what §19 already covers functionally — see
+A technical summary of what §22 already covers functionally — see
 [`SECURITY.md`](SECURITY.md) for the complete reference this section
 condenses.
 
-**What's actually enforced:** read-only-by-construction SQL (the §24
+**What's actually enforced:** read-only-by-construction SQL (the §27
 allowlist, checked on every single query regardless of origin), a
 database account that should itself be genuinely read-only (a second,
 independent layer — the app's own checks are not a substitute for this),
 a row cap and query timeout enforced at execution time, per-session and
 process-wide rate limiting, secret redaction in every log line, and
 Unicode-normalization plus pattern-based defenses against prompt-injection
-attempts (the same "untrusted until checked" treatment §24 applies to
-generated SQL and §28 applies to database content, uploaded documents, and
-web results).
+attempts (the same "untrusted until checked" treatment §27 applies to
+generated SQL and §31 applies to database content, uploaded documents,
+media-library content, and web results).
 
 **What's explicitly not guaranteed, by design:** there is no login or
 per-user authorization system — anyone who can reach the app's URL can use
 whatever access is configured, so it's not designed for exposure beyond a
 trusted network without a real authenticating reverse proxy in front of
 it. This project has not been through an independent security review or
-penetration test. Both are named, documented limitations, not silent gaps
+penetration test. Neither is there any per-item sensitivity classification
+for media library content (§19/§31) the way policy documents have (§16) —
+if that library could contain something restricted, that's a per-deployment
+gap to solve before turning media search on, not a control this app
+provides. All of these are named, documented limitations, not silent gaps
 — see `SECURITY.md`'s "What is explicitly not guaranteed" section for the
 complete, honest list.
 
-## 31. Further technical reading
+## 34. Further technical reading
 
 This guide's Part 2 is a condensed summary. For full depth:
 

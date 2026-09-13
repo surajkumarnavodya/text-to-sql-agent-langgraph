@@ -34,8 +34,9 @@ app was removed once this dashboard reached full feature parity with it
 ```bash
 npm install
 npm run dev      # Vite dev server, proxies /ask, /execute, /documents,
-                  # /schema, /feedback, /health, /media, /generate to
-                  # localhost:8000 (see vite.config.ts's BACKEND_ROUTES)
+                  # /schema, /feedback, /health, /media, /generate, /voice,
+                  # /search to localhost:8000 (see vite.config.ts's
+                  # BACKEND_ROUTES)
 npm run build    # outputs to dist/ -- api/main.py serves this directly
                   # in production (same origin, no CORS needed)
 npm run lint     # oxlint

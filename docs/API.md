@@ -81,9 +81,9 @@ Request:
 ```
 
 `conversation_history` is optional and, unlike the UI (which reconstructs
-it server-side from `ui/session_history.py`'s session state), must be
-resent by the caller each request — the API has no server-side session of
-its own. `enable_insight` defaults to `true`.
+it client-side from `frontend/src/store/chatStore.ts`'s `queryHistory`),
+must be resent by the caller each request — the API has no server-side
+session of its own. `enable_insight` defaults to `true`.
 
 Response (mirrors what the React dashboard renders — see `agent.state.AgentState`):
 
@@ -162,13 +162,84 @@ Rate-limited per client IP (`API_ACTION_RATE_LIMIT_PER_MINUTE`) in addition
 to the existing process-wide `MEDIA_GEN_RATE_LIMIT`. Requires auth if
 `API_AUTH_TOKEN` is set.
 
+### `POST /voice/transcribe`
+
+Transcribes a recorded question to text (`api/voice.py`), locally via
+`faster-whisper` — never routed through `POST /ask` itself, so the caller
+is responsible for submitting the returned text through that endpoint
+next (`agent.input_guard.check_input` applies there, identically to a
+typed question). 404 when `ENABLE_VOICE_MODE` is off (on by default).
+Multipart upload (`audio`, any format `faster-whisper`/`ffmpeg` can
+decode), capped at `Settings.voice_max_upload_mb` (default 10MB) and
+`Settings.voice_max_duration_seconds` (default 30s, checked before the
+comparatively expensive transcription call). Rate-limited per client IP
+(`API_ACTION_RATE_LIMIT_PER_MINUTE`).
+
+```json
+{"text": "what were total sales last quarter", "stt_duration_ms": 812.4}
+```
+
+### `POST /voice/synthesize`
+
+Synthesizes text to speech (`api/voice.py`), locally via Piper — returns
+raw `audio/wav` bytes, not JSON. 404 when `ENABLE_VOICE_MODE` is off.
+`text` is capped at `Settings.max_question_length` (the same bound
+`AskRequest.question` uses). Returns `503` if the configured Piper voice
+model hasn't been downloaded yet (`python scripts/download_voice_model.py`
+is a one-time setup step, separate from the app itself). Rate-limited per
+client IP.
+
+### `POST /search/media`
+
+Direct media-library search (`api/media_search.py`), independent of the
+conversational `/ask` flow — returns raw ranked hits with a templated
+summary, not an LLM-composed answer (ask through `/ask` instead for that,
+which routes through `agent.orchestrator.nodes.media_search_node`). 404
+when `ENABLE_MEDIA_SEARCH` is off (off by default). Rate-limited per
+client IP, sharing `API_ACTION_RATE_LIMIT_PER_MINUTE` with other
+lightweight actions rather than a dedicated limiter.
+
+```json
+// Request
+{"query": "the photo of the site inspection", "media_type": null}
+
+// Response
+{
+  "answer": "Found 2 result(s).",
+  "status": "succeeded",
+  "hits": [
+    {"media_id": "a1b2...", "media_type": "image", "caption": "...", "timestamp_start": null, "timestamp_end": null}
+  ]
+}
+```
+
+`media_type` is optional (`"image"`, `"video"`, or omitted/`null` for
+both). A video hit's `timestamp_start`/`timestamp_end` mark the matched
+scene-detected segment; fetch its representative keyframe (or an image
+hit's original file) via `GET /media/library/{media_id}` below — a full
+video clip is never streamed.
+
+### `GET /media/library/{media_id}`
+
+Streams one media-library asset's bytes (`api/media_library.py`) — the
+original file for an image hit, or the representative keyframe thumbnail
+for a video-segment hit. Distinct from `GET /media/{media_id}`
+(`api/media.py`), which serves freshly *generated* media from an
+in-memory, 100-entry cache — this route instead resolves `media_id`
+against the persistent Chroma-backed media library and re-validates the
+resolved path stays inside the configured library root before opening it.
+404 when media search is disabled, `media_id` is unknown, or the
+underlying file has moved/been deleted.
+
 ### Other routes
 
 `POST /execute` (SQL "Confirm and Run" equivalent), `POST /schema/refresh`,
 `GET`/`POST`/`DELETE /documents`, `GET /documents/{id}/download`, and
-`GET /media/{media_id}` also exist (`api/main.py`, `api/documents.py`,
-`api/media.py`) — not yet given their own subsection here; see each
-module's own docstrings for the authoritative contract in the meantime.
+`GET /media/{media_id}` (serving freshly *generated* media — see
+`GET /media/library/{media_id}` above for the persistent-library
+equivalent) also exist (`api/main.py`, `api/documents.py`, `api/media.py`)
+— not yet given their own subsection here; see each module's own
+docstrings for the authoritative contract in the meantime.
 
 ## Auth: a lightweight hook, not a full auth system
 

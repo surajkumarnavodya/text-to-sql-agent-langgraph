@@ -293,6 +293,86 @@ be tied to actual authenticated identity, not just a correlation token.
 
 ---
 
+### R-012 — No sensitivity classification for media search library content
+
+**Severity:** Medium (higher if the configured library could contain
+sensitive imagery/audio) · **Status:** Open
+
+Media search (`ENABLE_MEDIA_SEARCH`, off by default) indexes and makes
+searchable everything under `MEDIA_LIBRARY_PATH` — including OCR'd
+on-screen text, ASR transcripts, and generated captions — with **no
+per-item sensitivity-tagging mechanism at all**, unlike policy RAG's
+`SensitivityCategory` gate (`docs/GOVERNANCE.md`'s "Data classification
+policy," extended to policy documents 2026-09-10). A photo or recording
+containing something restricted (a face, a license plate, spoken PII, a
+sensitive document photographed on-screen) is exactly as retrievable as
+any other indexed item — there is no equivalent of the policy-RAG
+"never summarized into an answer" fail-closed gate for this data shape.
+
+**Mitigation today:** none beyond the operator's own judgment about what
+goes in the configured library folder — this is the same "add the
+classification/authorization layer yourself before connecting anything
+sensitive" posture R-002 already states for database columns, applied to
+a new data shape this project added after R-002 was written.
+
+**Review date:** before pointing `MEDIA_LIBRARY_PATH` at any folder that
+could contain sensitive imagery, recordings, or on-screen text — see
+`docs/PRODUCTION_CHECKLIST.md`.
+
+### R-013 — Content ingestion now depends on a required third-party cloud API (Azure Content Safety)
+
+**Severity:** Medium · **Status:** Accepted (a deliberate design tradeoff, not an oversight)
+
+The pre-ingestion moderation gate (`moderation/`, mandatory whenever
+`ENABLE_MEDIA_SEARCH` or `ENABLE_DOCUMENT_RAG`/`ENABLE_POLICY_RAG` is on)
+calls Azure AI Content Safety's REST API for every chunk of every file
+before it can be embedded/stored. This is a real, disclosed departure from
+this project's otherwise "fully local, Ollama not a hosted API" posture
+(`README.md`'s "Why this project") -- unlike voice mode/media search's own
+embedding path, no mainstream moderation classifier with comparable
+accuracy runs fully on-device today, and this project's own design note
+for the feature states that tradeoff explicitly rather than silently
+picking a path. A practical consequence: ingestion for either pipeline now
+requires outbound HTTPS reachability to Azure and a paid Content Safety
+resource -- an Azure outage or misconfiguration blocks all new
+image/video/PDF ingestion (existing, already-embedded content is
+unaffected; only new ingestion is gated).
+
+**Mitigation today:** the provider is pluggable
+(`moderation.provider.SUPPORTED_MODERATION_PROVIDERS`, shaped like
+`search/web_search.py`'s own provider map) -- swapping to a different
+provider, or in principle a self-hosted one, is a config/code addition,
+not a redesign.
+
+**Review date:** if a locally-run moderation classifier with acceptable
+accuracy becomes practical, revisit whether Azure should remain the only
+implemented provider.
+
+### R-014 — Synthetic/manipulated-media ("deepfake") detection is a disclosed placeholder, not a real control
+
+**Severity:** Low (a soft-flag category, never a hard-reject -- see below) · **Status:** Open
+
+`moderation/taxonomy.py`'s `synthetic_media` category exists in the
+taxonomy but has **no detector wired in** -- every image/video chunk is
+recorded as `"not_checked"` for this category, honestly, rather than
+silently omitted or falsely presented as covered. No mainstream cloud
+moderation API (including Azure Content Safety, the one provider
+implemented) reliably classifies AI-generated/manipulated media as of this
+writing. This category is deliberately a soft-flag, never a hard-reject,
+even once a real detector is eventually plugged in -- deepfake/synthetic-
+media classifiers have well-documented accuracy limits, and auto-rejecting
+real user content on a false positive was judged a worse failure mode than
+under-flagging.
+
+**Mitigation today:** none -- disclosed as a known gap rather than
+implemented as a weak/misleading control. `docs/RESPONSIBLE_AI.md` states
+this alongside media generation's own similarly-honest content-policy
+disclosure.
+
+**Review date:** if a specific, evaluated synthetic-media detector
+(cloud or local) becomes available with a stated accuracy profile worth
+building a real (still soft-flag) check around.
+
 ## Accepted exceptions
 
 *(None currently accepted — this section exists for `GOVERNANCE.md`'s

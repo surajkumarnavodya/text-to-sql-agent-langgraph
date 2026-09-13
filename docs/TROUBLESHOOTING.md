@@ -167,7 +167,7 @@ on SQL Server) rather than assuming the connection's default.
 
 ## Multi-source router picked the wrong source, or a source you configured isn't offered
 
-See [`docs/MULTI_SOURCE_GUIDE.md`](MULTI_SOURCE_GUIDE.md#7-troubleshooting)
+See [`docs/MULTI_SOURCE_GUIDE.md`](MULTI_SOURCE_GUIDE.md#9-troubleshooting)
 — almost always either a missed app restart after a `.env` change
 (`Settings` is a cached singleton, same as every other setting — see
 above), or a genuinely ambiguous/compound question. Check the
@@ -206,6 +206,91 @@ For any other repeated failure shape, a larger or SQL-specialized model
 (`sqlcoder`, `duckdb-nsql` via `OLLAMA_MODEL`) remains the most direct
 lever — see `docs/EVALUATION.md`'s measured accuracy numbers and known
 limitations before assuming the app itself is broken.
+
+## Voice mode
+
+- **`POST /voice/synthesize` returns 503, or the dashboard shows a voice
+  error when it tries to speak an answer.** The Piper voice model hasn't
+  been downloaded yet — run `python scripts/download_voice_model.py` once
+  (see `CLAUDE.md`'s "Voice mode" section). This is a one-time setup step,
+  separate from `pip install`.
+- **No microphone button, or `GET /health`'s `voice_enabled` is `false`.**
+  `ENABLE_VOICE_MODE` is off (it defaults to `true`, so this usually means
+  someone explicitly disabled it) — restart the app after changing it,
+  same `Settings`-is-a-cached-singleton caveat as everywhere else.
+- **No live word-by-word captions while speaking.** Live captions use the
+  browser's own `SpeechRecognition` Web Speech API, only available in
+  Chromium-based browsers — Firefox/Safari fall back to a manual "Done
+  speaking" button instead. This doesn't affect transcription accuracy;
+  the actual submitted text always comes from local `faster-whisper`, not
+  the browser's caption.
+- **`413`/a "recording exceeds limit" error.** `Settings.voice_max_upload_mb`
+  (default 10MB) or `Settings.voice_max_duration_seconds` (default 30s)
+  was exceeded — ask a shorter question, or have your administrator raise
+  either limit in `.env`.
+- **Transcription of schema-specific terms (table/column names) is
+  inaccurate.** `voice/stt.py` biases Whisper toward your actual schema's
+  vocabulary automatically (`_build_vocabulary_hint`) — this fails open
+  (silently does nothing) if schema introspection itself errors, so a
+  persistent mismatch is more likely a genuinely unusual/ambiguous term
+  than a broken feature.
+
+## Media generation
+
+- **A generation request never seems to fire, or IMA API errors surface
+  as a failed generation.** Confirm both `ENABLE_MEDIA_GENERATION=true`
+  and a real `IMA_API_KEY` are set — an enabled flag with no key is not
+  "available" to the router (same pattern as every other source; see
+  `docs/MULTI_SOURCE_GUIDE.md`). Video generation shares its code path
+  with image generation but hasn't been separately confirmed against a
+  live IMA account — if only video fails, that's the most likely reason.
+- **Nothing happens after asking to generate something.** By design
+  (`Settings.require_generation_approval`, default `true`) — the router
+  only proposes what would be generated; you must click **"▶ Generate
+  image"/"▶ Generate video"** (or call `POST /generate/confirm`) before
+  anything is actually created or charged. Check for that button/proposal
+  in the response before assuming the request failed.
+- **A generation request is answered as an ordinary data/chart question
+  instead.** The router distinguishes "create new media" from "show me
+  the data" fairly conservatively — try an explicit "generate an image
+  of..."/"create a video of..." phrasing.
+- **`MEDIA_GEN_VIDEO_DURATION_SECONDS` seems to have no effect, or the
+  provider rejects the value.** The underlying video model has its own
+  hard duration ceiling (commonly 4–15 seconds) — this setting can request
+  a shorter clip within that range, but can't exceed what the model
+  itself supports; an out-of-range value is rejected by the provider, not
+  pre-validated here.
+
+## Media search
+
+- **The "🖼️ Media Search" page (or a chat question) says the feature is
+  disabled.** Both `ENABLE_MEDIA_SEARCH=true` and a real, existing
+  `MEDIA_LIBRARY_PATH` are required — same "flag alone isn't enough"
+  pattern as every other source.
+- **A file you know is in the library never turns up in search results.**
+  Nothing is searchable until it's been indexed — run
+  `python scripts/build_media_index.py` after adding files (`--force` to
+  re-index files that already have an unchanged content hash on record).
+- **`pip install`/first run fails or is unexpectedly slow when media
+  search is enabled.** `sentence-transformers`/`torch` and
+  `scenedetect`/`opencv-python` are real, meaningfully larger dependencies
+  pulled in only by this feature (see `requirements.txt`'s own comments) —
+  expect a bigger install and a first-run model download (the CLIP
+  checkpoint, cached afterward) compared to the rest of this app.
+- **On-screen text in a video frame is never matched by search.** OCR
+  needs the system Tesseract binary installed separately (not
+  pip-installable — see `CLAUDE.md`'s Windows-specific notes); a missing
+  binary fails open (the segment is still indexed via transcript/caption
+  text alone), so this looks like reduced recall, not an error.
+- **Video segments have no generated caption, or captioning is skipped
+  entirely.** `MEDIA_VISION_MODEL` is blank by default — set it to a
+  pulled Ollama vision model (e.g. `llava`, via `ollama pull llava`) to
+  enable captioning; a blank setting or any captioning-call failure fails
+  open (indexed via transcript/OCR text only), never blocks indexing.
+- **A search for something you're confident is in the library returns
+  nothing, or an unrelated hit.** Search is embedding-based, not keyword
+  matching — try describing the visual/audio content more directly
+  ("crane lifting a beam" rather than a file name or an abstract label).
 
 ## "It rejected my question and I don't know why"
 

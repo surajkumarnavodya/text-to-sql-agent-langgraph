@@ -89,6 +89,17 @@ have shipped silently without this entry. For a follow-up (multi-turn)
 case, use `followup_cases`/`turns` instead — see `follow_up.yaml` for the
 shape.
 
+## Adding a media search test or eval case
+
+Media search (`media/`, `ENABLE_MEDIA_SEARCH`) has a fully mocked
+`pytest` suite (`tests/test_media_*.py`, `tests/test_api_media_*.py`) —
+no real library, Ollama, or Tesseract install needed to add or run one.
+`eval/media_benchmark/` is the separate, real-library-required equivalent
+of `eval/benchmark/*.yaml` above (`python scripts/run_media_eval.py`) —
+it ships as an empty template since this repo has no checked-in media
+library to grade against; see `eval/media_benchmark/dataset.yaml`'s own
+comments for the format if you want to populate it against your own.
+
 ## Reporting issues
 
 Open a GitHub issue using the provided template. For anything that looks

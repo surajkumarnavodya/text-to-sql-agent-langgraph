@@ -122,6 +122,16 @@ and `CLAUDE.md`'s "Document/policy agentic RAG" for the mechanism. Same
 caveat as the column-level "Restricted" tier: this blocks everyone
 equally, it is not per-user access control.
 
+**Not yet extended to the media search library (2026-09-13, optional
+feature, off by default):** unlike policy documents above, media search
+(`media/`, `ENABLE_MEDIA_SEARCH`) has **no equivalent classification
+mechanism at all** for what it indexes (OCR text, ASR transcripts,
+generated captions, the images/keyframes themselves) — this is a real,
+disclosed gap, not an oversight left undocumented, tracked as
+`docs/RISK_REGISTER.md`'s R-012. Treat anything placed in the configured
+`MEDIA_LIBRARY_PATH` as visible to anyone who can use this app until a
+tagging/gating mechanism for this data shape is built.
+
 ### The policy tiers, as enforced
 
 - Every table/column's classification is recorded in that file, not in

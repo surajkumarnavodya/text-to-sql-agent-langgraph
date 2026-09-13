@@ -81,6 +81,14 @@ users each re-open several of these items.
 - [ ] Review `docs/COMPLIANCE.md` and `docs/RESPONSIBLE_AI.md` against
       your organization's own requirements, if you have any beyond what
       this project self-assesses.
+- [ ] **If `ENABLE_MEDIA_SEARCH` is on:** confirm the system Tesseract
+      binary is installed (not pip-installable, and not in the base Docker
+      image by default — see `docs/DEPLOYMENT.md`'s "Media search"
+      section) if on-screen-text search matters to you, and decide
+      whether the configured `MEDIA_LIBRARY_PATH` could contain anything
+      sensitive — there is no per-item classification for media content
+      the way there is for policy documents (`docs/RISK_REGISTER.md`'s
+      R-012).
 
 ## Explicitly out of scope for "production-ready" as shipped
 

@@ -851,6 +851,145 @@ nav entry, for direct use outside chat.
   timestamp range. Real HTTP range-request video streaming is a
   deliberately out-of-scope follow-up.
 
+### Content moderation gate (mandatory, not a feature flag) (`moderation/`)
+
+Both content-ingestion pipelines — media search's images/video
+(`media/ingest.py`) and document/policy RAG's PDFs (`rag/ingestion.py`) —
+run every chunk of every file through `moderation/gate.py::moderate_chunks`
+before either one ever calls its own store's upsert/insert functions.
+**Mandatory whenever `ENABLE_MEDIA_SEARCH` or `ENABLE_DOCUMENT_RAG`/
+`ENABLE_POLICY_RAG` is on** — deliberately no `ENABLE_CONTENT_MODERATION`
+toggle exists that could silently disable it while leaving either pipeline
+on; missing provider/store config fails ingestion closed
+(`moderation.exceptions.ModerationNotConfiguredError`), mirroring
+`rag.store.RagStoreNotConfiguredError`'s existing pattern.
+
+**Chunking, per type, before moderation ever runs** (a classifier has
+input limits, and checking only a whole asset can miss a problem buried in
+one part of it):
+- **Image**: one chunk, unless it exceeds `MEDIA_IMAGE_TILE_THRESHOLD_PX`
+  in either dimension (default 2048px), in which case it's split into an
+  NxN grid of temp-file tiles first (`media/ingest.py::_tile_image_for_moderation`)
+  — a classifier's own internal downsampling could otherwise shrink away a
+  small region of concern in a very large image.
+- **Video**: one chunk per already-detected scene segment (reusing
+  `media/keyframes.py`'s existing segmentation, no second pass) — both the
+  keyframe image and its combined caption/transcript/OCR text are checked.
+  `media/ingest.py::_ingest_video` was restructured into two phases for
+  this: extract-and-moderate-every-segment-first, then only if *all* of
+  them pass does the existing embed+store loop run (reusing phase 1's
+  already-computed transcript/OCR/caption text, not redoing that work) —
+  per the decision rule below, one rejected segment blocks the whole video,
+  so nothing may be stored until every segment has been checked.
+- **PDF**: one chunk per page's text, plus one per embedded image
+  (`pypdf`'s `page.images`). A page flagged likely-scanned (the existing
+  `_OCR_SUSPECT_CHAR_THRESHOLD` heuristic, previously just a warning shown
+  to the uploader) is now actually rasterized (`pymupdf`, a new dependency
+  chosen over `pdf2image` specifically because it needs no system Poppler
+  binary) and OCR'd via the **existing** `media.ocr.extract_text`, reused
+  as-is rather than duplicated — the OCR'd text is used both for
+  moderation and for the real retrieval chunk that page contributes, so a
+  scanned page that passes moderation is also now actually searchable
+  (previously it indexed as an empty, unsearchable chunk).
+
+**Decision rule: a hard-reject on any chunk rejects the entire asset —
+never a partial ingestion.** Every chunk is still checked (not
+short-circuited on the first hit, so the audit trail is complete via
+`security.audit_log.log_security_event`), but nothing from a rejected file
+is ever embedded or stored anywhere. This required reordering
+`rag/ingestion.py::ingest_pdf` specifically: the pre-moderation flow called
+`rag/store.py::insert_document` (which can itself persist the file's raw
+bytes, if `ENABLE_PDF_DOWNLOAD` is on) *before* any content check ran — a
+real gap where a rejected file's bytes could already be sitting in the
+store ahead of the rejection being known. Now nothing touches
+`rag/store.py` until moderation has passed; a rejected PDF never gets a
+`rag.documents` row at all.
+
+**Taxonomy and its honest limits** (`moderation/taxonomy.py`). Azure AI
+Content Safety (the only provider implemented, `moderation/provider.py`,
+called via its REST API with `httpx` — no vendor SDK, matching
+`search/web_search.py`/`media_gen/client.py`'s existing pattern of calling
+a provider's REST endpoint directly) checks four real harm categories:
+Hate, SelfHarm, Sexual, Violence, each scored 0/2/4/6, hard-rejecting at or
+above `MODERATION_SEVERITY_THRESHOLD` (default 4). Azure has **no
+dedicated "weapons," "drugs," or "synthetic/AI-generated media" category**
+— stated honestly rather than glossed over:
+- **Weapons**: a coarse Violence-category proxy for imagery (Azure can't
+  distinguish "weapon" from "violence" generally) plus a custom text
+  blocklist (`config/moderation_blocklist.yaml`, loaded by
+  `config/moderation_blocklist.py`, mirroring `config/sensitive_columns.py`'s
+  exact hand-authored/read-fresh loader pattern) against OCR/caption/
+  transcript/extracted text.
+- **Drugs**: the same text blocklist only — no visual signal at all in
+  this implementation.
+- **Synthetic/manipulated ("hallucinated"/deepfake) media**: a
+  **disclosed placeholder**, not a real detector. Every image/video chunk
+  is recorded as `"not_checked"` for this category rather than silently
+  omitted or falsely presented as covered — no mainstream moderation API
+  reliably classifies this today. Deliberately a soft-flag, never a
+  hard-reject, even once a real detector is eventually plugged in
+  (deepfake classifiers have real, well-documented accuracy limits; an
+  auto-rejected false positive on real user content was judged worse than
+  under-flagging). See `docs/RISK_REGISTER.md`'s R-014.
+
+**A new, disclosed exception to "fully local."** Unlike every other model
+in this stack (Ollama, local CLIP, `faster-whisper`/Piper), accurate
+content moderation has no comparable on-device option today — this gate
+calls a third-party cloud API for every chunk of every ingested file. The
+provider is pluggable (`moderation.provider.SUPPORTED_MODERATION_PROVIDERS`,
+shaped exactly like `search/web_search.py::SUPPORTED_SEARCH_PROVIDERS`),
+so this is a deliberate, named tradeoff (see `docs/RISK_REGISTER.md`'s
+R-013), not an unexamined one — the design note for this feature stated
+the tension with this project's local-first posture explicitly before any
+code was written, rather than silently picking a path.
+
+**Metadata store (`moderation/store.py`), dedupe, and pooling.** A
+dedicated SQL Server connection (`MODERATION_STORE_CONNECTION_STRING`) —
+deliberately separate from both `DB_CONNECTIONS` and
+`RAG_STORE_CONNECTION_STRING` even though this table covers PDF assets
+too, since media search is independently toggleable from document/policy
+RAG and naming the shared setting after RAG specifically would be
+confusing when media-only search needs it — mirrors `rag/store.py`'s exact
+shape (a `@cache`-decorated `create_engine` call, idempotent
+`ensure_schema`, raw `text()` SQL, functions taking `engine: Engine`
+explicitly). One table, `moderation.media_assets`, keyed by content hash
+(`file_hash`, a unique index) — the dedupe lookup every ingestion call
+starts with: a previously-seen hash (whether it passed or was rejected)
+short-circuits before any extraction/moderation/embedding work, the
+feature's main performance win. `record_asset` is delete-then-insert
+(upsert-by-hash), not a bare `INSERT`, so a `force=True` re-run (bypassing
+the dedupe check on purpose) replaces the same content's old record rather
+than failing on the unique-index collision. Unlike `db/connection.py`/
+`rag/store.py` (both left on SQLAlchemy's `QueuePool` defaults of 5/10),
+this engine sets `pool_size`/`max_overflow` explicitly
+(`MODERATION_STORE_POOL_SIZE`/`_MAX_OVERFLOW`, default 10/20) since
+ingestion can run many concurrent DB writes.
+
+**Concurrency: this project's first bounded thread pool.** Before this,
+`scripts/build_media_index.py` was a plain sequential `for` loop; there
+was no background-job/task-queue/worker-pool infrastructure anywhere in
+this codebase (only a one-shot `threading.Thread` + `join(timeout)` idiom
+in `db/execution.py`/`db/query_cost.py`, used purely for hard query
+timeouts). Building a real async job queue (Celery/RQ) was judged heavier
+infrastructure than this project's stated scale justifies, so
+`scripts/build_media_index.py` instead gained a bounded
+`concurrent.futures.ThreadPoolExecutor` (`MEDIA_INGEST_WORKERS`, default
+4) — I/O-bound work (the moderation API call, DB writes) benefits from
+threads despite the GIL. The PDF upload path (`api/documents.py`) needed
+no equivalent change: FastAPI already dispatches each sync request handler
+to its own worker thread, so concurrent uploads already ran in parallel;
+only the connection pool sizing above matters there.
+
+**Known, narrow limitation, named rather than silently left:** the PDF
+dedupe short-circuit is keyed purely on content hash, not `(hash,
+collection, sensitivity_category)`. Re-uploading byte-identical PDF
+content to a *different* collection or with a different sensitivity tag
+than its first upload reuses the first upload's existing `rag.documents`
+row (collection/tag included) rather than creating a second one for the
+new intent — a deliberately accepted tradeoff for the common case (skip
+redundant moderation/embedding entirely for a true duplicate), not
+silently mishandled.
+
 ### Voice mode (speech input/output) (`voice/`)
 Optional, **on by default** (`ENABLE_VOICE_MODE=true`) — unlike media
 generation, this feature spends no money and makes no external network
