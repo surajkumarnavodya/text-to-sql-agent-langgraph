@@ -29,6 +29,20 @@ chromadb==1.5.9
 # pure-Python, no system dependency (unlike e.g. poppler-based extractors).
 pypdf==6.18.0
 
+# --- Content moderation gate (mandatory whenever ENABLE_MEDIA_SEARCH or
+# ENABLE_DOCUMENT_RAG/ENABLE_POLICY_RAG is on -- see moderation/, .env.example's
+# moderation section) ---
+# Rasterizes a PDF page to an image so a likely-scanned page can be OCR'd
+# (reusing media/ocr.py's existing Tesseract call) and moderated as an
+# image chunk (rag/ingestion.py::_ocr_suspect_pages) -- a genuinely new
+# capability, not previously built (the pre-moderation pipeline only
+# *warned* about scanned pages, never actually OCR'd them). Chosen over
+# `pdf2image` specifically because it's a pure pip wheel with no system
+# Poppler binary to install -- was already present transitively (via
+# chromadb's own PDF-handling extras) but pinned explicitly now that
+# rag/ingestion.py imports it directly.
+pymupdf==1.28.2
+
 # Result formatting/charting (agent/result_charting.py, db/column_formatting.py) --
 # consumed by the /execute API endpoint, whose chart JSON the React
 # dashboard renders via chart.js (frontend/src/lib/chartAdapter.ts).
