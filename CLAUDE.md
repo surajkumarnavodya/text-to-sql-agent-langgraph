@@ -698,17 +698,158 @@ opting in. Two design points worth knowing if you touch this:
   that constant for the exact phrasing this was tuned against.
 
 **Known gaps, named rather than silently left:**
-- **No "search existing media" capability exists.** A question that really
-  means "find the existing photo/recording of X" has no dedicated tool to
-  route to — it simply falls through to the ordinary data sources like any
-  other question, same as before this feature existed. Building a real
-  media-search tool (an index, a store) is a separate, larger feature, not
-  attempted here.
 - **Multi-source synthesis doesn't embed generated media inline.**
   `synthesis_node` only ever concatenates text; a generation result folded
   into a multi-source answer shows only its (link-free) confirmation text,
   not the image/video itself. Single-source generation (the realistic
   case) is unaffected.
+
+Update (this feature's original "Known gaps" note above used to read: *"No
+'search existing media' capability exists... Building a real media-search
+tool (an index, a store) is a separate, larger feature, not attempted
+here."* That gap is now closed — see "Media search" below.
+
+### Media search (image/video, optional, off by default) (`media/`)
+Content-based search over an **untagged** local image/video library — no
+filenames, no manual tags. Routed as the "media_search" orchestrator
+source (`agent.orchestrator.nodes.media_search_node`), gated by
+`ENABLE_MEDIA_SEARCH` + a real `MEDIA_LIBRARY_PATH` (both required —
+same flag-plus-config pattern as media generation's own
+`enable_media_generation`/`ima_api_key`). Off by default, unlike voice
+mode: it needs a configured library path and pulls in a real, meaningfully
+larger dependency footprint (`torch`, `opencv-python`) that shouldn't land
+on every fresh clone uninvited.
+
+**Local CLIP embeddings by default, not a hosted API.** This is a
+deliberate deviation from a common assumption for this kind of feature
+(the original implementation prompt for this asked for "a hosted
+multimodal embedding API," listing Voyage/Vertex/OpenAI as candidates).
+Given this project's consistent "local-first, cloud only as a disclosed
+opt-in exception" identity (Ollama for the LLM, faster-whisper+Piper for
+voice mode both chosen explicitly over cloud alternatives), the default
+path instead uses `sentence-transformers`' `clip-ViT-B-32` running fully
+on-device (`media/embedding.py`) — no API key, no per-image cost, no
+media content ever leaving the machine. The **same** model embeds both
+images and query text, which is what guarantees they land in one
+comparable vector space; this is why `media/embedding.py` computes
+embeddings directly rather than through Chroma's own text-only
+`EmbeddingFunction` callback interface the way `embeddings/schema_indexer
+.py`/`rag/embedding.py` do. Built behind a small provider map
+(`Settings.media_embedding_provider`, shaped like `search/web_search.py`'s
+`SUPPORTED_SEARCH_PROVIDERS`) so a hosted provider could be added later as
+a second dict entry, without touching any call site — nothing exercises
+that path today. This is the one real exception to this project's
+otherwise-consistent "no torch" dependency posture (`faster-whisper`/
+`piper-tts`'s own requirements.txt comments both explicitly celebrate
+avoiding it) — a real, consequential tradeoff, not an oversight.
+
+**Vector store: the same ChromaDB this project already depends on**, not
+a new vendor (Pinecone/Qdrant/pgvector) — this app is explicitly
+"single-user, local-dev oriented" per `README.md`'s own Limitations
+section, so new vector-DB infrastructure would add real operational
+weight for no benefit at this scale. Two collections
+(`media/store.py`'s `media_images`/`media_video_segments`), mirroring
+`embeddings/golden_examples.py`'s "one collection per distinct purpose"
+convention — reusing the same process-lifetime-cached `PersistentClient`
+(`embeddings.schema_indexer.get_chroma_client`) every other Chroma-backed
+module here already shares, for the same "only one `PersistentClient` per
+on-disk directory per process" reason that caching exists.
+
+**Video pipeline**, per file ingested by `scripts/build_media_index.py`:
+1. **Scene-change keyframing** (`media/keyframes.py`, via `PySceneDetect`)
+   — segments a video at real scene boundaries, not fixed intervals, so a
+   long continuous shot isn't indexed as many near-identical frames.
+   `PySceneDetect` requires `opencv-python` unconditionally at its current
+   pinned version (confirmed against its own PyPI `requires_dist`
+   metadata before pinning — `av`/PyAV is only an optional extra for its
+   separate clip-export feature, not a way to avoid OpenCV here).
+2. **ASR** (`media/transcription.py`) — reuses `voice/stt.py`'s
+   faster-whisper model loader directly (`voice.stt.get_whisper_model`,
+   a small refactor extracted specifically for this reuse) rather than
+   loading a second Whisper model instance; per-Whisper-segment
+   timestamps are bucketed against each detected scene's own time range
+   (`transcript_for_range`), not just flattened into one string.
+3. **OCR** (`media/ocr.py`, via `pytesseract`/Tesseract) — on-screen text
+   in the representative keyframe. Needs the system Tesseract binary
+   installed separately (see "Windows-specific notes" below).
+4. **Captioning** (`media/captioning.py`) — reuses **Ollama**, this
+   project's existing local LLM runtime, with a vision-capable model
+   (`Settings.media_vision_model`, e.g. `llava`) rather than a separate
+   hosted vision-language model API. The only new setup step is `ollama
+   pull <model>`, mirroring the Piper voice-model download precedent
+   (`scripts/download_voice_model.py`) instead of introducing a new
+   provider architecture. **Fails open**: a blank `media_vision_model`
+   (the default) or any call failure returns `None`, not an error — the
+   segment is still indexed and searchable via its ASR transcript + OCR
+   text alone, same fail-open philosophy as
+   `agent.llm_client._build_golden_examples_block`.
+5. Each segment gets **up to two embeddings, sharing a `segment_id`**: one
+   from its combined caption/transcript/OCR text (via CLIP's own text
+   encoder), one from its keyframe image (via CLIP's image encoder) —
+   `media/search.py` queries both and merges/de-dupes hits that share a
+   `segment_id`, keeping the better-scoring modality.
+
+**Serving is a separate, persistent path from generated-media serving.**
+`api/media_library.py`'s `GET /media/library/{media_id}` is deliberately
+**not** built on `media_gen.cache.MediaCache` — that cache is in-memory,
+process-lifetime, and bounded to 100 entries with FIFO eviction, built for
+short-lived *generated* media, the wrong fit for a persistent library
+meant to stay searchable indefinitely. Instead it looks up `media_id`
+directly in the Chroma collections' own stored metadata to resolve either
+the original file (an image hit) or the representative keyframe thumbnail
+(a video-segment hit — a full clip is never streamed; the UI shows frame +
+timestamp instead, the lighter option this feature's own requirements
+explicitly allowed), then re-validates the resolved path is still inside
+the expected root directory before ever opening it — a local-path-
+traversal defense in the same spirit as `media_gen/download.py`'s SSRF
+hardening, applied to disk paths instead of URLs.
+
+**Untrusted content is framed as data, not sanitized/quoted.** OCR text,
+ASR transcripts, and generated captions are all attacker-influenceable
+(a sign in a photo, or spoken audio, could contain an instruction-like
+string) once they reach `media_search_node`'s answer-composition prompt.
+Rather than introducing a new sanitize/escape step, this follows the
+exact convention `rag/graph.py` and `web_search_node` already established
+for the same class of risk: the system prompt explicitly frames hit
+captions/OCR/ASR text as **untrusted data, never instructions** — see
+`SECURITY.md`'s "Media search" section.
+
+**Router disambiguation from "generation."** `media_search` and
+`generation` are the two media-adjacent sources, and the one real
+ambiguity between them ("make a picture of X" vs. "find a picture of X")
+is handled by `agent.orchestrator.nodes._MEDIA_SEARCH_VS_GENERATION
+_GUIDANCE`, appended to the classifier prompt only when *both* sources
+are available — see that constant for the exact phrasing this was tuned
+against. Unlike `generation_result`, `media_search_result` **does**
+contribute a text bullet to `synthesis_node`'s combined answer (it has a
+natural citable answer — what was found, and roughly when for a video —
+unlike a freshly-created asset); its hits still separately drive
+`MediaSearchResultCard.tsx`'s own thumbnail rendering, the same "always
+outside the synthesis-text ternary" rule `generation_result` established.
+
+**API + standalone page.** `POST /search/media` (`api/media_search.py`)
+searches directly, independent of the conversational `/ask` flow, per this
+feature's own requirement — reuses the existing shared
+`api_action_rate_limit_per_minute` (`api.rate_limit
+.enforce_api_action_rate_limit`) rather than a dedicated limiter, since a
+query is cheap and orchestrator-routed questions are already bounded by
+`/ask`'s own limiter (the same reasoning document/policy RAG have no
+dedicated limiter of their own either). `frontend/src/pages/MediaSearch.tsx`
+is a standalone page (mirrors `KnowledgeSources.tsx`'s shape) with its own
+nav entry, for direct use outside chat.
+
+**Known gaps, named rather than silently left:**
+- **No dense-video-captioning quality tuning has been done.** Whichever
+  small Ollama vision model is pulled works as-is; no evaluation of
+  caption quality across different models/prompts was performed as part
+  of building this.
+- **The eval harness extension (`eval/media_benchmark/`) ships as an
+  empty template**, not a populated dataset — this repo has no checked-in
+  media library to grade against. See that package's own `__init__.py`
+  and `dataset.yaml` for how to populate it against your own library.
+- **A full video clip is never streamed** — only a representative frame +
+  timestamp range. Real HTTP range-request video streaming is a
+  deliberately out-of-scope follow-up.
 
 ### Voice mode (speech input/output) (`voice/`)
 Optional, **on by default** (`ENABLE_VOICE_MODE=true`) — unlike media
@@ -1110,6 +1251,15 @@ manual, real-DB-required script; it is never run by `pytest` or CI.
   already running if installed via the Windows installer) before the agent or
   UI is started — `config/settings.py` reads `OLLAMA_HOST` from `.env`,
   default `http://localhost:11434`.
+- `ENABLE_MEDIA_SEARCH=true` requires the Tesseract OCR binary installed as
+  a *system* package (not pip-installable — `pytesseract` is just a thin
+  Python wrapper around it) — another extra manual install step on a
+  fresh Windows machine, same shape as `DB_TYPE=mssql`'s ODBC driver
+  requirement above. `media/ocr.py` fails open (indexes without OCR text)
+  if it's missing, so this isn't a hard blocker, just reduced search
+  accuracy for on-screen text until it's installed. Video keyframe
+  extraction/captioning also each need a one-time local model pull —
+  see `CLAUDE.md`'s "Media search" section.
 
 ## Coding standards
 

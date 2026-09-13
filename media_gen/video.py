@@ -52,7 +52,7 @@ def generate_video(
             form_overrides={"duration": duration_seconds} if duration_seconds is not None else None,
         )
     except MediaGenerationError as exc:
-        return MediaResult(status="failed", error=str(exc))
+        return MediaResult(status="failed", error=exc.safe_message, detail=str(exc))
 
     url = media.get("url") or media.get("watermark_url") or media.get("preview_url")
     return MediaResult(status="completed", url=url, model=model_name)

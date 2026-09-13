@@ -25,7 +25,9 @@ export function RetryTimeline({ attempts }: { attempts: AttemptRecord[] }) {
               {attempt.will_retry && ' (will retry)'}
             </p>
             {attempt.sql && (
-              <pre className="mt-1 overflow-x-auto rounded bg-[var(--muted)] p-2 font-mono">{attempt.sql}</pre>
+              <pre className="mt-1 whitespace-pre-wrap break-words rounded bg-[var(--muted)] p-2 font-mono">
+                {attempt.sql}
+              </pre>
             )}
             {attempt.error && <p className="mt-1 text-[var(--danger)]">{attempt.error}</p>}
           </div>

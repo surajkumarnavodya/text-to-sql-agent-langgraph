@@ -1,0 +1,33 @@
+# Media-search benchmark dataset -- TEMPLATE, empty by default.
+#
+# This repo has no checked-in media library to grade against (media
+# content isn't the kind of thing that belongs in git the way sample SQL
+# data conceptually could be). To use this benchmark:
+#   1. Point MEDIA_LIBRARY_PATH at a small folder of your own images/videos.
+#   2. Run: python scripts\build_media_index.py
+#   3. List known (query -> expected file) pairs below.
+#   4. Run: python scripts\run_media_eval.py
+#
+# Fields:
+#   id                  - unique case id
+#   query                - the natural-language query to search with
+#   expected_filename    - the basename of the file that SHOULD be the top hit
+#   media_type            - "image" | "video" | "any" (default "any")
+#   expected_timestamp    - (video only, optional) a second into the source
+#                           video the correct segment should cover
+#   notes                 - free text, not used by the runner
+#
+# Example (uncomment and adapt once you have a real library indexed):
+#
+# cases:
+#   - id: site_inspection_photo
+#     query: "the photo of the site inspection"
+#     expected_filename: "site_inspection_2025-03.jpg"
+#     media_type: image
+#   - id: crane_lifting_beam
+#     query: "the clip where the crane lifts the beam"
+#     expected_filename: "construction_day3.mp4"
+#     media_type: video
+#     expected_timestamp: 42.0
+
+cases: []

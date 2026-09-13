@@ -46,6 +46,16 @@ def _get_whisper_model(model_size: str, device: str) -> WhisperModel:
     return WhisperModel(model_size, device=device)
 
 
+def get_whisper_model(settings: Settings) -> WhisperModel:
+    """Public wrapper around `_get_whisper_model` for callers outside this
+    module that only have a `Settings` object -- `media/transcription.py`
+    reuses this rather than loading (and caching) a second Whisper model
+    instance for video-audio transcription, same "private cached loader +
+    public wrapper" shape as `agent.llm_client._get_ollama_client`/
+    `get_ollama_client`."""
+    return _get_whisper_model(settings.stt_model_size, settings.stt_device)
+
+
 def _probe_duration_seconds(audio_bytes: bytes) -> float:
     """Cheaply reads the decoded audio's duration without running Whisper.
 

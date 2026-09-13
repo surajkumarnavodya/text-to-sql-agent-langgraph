@@ -3,6 +3,7 @@ import { Badge } from '@/components/ui/badge'
 import { Markdown } from '@/components/ui/markdown'
 import type { AskResponse } from '@/lib/types'
 import { MediaResultCard } from './MediaResultCard'
+import { MediaSearchResultCard } from './MediaSearchResultCard'
 import { SourceAnswerCard } from './SourceAnswerCard'
 
 const SOURCE_CHIP_LABELS: Record<string, string> = {
@@ -11,6 +12,7 @@ const SOURCE_CHIP_LABELS: Record<string, string> = {
   policy: 'Policy',
   web: 'Web',
   generation: 'Generated Media',
+  media_search: 'Media Library',
 }
 
 /** Shows which source(s) contributed, and either the synthesized combined
@@ -19,15 +21,16 @@ const SOURCE_CHIP_LABELS: Record<string, string> = {
  * aside once another source already answered (see agent/orchestrator/
  * nodes.py::synthesis_node, which already filters that out server-side).
  *
- * `generation_result` is the one exception to "never both": the actual
- * generated image/video always renders as its own component *in addition
- * to* the synthesized text, regardless of whether the router also picked
- * another source alongside "generation" (it does, often enough that this
- * must be handled, not just the common single-source case -- see
- * synthesis_node's docstring). Rendering it inside the ternary would mean
- * a real user-reported bug: ask to "generate an image of X", the router
- * also picks "web", and the image silently never appears because only
- * the combined text branch rendered. */
+ * `generation_result`/`media_search_result` are the exceptions to "never
+ * both": the generated image/video, and any retrieved media-library
+ * hits, always render as their own component *in addition to* the
+ * synthesized text, regardless of whether the router also picked another
+ * source alongside "generation"/"media_search" (it does, often enough
+ * that this must be handled, not just the common single-source case --
+ * see synthesis_node's docstring). Rendering them inside the ternary
+ * would mean a real user-reported bug: ask to "generate an image of X",
+ * the router also picks "web", and the image silently never appears
+ * because only the combined text branch rendered. */
 export function SourcesUsedPanel({ state, entryId }: { state: AskResponse; entryId: string }) {
   const { t } = useTranslation()
   if (state.sources_used.length === 0) return null
@@ -52,6 +55,7 @@ export function SourcesUsedPanel({ state, entryId }: { state: AskResponse; entry
         </>
       )}
       {state.generation_result && <MediaResultCard result={state.generation_result} entryId={entryId} />}
+      {state.media_search_result && <MediaSearchResultCard result={state.media_search_result} />}
     </div>
   )
 }

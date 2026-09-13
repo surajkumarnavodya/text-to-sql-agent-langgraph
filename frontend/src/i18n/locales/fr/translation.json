@@ -5,7 +5,8 @@
   },
   "nav": {
     "chat": "Chat",
-    "knowledgeSources": "Sources de connaissances"
+    "knowledgeSources": "Sources de connaissances",
+    "mediaSearch": "Recherche de médias"
   },
   "header": {
     "openHistory": "Ouvrir l'historique du chat",

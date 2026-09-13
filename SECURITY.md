@@ -366,6 +366,62 @@ others don't need.
   boundary — see `docs/RISK_REGISTER.md`'s R-011 for the honest limit of
   what it actually guarantees.
 
+## Media search (image/video, optional, off by default)
+
+Same `ENABLE_MULTI_SOURCE_ROUTER=true` gate as above, plus its own
+`ENABLE_MEDIA_SEARCH`/`MEDIA_LIBRARY_PATH`. Unlike media generation, no
+per-call third-party cost — the controls here are about untrusted content
+and file-system safety instead.
+
+- **OCR text, ASR transcripts, and generated captions are a real
+  prompt-injection surface, and are treated as such.** A sign in a
+  photographed scene, or spoken audio in a video, is attacker-influenceable
+  content that ends up inside `media_search_node`'s answer-composition
+  prompt once a video is indexed. This is handled the same way this app
+  already handles the identical class of risk for RAG chunks
+  (`rag/graph.py`'s generate-node system prompt) and live web results
+  (`web_search_node`): explicit framing as **untrusted data, never
+  instructions**, in the system prompt — not a sanitize/escape
+  transformation of the text itself, since escaping doesn't stop a model
+  from *reading* an embedded instruction, only prompt framing does. This
+  is a mitigation, not a guarantee — a sufficiently crafted embedded
+  instruction could still influence the model's phrasing, same honest
+  limitation this app's other untrusted-content sources already carry.
+- **Ingested files are validated by actual content, never by extension or
+  filename.** `media/ingest.py::_sniff_media_type` checks a file's real
+  magic bytes before any processing; an unrecognized signature is rejected
+  (`UnsupportedMediaTypeError`) rather than assumed safe because it has a
+  `.jpg`/`.mp4` extension. Size is capped (`MEDIA_MAX_FILE_MB`) via a cheap
+  `stat()` check before any decoding, the same read-and-reject-if-over
+  posture `MAX_DOCUMENT_UPLOAD_MB`/`VOICE_MAX_UPLOAD_MB` already use for
+  their own uploads. Ingestion only ever decodes bytes via well-scoped
+  library calls (`PyAV`/`cv2`/`Pillow`/`pytesseract`) — it never opens a
+  file via a shell command or the OS's default file-type handler.
+- **Library serving re-validates every resolved path, not just the
+  lookup.** `GET /media/library/{media_id}` (`api/media_library.py`)
+  never accepts a client-supplied file path — it looks up `media_id` in
+  Chroma's own stored metadata, then re-checks the resolved path is still
+  inside the expected root directory (the configured `MEDIA_LIBRARY_PATH`
+  for an image, or the internal thumbnail cache directory for a video
+  segment) before ever opening it. This is a local-path-traversal defense
+  in the same spirit as `media_gen/download.py`'s SSRF hardening for a
+  provider-returned URL, applied here to a locally-stored path in case a
+  Chroma record were ever stale, corrupted, or manipulated.
+- **A full video clip is never streamed** — only a representative
+  keyframe + timestamp range. This is a scope choice (real HTTP
+  range-request video streaming is a larger feature, deliberately not
+  attempted here), not a security control, but it does mean this route's
+  attack surface is "serve one small image file," never "stream an
+  arbitrary video file," which is a meaningfully smaller thing to get
+  wrong.
+- **Search itself is rate-limited generically, not specially.**
+  `POST /search/media` reuses the existing shared
+  `API_ACTION_RATE_LIMIT_PER_MINUTE` (`api/rate_limit.py`), the same
+  per-client-IP guard `POST /generate/confirm`/`POST /execute` already
+  use — a query is cheap (embeds text, searches a local Chroma
+  collection), so this is a generous DoS/abuse guard, not a cost-control
+  gate like media generation's dedicated limiter.
+
 ## Resource exhaustion / abuse protections
 
 Two independent, deliberately simple protections guard against both

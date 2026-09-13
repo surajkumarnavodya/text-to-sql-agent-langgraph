@@ -601,6 +601,76 @@ class Settings(BaseSettings):
             `.onnx`/`.onnx.json` pair lives, if not the default
             `voice/models/<tts_voice>.onnx`. `None` (the default) uses
             that default location.
+        enable_media_search: Whether the "media_search" orchestrator
+            source (`media/`, searching an untagged local image/video
+            library by content -- see `agent.orchestrator.nodes
+            .media_search_node`) is offered at all. False by default, and
+            independent of `media_library_path` being set -- both must be
+            true/present for `get_available_sources` to include it,
+            mirroring `enable_web_search`/`web_search_api_key`'s pair.
+            Unlike every other optional source, this needs no API key for
+            its default embedding provider (`local_clip`, fully on-device)
+            -- but does pull in `torch` (via `sentence-transformers`) and
+            `opencv-python` (via `scenedetect`), a real, meaningfully
+            larger dependency footprint than this project's other optional
+            features, which is why it stays off by default rather than
+            joining voice mode as an on-by-default feature.
+        media_library_path: Root folder `scripts/build_media_index.py`
+            walks to ingest images/videos, and the same root
+            `api/media_library.py`'s serving route re-validates a resolved
+            file still lives under before ever opening it (a path-
+            traversal guard, in case a stored path were ever stale/
+            manipulated). `None` (the default) means media search has
+            nothing to index -- `get_available_sources` treats that the
+            same as the flag being off.
+        media_embedding_provider: Which embedding backend `media/embedding
+            .py` uses. Only `local_clip` (on-device, via
+            `sentence-transformers`, no API key, no per-item cost, no data
+            leaving the machine) is implemented today -- the `Literal` type
+            (rather than a bare `str`, unlike `web_search_provider`) is
+            deliberate: there's exactly one real option right now, and a
+            typo should fail loudly at config-load time, not silently at
+            first use. Structured the same way `search/web_search.py`'s
+            `SUPPORTED_SEARCH_PROVIDERS` dict is, so adding a hosted
+            provider (Voyage/Vertex/OpenAI multimodal embeddings) later is
+            a new dict entry, not a redesign.
+        media_clip_model_name: The `sentence-transformers` CLIP checkpoint
+            used for both image and query-text embedding (the same model
+            embeds both sides, guaranteeing they share one vector space --
+            see `media/embedding.py`). `clip-ViT-B-32` is a small, current,
+            well-documented default; confirmed to still be the right
+            general-purpose pick (not superseded by something bundled by
+            default) as of this feature's implementation.
+        media_vision_model: An Ollama vision-capable model name (e.g.
+            `llava`) used by `media/captioning.py` to generate a dense
+            caption per video segment from its keyframe + transcript
+            context. Blank (the default) means captioning is skipped --
+            `media/ingest.py` still indexes a video segment via its ASR
+            transcript and OCR text alone, just with less signal. This is
+            a fail-open accuracy aid, the same posture as
+            `agent.llm_client._build_golden_examples_block`, never a
+            reason ingestion can't proceed. Requires a one-time `ollama
+            pull <model>`, the same kind of setup step
+            `scripts/download_voice_model.py` already requires for Piper.
+        media_max_file_mb: Max size of one file `media/ingest.py` will
+            process, enforced by reading and rejecting-if-over before any
+            decoding -- the same read-and-reject-if-over pattern
+            `max_document_upload_mb`/`voice_max_upload_mb` already use.
+        media_search_top_k: Max hits returned by `media.search.search_media`
+            per query, across both the image and video-segment collections
+            combined.
+        media_scene_detect_threshold: `PySceneDetect`'s `ContentDetector`
+            sensitivity used by `media/keyframes.py` -- lower values
+            detect more (subtler) scene changes, producing more segments
+            per video. 27.0 is `PySceneDetect`'s own documented default.
+            `POST /search/media` reuses the existing shared
+            `api_action_rate_limit_per_minute` (`api.rate_limit
+            .enforce_api_action_rate_limit`) rather than a dedicated
+            limiter -- a query is cheap (embeds text, searches a local
+            Chroma collection) and orchestrator-routed media_search
+            questions are already bounded by `/ask`'s own limiter, the
+            same reasoning document/policy RAG have no dedicated limiter
+            of their own either.
         session_expensive_source_limit: Max combined "generation"/"web"
             source invocations allowed per `session_id` within
             `session_expensive_source_window_seconds`, checked in
@@ -726,6 +796,14 @@ class Settings(BaseSettings):
     voice_max_duration_seconds: int = Field(default=30, gt=0)
     tts_voice: str = "en_US-lessac-medium"
     tts_voice_model_path: Path | None = None
+    enable_media_search: bool = False
+    media_library_path: Path | None = None
+    media_embedding_provider: Literal["local_clip"] = "local_clip"
+    media_clip_model_name: str = "clip-ViT-B-32"
+    media_vision_model: str = ""
+    media_max_file_mb: int = Field(default=200, gt=0)
+    media_search_top_k: int = Field(default=5, gt=0)
+    media_scene_detect_threshold: float = Field(default=27.0, gt=0)
     session_expensive_source_limit: int = Field(default=10, gt=0)
     session_expensive_source_window_seconds: float = Field(default=3600.0, gt=0)
     cors_allowed_origins: tuple[str, ...] = Field(

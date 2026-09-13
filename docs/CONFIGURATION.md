@@ -161,6 +161,26 @@ design.
 | `TTS_VOICE` | `en_US-lessac-medium` | Piper voice name — download it once with `python scripts/download_voice_model.py`. |
 | `TTS_VOICE_MODEL_PATH` | *(unset)* | Override for the `.onnx`/`.onnx.json` location, if not the default `voice/models/<TTS_VOICE>.onnx`. |
 
+### Media search (optional, off by default)
+
+Content-based search over an untagged local image/video library. Unlike
+voice mode, this stays off by default: it needs a real
+`MEDIA_LIBRARY_PATH` configured, and its default local-CLIP embedding
+path pulls in `torch`/`opencv-python` — a real, meaningfully larger
+dependency footprint than this project's other optional features. See
+`CLAUDE.md`'s "Media search" section for the full design.
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `ENABLE_MEDIA_SEARCH` | `false` | Whether the "media_search" orchestrator source and `POST /search/media` are offered at all. Also requires `MEDIA_LIBRARY_PATH`. |
+| `MEDIA_LIBRARY_PATH` | *(unset)* | Root folder `scripts/build_media_index.py` walks to ingest images/videos. |
+| `MEDIA_EMBEDDING_PROVIDER` | `local_clip` | Only `local_clip` (on-device, via `sentence-transformers`) is implemented today — see `media/embedding.py`. |
+| `MEDIA_CLIP_MODEL_NAME` | `clip-ViT-B-32` | The CLIP checkpoint used to embed both images and query text. |
+| `MEDIA_VISION_MODEL` | *(unset)* | An Ollama vision-capable model name (e.g. `llava`) for per-video-segment captioning — pull it once with `ollama pull llava`. Blank skips captioning; segments are still indexed via ASR transcript + OCR text alone. |
+| `MEDIA_MAX_FILE_MB` | `200` | Max size of one file `media/ingest.py` will process. |
+| `MEDIA_SEARCH_TOP_K` | `5` | Max hits returned per query, across images and video segments combined. |
+| `MEDIA_SCENE_DETECT_THRESHOLD` | `27.0` | `PySceneDetect`'s `ContentDetector` sensitivity — lower detects more (subtler) scene changes. |
+
 ## Validation behavior worth knowing
 
 - **Missing vs. malformed are treated differently.** A missing `DB_HOST`

@@ -52,6 +52,8 @@ from api.auth import verify_api_key
 from api.documents import router as documents_router
 from api.generation import router as generation_router
 from api.media import router as media_router
+from api.media_library import router as media_library_router
+from api.media_search import router as media_search_router
 from api.rate_limit import enforce_api_action_rate_limit
 from api.schemas import (
     AskRequest,
@@ -68,6 +70,8 @@ from api.schemas import (
     GoldenExampleFeedbackResponse,
     HealthResponse,
     MediaGenerationResultOut,
+    MediaSearchHitOut,
+    MediaSearchResultOut,
     SchemaRefreshResponse,
     SchemaRefreshResult,
     SchemaTableOut,
@@ -153,6 +157,8 @@ app.include_router(documents_router)
 app.include_router(media_router)
 app.include_router(generation_router)
 app.include_router(voice_router)
+app.include_router(media_search_router)
+app.include_router(media_library_router)
 
 # No-op when Settings.cors_allowed_origins is empty (the default) -- a
 # same-origin deployment (the built React app served by this same FastAPI
@@ -324,6 +330,29 @@ def _media_generation_result_out(
     )
 
 
+def _media_search_result_out(
+    result: Mapping[str, Any] | None,
+) -> MediaSearchResultOut | None:
+    """Converts one `agent.orchestrator.state.MediaSearchResult` dict
+    (media_search_result) to its API shape -- None passes through as None."""
+    if result is None:
+        return None
+    return MediaSearchResultOut(
+        answer=result.get("answer", ""),
+        status=result.get("status", "succeeded"),
+        hits=[
+            MediaSearchHitOut(
+                media_id=hit["media_id"],
+                media_type=hit["media_type"],
+                caption=hit["caption"],
+                timestamp_start=hit.get("timestamp_start"),
+                timestamp_end=hit.get("timestamp_end"),
+            )
+            for hit in result.get("hits", [])
+        ],
+    )
+
+
 def _followup_resolved_against_out(
     exchange: Mapping[str, Any] | None,
 ) -> ConversationExchangeOut | None:
@@ -369,6 +398,7 @@ def _ask_response_from_state(state: Mapping[str, Any], session_id: str) -> AskRe
         policy_result=_source_answer_out(state.get("policy_result")),
         web_result=_source_answer_out(state.get("web_result")),
         generation_result=_media_generation_result_out(state.get("generation_result")),
+        media_search_result=_media_search_result_out(state.get("media_search_result")),
         query_plan=state.get("query_plan"),
         schema_tables=[
             SchemaTableOut(
@@ -450,6 +480,7 @@ def health(response: Response) -> HealthResponse:
         databases=databases,
         ollama=ollama_health,
         voice_enabled=settings.enable_voice_mode,
+        media_search_enabled=settings.enable_media_search,
     )
 
 

@@ -127,6 +127,22 @@ body {
   overflow-x: auto;
 }
 
+/* Tailwind Typography's `prose` defaults give code blocks `overflow-x:
+   auto` + no-wrap -- fine for a docs site, wrong here: an LLM-composed
+   answer/insight (Markdown.tsx) that happens to include a fenced code
+   block (e.g. a SQL snippet) should wrap and grow taller within the
+   answer area instead of scrolling sideways, same as the SQL editor and
+   retry-timeline SQL blocks. */
+.prose pre,
+.prose code {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.prose pre {
+  overflow-x: visible;
+}
+
 ::selection {
   background: var(--accent-soft);
 }

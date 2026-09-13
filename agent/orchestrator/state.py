@@ -72,6 +72,32 @@ class MediaGenerationResult(SourceAnswer):
     model: str | None
 
 
+class MediaSearchHit(TypedDict):
+    """One retrieved image or video segment, trimmed to exactly what the
+    UI/answer-composition prompt need -- mirrors `media.search.MediaHit`
+    but never carries its internal `similarity` score (that stays purely
+    an internal ranking detail, never surfaced to the user, same as no
+    other source here ever shows a raw retrieval score)."""
+
+    media_id: str
+    media_type: str
+    caption: str
+    timestamp_start: float | None
+    timestamp_end: float | None
+
+
+class MediaSearchResult(SourceAnswer):
+    """The "media_search" source's contribution -- extends `SourceAnswer`
+    (a real citable text answer, unlike `MediaGenerationResult`'s -- see
+    `agent.orchestrator.nodes.media_search_node`) with the retrieved hits
+    the UI renders as its own thumbnail-grid component
+    (`MediaSearchResultCard.tsx`), the same "always render outside the
+    synthesis-text ternary" rule `generation_result` already established.
+    """
+
+    hits: list[MediaSearchHit]
+
+
 class OrchestratorState(AgentState, total=False):
     """Full state threaded through the orchestrator graph."""
 
@@ -102,6 +128,8 @@ class OrchestratorState(AgentState, total=False):
     web_result: SourceAnswer | None
     # Set by generation_node -- see media_gen/ and Settings.enable_media_generation.
     generation_result: MediaGenerationResult | None
+    # Set by media_search_node -- see media/ and Settings.enable_media_search.
+    media_search_result: MediaSearchResult | None
 
     # Set by synthesis_node -- None when only one source fired (that source's
     # own answer stands unedited; see synthesis_node's docstring).

@@ -134,6 +134,7 @@ function emptyAskResponse(message: string): AskResponse {
     policy_result: null,
     web_result: null,
     generation_result: null,
+    media_search_result: null,
     query_plan: null,
     schema_tables: [],
     followup_classification: null,

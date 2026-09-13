@@ -105,7 +105,9 @@ export function TurnCard({ entry, isMultiDb }: { entry: QueryHistoryEntry; isMul
               {state.failure_explanation ?? state.error_history.at(-1) ?? 'Unknown error.'}
             </p>
             {state.sql && (
-              <pre className="overflow-x-auto rounded bg-[var(--muted)] p-2 font-mono text-xs">{state.sql}</pre>
+              <pre className="whitespace-pre-wrap break-words rounded bg-[var(--muted)] p-2 font-mono text-xs">
+                {state.sql}
+              </pre>
             )}
           </div>
         )}

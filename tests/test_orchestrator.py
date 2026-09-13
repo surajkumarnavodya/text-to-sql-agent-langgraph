@@ -31,6 +31,7 @@ from agent.orchestrator.nodes import (
     document_rag_node,
     generation_node,
     get_available_sources,
+    media_search_node,
     policy_rag_node,
     route_after_router,
     router_node,
@@ -118,6 +119,12 @@ class TestGetAvailableSources:
         assert get_available_sources(
             _settings(enable_media_generation=True, ima_api_key=SecretStr("ima_x"))
         ) == ["sql", "generation"]
+
+    def test_media_search_needs_both_flag_and_library_path(self, tmp_path):
+        assert get_available_sources(_settings(enable_media_search=True)) == ["sql"]
+        assert get_available_sources(
+            _settings(enable_media_search=True, media_library_path=tmp_path)
+        ) == ["sql", "media_search"]
 
 
 class TestClassifySources:
@@ -300,6 +307,16 @@ class TestRouteAfterRouter:
         }
         assert route_after_router(state) == ["sql_subgraph", "policy_rag", "web_search"]
 
+    def test_routes_media_search_to_media_search_node(self):
+        state = {
+            "route_decision": {
+                "sources": ["sql", "media_search"],
+                "reasoning": "x",
+                "short_circuited": False,
+            }
+        }
+        assert route_after_router(state) == ["sql_subgraph", "media_search"]
+
     def test_raises_for_an_unwired_source_name(self):
         state = {
             "route_decision": {
@@ -345,6 +362,77 @@ class TestSqlSubgraphNode:
         monkeypatch.setattr(orchestrator_nodes, "run_agent", fake_run_agent)
         sql_subgraph_node({"question": "x"})
         assert captured["enable_insight"] is True
+
+
+class TestMediaSearchNode:
+    def test_returns_insufficient_when_no_hits(self, monkeypatch):
+        settings = _settings(enable_media_search=True)
+        monkeypatch.setattr(orchestrator_nodes, "get_settings", lambda: settings)
+        import media.search
+
+        monkeypatch.setattr(media.search, "search_media", lambda query, settings, **k: [])
+
+        result = media_search_node({"question": "find the photo of the site inspection"})
+
+        assert result["media_search_result"]["status"] == "insufficient_information"
+        assert result["media_search_result"]["hits"] == []
+        assert result["sources_used"] == ["media_search"]
+
+    def test_composes_answer_and_carries_structured_hits(self, monkeypatch):
+        settings = _settings(enable_media_search=True)
+        monkeypatch.setattr(orchestrator_nodes, "get_settings", lambda: settings)
+        import media.search
+        from media.search import MediaHit
+
+        monkeypatch.setattr(
+            media.search,
+            "search_media",
+            lambda query, settings, **k: [
+                MediaHit(
+                    media_id="seg1",
+                    media_type="video",
+                    caption="a crane lifts a steel beam",
+                    similarity=0.9,
+                    timestamp_start=10.0,
+                    timestamp_end=15.0,
+                )
+            ],
+        )
+        import rag.llm
+
+        monkeypatch.setattr(
+            rag.llm, "call_ollama", lambda *a, **k: "Found a video of a crane lifting a beam."
+        )
+
+        result = media_search_node({"question": "show me the clip where the crane lifts the beam"})
+
+        assert result["media_search_result"]["status"] == "succeeded"
+        assert "crane" in result["media_search_result"]["answer"].lower()
+        assert result["media_search_result"]["hits"] == [
+            {
+                "media_id": "seg1",
+                "media_type": "video",
+                "caption": "a crane lifts a steel beam",
+                "timestamp_start": 10.0,
+                "timestamp_end": 15.0,
+            }
+        ]
+        assert result["sources_used"] == ["media_search"]
+
+    def test_degrades_gracefully_on_a_search_failure(self, monkeypatch):
+        settings = _settings(enable_media_search=True)
+        monkeypatch.setattr(orchestrator_nodes, "get_settings", lambda: settings)
+        import media.search
+
+        def _raise(query, settings, **k):
+            raise RuntimeError("chroma unavailable")
+
+        monkeypatch.setattr(media.search, "search_media", _raise)
+
+        result = media_search_node({"question": "find the photo"})
+
+        assert result["media_search_result"]["status"] == "failed"
+        assert result["sources_used"] == ["media_search"]
 
 
 class TestDocumentAndPolicyRagNodes:
@@ -996,6 +1084,26 @@ class TestSynthesisNode:
         assert "Database" in synthesized
         assert "Policy" in synthesized
         assert "Policy says X." in synthesized
+
+    def test_media_search_contributes_a_text_bullet_unlike_generation(self):
+        """Unlike `generation_result` (a freshly-created asset with no
+        natural text answer), `media_search_result` has a real citable
+        answer and behaves like document/policy/web here -- it shows up in
+        the combined synthesized text, not just as its own rendered card."""
+        state = {
+            "sources_used": ["sql", "media_search"],
+            "status": "succeeded",
+            "row_count": 3,
+            "media_search_result": {
+                "answer": "Found a photo of the site inspection.",
+                "citations": [],
+                "status": "succeeded",
+                "hits": [],
+            },
+        }
+        synthesized = synthesis_node(state)["synthesized_answer"]
+        assert "Media Library" in synthesized
+        assert "Found a photo of the site inspection." in synthesized
 
     def test_suppresses_an_empty_source_when_another_one_succeeded(self):
         """The database answered; the policy collection found nothing --

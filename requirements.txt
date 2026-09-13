@@ -73,6 +73,36 @@ python-multipart==0.0.32
 faster-whisper==1.2.1
 piper-tts==1.8.0
 
+# --- Media search (optional, off by default -- see media/, ENABLE_MEDIA_SEARCH) ---
+# Local CLIP embeddings (media/embedding.py's "local_clip" provider) --
+# chosen over a hosted multimodal embedding API (Voyage/Vertex/OpenAI) to
+# keep this feature's default path free, private, and API-key-free, same
+# as every other model choice in this project. This is the one real
+# exception to this project's "no torch" posture (faster-whisper/piper-tts
+# both deliberately avoid it, see the note above) -- sentence-transformers
+# needs it. Confirmed before pinning: torch publishes a real cp314 wheel
+# (this machine's only installed Python is 3.14).
+sentence-transformers==6.0.1
+torch==2.14.0
+# Scene-change (not fixed-interval) video keyframe extraction
+# (media/keyframes.py). Pulls in opencv-python unconditionally (checked
+# against its PyPI metadata before pinning -- a PyAV-only install isn't
+# possible with this library today, "pyav" is only an extra for its
+# separate clip-export feature). Pinned explicitly alongside it since
+# media/keyframes.py doesn't import it directly but scenedetect requires
+# it to run at all.
+scenedetect==0.7.1
+opencv-python==5.0.0.93
+# OCR for on-screen text in video frames (media/ocr.py) -- needs the
+# system Tesseract binary installed separately, see CLAUDE.md's
+# Windows-specific notes (same "extra manual step" shape as DB_TYPE=mssql's
+# system ODBC driver requirement).
+pytesseract==0.3.13
+# Frame/thumbnail image I/O (media/keyframes.py, media/ingest.py) -- was
+# already present transitively; pinned explicitly now that media/ imports
+# it directly, same reasoning pydantic was pinned explicitly above.
+pillow==11.3.0
+
 # Config
 python-dotenv==1.0.1
 pyyaml==6.0.3   # config/table_descriptions.py -- was only a transitive dep before

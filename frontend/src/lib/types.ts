@@ -64,6 +64,22 @@ export interface MediaGenerationResult {
   model: string | null
 }
 
+export interface MediaSearchHit {
+  // Opaque id to fetch via GET /media/library/{media_id} -- never a raw
+  // filesystem path.
+  media_id: string
+  media_type: 'image' | 'video'
+  caption: string
+  timestamp_start: number | null
+  timestamp_end: number | null
+}
+
+export interface MediaSearchResult {
+  answer: string
+  status: string
+  hits: MediaSearchHit[]
+}
+
 export interface AskRequest {
   question: string
   conversation_history?: ConversationExchange[]
@@ -96,6 +112,7 @@ export interface AskResponse {
   policy_result: SourceAnswer | null
   web_result: SourceAnswer | null
   generation_result: MediaGenerationResult | null
+  media_search_result: MediaSearchResult | null
   query_plan: string[] | null
   schema_tables: SchemaTable[]
   followup_classification: 'standalone' | 'followup' | 'ambiguous' | null
@@ -155,6 +172,7 @@ export interface HealthResponse {
   databases: DatabaseHealth[]
   ollama: ComponentHealth
   voice_enabled: boolean
+  media_search_enabled: boolean
 }
 
 export interface ColumnOut {

@@ -22,9 +22,9 @@
 
 <!-- Newest first, sourced from real commit history. Keep no more than the three most recent entries. -->
 
+- **2026-09-13** — Added optional media search — content-based search over an untagged local image/video library (local CLIP embeddings, scene-detected video segments, Whisper transcription, OCR, optional Ollama vision captioning), off by default
 - **2026-09-13** — Added optional voice mode — local speech-to-text (faster-whisper) and text-to-speech (Piper), schema-aware transcription, off by default
 - **2026-09-13** — Removed the Streamlit UI now that the React dashboard has full feature parity; the FastAPI app serves the dashboard directly (single container, single port)
-- **2026-09-13** — [Security hardening pass on the agentic orchestrator (media generation, RAG, rate limits)](https://github.com/surajkumarnavodya/text-to-sql-agent-langgraph/commit/ec91b96)
 
 <a id="example-usage"></a>
 
@@ -155,6 +155,18 @@ dashboard; it was removed once the dashboard reached full feature parity
   disclosed exception: they use the browser's own built-in speech
   recognition, which in Chromium browsers is cloud-backed; the actual
   submitted transcript still comes from local Whisper.)
+- **Optional media search** (off by default) — search a local, *untagged*
+  image/video library by plain-English content description (e.g. "find the
+  photo of the site inspection," "show me the clip where the crane lifts
+  the beam"), routed as its own orchestrator source or usable directly via
+  a standalone search page. No filenames or manual tags needed: images are
+  embedded with a local CLIP model, videos are segmented at scene-change
+  boundaries with each segment transcribed (local Whisper), OCR'd, and
+  optionally captioned (a local Ollama vision model). Fully local by
+  default, same as the LLM itself — no hosted embedding API, no cost per
+  image indexed. Off by default (unlike voice mode) since it needs a real
+  library folder configured and pulls in a meaningfully larger dependency
+  footprint (`torch`, OpenCV).
 - **Grounded insights, not free-form narration.** An optional plain-English
   summary sentence is checked against the actual result data before it's
   shown; an unsupported number is silently dropped rather than displayed as
@@ -259,9 +271,9 @@ as above in one terminal, then in a second terminal:
 cd frontend && npm run dev
 ```
 Open `http://localhost:5173/` — Vite proxies `/ask`, `/execute`,
-`/documents`, `/schema`, `/feedback`, `/health`, `/media`, and `/generate`
-to the API on port 8000 (see `frontend/vite.config.ts`), so no CORS setup
-is needed either way.
+`/documents`, `/schema`, `/feedback`, `/health`, `/media`, `/generate`,
+`/voice`, and `/search` to the API on port 8000 (see
+`frontend/vite.config.ts`), so no CORS setup is needed either way.
 
 **REST API only** (no UI): `uvicorn api.main:app --host 0.0.0.0 --port 8000` —
 see [`docs/API.md`](docs/API.md).
@@ -389,6 +401,16 @@ not a marketing claim.
   browser's own speech recognition, so they need a Chromium-based browser
   and, in that browser, are not fully local (see `CLAUDE.md`'s "Voice
   mode" section).
+- **Media search (`ENABLE_MEDIA_SEARCH`, off by default) adds a real,
+  meaningfully larger dependency footprint** — `torch` (via
+  `sentence-transformers`, for local CLIP embeddings) and `opencv-python`
+  (via `PySceneDetect`, for video scene detection), unlike every other
+  optional feature here. OCR needs the system Tesseract binary installed
+  separately (not pip-installable — see `CLAUDE.md`'s Windows-specific
+  notes); captioning needs a one-time `ollama pull <vision-model>`. A full
+  video clip is never streamed back — only a representative frame +
+  timestamp range. No dense-captioning quality tuning has been done
+  across different Ollama vision models.
 
 <a id="contributing"></a>
 

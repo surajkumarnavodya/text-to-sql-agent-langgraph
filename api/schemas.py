@@ -132,6 +132,43 @@ class MediaGenerationResultOut(BaseModel):
     model: str | None = None
 
 
+class MediaSearchHitOut(BaseModel):
+    """Mirrors `agent.orchestrator.state.MediaSearchHit` -- one retrieved
+    image or video segment. `media_id` is an opaque id to fetch the actual
+    bytes via `GET /media/library/{media_id}` (`api/media_library.py`) --
+    never a raw filesystem path. No similarity score -- that stays an
+    internal ranking detail, never surfaced to a client."""
+
+    model_config = ConfigDict(frozen=True)
+
+    media_id: str
+    media_type: str
+    caption: str
+    timestamp_start: float | None = None
+    timestamp_end: float | None = None
+
+
+class MediaSearchResultOut(BaseModel):
+    """Mirrors `agent.orchestrator.state.MediaSearchResult` -- the
+    "media_search" source's contribution."""
+
+    model_config = ConfigDict(frozen=True)
+
+    answer: str
+    status: str
+    hits: list[MediaSearchHitOut] = Field(default_factory=list)
+
+
+class MediaSearchRequest(BaseModel):
+    """`POST /search/media` -- direct media search, independent of the
+    conversational `/ask` flow."""
+
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    query: str = Field(..., min_length=1)
+    media_type: Literal["image", "video", "any"] = "any"
+
+
 class ConversationExchangeOut(BaseModel):
     """Mirrors `agent.state.ConversationExchange` -- the specific prior turn
     a "followup" question was resolved against, for a client to render a
@@ -205,6 +242,7 @@ class AskResponse(BaseModel):
     policy_result: SourceAnswerOut | None = None
     web_result: SourceAnswerOut | None = None
     generation_result: MediaGenerationResultOut | None = None
+    media_search_result: MediaSearchResultOut | None = None
     query_plan: list[str] | None = Field(
         default=None,
         description="Ordered plan steps for a complexity-flagged question; None if planning was skipped.",
@@ -334,6 +372,7 @@ class HealthResponse(BaseModel):
     databases: list[DatabaseHealth]
     ollama: ComponentHealth
     voice_enabled: bool
+    media_search_enabled: bool
 
 
 class ColumnOut(BaseModel):

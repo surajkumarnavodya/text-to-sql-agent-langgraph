@@ -5,7 +5,8 @@
   },
   "nav": {
     "chat": "चॅट",
-    "knowledgeSources": "ज्ञान स्रोत"
+    "knowledgeSources": "ज्ञान स्रोत",
+    "mediaSearch": "मीडिया शोध"
   },
   "header": {
     "openHistory": "चॅट इतिहास उघडा",

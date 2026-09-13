@@ -81,17 +81,66 @@ class MediaGenerationNotConfiguredError(ConfigurationError):
     """
 
 
+_DEFAULT_SAFE_MESSAGE = (
+    "Media generation failed due to a provider error. Please try again in a moment."
+)
+
+# IMA business codes (payload["code"]) this app gives a friendly,
+# actionable message for -- see the module docstring's "Business errors"
+# paragraph for where these values come from (IMA's own reference
+# implementation, not guessed). Every other/unrecognized code falls back
+# to `_DEFAULT_SAFE_MESSAGE`; the full raw code/message is never lost --
+# it stays in `str(exc)` for logs (see `MediaResult.detail`).
+_SAFE_MESSAGES_BY_CODE: dict[int, str] = {
+    4008: (
+        "The connected IMA Studio account has run out of credits "
+        "(insufficient points). Top up the account balance at "
+        "imastudio.com to continue generating images/videos."
+    ),
+    401: (
+        "The configured IMA Studio API key was rejected. Check " "IMA_API_KEY in your .env file."
+    ),
+}
+
+
+def _safe_message_for_payload(payload: Any) -> str:
+    """Maps a business error code (if the payload carries one) to a
+    friendly, actionable message -- see `_SAFE_MESSAGES_BY_CODE`."""
+    if isinstance(payload, dict):
+        code = payload.get("code")
+        if isinstance(code, int) and code in _SAFE_MESSAGES_BY_CODE:
+            return _SAFE_MESSAGES_BY_CODE[code]
+    return _DEFAULT_SAFE_MESSAGE
+
+
 class MediaGenerationError(RuntimeError):
     """Raised for any non-success response from the IMA API (business
     `code != 0/200`, an HTTP transport error, or a terminal task failure),
     or a network failure reaching it. `status_code`/`payload` carry the raw
     provider error for logging -- `str(exc)` itself is already redacted
-    (see `_request` below), so it's safe to surface directly to a user."""
+    (see `_request` below).
 
-    def __init__(self, message: str, status_code: int | None = None, payload: Any = None):
+    Same two-message convention as `agent/exceptions.py::AgentError`/
+    `media/exceptions.py::MediaSearchError`/`voice/exceptions.py::VoiceError`:
+    `str(exc)` is the full internal detail (safe to log, includes the raw
+    provider payload), `.safe_message` is a short, actionable sentence --
+    e.g. "insufficient points" becomes a message telling the user to top up
+    their account, rather than surfacing IMA's raw `{'code': 4008, ...}`
+    dict repr directly in the UI, which is what happened before this
+    existed (a real, reported bug)."""
+
+    def __init__(
+        self,
+        message: str,
+        status_code: int | None = None,
+        payload: Any = None,
+        *,
+        safe_message: str | None = None,
+    ):
         super().__init__(message)
         self.status_code = status_code
         self.payload = payload
+        self.safe_message = safe_message or _safe_message_for_payload(payload)
 
 
 class IMAEndpoints:
@@ -107,7 +156,13 @@ Status = Literal["completed", "pending", "processing", "failed"]
 
 @dataclass(frozen=True)
 class MediaResult:
-    """Normalized result shape every `generate_*` function returns."""
+    """Normalized result shape every `generate_*` function returns.
+
+    `error` is always the short, user-facing message (`MediaGenerationError
+    .safe_message`) -- safe to put directly in an API response/UI. `detail`
+    carries the full internal detail (`str(exc)`, including the raw
+    provider payload) for logs only -- see `agent.orchestrator.nodes
+    .execute_generation`, the only place that reads it."""
 
     status: Status
     url: str | None = None
@@ -115,6 +170,7 @@ class MediaResult:
     model: str | None = None
     job_id: str | None = None
     error: str | None = None
+    detail: str | None = None
 
     @property
     def ok(self) -> bool:

@@ -9,6 +9,7 @@ import type {
   GoldenExampleFeedbackRequest,
   HealthResponse,
   MediaGenerationResult,
+  MediaSearchResult,
   SchemaRefreshResponse,
   SensitivityCategory,
   TablesResponse,
@@ -147,6 +148,34 @@ export async function fetchMediaBlobUrl(mediaId: string): Promise<string> {
   }
   const blob = await response.blob()
   return URL.createObjectURL(blob)
+}
+
+/** Fetches one media-*library* asset's bytes (an ingested image, or a
+ * video segment's representative frame) -- distinct from
+ * `fetchMediaBlobUrl` above, which is for ephemeral *generated* media
+ * (`GET /media/{id}`). This hits the persistent library route instead
+ * (`GET /media/library/{id}`, `api/media_library.py`). */
+export async function fetchLibraryMediaBlobUrl(mediaId: string): Promise<string> {
+  const headers = new Headers()
+  if (API_TOKEN) headers.set('Authorization', `Bearer ${API_TOKEN}`)
+  const response = await fetch(`/media/library/${mediaId}`, { headers })
+  if (!response.ok) {
+    throw new ApiError('Could not load that media item.', response.status)
+  }
+  const blob = await response.blob()
+  return URL.createObjectURL(blob)
+}
+
+/** Direct media-library search, independent of the conversational `/ask`
+ * flow (`POST /search/media`, `api/media_search.py`). */
+export function searchMedia(
+  query: string,
+  mediaType: 'image' | 'video' | 'any' = 'any',
+): Promise<MediaSearchResult> {
+  return request<MediaSearchResult>('/search/media', {
+    method: 'POST',
+    body: JSON.stringify({ query, media_type: mediaType }),
+  })
 }
 
 /** Uploads one recorded question for local transcription (`voice/stt.py`).

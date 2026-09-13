@@ -1,4 +1,4 @@
-import { BookOpen, Database, MessageSquare, Settings } from 'lucide-react'
+import { BookOpen, Database, ImageIcon, MessageSquare, Settings } from 'lucide-react'
 import { useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { NavLink, Outlet } from 'react-router-dom'
@@ -34,6 +34,7 @@ export function AppShell() {
           <nav className="flex gap-1">
             <NavTab to="/" icon={MessageSquare} label={t('nav.chat')} />
             <NavTab to="/knowledge-sources" icon={BookOpen} label={t('nav.knowledgeSources')} />
+            <NavTab to="/media-search" icon={ImageIcon} label={t('nav.mediaSearch')} />
           </nav>
 
           <div className="ml-auto flex items-center gap-1.5">

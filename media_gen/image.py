@@ -28,7 +28,7 @@ def generate_image(
             poll_timeout_seconds=poll_timeout_seconds,
         )
     except MediaGenerationError as exc:
-        return MediaResult(status="failed", error=str(exc))
+        return MediaResult(status="failed", error=exc.safe_message, detail=str(exc))
 
     url = media.get("url") or media.get("watermark_url") or media.get("preview_url")
     return MediaResult(status="completed", url=url, model=model_name)

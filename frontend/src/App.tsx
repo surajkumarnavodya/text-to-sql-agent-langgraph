@@ -6,6 +6,7 @@ import { PwaUpdateBanner } from '@/components/layout/PwaUpdateBanner'
 import { watchSystemTheme, applyThemeMode } from '@/lib/theme'
 import { Chat } from '@/pages/Chat'
 import { KnowledgeSources } from '@/pages/KnowledgeSources'
+import { MediaSearch } from '@/pages/MediaSearch'
 import { useSettingsStore } from '@/store/settingsStore'
 
 export function App() {
@@ -36,6 +37,7 @@ export function App() {
         <Route element={<AppShell />}>
           <Route path="/" element={<Chat />} />
           <Route path="/knowledge-sources" element={<KnowledgeSources />} />
+          <Route path="/media-search" element={<MediaSearch />} />
         </Route>
       </Routes>
     </>

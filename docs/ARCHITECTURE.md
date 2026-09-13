@@ -516,10 +516,14 @@ flowchart TD
     FANOUT --> DOCSUB["document_rag<br/>rag.graph.run_rag(collection='documents')"]
     FANOUT --> POLSUB["policy_rag<br/>rag.graph.run_rag(collection='policies')"]
     FANOUT --> WEBSUB["web_search<br/>search.web_search.web_search()"]
+    FANOUT --> GENSUB["generation<br/>media_gen.generate_image/generate_video()"]
+    FANOUT --> MEDSUB["media_search<br/>media.search.search_media()"]
     SQLSUB --> SYN
     DOCSUB --> SYN
     POLSUB --> SYN
     WEBSUB --> SYN
+    GENSUB --> SYN
+    MEDSUB --> SYN
     SYN["synthesis_node<br/>pass-through if 1 source fired;<br/>labeled per-source attribution if 2+"]
     SYN --> ENDOK(["END — sources_used + synthesized_answer (if 2+)"])
 ```
@@ -528,11 +532,12 @@ flowchart TD
 
 `get_available_sources(settings)` (`agent/orchestrator/nodes.py`) always
 includes `"sql"` (`Settings.databases` always has ≥1 entry) and adds
-`"documents"`/`"policy"`/`"web"` only when **both** that source's
-`ENABLE_*` flag **and** the config it actually needs are present (a
-document-store connection string, a web-search API key) — an enabled flag
-alone with nothing configured behind it is not "available," since routing
-to it would just fail.
+`"documents"`/`"policy"`/`"web"`/`"generation"`/`"media_search"` only when
+**both** that source's `ENABLE_*` flag **and** the config it actually needs
+are present (a document-store connection string, a web-search API key, an
+IMA API key, a real `MEDIA_LIBRARY_PATH`) — an enabled flag alone with
+nothing configured behind it is not "available," since routing to it would
+just fail.
 
 With ≤1 source available, `router_node` short-circuits: no Chroma-style
 extra query, no LLM call, mirroring `embeddings.retriever.select_database`'s

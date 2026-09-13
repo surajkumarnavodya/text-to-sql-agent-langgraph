@@ -20,6 +20,7 @@ const BACKEND_ROUTES = [
   '/media',
   '/generate',
   '/voice',
+  '/search',
 ]
 
 export default defineConfig({

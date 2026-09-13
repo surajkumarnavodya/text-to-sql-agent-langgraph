@@ -8,11 +8,15 @@
             |   (rag.graph.run_rag, collection="policies")
             +-> web_search     |
             |   (search.web_search.web_search)
-            +-> generation    -+
-                (media_gen.generate_image/generate_video -- off by
-                 default, Settings.enable_media_generation; image
-                 generation confirmed working end-to-end against a
-                 real IMA account, see media_gen/client.py)
+            +-> generation     +
+            |   (media_gen.generate_image/generate_video -- off by
+            |    default, Settings.enable_media_generation; image
+            |    generation confirmed working end-to-end against a
+            |    real IMA account, see media_gen/client.py)
+            +-> media_search  -+
+                (media.search.search_media -- off by default,
+                 Settings.enable_media_search; local CLIP embeddings
+                 over an untagged image/video library, see media/)
 
 `route_after_router` returns a *list* of destination node names -- LangGraph
 runs every one of them as a parallel branch before the graph proceeds to
@@ -58,6 +62,7 @@ from agent.graph import run_agent
 from agent.orchestrator.nodes import (
     document_rag_node,
     generation_node,
+    media_search_node,
     policy_rag_node,
     route_after_router,
     router_node,
@@ -91,6 +96,7 @@ def build_orchestrator_graph():
     graph.add_node("policy_rag", policy_rag_node)
     graph.add_node("web_search", web_search_node)
     graph.add_node("generation", generation_node)
+    graph.add_node("media_search", media_search_node)
     graph.add_node("synthesis", synthesis_node)
 
     graph.set_entry_point("router")
@@ -103,9 +109,17 @@ def build_orchestrator_graph():
             "policy_rag": "policy_rag",
             "web_search": "web_search",
             "generation": "generation",
+            "media_search": "media_search",
         },
     )
-    for destination in ("sql_subgraph", "document_rag", "policy_rag", "web_search", "generation"):
+    for destination in (
+        "sql_subgraph",
+        "document_rag",
+        "policy_rag",
+        "web_search",
+        "generation",
+        "media_search",
+    ):
         graph.add_edge(destination, "synthesis")
     graph.add_edge("synthesis", END)
 

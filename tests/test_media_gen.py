@@ -74,6 +74,49 @@ class TestIMAClientRequest:
             with pytest.raises(MediaGenerationError, match="code=401"):
                 client._request("POST", "/open/v1/tasks/create", json={"prompt": "x"})
 
+    def test_insufficient_points_gets_a_friendly_safe_message(self, client):
+        """Regression test: a real, reported bug -- IMA's raw
+        `{'code': 4008, 'message': 'Insufficient points', ...}` dict repr
+        was reaching the UI verbatim as the answer text. `.safe_message`
+        must instead be an actionable, human sentence, never that repr."""
+        with patch.object(client.session, "request") as mock_request:
+            mock_request.return_value.status_code = 500
+            mock_request.return_value.json.return_value = {
+                "code": 4008,
+                "message": "Insufficient points",
+                "timestamp": 1789305859,
+            }
+            with pytest.raises(MediaGenerationError) as exc_info:
+                client._request("POST", "/open/v1/tasks/create", json={"prompt": "x"})
+            safe_message = exc_info.value.safe_message.lower()
+            assert "credits" in safe_message or "points" in safe_message
+            assert "top up" in safe_message
+            assert "4008" not in exc_info.value.safe_message
+            # str(exc) (the internal detail, for logs) is unaffected -- it
+            # still carries the raw provider payload.
+            assert "4008" in str(exc_info.value)
+
+    def test_business_error_code_also_gets_a_safe_message_on_http_200(self, client):
+        with patch.object(client.session, "request") as mock_request:
+            mock_request.return_value.status_code = 200
+            mock_request.return_value.json.return_value = {
+                "code": 4008,
+                "message": "Insufficient points",
+            }
+            with pytest.raises(MediaGenerationError) as exc_info:
+                client._request("POST", "/open/v1/tasks/create", json={"prompt": "x"})
+            assert "top up" in exc_info.value.safe_message.lower()
+
+    def test_unrecognized_code_falls_back_to_the_generic_safe_message(self, client):
+        with patch.object(client.session, "request") as mock_request:
+            mock_request.return_value.status_code = 500
+            mock_request.return_value.json.return_value = {"code": 9999, "message": "who knows"}
+            with pytest.raises(MediaGenerationError) as exc_info:
+                client._request("POST", "/open/v1/tasks/create", json={"prompt": "x"})
+            assert exc_info.value.safe_message == (
+                "Media generation failed due to a provider error. Please try again in a moment."
+            )
+
     def test_network_error_is_wrapped(self, client):
         import requests
 
@@ -299,7 +342,12 @@ class TestGenerateImage:
             result = generate_image(client, prompt="anything")
             assert not result.ok
             assert result.status == "failed"
-            assert "boom" in result.error
+            # error is always the short, user-facing safe_message (never the
+            # raw internal detail) -- detail carries "boom" instead, for logs.
+            assert result.error == (
+                "Media generation failed due to a provider error. Please try again in a moment."
+            )
+            assert "boom" in result.detail
 
 
 class TestGenerateVideo:
