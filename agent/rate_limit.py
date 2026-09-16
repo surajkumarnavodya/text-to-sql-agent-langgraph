@@ -37,7 +37,7 @@ from __future__ import annotations
 
 import logging
 import time
-from collections import deque
+from collections import OrderedDict, deque
 from dataclasses import dataclass
 
 logger = logging.getLogger(__name__)
@@ -138,6 +138,74 @@ class SlidingWindowRateLimiter:
         self._events.clear()
 
 
+class BoundedLimiterCache:
+    """A dict of `SlidingWindowRateLimiter`, keyed by an arbitrary string
+    and bounded to `max_entries` via least-recently-used eviction.
+
+    Every per-key rate limiter in this codebase (`api/main.py`'s per-IP
+    question-submission limiter, `api/rate_limit.py`'s per-IP-per-action
+    limiter, and this module's own per-session expensive-source limiter --
+    see `get_session_expensive_source_limiter`) used to be a bare,
+    never-pruned `dict`. Each is keyed by a value at least partly outside
+    this app's control -- a client IP, or, for the session-scoped one, a
+    value the *client itself* supplies in the request body with nothing
+    authenticating it (`get_session_expensive_source_limiter`'s own
+    docstring already discloses that a caller can mint a fresh session_id
+    per request to reset their cost ceiling). Nothing stopped that same
+    trick from growing the backing dict without bound -- a real, previously
+    unpatched memory-exhaustion vector requiring no more than an ordinary
+    ability to send requests with a different key each time (2026 Phase 1
+    security review, finding API-02).
+
+    LRU eviction (rather than a background TTL-sweep task/thread) keeps the
+    common case -- a small, stable set of real callers -- completely
+    unaffected: an entry is only ever evicted once `max_entries` distinct
+    keys are live at once, and the one evicted is always the
+    least-recently-touched, i.e. the one least likely to belong to an
+    active caller.
+    """
+
+    def __init__(self, max_entries: int = 10_000) -> None:
+        self._max_entries = max_entries
+        self._cache: OrderedDict[str, SlidingWindowRateLimiter] = OrderedDict()
+
+    def get_or_create(
+        self, key: str, max_events: int, window_seconds: float, name: str
+    ) -> SlidingWindowRateLimiter:
+        """Returns the limiter for `key`, creating it on first use.
+
+        `max_events`/`window_seconds`/`name` are only used the first time a
+        given `key` is seen -- same "first call wins" convention as this
+        module's other `get_*_limiter` singleton factories.
+        """
+        limiter = self._cache.get(key)
+        if limiter is not None:
+            self._cache.move_to_end(key)
+            return limiter
+
+        limiter = SlidingWindowRateLimiter(
+            max_events=max_events, window_seconds=window_seconds, name=name
+        )
+        self._cache[key] = limiter
+        if len(self._cache) > self._max_entries:
+            evicted_key, _ = self._cache.popitem(last=False)
+            logger.info(
+                "[rate_limit] bounded cache at capacity (%d entries) -- evicted "
+                "least-recently-used key %r to admit %r",
+                self._max_entries,
+                evicted_key,
+                key,
+            )
+        return limiter
+
+    def clear(self) -> None:
+        """Drops every entry. Mainly for tests and session resets."""
+        self._cache.clear()
+
+    def __len__(self) -> int:
+        return len(self._cache)
+
+
 _llm_call_limiter: SlidingWindowRateLimiter | None = None
 _media_generation_limiter: SlidingWindowRateLimiter | None = None
 
@@ -186,8 +254,9 @@ def get_media_generation_limiter(
 
 # Keyed by session_id -- unlike the two process-wide limiters above, this
 # one deliberately needs per-session scope (see get_session_expensive_source_limiter's
-# docstring for why).
-_session_expensive_source_limiters: dict[str, SlidingWindowRateLimiter] = {}
+# docstring for why). Bounded (see BoundedLimiterCache's docstring) since
+# session_id is client-supplied and unauthenticated.
+_session_expensive_source_limiters = BoundedLimiterCache()
 
 
 def get_session_expensive_source_limiter(
@@ -216,12 +285,9 @@ def get_session_expensive_source_limiter(
     can be evaded by changing IP; this is a cost-control speed bump, not an
     access-control boundary).
     """
-    limiter = _session_expensive_source_limiters.get(session_id)
-    if limiter is None:
-        limiter = SlidingWindowRateLimiter(
-            max_events=max_calls_per_window,
-            window_seconds=window_seconds,
-            name=f"session_expensive_source[{session_id}]",
-        )
-        _session_expensive_source_limiters[session_id] = limiter
-    return limiter
+    return _session_expensive_source_limiters.get_or_create(
+        session_id,
+        max_events=max_calls_per_window,
+        window_seconds=window_seconds,
+        name=f"session_expensive_source[{session_id}]",
+    )

@@ -1,6 +1,7 @@
 import { Database } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
 import { ChatInput } from '@/components/chat/ChatInput'
+import { PendingTurn } from '@/components/chat/PendingTurn'
 import { SuggestedPrompts } from '@/components/chat/SuggestedPrompts'
 import { TurnCard } from '@/components/chat/TurnCard'
 import { useHealth } from '@/hooks/queries'
@@ -48,15 +49,12 @@ export function Chat() {
             {queryHistory.map((entry) => (
               <TurnCard key={entry.entryId} entry={entry} isMultiDb={isMultiDb} />
             ))}
+            {pendingQuestion && <PendingTurn pendingQuestion={pendingQuestion} />}
           </div>
         </div>
       </div>
       <div className="mx-auto w-full max-w-4xl px-4 pb-4">
-        <ChatInput
-          onSubmit={(question) => void askQuestion(question)}
-          disabled={pendingQuestion !== null}
-          isLoading={pendingQuestion !== null}
-        />
+        <ChatInput />
       </div>
     </div>
   )

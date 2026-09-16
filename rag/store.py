@@ -364,6 +364,33 @@ def list_documents(engine: Engine, collection: Collection | None = None) -> list
     ]
 
 
+def get_document_sensitivity(engine: Engine, document_id: str) -> str | None:
+    """Fetches one document's `sensitivity_category` without pulling its
+    (potentially large) `pdf_bytes` blob -- 2026 Phase 2 security review:
+    `api/documents.py`'s download route uses this to decide whether the
+    caller needs `agent.authz.Permission.DOCUMENTS_READ_SENSITIVE`,
+    closing the gap where a sensitivity-tagged document's raw bytes were
+    downloadable through this route with no access check beyond the
+    general document-management permission (the chat-answer sensitivity
+    gate in `rag/graph.py` was always a separate, narrower control -- see
+    that module's docstring).
+
+    Returns `None` both for a document ID that doesn't exist and for one
+    that exists but isn't sensitivity-tagged -- callers that need to tell
+    these apart (this one doesn't: it only ever calls this after already
+    confirming the document exists via `get_document_bytes`) should check
+    existence separately first.
+    """
+    with engine.connect() as conn:
+        row = conn.execute(
+            text("SELECT sensitivity_category FROM rag.documents WHERE id = :document_id"),
+            {"document_id": document_id},
+        ).fetchone()
+    if row is None:
+        return None
+    return row.sensitivity_category
+
+
 def get_document_bytes(engine: Engine, document_id: str) -> bytes | None:
     """Fetches one document's original PDF bytes, or None if never stored.
 

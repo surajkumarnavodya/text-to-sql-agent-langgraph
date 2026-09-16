@@ -436,13 +436,20 @@ class DocumentUploadResponse(BaseModel):
 
 
 class TranscribeResponse(BaseModel):
-    """Output of `POST /voice/transcribe`. `text` is plain, untrusted text
-    -- the caller is expected to submit it back through `POST /ask` like
-    any typed question, not treat it as pre-validated."""
+    """Output of `POST /voice/transcribe`. `text` is the raw, untrusted
+    Whisper transcript. `corrected_text` is an AI-cleaned suggestion
+    (misheard words/filler words fixed, gated by
+    `Settings.enable_voice_correction`) -- `None` when correction is
+    disabled or produced no actual change, so the frontend only needs to
+    branch on "is there a suggestion" rather than compare strings itself.
+    Neither field is pre-validated or submitted anywhere -- the caller
+    shows both and only submits back through `POST /ask` once the user
+    explicitly confirms which text to send."""
 
     model_config = ConfigDict(frozen=True)
 
     text: str
+    corrected_text: str | None
     stt_duration_ms: float
 
 

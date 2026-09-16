@@ -132,6 +132,53 @@ class TestBuildConnectionUrl:
             build_connection_url(_settings(db_host=None))
 
 
+class TestEnginePoolSizing:
+    """2026 Phase 3 performance review: `_cached_engine` now passes
+    `Settings.db_pool_size`/`db_max_overflow` to `create_engine` instead of
+    silently relying on SQLAlchemy's own default (5/10) -- see those
+    fields' docstrings for why. Mocks `create_engine` directly (a real
+    SQLite `:memory:` engine can't be used here: its default pool class
+    doesn't accept `pool_size`/`max_overflow` at all, a SQLite-specific
+    quirk irrelevant to this app's actual supported dialects) and calls
+    `_cached_engine` with a connection string unique to this test class, so
+    it can't collide with another test's cached engine for the same
+    connection string (`db.connection._cached_engine` is a process-wide
+    `functools.cache` not cleared between tests, unlike this app's other
+    singleton caches -- see `tests/conftest.py`)."""
+
+    def test_pool_size_and_max_overflow_are_passed_to_create_engine(self, monkeypatch):
+        import db.connection as db_connection
+
+        settings = _settings(db_pool_size=7, db_max_overflow=13)
+        monkeypatch.setattr(db_connection, "get_settings", lambda: settings)
+
+        captured: dict[str, object] = {}
+
+        def _fake_create_engine(connection_string, **kwargs):
+            captured["connection_string"] = connection_string
+            captured.update(kwargs)
+            return MagicMock()
+
+        monkeypatch.setattr(db_connection, "create_engine", _fake_create_engine)
+
+        db_connection._cached_engine("test://unique-pool-sizing-connection-string")
+
+        assert captured["pool_size"] == 7
+        assert captured["max_overflow"] == 13
+        assert captured["pool_pre_ping"] is True
+        assert captured["pool_recycle"] == 1800
+
+    def test_default_pool_size_and_max_overflow(self, monkeypatch):
+        """Sanity check on the defaults themselves -- generous enough for
+        real concurrent traffic without being unbounded."""
+        import db.connection as db_connection
+
+        settings = _settings()
+        monkeypatch.setattr(db_connection, "get_settings", lambda: settings)
+        assert settings.db_pool_size == 10
+        assert settings.db_max_overflow == 20
+
+
 class TestGetSqlglotDialect:
     @pytest.mark.parametrize(
         "db_type,expected",

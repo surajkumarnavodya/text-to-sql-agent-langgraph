@@ -10,17 +10,22 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 
-from api.auth import verify_api_key
+from agent.authz import Permission
+from api.authz import require_permission
 from api.rate_limit import enforce_api_action_rate_limit
 from api.schemas import MediaSearchHitOut, MediaSearchRequest, MediaSearchResultOut
 from config.settings import get_settings
 from media.search import search_media
 
-router = APIRouter(dependencies=[Depends(verify_api_key)])
+router = APIRouter()
 
 
 @router.post("/search/media", response_model=MediaSearchResultOut)
-def search_media_endpoint(payload: MediaSearchRequest, request: Request) -> MediaSearchResultOut:
+def search_media_endpoint(
+    payload: MediaSearchRequest,
+    request: Request,
+    _identity=Depends(require_permission(Permission.MEDIA_SEARCH)),
+) -> MediaSearchResultOut:
     """Searches the media library directly for `payload.query`, restricted
     to `payload.media_type` if given. 404 when `Settings.enable_media_search`
     is off, same "an infra flag that's off means the route doesn't exist"

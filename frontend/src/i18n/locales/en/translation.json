@@ -43,11 +43,9 @@
     "startConversation": "Start voice conversation",
     "listening": "Listening…",
     "transcribing": "Transcribing…",
-    "thinking": "Thinking…",
     "speaking": "Speaking…",
-    "doneSpeaking": "Done speaking",
-    "stopConversation": "Stop conversation",
-    "unsupportedCaption": "Recording... speak now, then click \"Done speaking\".",
+    "stopConversation": "Stop",
+    "unsupportedCaption": "Recording... speak now, then tap stop.",
     "transcribeFailed": "Could not transcribe that recording. Please try again or type your question.",
     "micDenied": "Microphone access was denied or is unavailable."
   },

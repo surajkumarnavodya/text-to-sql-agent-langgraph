@@ -4,8 +4,36 @@ on:
   push:
     branches: [main]
   pull_request:
+  # 2026 Phase 2 security review: lets `benchmark-regression` below be
+  # triggered manually -- it never runs on an ordinary push/PR (see that
+  # job's own comment for why).
+  workflow_dispatch:
 
 jobs:
+  # 2026 Phase 2 security review: secret scanning is its own job (not a
+  # step inside `test`) so it runs even if dependency install/lint fails
+  # elsewhere, and so its `fetch-depth: 0` full-history checkout (needed to
+  # scan every past commit, not just the current tree) doesn't slow down
+  # the other jobs, which only need the current tree.
+  secret-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Secret scan (gitleaks)
+        # Report-only for now (continue-on-error), same reasoning as the
+        # pip-audit step below: this is gitleaks' first run against this
+        # repository's full history, and its findings (if any) haven't
+        # been triaged yet -- flip to a hard gate once a clean baseline
+        # run confirms there's nothing pre-existing to triage first. A
+        # *newly introduced* secret in a PR diff is exactly the kind of
+        # finding this step exists to catch even while report-only, since
+        # the job output is still visible on every run.
+        uses: gitleaks/gitleaks-action@v2
+        continue-on-error: true
+
   test:
     runs-on: ubuntu-latest
     steps:
@@ -28,6 +56,22 @@ jobs:
 
       - name: Type check (mypy)
         run: mypy .
+
+      - name: SAST (bandit)
+        # Report-only for now (continue-on-error) -- same reasoning as the
+        # pip-audit step below: bandit has never run against this codebase
+        # before, so its findings haven't been triaged. Scoped to this
+        # project's own first-party packages (`agent`, `api`, `config`,
+        # `db`, `security`, `media_gen`, `moderation`, `rag`, `search`,
+        # `voice`, `media`, `embeddings`) -- excludes `tests/` (test code
+        # legitimately does things bandit flags, e.g. constructing SQL
+        # strings/tokens for fixtures) and `.venv`/`frontend` (not Python
+        # source this project owns). Remove `continue-on-error` once the
+        # backlog is triaged.
+        run: |
+          pip install bandit
+          bandit -r agent api config db security media_gen moderation rag search voice media embeddings -f txt
+        continue-on-error: true
 
       # Only the mocked unit test suite runs in CI -- scripts/run_eval.py and
       # scripts/integration_test.py both require a live database + a running
@@ -81,3 +125,69 @@ jobs:
       # exact same command.
       - name: Build
         run: npm run build
+
+  # 2026 Phase 2 security review: builds the actual image this project
+  # ships (Dockerfile) and scans it for OS-package and known-vulnerable-
+  # dependency CVEs -- `pip-audit` above only covers this project's own
+  # Python dependency graph, not the base image's apt packages or anything
+  # baked in by the frontend-build stage. Separate job (not a step in
+  # `test`) so a slow multi-stage image build doesn't block the fast
+  # lint/test feedback loop.
+  docker-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build image
+        run: docker build -t text-to-sql-dashboard:ci .
+
+      - name: Vulnerability scan (Trivy)
+        # Report-only for now (continue-on-error) -- same reasoning as the
+        # other new scanners in this workflow: this is Trivy's first run
+        # against this image, so its findings (a real base-image OS-package
+        # backlog is likely, same as any base image) haven't been triaged
+        # yet. Remove `continue-on-error` once that backlog is triaged.
+        uses: aquasecurity/trivy-action@0.24.0
+        with:
+          image-ref: text-to-sql-dashboard:ci
+          format: table
+          severity: CRITICAL,HIGH
+        continue-on-error: true
+
+  # 2026 Phase 2 security review: a real Text-to-SQL accuracy/security-
+  # rejection regression check (scripts/run_benchmark.py --check-
+  # regression against eval/baselines/latest.json), deliberately gated
+  # behind `workflow_dispatch` (manual trigger only) rather than running
+  # on every push/PR -- it needs a live Ollama instance with the
+  # configured model pulled and a live database, neither of which a
+  # GitHub-hosted runner has (the same constraint the pre-existing
+  # comment on the `test` job's own "Run tests" step already documents
+  # for `scripts/run_eval.py`/`scripts/integration_test.py`). This job is
+  # a real, runnable scaffold for whoever points a **self-hosted** runner
+  # (`runs-on: [self-hosted, ...]`, with Ollama + a reachable database
+  # configured) at this workflow -- not wired to a hosted runner here,
+  # since that would just fail every time with no useful signal. See
+  # docs/PHASE2_SECURITY_REPORT.md's CI/CD section for the honest state
+  # of this gap.
+  benchmark-regression:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Benchmark regression check
+        # Requires OLLAMA_HOST/a pulled model and DB_*/DB_CONNECTIONS to be
+        # configured as repository/environment secrets on whichever
+        # self-hosted runner actually executes this -- absent here by
+        # design (no live infrastructure exists in this repository's own
+        # CI environment to point them at).
+        run: python scripts/run_benchmark.py --check-regression

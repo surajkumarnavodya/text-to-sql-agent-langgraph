@@ -10,6 +10,7 @@ from __future__ import annotations
 from agent.rate_limit import (
     LLM_CALL_LIMIT_MESSAGE,
     QUESTION_LIMIT_MESSAGE,
+    BoundedLimiterCache,
     SlidingWindowRateLimiter,
     get_llm_call_limiter,
 )
@@ -107,6 +108,74 @@ class TestGetLlmCallLimiter:
         assert len(same_limiter._events) == 1  # noqa: SLF001 - white-box check, test-only
 
         limiter.reset()
+
+
+class TestBoundedLimiterCache:
+    """Regression tests for the 2026 Phase 1 security review's API-02
+    finding: `api/main.py`'s per-IP limiter dict, `api/rate_limit.py`'s
+    per-IP-per-action limiter dict, and this module's own per-session
+    expensive-source limiter dict were all bare `dict`s that grew one
+    entry per distinct key forever -- a real memory-exhaustion vector for
+    the session-scoped one in particular, since `session_id` is
+    client-supplied and unauthenticated (an attacker can mint a fresh one
+    per request at zero cost). `BoundedLimiterCache` is the shared fix all
+    three now use."""
+
+    def test_returns_the_same_instance_for_the_same_key(self):
+        cache = BoundedLimiterCache(max_entries=10)
+        first = cache.get_or_create("a", max_events=5, window_seconds=60.0, name="a")
+        second = cache.get_or_create("a", max_events=5, window_seconds=60.0, name="a")
+        assert first is second
+
+    def test_state_is_preserved_per_key(self):
+        cache = BoundedLimiterCache(max_entries=10)
+        limiter = cache.get_or_create("a", max_events=1, window_seconds=60.0, name="a")
+        assert limiter.check(now=0.0).allowed is True
+        assert limiter.check(now=1.0).allowed is False  # same key, budget already spent
+
+        other = cache.get_or_create("b", max_events=1, window_seconds=60.0, name="b")
+        assert other.check(now=1.0).allowed is True  # different key, fresh budget
+
+    def test_evicts_the_least_recently_used_key_once_over_capacity(self):
+        cache = BoundedLimiterCache(max_entries=2)
+        cache.get_or_create("a", max_events=5, window_seconds=60.0, name="a")
+        cache.get_or_create("b", max_events=5, window_seconds=60.0, name="b")
+        cache.get_or_create("c", max_events=5, window_seconds=60.0, name="c")  # evicts "a"
+
+        assert len(cache) == 2
+        # "a" is gone -- fetching it again creates a brand-new limiter with a
+        # fresh budget, proof its prior state (and memory) was actually freed.
+        recreated = cache.get_or_create("a", max_events=1, window_seconds=60.0, name="a")
+        assert recreated.check(now=0.0).allowed is True
+        assert recreated.check(now=0.0).allowed is False
+
+    def test_accessing_a_key_protects_it_from_eviction(self):
+        """LRU, not FIFO: touching an old key must move it to the back of
+        the eviction order."""
+        cache = BoundedLimiterCache(max_entries=2)
+        cache.get_or_create("a", max_events=5, window_seconds=60.0, name="a")
+        cache.get_or_create("b", max_events=5, window_seconds=60.0, name="b")
+        cache.get_or_create("a", max_events=5, window_seconds=60.0, name="a")  # touch "a"
+        cache.get_or_create("c", max_events=5, window_seconds=60.0, name="c")  # should evict "b"
+
+        assert len(cache) == 2
+        recreated_b = cache.get_or_create("b", max_events=1, window_seconds=60.0, name="b")
+        assert recreated_b.check(now=0.0).allowed is True  # fresh -- "b" was actually evicted
+
+    def test_unbounded_key_growth_never_exceeds_max_entries(self):
+        """The actual DoS scenario: many distinct keys (e.g. an attacker
+        minting a fresh session_id per request) must never grow the cache
+        past its configured cap."""
+        cache = BoundedLimiterCache(max_entries=100)
+        for i in range(10_000):
+            cache.get_or_create(f"key-{i}", max_events=5, window_seconds=60.0, name="k")
+        assert len(cache) == 100
+
+    def test_clear_drops_every_entry(self):
+        cache = BoundedLimiterCache(max_entries=10)
+        cache.get_or_create("a", max_events=5, window_seconds=60.0, name="a")
+        cache.clear()
+        assert len(cache) == 0
 
 
 class TestMessages:

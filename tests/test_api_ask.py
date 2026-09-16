@@ -126,11 +126,20 @@ class TestAsk:
     def test_conversation_history_is_forwarded_to_run_agent(self, monkeypatch, client):
         captured = {}
 
-        def _capture(question, conversation_history=None, enable_insight=True, session_id=None):
+        def _capture(
+            question,
+            conversation_history=None,
+            enable_insight=True,
+            session_id=None,
+            caller_roles=(),
+            caller_subject=None,
+        ):
             captured["question"] = question
             captured["conversation_history"] = conversation_history
             captured["enable_insight"] = enable_insight
             captured["session_id"] = session_id
+            captured["caller_roles"] = caller_roles
+            captured["caller_subject"] = caller_subject
             return {"status": "succeeded", "error_history": []}
 
         monkeypatch.setattr("api.main.run_orchestrated", _capture)
@@ -173,6 +182,30 @@ class TestAsk:
         # module docstring and api/main.py's /ask handler.
         assert body["error_history"][0] == SchemaRetrievalError("x").safe_message
         assert "Chroma index is empty" not in body["error_history"][0]
+
+    def test_request_timeout_returns_a_failed_status_not_a_hang(self, monkeypatch, client):
+        """2026 Phase 3 reliability fix: `POST /ask` no longer blocks
+        indefinitely if `run_orchestrated` never returns within
+        `Settings.request_timeout_seconds` -- see that setting's docstring
+        and `api.main._run_orchestrated_with_timeout`. A tiny timeout plus a
+        `run_orchestrated` that sleeps past it exercises the real
+        background-thread-join path, not just a mocked exception."""
+        import time as time_module
+
+        monkeypatch.setattr("api.main.get_settings", lambda: _settings(request_timeout_seconds=1))
+
+        def _slow(*a, **k):
+            time_module.sleep(5)
+            return {"status": "succeeded", "error_history": []}
+
+        monkeypatch.setattr("api.main.run_orchestrated", _slow)
+
+        response = client.post("/ask", json={"question": "How many rows are there?"})
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body["status"] == "failed"
+        assert "exceeded the maximum processing time" in body["error_history"][0]
 
     def test_empty_question_is_rejected_by_request_validation(self, client):
         response = client.post("/ask", json={"question": ""})

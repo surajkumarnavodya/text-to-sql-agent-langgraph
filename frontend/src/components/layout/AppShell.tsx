@@ -2,7 +2,6 @@ import { BookOpen, Database, ImageIcon, MessageSquare, Settings } from 'lucide-r
 import { useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { NavLink, Outlet } from 'react-router-dom'
-import { ThinkingOverlay } from '@/components/chat/ThinkingOverlay'
 import { ThemeToggle } from '@/components/settings/ThemeToggle'
 import { Button } from '@/components/ui/button'
 import { cn } from '@/lib/utils'
@@ -68,10 +67,6 @@ export function AppShell() {
             controlled portion of the screen" for the drawer on desktop
             without covering the workspace -- on mobile the drawer is a
             full overlay instead, so no shift happens there. */}
-        {/* `relative` scopes ThinkingOverlay's `absolute inset-0` to just
-            this content pane -- header stays visible/usable the whole time
-            a question is in flight, only the answer area itself takes
-            over while waiting. */}
         <main
           className={cn(
             'relative min-h-0 min-w-0 flex-1 overflow-hidden transition-[padding] duration-300 motion-reduce:transition-none',
@@ -79,7 +74,6 @@ export function AppShell() {
           )}
         >
           <Outlet />
-          <ThinkingOverlay />
         </main>
       </div>
 

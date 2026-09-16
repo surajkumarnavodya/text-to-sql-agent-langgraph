@@ -76,6 +76,17 @@ fastapi==0.141.1
 # POST /documents (PDF upload) is the only route that needs it.
 python-multipart==0.0.32
 
+# --- Production authentication (optional, see security/oidc.py, docs/AUTHENTICATION.md) ---
+# OIDC/JWT validation for `AUTH_MODE` beyond the legacy static bearer token
+# (api/auth.py's pre-existing API_AUTH_TOKEN check, kept unchanged and still
+# supported). The `crypto` extra pulls in nothing new at runtime --
+# `cryptography` is already present transitively (via `pyodbc`'s own deps) --
+# but is declared explicitly so this dependency is self-contained rather than
+# silently relying on another package continuing to pull cryptography in.
+# `PyJWKClient` (this module's actual JWKS-fetch/cache/key-rotation
+# mechanism) is part of the base package, not the extra.
+pyjwt[crypto]==2.14.0
+
 # --- Voice mode (optional, on by default -- see voice/, ENABLE_VOICE_MODE) ---
 # Both are local/offline inference, no cloud API, matching this project's
 # "Ollama not a hosted LLM" posture. Neither pulls in torch (confirmed
@@ -115,10 +126,21 @@ pytesseract==0.3.13
 # Frame/thumbnail image I/O (media/keyframes.py, media/ingest.py) -- was
 # already present transitively; pinned explicitly now that media/ imports
 # it directly, same reasoning pydantic was pinned explicitly above.
-pillow==11.3.0
+# Bumped 11.3.0 -> 12.3.0 (2026 Phase 1 dependency pass, docs/DEPENDENCY_SECURITY.md)
+# to close ~18 known advisories (decompression bombs / OOB writes in the PSD,
+# FITS, PCF/BDF font, and GD plugins). None were reachable through this app's
+# own ingestion path -- media/ingest.py::_sniff_media_type only ever passes
+# JPEG/PNG/GIF/BMP/WEBP magic-byte-verified bytes to Image.open(), and none of
+# the vulnerable formats are in that allowlist -- but the bump is a same-API,
+# low-risk hygiene fix (full test suite reran clean after it).
+pillow==12.3.0
 
 # Config
-python-dotenv==1.0.1
+# Bumped 1.0.1 -> 1.2.2 (2026 Phase 1 dependency pass) for CVE-2026-28684
+# (set_key()/unset_key() symlink-following file overwrite). Not reachable --
+# this app only ever reads .env via pydantic-settings, never calls
+# set_key()/unset_key() -- but a same-minor-line, low-risk bump.
+python-dotenv==1.2.2
 pyyaml==6.0.3   # config/table_descriptions.py -- was only a transitive dep before
 
 # --- Dev / test / lint (not required to run the app) ---

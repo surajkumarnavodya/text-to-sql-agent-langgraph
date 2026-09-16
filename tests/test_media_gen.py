@@ -410,6 +410,30 @@ class TestCreateAndPollFormOverrides:
 _PUBLIC_ADDRINFO = [(2, 1, 6, "", ("93.184.216.34", 0))]  # a real, public IPv4 (example.com)
 
 
+class _MockStreamResponse:
+    """A `requests.Response` stand-in supporting exactly what
+    `download_media_bytes` needs since it moved to a streamed,
+    size-capped download (2026 Phase 2 security review): the context-
+    manager protocol (`with response:`) and `.iter_content()`, on top of
+    the plain `status_code`/`headers` attributes the pre-existing mocks
+    already provided."""
+
+    def __init__(self, status_code: int, headers: dict, body: bytes):
+        self.status_code = status_code
+        self.headers = headers
+        self._body = body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        return False
+
+    def iter_content(self, chunk_size: int = 1024):
+        if self._body:
+            yield self._body
+
+
 class TestDownloadMediaBytes:
     """`_validate_download_url` resolves the hostname for real (see its own
     docstring for why -- SSRF defense) before ever reaching `requests.get`,
@@ -419,11 +443,7 @@ class TestDownloadMediaBytes:
     def test_success_returns_bytes_and_content_type(self):
         from media_gen.download import download_media_bytes
 
-        mock_response = type(
-            "Resp",
-            (),
-            {"status_code": 200, "headers": {"Content-Type": "image/png"}, "content": b"abc"},
-        )()
+        mock_response = _MockStreamResponse(200, {"Content-Type": "image/png"}, b"abc")
         with (
             patch("socket.getaddrinfo", return_value=_PUBLIC_ADDRINFO),
             patch("requests.get", return_value=mock_response),
@@ -432,16 +452,84 @@ class TestDownloadMediaBytes:
         assert data == b"abc"
         assert content_type == "image/png"
 
+    def test_video_and_audio_content_types_pass_through(self):
+        from media_gen.download import download_media_bytes
+
+        for declared in ("video/mp4", "audio/mpeg", "IMAGE/PNG"):  # case-insensitive
+            mock_response = _MockStreamResponse(200, {"Content-Type": declared}, b"abc")
+            with (
+                patch("socket.getaddrinfo", return_value=_PUBLIC_ADDRINFO),
+                patch("requests.get", return_value=mock_response),
+            ):
+                _, content_type = download_media_bytes("https://cdn.example/f")
+            assert content_type == declared
+
+    def test_disallowed_content_type_falls_back_to_generic_binary(self):
+        """2026 Phase 3 file-upload security review (finding G1): this app
+        only ever generates image/video/audio -- a provider response
+        claiming `text/html` (or anything else) must not be reflected
+        verbatim into `GET /media/{media_id}`'s response Content-Type, since
+        that could let a compromised/malicious provider serve
+        script-executing content under this app's own origin."""
+        from media_gen.download import download_media_bytes
+
+        mock_response = _MockStreamResponse(200, {"Content-Type": "text/html"}, b"<script>")
+        with (
+            patch("socket.getaddrinfo", return_value=_PUBLIC_ADDRINFO),
+            patch("requests.get", return_value=mock_response),
+        ):
+            data, content_type = download_media_bytes("https://cdn.example/f")
+        assert content_type == "application/octet-stream"
+        assert data == b"<script>"  # bytes themselves are still returned, only the type is capped
+
     def test_http_error_raises_media_generation_error(self):
         from media_gen.download import download_media_bytes
 
-        mock_response = type("Resp", (), {"status_code": 404, "headers": {}, "content": b""})()
+        mock_response = _MockStreamResponse(404, {}, b"")
         with (
             patch("socket.getaddrinfo", return_value=_PUBLIC_ADDRINFO),
             patch("requests.get", return_value=mock_response),
             pytest.raises(MediaGenerationError, match="404"),
         ):
             download_media_bytes("https://cdn.example/missing.png")
+
+    def test_declared_content_length_over_limit_is_rejected_before_streaming(self):
+        from media_gen.download import download_media_bytes
+
+        mock_response = _MockStreamResponse(
+            200, {"Content-Type": "image/png", "Content-Length": "999999999"}, b"abc"
+        )
+        with (
+            patch("socket.getaddrinfo", return_value=_PUBLIC_ADDRINFO),
+            patch("requests.get", return_value=mock_response),
+            pytest.raises(MediaGenerationError, match="declared size"),
+        ):
+            download_media_bytes("https://cdn.example/huge.png", max_bytes=1000)
+
+    def test_actual_streamed_size_over_limit_is_rejected_even_without_content_length(self):
+        """A response that omits or lies about Content-Length must still be
+        caught while streaming -- the declared-length check alone isn't
+        sufficient."""
+        from media_gen.download import download_media_bytes
+
+        mock_response = _MockStreamResponse(200, {"Content-Type": "image/png"}, b"x" * 2000)
+        with (
+            patch("socket.getaddrinfo", return_value=_PUBLIC_ADDRINFO),
+            patch("requests.get", return_value=mock_response),
+            pytest.raises(MediaGenerationError, match="exceeded the"),
+        ):
+            download_media_bytes("https://cdn.example/huge.png", max_bytes=1000)
+
+    def test_size_within_limit_succeeds(self):
+        from media_gen.download import download_media_bytes
+
+        mock_response = _MockStreamResponse(200, {"Content-Type": "image/png"}, b"x" * 500)
+        with (
+            patch("socket.getaddrinfo", return_value=_PUBLIC_ADDRINFO),
+            patch("requests.get", return_value=mock_response),
+        ):
+            data, _ = download_media_bytes("https://cdn.example/ok.png", max_bytes=1000)
+        assert len(data) == 500
 
     def test_network_error_is_wrapped(self):
         import requests

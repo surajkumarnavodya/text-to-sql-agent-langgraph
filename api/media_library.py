@@ -21,12 +21,13 @@ from pathlib import Path
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.responses import FileResponse
 
-from api.auth import verify_api_key
+from agent.authz import Permission
+from api.authz import require_permission
 from config.settings import get_settings
 from media.keyframes import THUMBNAIL_DIR
 from media.store import get_image_metadata, get_segment_metadata
 
-router = APIRouter(dependencies=[Depends(verify_api_key)])
+router = APIRouter(dependencies=[Depends(require_permission(Permission.MEDIA_SEARCH))])
 
 _IMAGE_CONTENT_TYPES = {
     ".jpg": "image/jpeg",
@@ -67,17 +68,23 @@ def get_library_media(media_id: str) -> FileResponse:
             status_code=status.HTTP_404_NOT_FOUND, detail="Media search is not enabled."
         )
 
+    # X-Content-Type-Options: nosniff on both branches below -- see
+    # api/media.py's identical header for the 2026 Phase 3 rationale.
     image_metadata = get_image_metadata(media_id, settings)
     if image_metadata is not None:
         path = _resolve_safe_path(str(image_metadata["source_path"]), settings.media_library_path)
         content_type = _IMAGE_CONTENT_TYPES.get(path.suffix.lower(), "application/octet-stream")
-        return FileResponse(path, media_type=content_type)
+        return FileResponse(
+            path, media_type=content_type, headers={"X-Content-Type-Options": "nosniff"}
+        )
 
     segment_metadata = get_segment_metadata(media_id, settings)
     if segment_metadata is not None:
         # Thumbnails live under media/.thumbnails/, not the configured
         # media library root -- resolved against that directory instead.
         path = _resolve_safe_path(str(segment_metadata["thumbnail_path"]), THUMBNAIL_DIR)
-        return FileResponse(path, media_type="image/jpeg")
+        return FileResponse(
+            path, media_type="image/jpeg", headers={"X-Content-Type-Options": "nosniff"}
+        )
 
     raise _NOT_FOUND

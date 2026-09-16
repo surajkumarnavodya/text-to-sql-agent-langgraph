@@ -22,6 +22,7 @@ from __future__ import annotations
 import json
 import logging
 import sys
+import threading
 import time
 import uuid
 from collections.abc import AsyncIterator, Mapping
@@ -40,15 +41,16 @@ from sqlalchemy.exc import SQLAlchemyError
 # (unlike running as an installed package).
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from agent.authz import Permission
 from agent.exceptions import AgentError
 from agent.graph import build_graph
 from agent.llm_client import get_ollama_client
 from agent.orchestrator.graph import build_orchestrator_graph, run_orchestrated
-from agent.rate_limit import QUESTION_LIMIT_MESSAGE, SlidingWindowRateLimiter
+from agent.rate_limit import QUESTION_LIMIT_MESSAGE, BoundedLimiterCache, SlidingWindowRateLimiter
 from agent.result_charting import build_chart
 from agent.sql_validator import enforce_row_limit, qualify_table_schema, validate_sql
 from agent.state import ConversationExchange
-from api.auth import verify_api_key
+from api.authz import require_permission
 from api.documents import router as documents_router
 from api.generation import router as generation_router
 from api.media import router as media_router
@@ -87,6 +89,7 @@ from db.schema_introspection import introspect_schema
 from embeddings.golden_examples import save_golden_example
 from embeddings.schema_indexer import get_chroma_client, get_collection, refresh_all_schema_indexes
 from security.audit_log import get_correlation_id, reset_correlation_id, set_correlation_id
+from security.oidc import AuthIdentity
 from security.redaction import redact_secrets
 
 configure_logging()
@@ -232,19 +235,19 @@ async def _unhandled_exception_handler(request: Request, exc: Exception) -> JSON
 # stricter, process-wide LLM-*call* limiter (agent.rate_limit's other
 # limiter) already applies automatically inside generate_sql_node -- this
 # one adds a separate question-submission-level layer on top of it.
-_ip_limiters: dict[str, SlidingWindowRateLimiter] = {}
+# Bounded (see BoundedLimiterCache's docstring) -- previously a bare dict
+# that grew one entry per distinct client IP forever (2026 Phase 1 security
+# review, finding API-02).
+_ip_limiters = BoundedLimiterCache()
 
 
 def _limiter_for(client_ip: str) -> SlidingWindowRateLimiter:
-    limiter = _ip_limiters.get(client_ip)
-    if limiter is None:
-        limiter = SlidingWindowRateLimiter(
-            max_events=get_settings().question_rate_limit_per_minute,
-            window_seconds=60.0,
-            name=f"api_questions[{client_ip}]",
-        )
-        _ip_limiters[client_ip] = limiter
-    return limiter
+    return _ip_limiters.get_or_create(
+        client_ip,
+        max_events=get_settings().question_rate_limit_per_minute,
+        window_seconds=60.0,
+        name=f"api_questions[{client_ip}]",
+    )
 
 
 @app.middleware("http")
@@ -451,12 +454,12 @@ def health(response: Response) -> HealthResponse:
                 ),
             )
         except Exception as exc:  # noqa: BLE001 - health check must never crash the endpoint
-            # redact_secrets: this endpoint is unauthenticated (no
-            # Depends(verify_api_key), unlike /ask and /schema/tables --
-            # health checks typically need to be reachable by an
-            # orchestrator with no API key), so raw driver/Chroma text
-            # ending up here is a real, publicly-visible leak, not just an
-            # internal one.
+            # redact_secrets: this endpoint is unauthenticated (no auth
+            # dependency at all, unlike /ask and /schema/tables, both
+            # gated by api.authz.require_permission now -- health checks
+            # typically need to be reachable by an orchestrator with no
+            # API key), so raw driver/Chroma text ending up here is a
+            # real, publicly-visible leak, not just an internal one.
             schema_index = ComponentHealth(
                 ok=False, detail=f"Unreachable: {redact_secrets(str(exc), config)}"
             )
@@ -484,8 +487,70 @@ def health(response: Response) -> HealthResponse:
     )
 
 
-@app.post("/ask", response_model=AskResponse, dependencies=[Depends(verify_api_key)])
-def ask(payload: AskRequest, request: Request) -> AskResponse:
+class _AskRequestTimedOut(Exception):
+    """Raised by `_run_orchestrated_with_timeout` when `run_orchestrated`
+    hasn't returned within `Settings.request_timeout_seconds` -- see that
+    setting's docstring for the reliability gap this closes and its
+    "stop waiting, not true cancellation" caveat."""
+
+
+def _run_orchestrated_with_timeout(
+    question: str,
+    conversation_history: list[ConversationExchange],
+    *,
+    enable_insight: bool,
+    session_id: str,
+    caller_roles: tuple[str, ...],
+    caller_subject: str | None,
+    timeout_seconds: int,
+) -> Mapping[str, Any]:
+    """Runs `run_orchestrated` on a background thread and gives up waiting
+    past `timeout_seconds`, raising `_AskRequestTimedOut` instead of letting
+    the calling (FastAPI request-handling) thread block indefinitely.
+
+    Mirrors `db.execution._execute_with_timeout`'s "background thread +
+    `join(timeout)`" idiom -- the one difference is there is no connection
+    to force-close here (an in-flight Ollama call has no clean cross-thread
+    cancellation), so the abandoned thread simply keeps running to
+    completion in the background with its result discarded; see
+    `Settings.request_timeout_seconds`'s docstring for why that's still
+    worth doing (it frees the request-handling thread and gives the caller
+    a timely response, even though it doesn't reduce backend load from the
+    already-in-flight call).
+    """
+    result: dict[str, Any] = {}
+    error: dict[str, BaseException] = {}
+
+    def _run() -> None:
+        try:
+            result["state"] = run_orchestrated(
+                question,
+                conversation_history,
+                enable_insight=enable_insight,
+                session_id=session_id,
+                caller_roles=caller_roles,
+                caller_subject=caller_subject,
+            )
+        except BaseException as exc:  # noqa: BLE001 - re-raised on the caller's thread below
+            error["error"] = exc
+
+    worker = threading.Thread(target=_run, daemon=True)
+    worker.start()
+    worker.join(timeout_seconds)
+
+    if worker.is_alive():
+        raise _AskRequestTimedOut(timeout_seconds)
+    if "error" in error:
+        raise error["error"]
+    return result["state"]
+
+
+@app.post("/ask", response_model=AskResponse)
+def ask(
+    payload: AskRequest,
+    request: Request,
+    identity: AuthIdentity = Depends(require_permission(Permission.ASK)),
+) -> AskResponse:
     """Runs one question through the full agent graph -- schema retrieval,
     SQL generation, validation, cost estimation, execution, self-correction
     -- via the same
@@ -521,13 +586,34 @@ def ask(payload: AskRequest, request: Request) -> AskResponse:
         for turn in payload.conversation_history
     ]
 
+    settings = get_settings()
     try:
-        final_state = run_orchestrated(
+        final_state = _run_orchestrated_with_timeout(
             payload.question,
             conversation_history,
             enable_insight=payload.enable_insight,
             session_id=session_id,
+            caller_roles=identity.roles,
+            caller_subject=identity.subject if identity.mode == "oidc" else None,
+            timeout_seconds=settings.request_timeout_seconds,
         )
+    except _AskRequestTimedOut:
+        # See Settings.request_timeout_seconds's docstring: this is "stop
+        # waiting," not true cancellation -- the abandoned background thread
+        # keeps running and its result is discarded, but the caller gets a
+        # timely response instead of an indefinitely blocked request.
+        logger.warning(
+            "[api] /ask exceeded request_timeout_seconds=%ds (session_id=%s)",
+            settings.request_timeout_seconds,
+            session_id,
+        )
+        final_state = {
+            "status": "failed",
+            "error_history": [
+                f"The request exceeded the maximum processing time "
+                f"({settings.request_timeout_seconds}s) and was abandoned."
+            ],
+        }
     except AgentError as exc:
         # A source (schema retrieval today; document/policy RAG or web
         # search tomorrow, once they're wired into run_orchestrated the
@@ -549,8 +635,12 @@ def ask(payload: AskRequest, request: Request) -> AskResponse:
     return _ask_response_from_state(final_state, session_id)
 
 
-@app.post("/execute", response_model=ExecuteResponse, dependencies=[Depends(verify_api_key)])
-def execute(payload: ExecuteRequest, request: Request) -> ExecuteResponse:
+@app.post("/execute", response_model=ExecuteResponse)
+def execute(
+    payload: ExecuteRequest,
+    request: Request,
+    _identity: AuthIdentity = Depends(require_permission(Permission.EXECUTE_SQL)),
+) -> ExecuteResponse:
     """Validates and executes a specific SQL string read-only -- the exact
     `validate_sql` -> `enforce_row_limit` -> `qualify_table_schema` ->
     `execute_readonly_sql` sequence the React dashboard's "Confirm and Run"
@@ -634,9 +724,11 @@ def execute(payload: ExecuteRequest, request: Request) -> ExecuteResponse:
 @app.post(
     "/feedback/golden-example",
     response_model=GoldenExampleFeedbackResponse,
-    dependencies=[Depends(verify_api_key)],
 )
-def feedback_golden_example(payload: GoldenExampleFeedbackRequest) -> GoldenExampleFeedbackResponse:
+def feedback_golden_example(
+    payload: GoldenExampleFeedbackRequest,
+    _identity: AuthIdentity = Depends(require_permission(Permission.GOLDEN_EXAMPLE_WRITE)),
+) -> GoldenExampleFeedbackResponse:
     """Records a human-approved (question, SQL) pair for future few-shot
     retrieval -- the same `embeddings.golden_examples.save_golden_example`
     call the dashboard's thumbs-up widget makes when a user confirms a result.
@@ -648,10 +740,11 @@ def feedback_golden_example(payload: GoldenExampleFeedbackRequest) -> GoldenExam
     return GoldenExampleFeedbackResponse(saved=True)
 
 
-@app.post(
-    "/schema/refresh", response_model=SchemaRefreshResponse, dependencies=[Depends(verify_api_key)]
-)
-def schema_refresh(request: Request) -> SchemaRefreshResponse:
+@app.post("/schema/refresh", response_model=SchemaRefreshResponse)
+def schema_refresh(
+    request: Request,
+    _identity: AuthIdentity = Depends(require_permission(Permission.SCHEMA_REFRESH)),
+) -> SchemaRefreshResponse:
     """Re-introspects and re-embeds every configured database's schema --
     the same `refresh_all_schema_indexes` call the React dashboard's
     "Refresh Schema" button makes. Skips re-embedding a database whose
@@ -674,8 +767,11 @@ def schema_refresh(request: Request) -> SchemaRefreshResponse:
     )
 
 
-@app.get("/schema/tables", response_model=TablesResponse, dependencies=[Depends(verify_api_key)])
-def schema_tables(database: str | None = None) -> TablesResponse:
+@app.get("/schema/tables", response_model=TablesResponse)
+def schema_tables(
+    database: str | None = None,
+    _identity: AuthIdentity = Depends(require_permission(Permission.ASK)),
+) -> TablesResponse:
     """Live schema listing (table/column names, types) -- the same
     `db.schema_introspection.introspect_schema` the UI's sidebar schema
     browser and `scripts/build_embeddings.py` use, metadata-only (no data

@@ -66,6 +66,36 @@ def get_correlation_id() -> str | None:
     return _correlation_id.get()
 
 
+class CorrelationIdLogFilter(logging.Filter):
+    """Stamps `record.correlation_id` from the current request context onto
+    every log record passing through the handler this filter is attached to.
+
+    2026 Phase 3 observability gap: before this, a request's correlation ID
+    was only visible on `security.audit` events (`log_security_event` reads
+    the contextvar explicitly, above) -- every *ordinary* `logger.info`/
+    `.warning`/`.error` call in `agent/nodes.py`, `rag/`, `db/`,
+    `media_gen/`, `search/`, etc. used a plain per-module `logging.getLogger`
+    with no correlation ID at all, making it impossible to grep one
+    request's full trace across the API -> LangGraph -> RAG/SQL/external-call
+    boundary the way `docs/OBSERVABILITY.md` describes. Attaching this filter
+    to the root handler (`config.settings.configure_logging`) fixes that for
+    every existing call site with zero changes to any of those modules --
+    `logging.Filter` runs on every record before formatting, and the
+    correlation ID is already available via the same `contextvars.ContextVar`
+    `log_security_event` reads.
+
+    Outside a request (a CLI script, a test, startup logging before the
+    middleware has run) `get_correlation_id()` is `None`; this renders as
+    `"-"` rather than the string `"None"`, so the format string's column
+    stays a stable width and `grep -v ' correlation_id=- '` cleanly isolates
+    request-scoped log lines from background ones.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        record.correlation_id = get_correlation_id() or "-"
+        return True
+
+
 Severity = Literal["info", "warning", "critical"]
 
 _LEVEL_MAP: dict[Severity, int] = {

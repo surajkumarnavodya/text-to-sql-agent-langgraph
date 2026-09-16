@@ -198,8 +198,25 @@ def _cached_engine(connection_string: str) -> Engine:
     and rebuild engines (and their connection pools) on every switch rather
     than reusing them. The cache key lives only in memory for this process
     -- it is never logged or persisted.
+
+    2026 Phase 3 performance review: `pool_size`/`max_overflow` are now
+    read from `Settings.db_pool_size`/`db_max_overflow`
+    (`get_settings()`, itself cached) rather than left on SQLAlchemy's own
+    default of 5/10 -- see those fields' docstrings for why. Sourced from
+    the global `Settings` rather than threaded through as a parameter
+    because pool sizing is a deployment-wide tuning knob in this app's
+    model (one process, one pool-sizing policy), not a per-named-database
+    setting -- matching this function's own existing "cache key is just
+    the connection string" contract, left unchanged.
     """
-    return create_engine(connection_string, pool_pre_ping=True, pool_recycle=1800)
+    settings = get_settings()
+    return create_engine(
+        connection_string,
+        pool_pre_ping=True,
+        pool_recycle=1800,
+        pool_size=settings.db_pool_size,
+        max_overflow=settings.db_max_overflow,
+    )
 
 
 def get_engine(settings: DbConnectionLike | None = None) -> Engine:

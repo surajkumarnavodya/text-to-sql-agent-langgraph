@@ -131,6 +131,8 @@ def run_orchestrated(
     conversation_history: list[ConversationExchange] | None = None,
     enable_insight: bool = True,
     session_id: str | None = None,
+    caller_roles: tuple[str, ...] = (),
+    caller_subject: str | None = None,
 ) -> AgentState | OrchestratorState:
     """Routes a question to one or more sources and returns the combined result.
 
@@ -151,6 +153,16 @@ def run_orchestrated(
             `agent.rate_limit.get_session_expensive_source_limiter`);
             `None` (the default, e.g. for `eval/runner.py` or standalone
             scripts) simply means that ceiling doesn't apply.
+        caller_roles: Same shape and meaning as `agent.graph.run_agent`'s
+            parameter of the same name -- also consulted by
+            `router_node`'s per-source authorization check (2026 Phase 2
+            security review, closing the "no authorization layer between
+            routing and execution" gap -- see `docs/AUTHORIZATION.md`).
+        caller_subject: The authenticated caller's `security.oidc
+            .AuthIdentity.subject`, when a real one exists (OIDC mode).
+            `router_node` prefers this over `session_id` to scope the
+            session-level expensive-source cost ceiling, since unlike
+            `session_id` it can't be reset by the caller at will.
 
     Returns:
         When `Settings.enable_multi_source_router` is off, exactly what
@@ -162,7 +174,7 @@ def run_orchestrated(
     """
     settings = get_settings()
     if not settings.enable_multi_source_router:
-        return run_agent(question, conversation_history, enable_insight)
+        return run_agent(question, conversation_history, enable_insight, caller_roles)
 
     logger.info("Starting orchestrated run for question=%r", question)
     compiled_graph = build_orchestrator_graph()
@@ -174,6 +186,8 @@ def run_orchestrated(
     # reason: never rely on a reducer channel's implicit empty state.
     initial_state: OrchestratorState = {
         "question": question,
+        "caller_roles": caller_roles,
+        "caller_subject": caller_subject,
         "session_id": session_id,
         "rejection_reason": None,
         "rejection_message": None,

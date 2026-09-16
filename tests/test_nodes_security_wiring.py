@@ -141,6 +141,49 @@ class TestValidateSqlNodeSensitiveColumnGate:
 
         assert result["status"] == "executing"
 
+    def test_caller_with_view_restricted_columns_permission_bypasses_the_gate(self, monkeypatch):
+        """2026 Phase 2 security review: a caller whose role(s) grant
+        `agent.authz.Permission.VIEW_RESTRICTED_COLUMNS` (e.g. "analyst"/
+        "admin" in the default role map, see docs/AUTHORIZATION.md) must
+        be able to see a restricted column the same query would otherwise
+        be blocked for."""
+        monkeypatch.setattr(
+            "agent.nodes.load_sensitive_columns",
+            lambda: {("DimCustomer", "EmailAddress"): "restricted"},
+        )
+        state: AgentState = {
+            "sql": "SELECT EmailAddress FROM DimCustomer",
+            "retry_count": 0,
+            "schema_tables": self._schema_tables(),
+            "selected_database": "default",
+            "caller_roles": ("analyst",),
+        }
+
+        result = validate_sql_node(state)
+
+        assert result["status"] == "executing"
+
+    def test_caller_with_only_viewer_role_is_still_blocked(self, monkeypatch):
+        """Sanity check: having *some* role isn't enough -- it must be one
+        that actually grants VIEW_RESTRICTED_COLUMNS ("viewer"/"user" in
+        the default role map do not)."""
+        monkeypatch.setattr(
+            "agent.nodes.load_sensitive_columns",
+            lambda: {("DimCustomer", "EmailAddress"): "restricted"},
+        )
+        state: AgentState = {
+            "sql": "SELECT EmailAddress FROM DimCustomer",
+            "retry_count": 0,
+            "schema_tables": self._schema_tables(),
+            "selected_database": "default",
+            "caller_roles": ("viewer",),
+        }
+
+        result = validate_sql_node(state)
+
+        assert result["status"] == "generating"
+        assert result["last_error_category"] == "restricted_column"
+
     def test_restricted_column_on_a_table_not_in_this_attempts_schema_is_not_flagged(
         self, monkeypatch
     ):

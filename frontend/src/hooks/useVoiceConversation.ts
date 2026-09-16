@@ -2,23 +2,30 @@ import { useEffect, useRef, useState } from 'react'
 import { useAudioRecorder } from '@/hooks/useAudioRecorder'
 import { useSpeechRecognition } from '@/hooks/useSpeechRecognition'
 import { transcribeAudio } from '@/lib/api'
-import { useChatStore } from '@/store/chatStore'
 
-export type VoiceConversationPhase = 'idle' | 'listening' | 'transcribing' | 'thinking' | 'speaking'
+export type VoiceConversationPhase = 'idle' | 'listening' | 'transcribing' | 'speaking'
 
 // A ~0-sample silent WAV, used only to "warm up" `<audio>` playback for
 // the browser's autoplay policy -- see `start()`'s comment below.
 const SILENT_AUDIO_SRC =
   'data:audio/wav;base64,UklGRigAAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQAAAAA='
 
-/** Orchestrates a single-shot voice turn -- listen -> (auto-detected
- * silence) -> transcribe locally -> ask -> speak the answer -> back to the
- * normal typing composer. One question, one spoken answer, then it stops
- * on its own; the user clicks the mic again to ask another.
+/** Drives one voice turn *inline in the composer* -- there is no separate
+ * takeover card. `listen()` -> (auto-detected silence, or the mic button
+ * itself toggled to a stop button) -> transcribe locally -> the raw heard
+ * text is handed to `onTranscribed`, whose caller (`ChatInput`) drops it
+ * straight into the normal textarea. From there it's exactly like a typed
+ * question: the user can read/edit it, and the existing Send button (or
+ * Enter) is the only way it's ever submitted -- nothing here auto-submits.
+ * Only the raw transcript is ever surfaced, never an AI-cleaned rewrite --
+ * what lands in the box is exactly what was heard.
  *
  * Two independent inputs run in parallel while listening:
  *   - `useSpeechRecognition` (browser-native, live interim captions only --
  *     see that hook's own docstring for the local-vs-cloud disclosure).
+ *     `ChatInput` renders these interim words directly into the textarea
+ *     as they arrive, so the box visibly "types itself" while the user
+ *     talks.
  *   - `useAudioRecorder` (plain `MediaRecorder`, captures the same
  *     utterance for the authoritative local `faster-whisper` pass via
  *     `POST /voice/transcribe`).
@@ -27,28 +34,23 @@ const SILENT_AUDIO_SRC =
  * what's actually asked.
  *
  * `continuous: false` on the recognition side means the browser itself
- * signals end-of-utterance (`onend`), which is what ends listening
- * automatically without a manual stop button. Browsers without
- * `SpeechRecognition` support (`isSupported: false`) get no live caption
- * and no auto-stop signal -- the caller (`VoiceConversationBar`) falls
- * back to a manual "Done speaking" button that calls `stopListening()`
- * itself in that case.
+ * signals end-of-utterance (`onend`), which also ends listening -- but the
+ * mic-turned-stop button (`stopListening`) works identically in every
+ * browser, so listening never depends on `SpeechRecognition` support to be
+ * endable.
  */
-export function useVoiceConversation() {
+export function useVoiceConversation(onTranscribed: (text: string) => void) {
   const [phase, setPhase] = useState<VoiceConversationPhase>('idle')
-  const [isActive, setIsActive] = useState(false)
   const [liveCaption, setLiveCaption] = useState('')
   const [error, setError] = useState<string | null>(null)
 
   const recorder = useAudioRecorder()
   const speech = useSpeechRecognition()
-  const askQuestion = useChatStore((state) => state.askQuestion)
 
-  // Mutable, read-fresh-at-call-time mirrors of state that async callbacks
+  // Mutable, read-fresh-at-call-time mirror of `phase` that async callbacks
   // (speech recognition's onend, in particular -- registered once per
   // listening turn, potentially long-lived) need without risking a stale
   // closure over a `useState` value captured at registration time.
-  const isActiveRef = useRef(false)
   const phaseRef = useRef<VoiceConversationPhase>('idle')
   const audioElRef = useRef<HTMLAudioElement | null>(null)
 
@@ -57,27 +59,32 @@ export function useVoiceConversation() {
     setPhase(next)
   }
 
+  /** Plays a synthesized spoken-answer URL through the same `<audio>`
+   * element `start()` warmed up for autoplay -- called by `ChatInput`
+   * after a voice-originated question's answer comes back. Resolves once
+   * playback ends (or fails), never rejects. */
   const playAnswer = (url: string): Promise<void> =>
-    new Promise((resolve) => {
+    new Promise<void>((resolve) => {
       if (!audioElRef.current) audioElRef.current = new Audio()
       const audioEl = audioElRef.current
       audioEl.src = url
-      audioEl.onended = () => resolve()
-      audioEl.onerror = () => resolve()
-      audioEl.play().catch(() => resolve())
+      const finish = () => {
+        updatePhase('idle')
+        resolve()
+      }
+      audioEl.onended = finish
+      audioEl.onerror = finish
+      updatePhase('speaking')
+      audioEl.play().catch(finish)
     })
 
-  /** Ends the current turn and returns to the normal typing composer.
-   * `clearError` is false when a turn just failed (transcription error,
-   * mic denied) -- the message needs to survive past this reset so
-   * `ChatInput`'s normal (non-voice) view can still show it; the next
-   * `start()` clears it. */
+  /** Aborts whatever's in flight and returns to idle. `clearError` is
+   * false when a turn just failed (transcription error, mic denied) -- the
+   * message needs to survive so it's still visible after the reset; the
+   * next `start()` clears it. */
   const reset = (clearError: boolean) => {
-    isActiveRef.current = false
-    setIsActive(false)
     speech.abort()
     void recorder.stop()
-    audioElRef.current?.pause()
     setLiveCaption('')
     if (clearError) setError(null)
     updatePhase('idle')
@@ -96,38 +103,39 @@ export function useVoiceConversation() {
     let text = ''
     try {
       const result = await transcribeAudio(audioBlob)
+      // Only ever the raw heard transcript -- `result.corrected_text` (an
+      // AI-cleaned rewrite) is deliberately never used here, so what lands
+      // in the composer is exactly what was heard, nothing else.
       text = result.text.trim()
     } catch {
       setError('voice.transcribeFailed')
     }
     setLiveCaption('')
-
-    if (!text) {
-      reset(false)
-      return
-    }
-
-    updatePhase('thinking')
-    const entry = await askQuestion(text, { originatedFromVoice: true })
-
-    if (entry.spokenAudioUrl && isActiveRef.current) {
-      updatePhase('speaking')
-      await playAnswer(entry.spokenAudioUrl)
-    }
-
-    // One question, one spoken answer, then back to the normal composer --
-    // a single voice turn, not a continuous hands-free loop.
-    reset(false)
+    updatePhase('idle')
+    if (text) onTranscribed(text)
   }
 
-  const listen = async () => {
+  const start = async () => {
+    setError(null)
     setLiveCaption('')
     updatePhase('listening')
+    // "Warms up" this <audio> element with a real, gesture-attributed
+    // play() call, synchronously inside this click handler. The actual
+    // spoken answer plays several seconds later (after transcription +
+    // the agent's own round trip via `playAnswer`), well outside this
+    // call stack -- some browsers only treat that later, code-triggered
+    // play() as allowed if the tab has already produced audio once;
+    // without this, the very first spoken answer of a session can be
+    // silently blocked by the browser's autoplay policy.
+    if (!audioElRef.current) audioElRef.current = new Audio()
+    audioElRef.current.src = SILENT_AUDIO_SRC
+    void audioElRef.current.play().catch(() => {})
+
     const recordingStarted = await recorder.start()
     // The mic permission prompt can take a while (the user has to actually
-    // click "Allow") -- if the turn was cancelled during that wait, don't
-    // resurrect a turn nobody wants anymore.
-    if (!isActiveRef.current) {
+    // click "Allow") -- if the turn was cancelled/superseded during that
+    // wait, don't resurrect a turn nobody wants anymore.
+    if (phaseRef.current !== 'listening') {
       void recorder.stop()
       return
     }
@@ -146,31 +154,15 @@ export function useVoiceConversation() {
         },
       )
     }
-    // Unsupported browsers: no auto-stop signal. VoiceConversationBar shows
-    // a manual "Done speaking" button in this case, wired to stopListening().
-  }
-
-  const start = () => {
-    isActiveRef.current = true
-    setIsActive(true)
-    setError(null)
-    // "Warms up" this <audio> element with a real, gesture-attributed
-    // play() call, synchronously inside this click handler. The actual
-    // spoken answer plays several seconds later (after transcription +
-    // the agent's own round trip via `playAnswer`), well outside this
-    // call stack -- some browsers only treat that first later, code-
-    // triggered play() as allowed if the tab has already produced audio
-    // once; without this, the very first spoken answer of a session can
-    // be silently blocked by the browser's autoplay policy.
-    if (!audioElRef.current) audioElRef.current = new Audio()
-    audioElRef.current.src = SILENT_AUDIO_SRC
-    void audioElRef.current.play().catch(() => {})
-    void listen()
+    // Unsupported browsers: no auto-stop signal. ChatInput shows a static
+    // "recording" placeholder in this case; the mic-turned-stop button is
+    // the only way to end listening.
   }
 
   /** Ends the current listening turn early -- the fallback path for
-   * browsers without live speech recognition, and also usable any time
-   * the user doesn't want to wait for silence detection. */
+   * browsers without live speech recognition, and also usable any time the
+   * user doesn't want to wait for silence detection. Same button that
+   * started listening, just toggled -- no separate stop control. */
   const stopListening = () => {
     if (phaseRef.current !== 'listening') return
     if (speech.isSupported) {
@@ -180,15 +172,10 @@ export function useVoiceConversation() {
     }
   }
 
-  /** Cancels the current turn from any phase -- the user explicitly
-   * backing out, so any pending error is dismissed along with it. */
-  const stopConversation = () => reset(true)
-
-  useEffect(() => stopConversation, []) // eslint-disable-line react-hooks/exhaustive-deps -- cleanup only, intentionally runs once
+  useEffect(() => () => reset(true), []) // eslint-disable-line react-hooks/exhaustive-deps -- cleanup only, intentionally runs once
 
   return {
     phase,
-    isActive,
     liveCaption,
     /** An i18next key (e.g. `"voice.micDenied"`), not a display string --
      * the caller translates it with `t()`. `null` when there's nothing to show. */
@@ -196,6 +183,6 @@ export function useVoiceConversation() {
     isSupported: speech.isSupported,
     start,
     stopListening,
-    stopConversation,
+    playAnswer,
   }
 }

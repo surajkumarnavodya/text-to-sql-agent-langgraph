@@ -17,12 +17,15 @@ from __future__ import annotations
 
 from fastapi import HTTPException, Request, status
 
-from agent.rate_limit import SlidingWindowRateLimiter
+from agent.rate_limit import BoundedLimiterCache
 from config.settings import Settings
 
 RATE_LIMIT_MESSAGE = "Too many requests -- please wait a moment and try again."
 
-_limiters: dict[str, SlidingWindowRateLimiter] = {}
+# Bounded (see BoundedLimiterCache's docstring) -- previously a bare dict
+# that grew one entry per distinct `f"{action}:{client_ip}"` key forever
+# (2026 Phase 1 security review, finding API-02).
+_limiters = BoundedLimiterCache()
 
 
 def _client_ip(request: Request) -> str:
@@ -35,14 +38,12 @@ def enforce_api_action_rate_limit(request: Request, action: str, settings: Setti
     (`Settings.api_action_rate_limit_per_minute`). Call at the top of a
     route handler that needs this -- before any real work happens."""
     key = f"{action}:{_client_ip(request)}"
-    limiter = _limiters.get(key)
-    if limiter is None:
-        limiter = SlidingWindowRateLimiter(
-            max_events=settings.api_action_rate_limit_per_minute,
-            window_seconds=60.0,
-            name=f"api_action[{key}]",
-        )
-        _limiters[key] = limiter
+    limiter = _limiters.get_or_create(
+        key,
+        max_events=settings.api_action_rate_limit_per_minute,
+        window_seconds=60.0,
+        name=f"api_action[{key}]",
+    )
 
     result = limiter.check()
     if not result.allowed:

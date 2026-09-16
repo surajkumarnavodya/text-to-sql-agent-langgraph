@@ -30,6 +30,16 @@ class TestGetMedia:
         assert response.content == b"\x89PNG raw bytes"
         assert response.headers["content-type"] == "image/png"
 
+    def test_response_sets_nosniff_header(self, client):
+        """2026 Phase 3 file-upload security review: defense-in-depth
+        alongside media_gen.download's Content-Type allowlist -- see
+        api/media.py's own comment."""
+        media_id = get_media_cache().put(b"\x89PNG raw bytes", "image/png")
+
+        response = client.get(f"/media/{media_id}")
+
+        assert response.headers["x-content-type-options"] == "nosniff"
+
     def test_unknown_id_returns_404(self, client):
         response = client.get("/media/does-not-exist")
 

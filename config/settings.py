@@ -301,6 +301,20 @@ class Settings(BaseSettings):
             "use the database's default schema".
         db_odbc_driver: ODBC driver name for DB_TYPE=mssql, e.g.
             "ODBC Driver 17 for SQL Server". Ignored for other DB_TYPEs.
+        db_pool_size: `QueuePool`'s `pool_size` for every configured
+            database's engine (`db/connection.py::_cached_engine`). 2026
+            Phase 3 performance review: previously left on SQLAlchemy's
+            own default (5) -- fine for this app's original single-user
+            target, a real concurrency ceiling once more than a handful of
+            callers query the same database at once (each held connection
+            is one `execute_sql_node`/`POST /execute` call in flight).
+            Mirrors `moderation_store_pool_size`'s existing, already-
+            explicit pattern below, now applied consistently to the
+            primary database engine too.
+        db_max_overflow: `QueuePool`'s `max_overflow` for the same engine
+            -- the burst ceiling above `db_pool_size` before a caller
+            waits for a connection, same meaning as
+            `moderation_store_max_overflow`.
         chroma_persist_dir: Directory where ChromaDB persists its index.
         chroma_collection_name: Name of the Chroma collection holding schema DDL.
         embedding_model_name: sentence-transformers model used for embeddings.
@@ -317,6 +331,32 @@ class Settings(BaseSettings):
             `max_retries`, the pre-existing behavior).
         max_result_rows: Row cap applied to every executed query.
         query_timeout_seconds: Wall-clock timeout for query execution.
+        request_timeout_seconds: Wall-clock ceiling on one whole `POST /ask`
+            request (the entire agent graph -- schema retrieval through every
+            self-correction retry through insight generation), enforced by
+            `api/main.py`'s own thread+join wrapper around `run_orchestrated`
+            (the same "run on a background thread, give up waiting past the
+            deadline" idiom `db.execution._execute_with_timeout` already uses
+            for query execution -- see that function's docstring). 2026 Phase
+            3 reliability fix: before this existed, nothing bounded how long
+            a single request could occupy a FastAPI worker thread -- this
+            project's own Phase 3 benchmark run measured one real case that
+            took ~5,502 seconds (~92 minutes, almost certainly abnormal
+            shared-machine contention, not steady-state behavior -- see
+            `docs/PERFORMANCE_RESULTS.md`) with nothing to cut it off. The
+            default (600s / 10 minutes) is chosen from that same benchmark's
+            *normal* distribution, not the outlier: it comfortably covers the
+            Phase 2 baseline's P99 (~440s) while still bounding the
+            pathological case. Note this is a "stop waiting" timeout, not a
+            true cancellation -- Ollama has no clean way to abort an in-flight
+            generation call, so the abandoned background thread still runs to
+            completion and its (now-unread) result is simply discarded; what
+            this buys is a timely response to the caller and a freed-up
+            request-handling thread, not reduced backend load from the
+            abandoned call itself. Deliberately scoped to the API layer only
+            -- `agent.graph.run_agent`/`run_orchestrated` themselves stay
+            unbounded by this setting so `eval/runner.py`'s benchmark
+            continues measuring real, untruncated completion times.
         llm_max_tokens: Max tokens the LLM may generate per call (sandboxing).
         insight_max_tokens: Max tokens the LLM may generate for the post-query
             plain-English insight sentence (see `agent.llm_client.
@@ -326,6 +366,26 @@ class Settings(BaseSettings):
             user's typed question, enforced by `agent.input_guard.
             check_input` before any normalization or LLM call -- see
             CLAUDE.md's adversarial-input-hardening notes.
+        max_conversation_history_turns: Maximum number of prior turns from a
+            caller-supplied `conversation_history` that are ever processed,
+            enforced by `agent.input_guard.sanitize_conversation_history`
+            (the oldest turns beyond this count are dropped, keeping only
+            the most recent ones). 2026 Phase 3 resource-governance finding:
+            `api.schemas.AskRequest.conversation_history` has no
+            schema-level length cap (matching `question`'s own
+            deliberately-downstream-enforced convention -- see that field's
+            docstring), and only the single most recent entry is ever
+            functionally read (`agent.nodes.retrieve_schema_node`'s
+            follow-up resolution uses `conversation_history[-1]`;
+            `classify_followup_node` only checks whether the list is
+            non-empty) -- every entry beyond that was being fully
+            normalized and regex-scanned for injection patterns
+            (`sanitize_conversation_history`) for zero functional benefit,
+            a real, unbounded-by-anything CPU/memory cost a caller could
+            trivially inflate by sending an arbitrarily long array. The
+            default (20) is deliberately generous relative to the "only the
+            last entry matters" reality above -- it exists to bound the
+            worst case, not to constrain any real conversation.
         question_rate_limit_per_minute: Max question submissions per minute,
             per client IP -- see `agent.rate_limit`. A basic, in-memory
             safeguard for local/single-user use, not a multi-tenant rate
@@ -371,14 +431,63 @@ class Settings(BaseSettings):
             schemas (e.g. `ssn`, `salary`) even though the data isn't
             logged, hence the stricter option rather than treating
             "no cell values" as sufficient on its own.
-        api_auth_token: Optional bearer token required on every `api/`
-            request (`Authorization: Bearer <token>`) when set. None
-            (default, unset in `.env`) means the API has no auth check of
-            its own -- a deliberate, documented "lightweight hook, not a
-            full auth system" posture (see `docs/DEPLOYMENT.md`): anything
-            beyond local/trusted-network use should sit behind a real
-            authenticating reverse proxy regardless of whether this is set.
-            A `SecretStr` for the same reason `db_password` is.
+        api_auth_token: Optional static bearer token required on every
+            `api/` request (`Authorization: Bearer <token>`) when set. None
+            (default, unset in `.env`) means this specific check is a
+            no-op -- kept unchanged from before `oidc_issuer` existed (see
+            below) as a deliberately simple option for
+            machine-to-machine/CI callers even once OIDC is configured for
+            interactive users; see `docs/AUTHENTICATION.md` for the full
+            picture of how the two combine. A `SecretStr` for the same
+            reason `db_password` is.
+        environment: "development" (default) or "production" -- an
+            explicit, coarse deployment-posture flag with exactly one
+            enforced consequence today (see `_require_identity_in_production`
+            below): a production deployment with no authentication
+            configured at all (`auth_mode == "none"`) fails to start rather
+            than silently serving every request unauthenticated. Not a
+            general-purpose feature flag -- see `docs/AUTHENTICATION.md`
+            for why this is deliberately narrow in scope.
+        oidc_issuer: The `iss` claim every validated JWT must exactly
+            match, and (together with `oidc_jwks_url`, if that's unset) the
+            base URL this app derives `<issuer>/.well-known/openid-configuration`
+            from to discover the provider's JWKS endpoint at startup. None
+            (default) means OIDC/JWT authentication is off -- see
+            `security/oidc.py` and `docs/AUTHENTICATION.md`.
+        oidc_audience: The `aud` claim every validated JWT must contain.
+            Required whenever `oidc_issuer` is set -- an issuer without an
+            audience check would accept a token minted for a *different*
+            application at the same identity provider, a real and common
+            OIDC misconfiguration this field exists specifically to
+            prevent.
+        oidc_jwks_url: Explicit JWKS endpoint URL. Optional -- if unset
+            while `oidc_issuer` is set, it's discovered once at first use
+            via the issuer's own `/.well-known/openid-configuration`
+            document (standard OIDC discovery). Set this directly to skip
+            that discovery round-trip, or if the provider's discovery
+            document lives somewhere non-standard.
+        oidc_algorithms: Signing algorithms accepted for JWT verification.
+            Deliberately a fixed allowlist read from *this config*, never
+            from the token's own (attacker-controlled) `alg` header --
+            accepting whatever algorithm a token claims is the classic
+            "alg confusion" JWT vulnerability (e.g. an RS256-signed
+            provider's public key gets misused as an HS256 shared secret).
+            Defaults to `("RS256",)`, the near-universal choice for a real
+            OIDC provider (Auth0, Okta, Azure AD, Keycloak, ...); `"none"`
+            can never appear here regardless of configuration (see
+            `_validate_oidc_algorithms` below).
+        oidc_clock_skew_seconds: Leeway applied to `exp`/`iat`/`nbf`
+            validation, to tolerate ordinary clock drift between this
+            server and the identity provider. Small and bounded
+            deliberately -- a large value would meaningfully extend how
+            long an expired token stays acceptable.
+        oidc_role_claim: Name of the JWT claim `agent.authz` reads the
+            caller's role(s) from (a single string or a list of strings,
+            both accepted -- see `security/oidc.py::extract_roles`).
+            Provider-specific in practice (a raw OIDC ID token has no
+            standard claim for this; Auth0/Keycloak/Azure AD each use their
+            own custom-claim convention) -- configure this to match
+            whatever the identity provider actually issues.
         enable_multi_source_router: Whether `api/main.py` routes
             questions through `agent.orchestrator.graph.run_orchestrated`
             (the multi-source router) instead of calling
@@ -479,6 +588,16 @@ class Settings(BaseSettings):
             claims its size is -- `api/documents.py::upload_document`
             previously called `file.read()` with no cap at all, an
             unbounded-memory-read risk from a single oversized upload.
+        max_document_pages: Upper bound on one uploaded PDF's page count,
+            enforced by `rag.ingestion.extract_pdf_pages` before extracting
+            text from any page. 2026 Phase 2 security review: closes a
+            decompression-bomb-shaped gap `max_document_upload_mb` alone
+            doesn't -- a PDF's on-disk size says little about how many
+            pages (and therefore how much CPU/memory) extracting its text
+            actually costs, so a small-but-absurdly-high-page-count file
+            could still be expensive relative to what its byte size
+            suggested. Default (2000) is generous for a legitimate
+            document while still bounding the worst case.
         enable_web_search: Whether the web_search node is offered to the
             router at all. False by default, and independent of
             `web_search_api_key` being set -- both must be true/present for
@@ -586,6 +705,23 @@ class Settings(BaseSettings):
             configured database, so "branch_id"/"dispute" are less likely
             to be misheard as similar-sounding common words) -- Whisper's
             own prompt-biasing works best short, not as a full schema dump.
+        enable_voice_correction: Whether a raw `voice/stt.py` transcript is
+            run through one extra Ollama call (`voice/correction.py`) to fix
+            misrecognized words, strip filler words/false starts, resolve
+            self-corrections, and normalize punctuation before it's
+            returned to the caller -- the same accuracy-aid shape as
+            `enable_query_planning`/`enable_golden_examples`, applied to STT
+            output instead of SQL generation. True by default -- like the
+            rest of voice mode, this is a local Ollama call, so it costs no
+            money and makes no external network call. Fails open on any
+            Ollama error (`voice.correction.correct_transcript` never
+            raises): the raw transcript is used unchanged rather than
+            failing the request.
+        voice_correction_max_tokens: Caps the correction call's `num_predict`
+            -- the corrected sentence is normally about as long as the raw
+            transcript, so this only needs headroom over
+            `stt_vocabulary_max_chars`-sized input, not a large budget like
+            `llm_max_tokens`.
         voice_max_upload_mb: Max accepted size of one recorded-question
             upload to `POST /voice/transcribe`, enforced the same way
             `max_document_upload_mb` already caps `POST /documents`
@@ -827,6 +963,8 @@ class Settings(BaseSettings):
     db_connection_string: SecretStr | None = None
     db_schema: str | None = None
     db_odbc_driver: str = "ODBC Driver 17 for SQL Server"
+    db_pool_size: int = Field(default=10, gt=0)
+    db_max_overflow: int = Field(default=20, ge=0)
 
     chroma_persist_dir: Path = Path("./embeddings/.chroma")
     chroma_collection_name: str = "schema_ddl"
@@ -836,9 +974,11 @@ class Settings(BaseSettings):
     complex_query_max_retry_bonus: int = Field(default=2, ge=0)
     max_result_rows: int = Field(default=1000, gt=0)
     query_timeout_seconds: int = Field(default=15, gt=0)
+    request_timeout_seconds: int = Field(default=600, gt=0)
     llm_max_tokens: int = Field(default=1024, gt=0)
     insight_max_tokens: int = Field(default=120, gt=0)
     max_question_length: int = Field(default=500, gt=0)
+    max_conversation_history_turns: int = Field(default=20, gt=0)
     question_rate_limit_per_minute: int = Field(default=10, gt=0)
     llm_call_rate_limit_per_minute: int = Field(default=20, gt=0)
     api_action_rate_limit_per_minute: int = Field(default=20, gt=0)
@@ -856,6 +996,13 @@ class Settings(BaseSettings):
     golden_examples_top_k: int = Field(default=3, gt=0)
     golden_examples_min_similarity: float = Field(default=0.75, ge=0.0, le=1.0)
     api_auth_token: SecretStr | None = None
+    environment: Literal["development", "production"] = "development"
+    oidc_issuer: str | None = None
+    oidc_audience: str | None = None
+    oidc_jwks_url: str | None = None
+    oidc_algorithms: tuple[str, ...] = ("RS256",)
+    oidc_clock_skew_seconds: int = Field(default=60, ge=0)
+    oidc_role_claim: str = "roles"
     rag_store_connection_string: SecretStr | None = None
     rag_store_odbc_driver: str = "ODBC Driver 17 for SQL Server"
     enable_document_rag: bool = False
@@ -867,6 +1014,7 @@ class Settings(BaseSettings):
     rag_embedding_model_name: str = ""
     enable_pdf_download: bool = True
     max_document_upload_mb: int = Field(default=25, gt=0)
+    max_document_pages: int = Field(default=2000, gt=0)
     enable_web_search: bool = False
     web_search_provider: str = "tavily"
     web_search_api_key: SecretStr | None = None
@@ -883,6 +1031,8 @@ class Settings(BaseSettings):
     stt_model_size: str = "base"
     stt_device: Literal["cpu", "cuda"] = "cpu"
     stt_vocabulary_max_chars: int = Field(default=200, gt=0)
+    enable_voice_correction: bool = True
+    voice_correction_max_tokens: int = Field(default=150, gt=0)
     voice_max_upload_mb: int = Field(default=10, gt=0)
     voice_max_duration_seconds: int = Field(default=30, gt=0)
     tts_voice: str = "en_US-lessac-medium"
@@ -1045,6 +1195,95 @@ class Settings(BaseSettings):
             )
         return self
 
+    @property
+    def auth_mode(self) -> Literal["none", "static_token", "oidc"]:
+        """The single dispatch point `api.auth.verify_api_key` (and
+        everything downstream of it, e.g. `agent.authz`) uses to decide how
+        a request is authenticated -- computed from the more granular
+        fields above rather than stored as its own field, so there is only
+        ever one source of truth for "is OIDC configured" instead of a
+        second flag that could disagree with `oidc_issuer`/`oidc_audience`.
+
+        "oidc" whenever `oidc_issuer` is configured (verified fully valid
+        by `_validate_oidc_requires_audience` below, so this can trust it),
+        regardless of whether `api_auth_token` is *also* set -- see
+        `docs/AUTHENTICATION.md` for why both can be configured
+        simultaneously (interactive users via OIDC, service/CI callers via
+        the static token) rather than being mutually exclusive. "none" only
+        when neither is configured at all, which `_require_identity_in_production`
+        below refuses to allow outside `environment="development"`.
+        """
+        if self.oidc_issuer is not None:
+            return "oidc"
+        if self.api_auth_token is not None:
+            return "static_token"
+        return "none"
+
+    @model_validator(mode="after")
+    def _validate_oidc_requires_audience(self) -> Settings:
+        """`OIDC_ISSUER` without `OIDC_AUDIENCE` is a real, dangerous
+        misconfiguration, not just an incomplete one: without an audience
+        check, this app would accept *any* validly-signed token from that
+        issuer, including one minted for a completely different
+        application that happens to share the same identity provider --
+        exactly the kind of cross-application token confusion OIDC's
+        audience claim exists to prevent. Caught here, at startup, rather
+        than left to `security/oidc.py` to reject per-request.
+        """
+        if self.oidc_issuer is not None and not self.oidc_audience:
+            raise ConfigurationError(
+                "OIDC_ISSUER is set but OIDC_AUDIENCE is not -- refusing to start. "
+                "Validating a token's signature and issuer without also checking its "
+                "audience would accept a token minted for a different application at "
+                "the same identity provider. Set OIDC_AUDIENCE in .env."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_oidc_algorithms(self) -> Settings:
+        """`OIDC_ALGORITHMS` must be non-empty and must never contain
+        `"none"` -- the classic JWT "alg confusion" bypass (a token whose
+        header claims `alg: none`, which some naive verifiers then skip
+        signature checking for entirely). `security/oidc.py` also never
+        reads the algorithm from the token itself, as defense in depth, but
+        this config-level guard exists so a typo'd/misguided `.env` value
+        can't silently reintroduce the same class of bug.
+        """
+        if not self.oidc_algorithms:
+            raise ConfigurationError(
+                "OIDC_ALGORITHMS must list at least one signing algorithm (e.g. RS256)."
+            )
+        if any(alg.strip().lower() == "none" for alg in self.oidc_algorithms):
+            raise ConfigurationError(
+                "OIDC_ALGORITHMS must never include 'none' -- this would accept an "
+                "unsigned token from anyone (the classic JWT 'alg confusion' bypass)."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _require_identity_in_production(self) -> Settings:
+        """`ENVIRONMENT=production` with no authentication configured at
+        all refuses to start, rather than silently serving every request
+        -- including `POST /execute`, document delete, and paid media
+        generation -- to any network caller with no credentials, which is
+        exactly what `auth_mode == "none"` means (see `api/auth.py`'s own
+        docstring). `ENVIRONMENT` defaults to "development", where this
+        never fires, so a fresh clone / local dev setup is completely
+        unaffected -- this only ever triggers for a deployment that
+        explicitly declared itself production-facing.
+        """
+        if self.environment == "production" and self.auth_mode == "none":
+            raise ConfigurationError(
+                "ENVIRONMENT=production requires authentication to be configured -- "
+                "refusing to start with no identity check of any kind, which would "
+                "leave every endpoint (including SQL execution, document deletion, "
+                "and paid media generation) open to any network caller. Set either "
+                "OIDC_ISSUER (+ OIDC_AUDIENCE) for production-grade OIDC/JWT "
+                "authentication, or API_AUTH_TOKEN for a lighter-weight static shared "
+                "secret -- see docs/AUTHENTICATION.md."
+            )
+        return self
+
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
@@ -1082,10 +1321,22 @@ def configure_logging(level: str | None = None) -> None:
     Called from entry points (scripts, api/main.py, tests) rather than at
     import time, so importing this module never has the side effect of
     reconfiguring a caller's logging setup.
+
+    Every handler on the root logger gets `security.audit_log
+    .CorrelationIdLogFilter` attached, and the format string includes
+    `correlation_id` -- this is what makes a request's correlation ID show
+    up on *every* log line (agent nodes, RAG, DB, external-call modules),
+    not just the dedicated `security.audit` event stream. See that filter's
+    docstring for the Phase 3 observability gap this closes.
     """
+    from security.audit_log import CorrelationIdLogFilter
+
     resolved_level = (level or get_settings().log_level).upper()
     logging.basicConfig(
         level=getattr(logging, resolved_level, logging.INFO),
-        format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
+        format="%(asctime)s | %(levelname)-8s | %(name)s | correlation_id=%(correlation_id)s | %(message)s",
         datefmt="%H:%M:%S",
     )
+    correlation_filter = CorrelationIdLogFilter()
+    for handler in logging.getLogger().handlers:
+        handler.addFilter(correlation_filter)

@@ -136,6 +136,31 @@ class AgentState(TypedDict, total=False):
     # Input
     question: str
 
+    # Input, set once by the caller (see agent.graph.run_agent /
+    # agent.orchestrator.graph.run_orchestrated) from the authenticated
+    # caller's `security.oidc.AuthIdentity.roles` (api/auth.py) -- empty
+    # tuple for an unauthenticated/"none"-auth-mode caller or a caller
+    # script that doesn't pass one (e.g. eval/runner.py), which resolves to
+    # the same "no elevated permissions" outcome `agent.authz`'s default-
+    # deny role map already gives an empty role set. Read by
+    # `validate_sql_node` (restricted-column gate) and, on the
+    # orchestrator's `OrchestratorState` superset, by
+    # `agent.orchestrator.nodes`'s per-source authorization check (2026
+    # Phase 2 security review) -- never mutated by a node, just read.
+    caller_roles: tuple[str, ...]
+
+    # Input, set once by the caller alongside caller_roles -- the
+    # authenticated caller's `security.oidc.AuthIdentity.subject`. `None`
+    # for the "none"/"static_token" auth modes (no real per-user identity
+    # exists to key anything on -- see api/auth.py) or for a caller that
+    # never passed one. 2026 Phase 2 security review: used by
+    # `agent.orchestrator.nodes.router_node` to scope the session-level
+    # expensive-source cost ceiling to a real, authenticated identity when
+    # one exists, instead of only the client-supplied, unauthenticated
+    # `OrchestratorState["session_id"]` (trivially resettable by minting a
+    # fresh one -- see that field's own docstring).
+    caller_subject: str | None
+
     # Set by sanitize_input_node -- None/"passed" means the question is
     # clean and may proceed. On rejection, status becomes "rejected" and
     # rejection_message holds the standardized, non-technical text shown to

@@ -137,6 +137,96 @@ class TestCostThresholdOrdering:
             _settings(cost_moderate_row_threshold=2000, cost_high_row_threshold=1000)
 
 
+class TestAuthModeAndOidcValidation:
+    """2026 Phase 2 security review: `Settings.auth_mode`'s derivation and
+    the OIDC-specific `model_validator`s that guard against the two
+    concrete JWT misconfiguration classes named in `docs/AUTHENTICATION.md`
+    (audience-less issuer trust, and an `alg` allowlist that could accept
+    `none`)."""
+
+    def test_auth_mode_is_none_when_nothing_configured(self):
+        settings = _settings()
+        assert settings.auth_mode == "none"
+
+    def test_auth_mode_is_static_token_when_only_api_auth_token_set(self):
+        settings = _settings(api_auth_token=SecretStr("s3cret"))
+        assert settings.auth_mode == "static_token"
+
+    def test_auth_mode_is_oidc_when_issuer_configured(self):
+        settings = _settings(
+            oidc_issuer="https://idp.example.com/",
+            oidc_audience="my-api",
+        )
+        assert settings.auth_mode == "oidc"
+
+    def test_auth_mode_is_oidc_even_with_a_static_token_also_configured(self):
+        """Both may be configured together (see api/auth.py's docstring) --
+        `auth_mode` still reports "oidc" as the primary mode."""
+        settings = _settings(
+            oidc_issuer="https://idp.example.com/",
+            oidc_audience="my-api",
+            api_auth_token=SecretStr("s3cret"),
+        )
+        assert settings.auth_mode == "oidc"
+
+    def test_oidc_issuer_without_audience_raises(self):
+        with pytest.raises(ConfigurationError, match="OIDC_AUDIENCE"):
+            _settings(oidc_issuer="https://idp.example.com/", oidc_audience=None)
+
+    def test_empty_oidc_algorithms_raises(self):
+        with pytest.raises(ConfigurationError, match="OIDC_ALGORITHMS"):
+            _settings(
+                oidc_issuer="https://idp.example.com/",
+                oidc_audience="my-api",
+                oidc_algorithms=(),
+            )
+
+    def test_oidc_algorithms_containing_none_raises(self):
+        with pytest.raises(ConfigurationError, match="alg confusion"):
+            _settings(
+                oidc_issuer="https://idp.example.com/",
+                oidc_audience="my-api",
+                oidc_algorithms=("RS256", "none"),
+            )
+
+    def test_oidc_algorithms_none_case_insensitive_raises(self):
+        with pytest.raises(ConfigurationError, match="alg confusion"):
+            _settings(
+                oidc_issuer="https://idp.example.com/",
+                oidc_audience="my-api",
+                oidc_algorithms=("None",),
+            )
+
+
+class TestProductionRequiresIdentity:
+    """`ENVIRONMENT=production` must refuse to start with `auth_mode ==
+    "none"` -- the fail-closed guarantee `docs/AUTHENTICATION.md` documents."""
+
+    def test_development_with_no_auth_is_accepted(self):
+        settings = _settings(environment="development")
+        assert settings.auth_mode == "none"
+
+    def test_production_with_no_auth_raises(self):
+        with pytest.raises(ConfigurationError, match="ENVIRONMENT=production"):
+            _settings(environment="production")
+
+    def test_production_with_static_token_is_accepted(self):
+        settings = _settings(environment="production", api_auth_token=SecretStr("s3cret"))
+        assert settings.auth_mode == "static_token"
+
+    def test_production_with_oidc_is_accepted(self):
+        settings = _settings(
+            environment="production",
+            oidc_issuer="https://idp.example.com/",
+            oidc_audience="my-api",
+        )
+        assert settings.auth_mode == "oidc"
+
+    def test_unknown_environment_value_raises(self):
+        with pytest.raises(ConfigurationError):
+            _settings(environment="staging")
+
+
 class TestLogRedactionLevelValidation:
     @pytest.mark.parametrize("level", ["standard", "strict"])
     def test_known_level_is_accepted(self, level):

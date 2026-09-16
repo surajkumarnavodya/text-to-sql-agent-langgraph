@@ -11,12 +11,13 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile, status
 from fastapi.responses import Response
+from moderation.exceptions import ModerationNotConfiguredError
 
-from api.auth import verify_api_key
+from agent.authz import Permission, has_permission
+from api.authz import require_permission
 from api.rate_limit import enforce_api_action_rate_limit
 from api.schemas import DocumentListResponse, DocumentOut, DocumentUploadResponse
 from config.settings import get_settings
-from moderation.exceptions import ModerationNotConfiguredError
 from rag.ingestion import ingest_pdf
 from rag.store import (
     Collection,
@@ -25,11 +26,13 @@ from rag.store import (
     delete_document,
     ensure_schema,
     get_document_bytes,
+    get_document_sensitivity,
     get_rag_engine,
     list_documents,
 )
+from security.audit_log import log_security_event
 
-router = APIRouter(dependencies=[Depends(verify_api_key)])
+router = APIRouter()
 
 
 def _require_collection_configured(collection: Collection) -> None:
@@ -46,7 +49,10 @@ def _require_collection_configured(collection: Collection) -> None:
 
 
 @router.get("/documents", response_model=DocumentListResponse)
-def list_documents_route(collection: Collection | None = None) -> DocumentListResponse:
+def list_documents_route(
+    collection: Collection | None = None,
+    _identity=Depends(require_permission(Permission.DOCUMENTS_READ)),
+) -> DocumentListResponse:
     """Lists ingested documents, optionally filtered to one collection --
     mirrors the Knowledge Sources page's per-tab document table."""
     if collection is not None:
@@ -84,6 +90,7 @@ async def upload_document(
     file: UploadFile = File(...),
     collection: Collection = Form(...),
     sensitivity_category: SensitivityCategory = Form(default=None),
+    _identity=Depends(require_permission(Permission.DOCUMENTS_WRITE)),
 ) -> DocumentUploadResponse:
     """Ingests one PDF into the "documents" or "policies" collection --
     mirrors the Knowledge Sources page's upload form, including the
@@ -140,7 +147,11 @@ async def upload_document(
 
 
 @router.delete("/documents/{document_id}", status_code=status.HTTP_204_NO_CONTENT)
-def delete_document_route(document_id: str, request: Request) -> None:
+def delete_document_route(
+    document_id: str,
+    request: Request,
+    _identity=Depends(require_permission(Permission.DOCUMENTS_DELETE)),
+) -> None:
     """Deletes a document and its chunks -- mirrors the management page's
     unconditional delete button (this page's admin surface is already
     fully-privileged/no-per-user-authorization; see CLAUDE.md's
@@ -159,15 +170,32 @@ def delete_document_route(document_id: str, request: Request) -> None:
 
 
 @router.get("/documents/{document_id}/download")
-def download_document(document_id: str) -> Response:
+def download_document(
+    document_id: str,
+    identity=Depends(require_permission(Permission.DOCUMENTS_READ)),
+) -> Response:
     """Streams a document's original PDF bytes -- mirrors the management
     page's per-document download button and the chat citation download
     button. Callers reaching this from a chat citation inherit the
-    sensitivity gate for free: a restricted policy match's citations list
-    is always empty (see `rag/graph.py`), so a client never has a
-    `document_id` to call this with for a restricted document in the first
-    place. This route itself has no separate access check, matching the
-    Knowledge Sources page's own already-fully-privileged exposure."""
+    `rag/graph.py` sensitivity gate for free (a restricted policy match's
+    citations list is always empty, so a client never has a `document_id`
+    to call this with for a restricted document via that path) -- but that
+    was always a narrower control specific to the *chat answer*, not this
+    route.
+
+    2026 Phase 2 security review: this route previously had no separate
+    access check of its own beyond the general document-management
+    permission, so a sensitivity-tagged ("compensation"/"disciplinary"/
+    "legal") document's raw bytes were downloadable by anyone who could
+    reach the API at all. A caller now additionally needs
+    `Permission.DOCUMENTS_READ_SENSITIVE` for a document whose
+    `sensitivity_category` is set, checked via `get_document_sensitivity`
+    before the response is ever built -- the bytes never leave this
+    process to a caller who fails that check, even though (to keep the
+    existing "no PDF stored" 404 behavior for a genuinely missing document
+    exactly as it was) the lookup runs after `get_document_bytes` rather
+    than instead of it.
+    """
     try:
         engine = get_rag_engine(get_settings())
     except RagStoreNotConfiguredError as exc:
@@ -180,4 +208,26 @@ def download_document(document_id: str) -> Response:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail="No PDF stored for this document."
         )
-    return Response(content=pdf_bytes, media_type="application/pdf")
+
+    sensitivity = get_document_sensitivity(engine, document_id)
+    if sensitivity and not has_permission(identity, Permission.DOCUMENTS_READ_SENSITIVE):
+        log_security_event(
+            "authz_denied",
+            "warning",
+            "A request to download a sensitivity-tagged document was denied.",
+            subject=identity.subject,
+            roles=list(identity.roles),
+            required_permission=Permission.DOCUMENTS_READ_SENSITIVE.value,
+            document_id=document_id,
+            sensitivity_category=sensitivity,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You do not have permission to download this document.",
+        )
+
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={"X-Content-Type-Options": "nosniff"},
+    )

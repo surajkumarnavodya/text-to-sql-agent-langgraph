@@ -34,8 +34,9 @@ export interface QueryHistoryEntry {
   confirmedSql: string | null
   confirmedChart: PlotlyFigure | null
   confirmedDurationMs: number | null
-  /** True only when this question was asked via the hands-free voice
-   * conversation loop (`useVoiceConversation`) -- the sole signal
+  /** True only when this question came from a voice turn
+   * (`useVoiceConversation`'s transcript, landed in the composer and then
+   * submitted like any typed question) -- the sole signal
    * `chatStore.askQuestion` uses to decide whether to synthesize and play
    * back the answer. A typed question always leaves this false, so it can
    * never trigger audio output. */

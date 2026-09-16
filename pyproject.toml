@@ -24,11 +24,20 @@ known-first-party = ["agent", "api", "config", "db", "embeddings", "eval", "medi
 
 [tool.ruff.lint.flake8-bugbear]
 # FastAPI's dependency-injection convention requires calling File()/Form()
-# as an argument default (fastapi.Depends is already ruff's built-in
-# default exemption) -- these are singleton marker objects FastAPI itself
-# inspects at request time, not the mutable-default-argument footgun B008
-# actually guards against.
-extend-immutable-calls = ["fastapi.File", "fastapi.Form"]
+# as an argument default -- these are singleton marker objects FastAPI
+# itself inspects at request time, not the mutable-default-argument
+# footgun B008 actually guards against. `fastapi.Depends` and
+# `api.authz.require_permission` (2026 Phase 2: a parameterized
+# dependency *factory*, FastAPI's own documented "parameterized
+# dependencies" pattern -- `Depends(require_permission(Permission.X))`
+# builds one closure once, at route-registration/import time, not per
+# request) are the same shape of safe, intentional call-in-default.
+extend-immutable-calls = [
+    "fastapi.Depends",
+    "fastapi.File",
+    "fastapi.Form",
+    "api.authz.require_permission",
+]
 
 [tool.mypy]
 # Deliberately not pinned to 3.11 (the project's nominal target, see

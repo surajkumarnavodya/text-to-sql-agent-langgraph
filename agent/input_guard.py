@@ -51,6 +51,8 @@ import re
 from dataclasses import dataclass
 from typing import Literal
 
+from agent.state import ConversationExchange
+from security.audit_log import log_security_event
 from security.injection_patterns import INJECTION_PATTERNS
 from security.sanitization import normalize_text, truncate_for_log
 
@@ -238,3 +240,100 @@ def check_input(question: str, max_length: int) -> GuardResult:
         )
 
     return GuardResult(passed=True, cleaned_question=cleaned)
+
+
+def sanitize_conversation_history(
+    history: list[ConversationExchange], max_length: int, max_turns: int | None = None
+) -> list[ConversationExchange]:
+    """Normalizes and injection-scans every prior turn's `question`/`sql`
+    text -- 2026 Phase 2 security review (finding LLM-01): unlike the
+    *current* question (`check_input` above), `conversation_history` is
+    resent by the caller on every request (the API is stateless -- see
+    `api.schemas.ConversationExchangeIn`'s docstring) and previously
+    reached `agent.llm_client._build_followup_block`'s prompt with none of
+    `check_input`'s scrutiny at all: no length cap, no Unicode
+    normalization (leaving the homoglyph-obfuscation gap plain NFKC
+    closes wide open for this specific entry point), and no injection-
+    pattern detection or audit logging.
+
+    Deliberately does **not** reject the request the way `check_input`
+    rejects the live question: a prior turn is historical context, not
+    the thing the caller is asking right now, so treating an old turn's
+    text as good enough reason to fail the *current* question would be a
+    confusing, disproportionate failure mode with no clear recovery for
+    the caller. Instead this mirrors `retrieve_schema_node`'s own
+    RAG-poisoning scan over retrieved schema content: normalize (closing
+    the homoglyph gap), detect and audit-log a match for visibility, but
+    let the structural defenses that actually gate what happens next --
+    `agent.llm_client`'s untrusted-data prompt framing and
+    `agent.sql_validator`'s SELECT-only allowlist -- remain the real
+    backstop, exactly as they already are for every other untrusted text
+    that reaches the prompt.
+
+    2026 Phase 3 resource-governance finding: only the single most recent
+    entry is ever functionally read downstream (`agent.nodes
+    .retrieve_schema_node`'s follow-up resolution uses `history[-1]`;
+    `classify_followup_node` only checks whether the list is non-empty at
+    all) -- every older entry was being fully normalized and regex-scanned
+    here for zero functional benefit, an unbounded cost a caller could
+    trivially inflate with an arbitrarily long array. `max_turns` (see
+    `Settings.max_conversation_history_turns`) keeps only the most recent
+    entries before any of that per-entry work runs, rather than doing the
+    work first and truncating the result.
+
+    Args:
+        history: Raw, caller-supplied prior turns.
+        max_length: Same bound `check_input` applies to the live question
+            (`Settings.max_question_length`) -- each entry's `question`/
+            `sql` text is truncated (not rejected) to this length, since
+            `api.schemas.ConversationExchangeIn` has no schema-level cap
+            of its own (matching `AskRequest.question`'s own convention of
+            enforcing this downstream rather than at the schema layer).
+        max_turns: Keep only the most recent `max_turns` entries (oldest
+            dropped first) before any normalization/scanning runs. `None`
+            (mainly for callers/tests that don't care) skips truncation
+            entirely.
+
+    Returns:
+        A new list (at most `max_turns` entries long) with every kept
+        entry's `question`/`sql` normalized and length-capped; `tables`/
+        `status` pass through unchanged.
+    """
+    if max_turns is not None and len(history) > max_turns:
+        history = history[-max_turns:]
+
+    cleaned: list[ConversationExchange] = []
+    for entry in history:
+        question = normalize_text(entry.get("question", ""))[:max_length]
+        raw_sql = entry.get("sql")
+        sql = normalize_text(raw_sql)[:max_length] if raw_sql is not None else raw_sql
+
+        matches = tuple(
+            name for name, pattern in _INJECTION_PATTERNS.items() if pattern.search(question)
+        )
+        if matches:
+            logger.warning(
+                "[input_guard] conversation_history entry matched injection pattern(s) "
+                "%s (not rejected -- see sanitize_conversation_history's docstring) "
+                "excerpt=%r",
+                matches,
+                truncate_for_log(question),
+            )
+            log_security_event(
+                "conversation_history_injection_detected",
+                "warning",
+                "A prior conversation-history entry matched an injection pattern. Not "
+                "rejected -- normalized and passed through; the untrusted-data prompt "
+                "framing and SQL validator remain the real backstop.",
+                patterns=matches,
+            )
+
+        cleaned.append(
+            ConversationExchange(
+                question=question,
+                sql=sql,
+                tables=entry.get("tables", []),
+                status=entry.get("status", "succeeded"),
+            )
+        )
+    return cleaned

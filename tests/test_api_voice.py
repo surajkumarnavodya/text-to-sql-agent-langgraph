@@ -2,7 +2,11 @@
 (api/voice.py). Fully mocked: `voice.stt.transcribe`/`voice.tts.synthesize`
 are patched at the `api.voice` module they're looked up from -- no real
 model ever loaded in the pytest suite. Mirrors `tests/test_api_media.py`/
-`tests/test_api_generation.py`'s structure.
+`tests/test_api_generation.py`'s structure. `voice.correction
+.correct_transcript` is mocked to a pass-through by default (autouse
+fixture) so most tests aren't coupled to the correction step -- see
+`TestTranscribeAudio::test_transcript_correction_is_applied` for the one
+test that exercises it directly.
 """
 
 from __future__ import annotations
@@ -64,6 +68,11 @@ def _mock_settings(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _mock_correct_transcript(monkeypatch):
+    monkeypatch.setattr("api.voice.correct_transcript", lambda text, settings: text)
+
+
+@pytest.fixture(autouse=True)
 def _reset_api_action_limiters():
     import api.rate_limit as api_rate_limit
 
@@ -113,6 +122,7 @@ class TestTranscribeAudio:
         assert response.status_code == 200
         body = response.json()
         assert body["text"] == "how many customers are there"
+        assert body["corrected_text"] is None
         assert body["stt_duration_ms"] == 42.0
 
     def test_oversized_upload_is_rejected_before_transcription(self, monkeypatch, client):
@@ -172,6 +182,52 @@ class TestTranscribeAudio:
 
         assert first.status_code == 200
         assert second.status_code == 429
+
+    def test_raw_text_and_corrected_suggestion_are_both_returned(self, monkeypatch, client):
+        monkeypatch.setattr(
+            "api.voice.transcribe",
+            lambda audio_bytes, settings: TranscriptionResult(
+                text="um how many employes", stt_duration_ms=42.0
+            ),
+        )
+        received = {}
+
+        def _fake_correct(text, settings):
+            received["text"] = text
+            return "How many employees?"
+
+        monkeypatch.setattr("api.voice.correct_transcript", _fake_correct)
+
+        response = client.post(
+            "/voice/transcribe", files={"audio": ("q.webm", b"fake audio", "audio/webm")}
+        )
+
+        assert response.status_code == 200
+        body = response.json()
+        # Raw transcript is preserved untouched -- the caller decides which
+        # text to submit, correction never silently substitutes it.
+        assert body["text"] == "um how many employes"
+        assert body["corrected_text"] == "How many employees?"
+        assert body["stt_duration_ms"] == 42.0
+        assert received["text"] == "um how many employes"
+
+    def test_corrected_text_is_none_when_correction_makes_no_change(self, monkeypatch, client):
+        monkeypatch.setattr(
+            "api.voice.transcribe",
+            lambda audio_bytes, settings: TranscriptionResult(
+                text="show all employees", stt_duration_ms=1.0
+            ),
+        )
+        monkeypatch.setattr("api.voice.correct_transcript", lambda text, settings: text)
+
+        response = client.post(
+            "/voice/transcribe", files={"audio": ("q.webm", b"fake audio", "audio/webm")}
+        )
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body["text"] == "show all employees"
+        assert body["corrected_text"] is None
 
 
 class TestSynthesizeSpeech:

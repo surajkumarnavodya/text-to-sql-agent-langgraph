@@ -227,5 +227,6 @@ export interface ApiErrorBody {
 
 export interface TranscribeResponse {
   text: string
+  corrected_text: string | null
   stt_duration_ms: number
 }

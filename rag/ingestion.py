@@ -46,28 +46,35 @@ from io import BytesIO
 from pathlib import Path
 
 import pymupdf
-from pypdf import PdfReader
-
-from config.settings import Settings, get_settings
-from media.ocr import extract_text
 from moderation.gate import decision_summary, moderate_chunks
 from moderation.store import (
     ensure_schema as ensure_moderation_schema,
+)
+from moderation.store import (
     get_asset_by_hash,
     get_moderation_engine,
     record_asset,
 )
 from moderation.types import ModerationChunk
+from pypdf import PdfReader
+
+from config.settings import Settings, get_settings
+from media.ocr import extract_text
 from rag.embedding import embed_texts
 from rag.store import (
     Collection,
     SensitivityCategory,
-    ensure_schema as ensure_rag_schema,
     get_rag_engine,
     insert_chunks,
     insert_document,
     update_document_status,
 )
+from rag.store import (
+    ensure_schema as ensure_rag_schema,
+)
+from security.audit_log import log_security_event
+from security.injection_patterns import INJECTION_PATTERNS
+from security.sanitization import normalize_text
 
 logger = logging.getLogger(__name__)
 
@@ -107,7 +114,7 @@ def _content_hash(file_bytes: bytes) -> str:
     return hashlib.sha256(file_bytes).hexdigest()
 
 
-def extract_pdf_pages(file_bytes: bytes) -> list[str]:
+def extract_pdf_pages(file_bytes: bytes, max_pages: int | None = None) -> list[str]:
     """Extracts text per page from a PDF's raw bytes.
 
     Pure metadata/text extraction -- never rasterizes or OCRs. A page that
@@ -115,8 +122,29 @@ def extract_pdf_pages(file_bytes: bytes) -> list[str]:
     embedded text layer; `ingest_pdf` OCRs it separately (see
     `_ocr_suspect_pages`) rather than silently indexing an empty chunk (see
     `_OCR_SUSPECT_CHAR_THRESHOLD`).
+
+    Args:
+        file_bytes: Raw PDF bytes.
+        max_pages: 2026 Phase 2 security review -- if given and the PDF
+            has more pages than this, raises `ValueError` before
+            extracting text from any of them. `None` (the default) means
+            unbounded, for callers (mainly tests) that want the raw
+            extraction behavior with no cap of their own; `ingest_pdf`
+            always passes `Settings.max_document_pages`. Closes a
+            decompression-bomb-shaped gap `Settings.max_document_upload_mb`
+            (a byte-size cap) doesn't: a PDF's size on disk says little
+            about how many pages -- and therefore how much CPU/memory
+            extracting its text actually costs -- it declares.
+
+    Raises:
+        ValueError: the PDF has more than `max_pages` pages.
     """
     reader = PdfReader(BytesIO(file_bytes))
+    if max_pages is not None and len(reader.pages) > max_pages:
+        raise ValueError(
+            f"PDF has {len(reader.pages)} pages, exceeding the {max_pages}-page limit "
+            f"(Settings.max_document_pages)."
+        )
     return [page.extract_text() or "" for page in reader.pages]
 
 
@@ -133,7 +161,9 @@ def _ocr_suspect_pages(file_bytes: bytes, pages: list[str]) -> dict[int, str]:
         which still shows up here as an empty string, not a missing key).
     """
     suspect_page_numbers = [
-        i for i, page_text in enumerate(pages, start=1) if len(page_text.strip()) < _OCR_SUSPECT_CHAR_THRESHOLD
+        i
+        for i, page_text in enumerate(pages, start=1)
+        if len(page_text.strip()) < _OCR_SUSPECT_CHAR_THRESHOLD
     ]
     if not suspect_page_numbers:
         return {}
@@ -146,7 +176,9 @@ def _ocr_suspect_pages(file_bytes: bytes, pages: list[str]) -> dict[int, str]:
             try:
                 pixmap = doc[page_number - 1].get_pixmap()
                 fd, tmp_path_str = tempfile.mkstemp(suffix=".png", prefix="pdf_page_")
-                os.close(fd)  # the fd must be closed before pymupdf can write to this path (Windows)
+                os.close(
+                    fd
+                )  # the fd must be closed before pymupdf can write to this path (Windows)
                 tmp_path = Path(tmp_path_str)
                 pixmap.save(tmp_path)
                 ocr_text_by_page[page_number] = extract_text(tmp_path)
@@ -275,12 +307,18 @@ def _build_moderation_chunks(
     for page_number, page_text in enumerate(pages, start=1):
         text_for_page = page_text if page_text.strip() else ocr_text_by_page.get(page_number, "")
         if text_for_page.strip():
-            chunks.append(ModerationChunk(chunk_index=chunk_index, content_type="text", text=text_for_page))
+            chunks.append(
+                ModerationChunk(chunk_index=chunk_index, content_type="text", text=text_for_page)
+            )
             chunk_index += 1
 
-    for page_number, image_paths in images_by_page.items():
+    for _page_number, image_paths in images_by_page.items():
         for image_path in image_paths:
-            chunks.append(ModerationChunk(chunk_index=chunk_index, content_type="image", image_path=image_path))
+            chunks.append(
+                ModerationChunk(
+                    chunk_index=chunk_index, content_type="image", image_path=image_path
+                )
+            )
             temp_files.append(image_path)
             chunk_index += 1
 
@@ -344,7 +382,7 @@ def ingest_pdf(
             chunk_count=existing.chunk_count,
         )
 
-    pages = extract_pdf_pages(file_bytes)
+    pages = extract_pdf_pages(file_bytes, max_pages=settings.max_document_pages)
     warnings = [
         f"Page {i}: little to no extractable text -- may be a scanned image "
         "that needs OCR before it can be indexed."
@@ -354,7 +392,9 @@ def ingest_pdf(
 
     ocr_text_by_page = _ocr_suspect_pages(file_bytes, pages)
     images_by_page = _extract_embedded_images(file_bytes)
-    moderation_chunks, temp_image_files = _build_moderation_chunks(pages, ocr_text_by_page, images_by_page)
+    moderation_chunks, temp_image_files = _build_moderation_chunks(
+        pages, ocr_text_by_page, images_by_page
+    )
 
     try:
         decision = moderate_chunks(file_hash, moderation_chunks, settings)
@@ -396,11 +436,56 @@ def ingest_pdf(
         # extraction for the actual retrieval chunks too, not just for the
         # moderation check above -- an indexed-but-unsearchable scanned
         # page would otherwise contribute nothing to retrieval.
+        #
+        # 2026 Phase 3 file-upload security review (finding G2): normalized
+        # here (NFKC + confusables-folding, the same `normalize_text` used
+        # for the live question, conversation_history, and retrieved schema
+        # content) before it's ever chunked/embedded/stored -- previously
+        # RAG-ingested PDF text was the one untrusted-content path in this
+        # codebase with no homoglyph-normalization step at all. Closes the
+        # obfuscation gap plain extraction leaves open for the same class of
+        # attack `agent.input_guard`/`agent.nodes.retrieve_schema_node`
+        # already defend against for every *other* untrusted-text entry
+        # point.
         pages_for_chunking = [
-            page_text if page_text.strip() else ocr_text_by_page.get(page_number, "")
+            normalize_text(
+                page_text if page_text.strip() else ocr_text_by_page.get(page_number, "")
+            )
             for page_number, page_text in enumerate(pages, start=1)
         ]
-        drafts = chunk_pages(pages_for_chunking, settings.rag_chunk_size, settings.rag_chunk_overlap)
+
+        # Detection-only, never blocks -- mirrors retrieve_schema_node's own
+        # RAG-poisoning scan over retrieved schema/sampled-value content:
+        # the moderation gate above already ran and is the real content-
+        # policy backstop; this is purely an operator-visibility signal that
+        # the extracted text itself looked injection-shaped, using the same
+        # shared pattern set (`security.injection_patterns`) rather than a
+        # second, drifting copy. The structural "untrusted data" framing in
+        # `rag/graph.py`'s generation prompt remains what actually bounds
+        # the consequences if this ever fires for real.
+        combined_text = "\n\n".join(pages_for_chunking)
+        matched_patterns = [
+            name for name, pattern in INJECTION_PATTERNS.items() if pattern.search(combined_text)
+        ]
+        if matched_patterns:
+            logger.warning(
+                "[rag.ingestion] [rag_poisoning] extracted PDF text matched injection-style "
+                "pattern(s): %s -- proceeding (detection only, moderation gate already passed)",
+                matched_patterns,
+            )
+            log_security_event(
+                "possible_rag_poisoning",
+                "warning",
+                "Extracted PDF text matched an injection-style pattern before being "
+                "chunked/embedded.",
+                matched_patterns=matched_patterns,
+                filename=filename,
+                collection=collection,
+            )
+
+        drafts = chunk_pages(
+            pages_for_chunking, settings.rag_chunk_size, settings.rag_chunk_overlap
+        )
         if not drafts:
             update_document_status(
                 rag_engine,
@@ -464,7 +549,9 @@ def ingest_pdf(
         )
     except Exception as exc:  # noqa: BLE001 - must still mark the document failed either way
         logger.exception("[rag.ingestion] failed filename=%r collection=%s", filename, collection)
-        update_document_status(rag_engine, document_id, "failed", chunk_count=0, error_message=str(exc))
+        update_document_status(
+            rag_engine, document_id, "failed", chunk_count=0, error_message=str(exc)
+        )
         return IngestionResult(
             document_id=document_id,
             filename=filename,

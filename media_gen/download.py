@@ -37,6 +37,22 @@ from security.redaction import redact_secrets
 
 _DEFAULT_CONTENT_TYPE = "application/octet-stream"
 
+# 2026 Phase 3 file-upload security review (finding G1): this app only ever
+# generates image/video/audio -- a provider response claiming anything else
+# (e.g. `text/html`) is either a bug or a compromised/malicious response,
+# and `GET /media/{media_id}` (api/media.py) serves this value back to the
+# browser verbatim as the HTTP response's Content-Type. Without this
+# allowlist, an attacker-controlled `text/html` (or `image/svg+xml`, which
+# browsers can render as script-executing markup) served under this app's
+# own origin would be a stored-content-confusion/XSS vector -- the same
+# class of risk `_validate_download_url` above already treats provider
+# responses as untrusted for (SSRF), just applied to the declared content
+# type instead of the URL. Falls back to the generic binary type (which
+# browsers download rather than render inline) rather than rejecting the
+# whole download outright, since the bytes themselves are still valid,
+# already-size-capped media content worth keeping.
+_ALLOWED_CONTENT_TYPE_PREFIXES = ("image/", "video/", "audio/")
+
 # Private/loopback/link-local/reserved ranges a legitimate public CDN
 # should never resolve to -- IPv4 and IPv6 alike. Deliberately broad (a
 # false positive here just means a generation fails closed with a clean
@@ -95,32 +111,89 @@ def _validate_download_url(url: str) -> None:
             )
 
 
-def download_media_bytes(url: str, timeout: float = 30.0) -> tuple[bytes, str]:
+_DEFAULT_MAX_DOWNLOAD_BYTES = 200 * 1024 * 1024  # matches Settings.media_max_file_mb's default
+_DOWNLOAD_CHUNK_SIZE = 1024 * 1024
+
+
+def download_media_bytes(
+    url: str, timeout: float = 30.0, max_bytes: int = _DEFAULT_MAX_DOWNLOAD_BYTES
+) -> tuple[bytes, str]:
     """Downloads `url` and returns `(content, content_type)`.
 
     `content_type` is read from the response's own `Content-Type` header
-    (falling back to a generic binary type if absent) -- IMA's CDN, not
-    this app, is the source of truth for what kind of file it actually
-    served. Raises `MediaGenerationError` on any transport/HTTP failure,
+    (falling back to a generic binary type if absent or if it doesn't match
+    `_ALLOWED_CONTENT_TYPE_PREFIXES` -- see that constant's docstring) --
+    IMA's CDN, not this app, is the source of truth for what kind of file
+    it actually served, within that allowlist. Raises `MediaGenerationError`
+    on any transport/HTTP failure,
     matching `media_gen.client.IMAClient._request`'s own error contract so
     callers only need to catch one exception type across the whole
     generate-then-download flow. `_validate_download_url` runs first --
     see this module's docstring for the SSRF risk it closes.
+
+    2026 Phase 2 security review: streams the response and aborts once
+    `max_bytes` is exceeded (checked both against a declared
+    `Content-Length`, before reading any body at all, and against the
+    actual bytes received while streaming, since a response can omit or
+    lie about `Content-Length`) -- a response-size limit, matching this
+    app's existing "never buffer an unbounded upload/download into memory"
+    posture elsewhere (`api/documents.py::upload_document`,
+    `api/voice.py::transcribe_audio`, both bounded-read for the same
+    reason). Without this, a compromised or misbehaving provider response
+    could exhaust this process's memory on a single generation result.
+    `max_bytes` defaults to matching `Settings.media_max_file_mb`'s own
+    default (200MB) -- the same cap this app already applies to a
+    locally-ingested media file, reused here rather than inventing a
+    second, independent limit for a conceptually identical "how big a
+    media file may this app hold in memory at once" question.
     """
     _validate_download_url(url)
 
     try:
-        response = requests.get(url, timeout=timeout)
+        response = requests.get(url, timeout=timeout, stream=True)
     except requests.RequestException as exc:
         raise MediaGenerationError(
             f"Network error downloading generated media: {redact_secrets(str(exc))}"
         ) from exc
 
-    if response.status_code >= 400:
-        raise MediaGenerationError(
-            f"HTTP error {response.status_code} downloading generated media from provider",
-            status_code=response.status_code,
-        )
+    with response:
+        if response.status_code >= 400:
+            raise MediaGenerationError(
+                f"HTTP error {response.status_code} downloading generated media from provider",
+                status_code=response.status_code,
+            )
 
-    content_type = response.headers.get("Content-Type", _DEFAULT_CONTENT_TYPE).split(";")[0].strip()
-    return response.content, content_type or _DEFAULT_CONTENT_TYPE
+        declared_length = response.headers.get("Content-Length")
+        if declared_length is not None:
+            try:
+                if int(declared_length) > max_bytes:
+                    raise MediaGenerationError(
+                        f"Refusing to download generated media: declared size "
+                        f"{declared_length} bytes exceeds the {max_bytes}-byte limit."
+                    )
+            except ValueError:
+                pass  # a malformed Content-Length is caught by the streaming check below anyway
+
+        content_type = (
+            response.headers.get("Content-Type", _DEFAULT_CONTENT_TYPE).split(";")[0].strip()
+        )
+        if not content_type.lower().startswith(_ALLOWED_CONTENT_TYPE_PREFIXES):
+            content_type = _DEFAULT_CONTENT_TYPE
+
+        chunks: list[bytes] = []
+        total = 0
+        try:
+            for chunk in response.iter_content(chunk_size=_DOWNLOAD_CHUNK_SIZE):
+                total += len(chunk)
+                if total > max_bytes:
+                    raise MediaGenerationError(
+                        f"Refusing to download generated media: exceeded the "
+                        f"{max_bytes}-byte limit while streaming the response."
+                    )
+                chunks.append(chunk)
+        except requests.RequestException as exc:
+            raise MediaGenerationError(
+                f"Network error downloading generated media: {redact_secrets(str(exc))}"
+            ) from exc
+
+    return b"".join(chunks), content_type or _DEFAULT_CONTENT_TYPE

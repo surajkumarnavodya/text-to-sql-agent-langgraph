@@ -156,3 +156,42 @@ class TestMalformedInputFailsCleanlyInsteadOfCrashing:
         result = validate_sql(malformed)
         assert result.is_valid is False
         assert result.violation_type in ("parse_error", "empty")
+
+
+class TestEncodingBypass:
+    """2026 Phase 2 security review: confirms a Unicode-homoglyph-obfuscated
+    dangerous keyword (the same class of trick `tests/test_adversarial_input
+    .py::TestUnicodeHomoglyphsAndControlCharacters` already covers for
+    `agent/input_guard.py`'s regex layer) cannot bypass the SQL validator
+    either. Unlike a regex/keyword blocklist, `validate_sql` never even
+    needs a homoglyph-specific defense: a keyword spelled with a look-alike
+    character (e.g. a Cyrillic 'О' standing in for Latin 'O') simply isn't
+    the ASCII keyword sqlglot's tokenizer recognizes, so the string fails
+    to parse as the *intended* dangerous statement at all -- it's rejected
+    via the same parse-failure path `TestParseErrorHandling` above covers,
+    not because a homoglyph check fired."""
+
+    def test_homoglyph_drop_fails_to_parse_as_drop(self):
+        # Cyrillic "О" (U+041E) in place of Latin "O".
+        result = validate_sql("DRОPS TABLE customers")
+        assert result.is_valid is False
+
+    def test_homoglyph_select_still_parses_and_is_accepted(self):
+        """The flip side: a homoglyph in an otherwise-harmless SELECT
+        doesn't need to be rejected at all -- confirms the above isn't
+        "any non-ASCII character is rejected," only "a keyword that no
+        longer tokenizes as itself doesn't parse.\" """
+        # A homoglyph inside a string literal (data, not syntax) must not
+        # affect validity -- only keyword-position homoglyphs break parsing.
+        result = validate_sql("SELECT * FROM customers WHERE name = 'Ignоre'")  # Cyrillic о
+        assert result.is_valid is True
+
+    def test_null_byte_embedded_in_sql_does_not_bypass_validation(self):
+        """A classic C-string-truncation trick against some naive parsers:
+        embedding a NUL byte hoping a downstream consumer stops reading at
+        it while a security check upstream saw the full (safe-looking)
+        string. sqlglot tokenizes the whole Python string, NUL included --
+        confirms this doesn't smuggle a second statement past the
+        single-statement check."""
+        result = validate_sql("SELECT 1\x00; DROP TABLE customers")
+        assert result.is_valid is False

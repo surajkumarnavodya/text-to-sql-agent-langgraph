@@ -14,10 +14,11 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.responses import Response
 
-from api.auth import verify_api_key
+from agent.authz import Permission
+from api.authz import require_permission
 from media_gen.cache import get_media_cache
 
-router = APIRouter(dependencies=[Depends(verify_api_key)])
+router = APIRouter(dependencies=[Depends(require_permission(Permission.MEDIA_GENERATE))])
 
 
 @router.get("/media/{media_id}")
@@ -31,4 +32,13 @@ def get_media(media_id: str) -> Response:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail="Media not found or expired."
         )
-    return Response(content=entry.data, media_type=entry.content_type)
+    # X-Content-Type-Options: nosniff -- defense-in-depth alongside
+    # media_gen.download's own Content-Type allowlist (2026 Phase 3 file-
+    # upload security review, finding G1): even an allowed value
+    # (image/video/audio) should never be MIME-sniffed by the browser into
+    # something more permissive than declared.
+    return Response(
+        content=entry.data,
+        media_type=entry.content_type,
+        headers={"X-Content-Type-Options": "nosniff"},
+    )

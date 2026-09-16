@@ -78,6 +78,12 @@ def _settings(**overrides: object) -> Settings:
         log_level="INFO",
         log_redaction_level="standard",
         enable_multi_source_router=False,
+        # enable_media_search/media_library_path default on/set at the
+        # Settings level (see config/settings.py) -- explicitly disabled
+        # here so this fixture's "only sql available" baseline matches
+        # every other optional source, which defaults off.
+        enable_media_search=False,
+        media_library_path=None,
     )
     base.update(overrides)
     return Settings(**base)
@@ -224,7 +230,7 @@ class TestRouterNode:
             "classify_sources",
             lambda q, avail, s: (["sql", "policy"], "reason"),
         )
-        result = router_node({"question": "compare sales with policy"})
+        result = router_node({"question": "compare sales with policy", "caller_roles": ("admin",)})
         decision = result["route_decision"]
         assert decision["sources"] == ["sql", "policy"]
         assert decision["short_circuited"] is False
@@ -246,10 +252,14 @@ class TestRouterNode:
         )
         session_id = f"test-session-{uuid.uuid4().hex}"
 
-        first = router_node({"question": "q1", "session_id": session_id})
+        first = router_node(
+            {"question": "q1", "session_id": session_id, "caller_roles": ("admin",)}
+        )
         assert first["route_decision"]["sources"] == ["sql", "web"]
 
-        second = router_node({"question": "q2", "session_id": session_id})
+        second = router_node(
+            {"question": "q2", "session_id": session_id, "caller_roles": ("admin",)}
+        )
         assert second["route_decision"]["sources"] == ["sql"]
         assert "expensive-source limit" in second["route_decision"]["reasoning"]
 
@@ -266,8 +276,8 @@ class TestRouterNode:
         monkeypatch.setattr(
             orchestrator_nodes, "classify_sources", lambda q, avail, s: (["sql", "web"], "reason")
         )
-        first = router_node({"question": "q1"})
-        second = router_node({"question": "q2"})
+        first = router_node({"question": "q1", "caller_roles": ("admin",)})
+        second = router_node({"question": "q2", "caller_roles": ("admin",)})
         assert first["route_decision"]["sources"] == ["sql", "web"]
         assert second["route_decision"]["sources"] == ["sql", "web"]
 
@@ -286,10 +296,204 @@ class TestRouterNode:
         session_a = f"test-session-{uuid.uuid4().hex}"
         session_b = f"test-session-{uuid.uuid4().hex}"
 
-        router_node({"question": "q1", "session_id": session_a})
+        router_node({"question": "q1", "session_id": session_a, "caller_roles": ("admin",)})
         # A different session's budget is untouched by session_a's usage.
-        second = router_node({"question": "q2", "session_id": session_b})
+        second = router_node(
+            {"question": "q2", "session_id": session_b, "caller_roles": ("admin",)}
+        )
         assert second["route_decision"]["sources"] == ["sql", "web"]
+
+    def test_caller_subject_is_preferred_over_session_id_for_the_ceiling(self, monkeypatch):
+        """2026 Phase 2: when a real authenticated identity exists
+        (`caller_subject`, set from `security.oidc.AuthIdentity.subject`),
+        the cost ceiling is scoped to *that*, not the client-supplied,
+        unauthenticated `session_id` -- so rotating `session_id` alone (a
+        documented, real evasion technique -- see
+        `get_session_expensive_source_limiter`'s own docstring) no longer
+        resets the budget for an authenticated caller."""
+        settings = _settings(
+            enable_web_search=True,
+            web_search_api_key=SecretStr("tvly-x"),
+            session_expensive_source_limit=1,
+            session_expensive_source_window_seconds=3600.0,
+        )
+        monkeypatch.setattr(orchestrator_nodes, "get_settings", lambda: settings)
+        monkeypatch.setattr(
+            orchestrator_nodes, "classify_sources", lambda q, avail, s: (["sql", "web"], "reason")
+        )
+
+        first = router_node(
+            {
+                "question": "q1",
+                "session_id": "session-a",
+                "caller_subject": "user-123",
+                "caller_roles": ("admin",),
+            }
+        )
+        assert first["route_decision"]["sources"] == ["sql", "web"]
+
+        # Same authenticated subject, but a *different* session_id --
+        # the old, session_id-only evasion trick -- must still be capped.
+        second = router_node(
+            {
+                "question": "q2",
+                "session_id": "session-b",
+                "caller_subject": "user-123",
+                "caller_roles": ("admin",),
+            }
+        )
+        assert second["route_decision"]["sources"] == ["sql"]
+        assert "expensive-source limit" in second["route_decision"]["reasoning"]
+
+
+class TestRouterNodeAuthorization:
+    """2026 Phase 2 security review: regression coverage for closing
+    2026 Phase 1's AGT-01/R-008 finding -- the LLM router's own
+    classification decision used to be sufficient by itself to reach the
+    access-sensitive "policies" collection or trigger paid media
+    generation, with no independent check of whether the *caller* was
+    actually permitted to. `router_node` now drops any LLM-selected source
+    the caller's role(s) don't grant, before `route_after_router` can ever
+    fan out to that source's subgraph node -- verified here at the
+    `router_node` level (the LLM classification itself is mocked, exactly
+    like the rest of `TestRouterNode` above); `tests/test_api_authz.py`
+    covers the same principle end-to-end through the real `/ask` route.
+    """
+
+    def _settings_with_policy_and_web(self, **overrides):
+        return _settings(
+            enable_policy_rag=True,
+            rag_store_connection_string=SecretStr("x"),
+            enable_web_search=True,
+            web_search_api_key=SecretStr("tvly-x"),
+            **overrides,
+        )
+
+    def test_viewer_role_loses_policy_and_web_but_keeps_sql(self, monkeypatch):
+        """Horizontal/vertical privilege escalation check: a low-privilege
+        role ("viewer" grants neither POLICY_RAG_QUERY nor WEB_SEARCH in
+        the default role map, see agent/authz.py) must never reach either
+        source purely by having the LLM classifier pick them."""
+        settings = self._settings_with_policy_and_web()
+        monkeypatch.setattr(orchestrator_nodes, "get_settings", lambda: settings)
+        monkeypatch.setattr(
+            orchestrator_nodes,
+            "classify_sources",
+            lambda q, avail, s: (["sql", "policy", "web"], "all relevant"),
+        )
+
+        result = router_node({"question": "compare policy with sales", "caller_roles": ("viewer",)})
+
+        assert result["route_decision"]["sources"] == ["sql"]
+
+    def test_missing_caller_roles_is_treated_as_no_permissions(self, monkeypatch):
+        """A state dict that never set caller_roles at all (e.g. an older
+        caller, or a bug upstream) must fail closed -- the same as an
+        explicit empty tuple -- never fail open and grant every source."""
+        settings = self._settings_with_policy_and_web()
+        monkeypatch.setattr(orchestrator_nodes, "get_settings", lambda: settings)
+        monkeypatch.setattr(
+            orchestrator_nodes,
+            "classify_sources",
+            lambda q, avail, s: (["sql", "policy"], "relevant"),
+        )
+
+        result = router_node({"question": "compare policy with sales"})
+
+        assert result["route_decision"]["sources"] == ["sql"]
+
+    def test_invalid_unrecognized_role_grants_nothing(self, monkeypatch):
+        """A role name `agent.authz.ROLE_PERMISSIONS` doesn't recognize
+        (a typo, a role this app hasn't been configured for, a role from
+        an identity provider claim this deployment never mapped) must
+        grant no permissions -- fail closed on an invalid role, not fail
+        open."""
+        settings = self._settings_with_policy_and_web()
+        monkeypatch.setattr(orchestrator_nodes, "get_settings", lambda: settings)
+        monkeypatch.setattr(
+            orchestrator_nodes,
+            "classify_sources",
+            lambda q, avail, s: (["sql", "policy"], "relevant"),
+        )
+
+        result = router_node(
+            {"question": "compare policy with sales", "caller_roles": ("not-a-real-role",)}
+        )
+
+        assert result["route_decision"]["sources"] == ["sql"]
+
+    def test_analyst_role_keeps_policy_but_user_role_does_not(self, monkeypatch):
+        """Confirms the default role hierarchy actually differentiates --
+        not every non-viewer role is equivalent."""
+        settings = self._settings_with_policy_and_web()
+        monkeypatch.setattr(orchestrator_nodes, "get_settings", lambda: settings)
+        monkeypatch.setattr(
+            orchestrator_nodes,
+            "classify_sources",
+            lambda q, avail, s: (["sql", "policy"], "relevant"),
+        )
+
+        analyst_result = router_node(
+            {"question": "compare policy with sales", "caller_roles": ("analyst",)}
+        )
+        user_result = router_node(
+            {"question": "compare policy with sales", "caller_roles": ("user",)}
+        )
+
+        assert analyst_result["route_decision"]["sources"] == ["sql", "policy"]
+        assert user_result["route_decision"]["sources"] == ["sql"]
+
+    def test_denial_falls_back_to_sql_alone_never_to_an_empty_route(self, monkeypatch):
+        """If every LLM-selected source is denied, the route must still
+        resolve to something runnable ("sql"), never an empty destination
+        list `route_after_router` would have nothing to do with."""
+        settings = self._settings_with_policy_and_web()
+        monkeypatch.setattr(orchestrator_nodes, "get_settings", lambda: settings)
+        monkeypatch.setattr(
+            orchestrator_nodes,
+            "classify_sources",
+            lambda q, avail, s: (["policy", "web"], "relevant"),
+        )
+
+        result = router_node({"question": "compare policy with sales", "caller_roles": ("viewer",)})
+
+        assert result["route_decision"]["sources"] == ["sql"]
+
+    def test_denial_is_audit_logged_without_leaking_content(self, monkeypatch, caplog):
+        import logging
+
+        settings = self._settings_with_policy_and_web()
+        monkeypatch.setattr(orchestrator_nodes, "get_settings", lambda: settings)
+        monkeypatch.setattr(
+            orchestrator_nodes,
+            "classify_sources",
+            lambda q, avail, s: (["sql", "policy"], "relevant"),
+        )
+
+        with caplog.at_level(logging.WARNING, logger="security.audit"):
+            router_node({"question": "compare policy with sales", "caller_roles": ("viewer",)})
+
+        events = [
+            r.message for r in caplog.records if "event=orchestrator_source_denied" in r.message
+        ]
+        assert len(events) == 1
+        assert "policy_rag_query" in events[0]
+        assert "'viewer'" in events[0]
+
+    def test_admin_role_reaches_every_source(self, monkeypatch):
+        """Sanity check against over-restriction: the highest default role
+        must still be able to reach every source the LLM picks."""
+        settings = self._settings_with_policy_and_web()
+        monkeypatch.setattr(orchestrator_nodes, "get_settings", lambda: settings)
+        monkeypatch.setattr(
+            orchestrator_nodes,
+            "classify_sources",
+            lambda q, avail, s: (["sql", "policy", "web"], "all relevant"),
+        )
+
+        result = router_node({"question": "compare policy with sales", "caller_roles": ("admin",)})
+
+        assert result["route_decision"]["sources"] == ["sql", "policy", "web"]
 
 
 class TestRouteAfterRouter:
@@ -334,8 +538,8 @@ class TestSqlSubgraphNode:
         captured: dict[str, object] = {}
         fake_result: AgentState = {"status": "succeeded", "sql": "SELECT 1", "row_count": 1}
 
-        def fake_run_agent(question, conversation_history, enable_insight):
-            captured["args"] = (question, conversation_history, enable_insight)
+        def fake_run_agent(question, conversation_history, enable_insight, caller_roles):
+            captured["args"] = (question, conversation_history, enable_insight, caller_roles)
             return fake_result
 
         monkeypatch.setattr(orchestrator_nodes, "run_agent", fake_run_agent)
@@ -347,7 +551,7 @@ class TestSqlSubgraphNode:
         }
         result = sql_subgraph_node(state)
 
-        assert captured["args"] == ("how many orders?", [], True)
+        assert captured["args"] == ("how many orders?", [], True, ())
         assert result["status"] == "succeeded"
         assert result["sql"] == "SELECT 1"
         assert result["sources_used"] == ["sql"]
@@ -355,7 +559,7 @@ class TestSqlSubgraphNode:
     def test_defaults_enable_insight_to_true_when_absent(self, monkeypatch):
         captured: dict[str, object] = {}
 
-        def fake_run_agent(question, conversation_history, enable_insight):
+        def fake_run_agent(question, conversation_history, enable_insight, caller_roles):
             captured["enable_insight"] = enable_insight
             return {"status": "succeeded"}
 
@@ -673,7 +877,9 @@ class TestGenerationNode:
             ),
         )
         monkeypatch.setattr(
-            media_gen, "download_media_bytes", lambda url, timeout=30.0: (b"bytes", "image/png")
+            media_gen,
+            "download_media_bytes",
+            lambda url, timeout=30.0, max_bytes=0: (b"bytes", "image/png"),
         )
         result = generation_node({"question": "generate a picture of a cat"})
         assert result["generation_result"]["status"] == "succeeded"
@@ -723,7 +929,9 @@ class TestExecuteGeneration:
             ),
         )
         monkeypatch.setattr(
-            media_gen, "download_media_bytes", lambda url, timeout=30.0: (b"bytes", "image/png")
+            media_gen,
+            "download_media_bytes",
+            lambda url, timeout=30.0, max_bytes=0: (b"bytes", "image/png"),
         )
         result = orchestrator_nodes.execute_generation(
             "generate a chart-style image of top sales", "image", settings
@@ -756,7 +964,7 @@ class TestExecuteGeneration:
             ),
         )
 
-        def _fail_download(url, timeout=30.0):
+        def _fail_download(url, timeout=30.0, max_bytes=0):
             raise media_gen.MediaGenerationError("boom")
 
         monkeypatch.setattr(media_gen, "download_media_bytes", _fail_download)
@@ -774,7 +982,9 @@ class TestExecuteGeneration:
 
         monkeypatch.setattr(media_gen, "get_ima_client", lambda settings: object())
         monkeypatch.setattr(
-            media_gen, "download_media_bytes", lambda url, timeout=30.0: (b"bytes", "video/mp4")
+            media_gen,
+            "download_media_bytes",
+            lambda url, timeout=30.0, max_bytes=0: (b"bytes", "video/mp4"),
         )
 
         def _fail_if_called(*args, **kwargs):
@@ -806,7 +1016,9 @@ class TestExecuteGeneration:
 
         monkeypatch.setattr(media_gen, "get_ima_client", lambda settings: object())
         monkeypatch.setattr(
-            media_gen, "download_media_bytes", lambda url, timeout=30.0: (b"bytes", "video/mp4")
+            media_gen,
+            "download_media_bytes",
+            lambda url, timeout=30.0, max_bytes=0: (b"bytes", "video/mp4"),
         )
         captured: dict[str, object] = {}
 
@@ -864,7 +1076,9 @@ class TestExecuteGeneration:
         monkeypatch.setattr(media_gen, "get_ima_client", lambda settings: object())
         monkeypatch.setattr(media_gen, "generate_image", _fake_generate_image)
         monkeypatch.setattr(
-            media_gen, "download_media_bytes", lambda url, timeout=30.0: (b"bytes", "image/png")
+            media_gen,
+            "download_media_bytes",
+            lambda url, timeout=30.0, max_bytes=0: (b"bytes", "image/png"),
         )
 
         first = orchestrator_nodes.execute_generation(
@@ -1184,8 +1398,8 @@ class TestRunOrchestrated:
         fake_result: AgentState = {"status": "succeeded", "sql": "SELECT 1"}
         captured: dict[str, object] = {}
 
-        def fake_run_agent(question, conversation_history, enable_insight):
-            captured["args"] = (question, conversation_history, enable_insight)
+        def fake_run_agent(question, conversation_history, enable_insight, caller_roles):
+            captured["args"] = (question, conversation_history, enable_insight, caller_roles)
             return fake_result
 
         monkeypatch.setattr(orchestrator_graph, "run_agent", fake_run_agent)
@@ -1200,7 +1414,7 @@ class TestRunOrchestrated:
         result = orchestrator_graph.run_orchestrated("how many orders?", None, True)
 
         assert result is fake_result
-        assert captured["args"] == ("how many orders?", None, True)
+        assert captured["args"] == ("how many orders?", None, True, ())
 
     def test_flag_on_routes_through_the_graph_to_sql(self, monkeypatch):
         settings = _settings(enable_multi_source_router=True)
@@ -1209,7 +1423,7 @@ class TestRunOrchestrated:
         monkeypatch.setattr(
             orchestrator_nodes,
             "run_agent",
-            lambda question, conversation_history, enable_insight: {
+            lambda question, conversation_history, enable_insight, caller_roles: {
                 "status": "succeeded",
                 "sql": "SELECT 1",
                 "row_count": 3,
@@ -1241,7 +1455,7 @@ class TestRunOrchestrated:
         monkeypatch.setattr(
             orchestrator_nodes,
             "run_agent",
-            lambda question, conversation_history, enable_insight: {
+            lambda question, conversation_history, enable_insight, caller_roles: {
                 "status": "succeeded",
                 "sql": "SELECT 1",
                 "row_count": 5,
@@ -1260,7 +1474,7 @@ class TestRunOrchestrated:
         )
 
         final_state = orchestrator_graph.run_orchestrated(
-            "compare leave taken with policy", None, True
+            "compare leave taken with policy", None, True, caller_roles=("admin",)
         )
 
         assert set(final_state["sources_used"]) == {"sql", "policy"}

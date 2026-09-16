@@ -241,6 +241,7 @@ def run_agent(
     question: str,
     conversation_history: list[ConversationExchange] | None = None,
     enable_insight: bool = True,
+    caller_roles: tuple[str, ...] = (),
 ) -> AgentState:
     """Runs the full agent graph for a single natural-language question.
 
@@ -259,6 +260,14 @@ def run_agent(
             default (normally low-risk, high-value); the UI exposes this as
             a toggle. False skips the extra LLM call entirely rather than
             just hiding the result.
+        caller_roles: The authenticated caller's roles (`security.oidc
+            .AuthIdentity.roles`, set by `api/auth.py`) -- `()` (the
+            default) for a caller with no elevated permissions, which is
+            also what a script calling this directly (`eval/runner.py`,
+            `scripts/integration_test.py`) gets without passing anything.
+            Read by `validate_sql_node`'s restricted-column gate (2026
+            Phase 2 security review) via `agent.authz.has_permission` --
+            see `docs/AUTHORIZATION.md`.
 
     Returns:
         The final `AgentState` after the graph reaches `END` -- check
@@ -290,6 +299,7 @@ def run_agent(
     compiled_graph = build_graph()
     initial_state: AgentState = {
         "question": question,
+        "caller_roles": caller_roles,
         "rejection_reason": None,
         "rejection_message": None,
         "rate_limit_message": None,

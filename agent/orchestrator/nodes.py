@@ -25,6 +25,7 @@ import logging
 from collections.abc import Hashable
 from typing import Any, Literal, cast
 
+from agent.authz import Permission, has_role_permission
 from agent.graph import run_agent
 from agent.orchestrator.state import (
     MediaGenerationResult,
@@ -250,6 +251,29 @@ def classify_sources(
 # already owns, with no per-call third-party cost.
 _EXPENSIVE_SOURCES = ("generation", "web")
 
+# 2026 Phase 2 security review: closes 2026 Phase 1's AGT-01/R-008 finding
+# ("no independent authorization layer between the router's LLM
+# classification and actual source execution" -- the LLM's own routing
+# decision used to be sufficient by itself to reach the access-sensitive
+# "policies" collection or trigger paid media generation). Maps a source
+# name to the permission a caller's role(s) must grant for that source to
+# survive `router_node`'s post-classification filter, applied *after* the
+# LLM picks candidate sources and *before* `route_after_router` ever fans
+# out to the corresponding subgraph node -- the LLM may still request a
+# source, but never gets to decide alone whether the request is permitted.
+# "sql" and "documents" have no entry here: reaching the orchestrator at
+# all already required `Permission.ASK` at the API boundary
+# (`api/main.py`'s `POST /ask`, via `api/authz.py`), and "documents"
+# queries the general (non-sensitivity-restricted) RAG collection, already
+# covered by `Permission.DOCUMENTS_READ`, which every default role grants
+# (see `agent/authz.py`).
+_SOURCE_PERMISSIONS: dict[str, Permission] = {
+    "policy": Permission.POLICY_RAG_QUERY,
+    "generation": Permission.MEDIA_GENERATE,
+    "web": Permission.WEB_SEARCH,
+    "media_search": Permission.MEDIA_SEARCH,
+}
+
 
 def router_node(state: OrchestratorState) -> dict[str, Any]:
     """Decides which source(s) this question should be routed to.
@@ -288,11 +312,20 @@ def router_node(state: OrchestratorState) -> dict[str, Any]:
         sources, reasoning = classify_sources(state["question"], available, settings)
         short_circuited = False
 
-    session_id = state.get("session_id")
+    # 2026 Phase 2 security review: prefer the authenticated caller's real
+    # subject (security.oidc.AuthIdentity.subject, set whenever OIDC auth
+    # is active) as the cost-ceiling key over the client-supplied,
+    # unauthenticated session_id -- a caller can always reset session_id
+    # by minting a fresh one (see get_session_expensive_source_limiter's
+    # own docstring), but cannot mint a fresh, still-valid JWT subject at
+    # will. Falls back to session_id when no real identity exists (the
+    # "none"/"static_token" auth modes -- see docs/AUTHENTICATION.md),
+    # keeping the pre-existing behavior for those deployments unchanged.
+    ceiling_key = state.get("caller_subject") or state.get("session_id")
     expensive_picked = [s for s in sources if s in _EXPENSIVE_SOURCES]
-    if session_id and expensive_picked:
+    if ceiling_key and expensive_picked:
         limiter = get_session_expensive_source_limiter(
-            session_id,
+            ceiling_key,
             settings.session_expensive_source_limit,
             settings.session_expensive_source_window_seconds,
         )
@@ -303,11 +336,38 @@ def router_node(state: OrchestratorState) -> dict[str, Any]:
                 "warning",
                 "A session exceeded its expensive-source (generation/web) budget; "
                 "those source(s) were dropped from this turn's routing.",
-                session_id=session_id,
+                ceiling_key=ceiling_key,
                 dropped_sources=expensive_picked,
             )
             sources = [s for s in sources if s not in _EXPENSIVE_SOURCES] or ["sql"]
             reasoning += f" (session expensive-source limit reached -- dropped {expensive_picked})"
+
+    # Authorization -- see _SOURCE_PERMISSIONS' own docstring. Deliberately
+    # placed after the LLM classification (and after the cost-ceiling drop
+    # above) but strictly before route_after_router ever reads
+    # route_decision to build the actual fan-out list, so a denied source
+    # is dropped from the route entirely rather than merely skipped once
+    # its subgraph node has already started.
+    caller_roles = state.get("caller_roles", ())
+    denied_sources = [
+        s
+        for s in sources
+        if s in _SOURCE_PERMISSIONS
+        and not has_role_permission(caller_roles, _SOURCE_PERMISSIONS[s])
+    ]
+    if denied_sources:
+        log_security_event(
+            "orchestrator_source_denied",
+            "warning",
+            "The router selected a source the caller's role(s) do not have permission "
+            "for; it was dropped from this turn's routing before that source's "
+            "subgraph ever ran.",
+            denied_sources=denied_sources,
+            required_permissions=[_SOURCE_PERMISSIONS[s].value for s in denied_sources],
+            caller_roles=list(caller_roles),
+        )
+        sources = [s for s in sources if s not in denied_sources] or ["sql"]
+        reasoning += f" (caller lacks permission for {denied_sources} -- dropped)"
 
     route_decision: RouteDecision = {
         "sources": sources,
@@ -389,6 +449,7 @@ def sql_subgraph_node(state: OrchestratorState) -> dict[str, Any]:
         state["question"],
         state.get("conversation_history"),
         state.get("enable_insight", True),
+        state.get("caller_roles", ()),
     )
     result = dict(sql_state)
     result["sources_used"] = ["sql"]
@@ -701,7 +762,10 @@ def execute_generation(
         )
 
     try:
-        data, content_type = download_media_bytes(result.url)  # type: ignore[arg-type]
+        data, content_type = download_media_bytes(
+            result.url,  # type: ignore[arg-type]
+            max_bytes=settings.media_max_file_mb * 1024 * 1024,
+        )
     except MediaGenerationError as exc:
         logger.warning("[generation] %s generated but download failed: %s", kind, exc)
         log_security_event("generation_download_failed", "warning", str(exc), media_type=kind)

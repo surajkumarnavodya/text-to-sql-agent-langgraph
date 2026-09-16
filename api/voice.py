@@ -7,7 +7,13 @@ Neither route calls into `agent/` at all: `POST /voice/transcribe` returns
 plain text for the caller to submit through the ordinary `POST /ask` path
 (so `agent.input_guard.check_input` still applies unconditionally, exactly
 as it does to a typed question), and `POST /voice/synthesize` only ever
-reads back an already-produced answer string.
+reads back an already-produced answer string. `POST /voice/transcribe`
+returns Whisper's raw output *and* a `voice.correction.correct_transcript`
+suggestion (misheard-word/filler-word/self-correction cleanup, gated by
+`Settings.enable_voice_correction`) side by side -- the frontend shows
+both and requires an explicit user action (never an automatic timer) to
+pick one and submit it. Both are plain, untrusted text either way, never
+pre-validated or treated as an instruction to this app.
 """
 
 from __future__ import annotations
@@ -17,17 +23,19 @@ import logging
 from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile, status
 from fastapi.responses import Response
 
-from api.auth import verify_api_key
+from agent.authz import Permission
+from api.authz import require_permission
 from api.rate_limit import enforce_api_action_rate_limit
 from api.schemas import SynthesizeRequest, TranscribeResponse
 from config.settings import get_settings
+from voice.correction import correct_transcript
 from voice.exceptions import VoiceInputTooLongError, VoiceModelNotFoundError, VoiceProcessingError
 from voice.stt import transcribe
 from voice.tts import synthesize
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter(dependencies=[Depends(verify_api_key)])
+router = APIRouter(dependencies=[Depends(require_permission(Permission.VOICE_USE))])
 
 
 def _require_voice_mode_enabled() -> None:
@@ -48,7 +56,10 @@ async def transcribe_audio(request: Request, audio: UploadFile = File(...)) -> T
     (the same bounded-read pattern `api/documents.py::upload_document`
     already uses), then rejects anything over that cap before it ever
     reaches the STT model. The returned text is never passed to the agent
-    here -- see this module's docstring.
+    here -- see this module's docstring. The raw Whisper text is also run
+    through `voice.correction.correct_transcript` (fails open to the raw
+    text unchanged on any Ollama error) to produce `corrected_text` --
+    both are returned; nothing is submitted automatically.
     """
     settings = get_settings()
     _require_voice_mode_enabled()
@@ -74,8 +85,13 @@ async def transcribe_audio(request: Request, audio: UploadFile = File(...)) -> T
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=exc.safe_message
         ) from exc
 
+    corrected = correct_transcript(result.text, settings=settings)
+    corrected_text = corrected if corrected != result.text else None
+
     logger.info("[voice] transcribed in %.0fms", result.stt_duration_ms)
-    return TranscribeResponse(text=result.text, stt_duration_ms=result.stt_duration_ms)
+    return TranscribeResponse(
+        text=result.text, corrected_text=corrected_text, stt_duration_ms=result.stt_duration_ms
+    )
 
 
 @router.post("/voice/synthesize")

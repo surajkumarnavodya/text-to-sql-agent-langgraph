@@ -278,6 +278,9 @@ class TestDownloadDocument:
         monkeypatch.setattr(
             "api.documents.get_document_bytes", lambda engine, document_id: b"%PDF-1.4 raw bytes"
         )
+        monkeypatch.setattr(
+            "api.documents.get_document_sensitivity", lambda engine, document_id: None
+        )
 
         response = client.get("/documents/doc-1/download")
 
@@ -291,3 +294,59 @@ class TestDownloadDocument:
         response = client.get("/documents/doc-1/download")
 
         assert response.status_code == 404
+
+    def test_sensitive_document_requires_documents_read_sensitive_permission(
+        self, monkeypatch, client
+    ):
+        """2026 Phase 2 security review regression: a document with a
+        `sensitivity_category` set must not be downloadable by a caller
+        whose role(s) don't grant `Permission.DOCUMENTS_READ_SENSITIVE`
+        (e.g. the default "user" role, which has DOCUMENTS_READ but not
+        the sensitive variant -- see agent/authz.py)."""
+        monkeypatch.setattr(
+            "api.documents.get_document_bytes", lambda engine, document_id: b"%PDF-1.4 raw bytes"
+        )
+        monkeypatch.setattr(
+            "api.documents.get_document_sensitivity",
+            lambda engine, document_id: "compensation",
+        )
+        # This module's own `client` fixture doesn't exercise the real
+        # OIDC/static-token dispatch (see tests/test_api_authz.py for
+        # that) -- only that a caller whose identity carries no elevated
+        # role is denied, regardless of how that identity was produced.
+        import api.authz as api_authz
+        from security.oidc import AuthIdentity
+
+        monkeypatch.setattr(
+            api_authz,
+            "get_auth_identity",
+            lambda request: AuthIdentity(subject="u1", roles=("user",), mode="oidc"),
+        )
+
+        response = client.get("/documents/doc-1/download")
+
+        assert response.status_code == 403
+
+    def test_sensitive_document_is_downloadable_with_documents_read_sensitive(
+        self, monkeypatch, client
+    ):
+        monkeypatch.setattr(
+            "api.documents.get_document_bytes", lambda engine, document_id: b"%PDF-1.4 raw bytes"
+        )
+        monkeypatch.setattr(
+            "api.documents.get_document_sensitivity",
+            lambda engine, document_id: "compensation",
+        )
+        import api.authz as api_authz
+        from security.oidc import AuthIdentity
+
+        monkeypatch.setattr(
+            api_authz,
+            "get_auth_identity",
+            lambda request: AuthIdentity(subject="a1", roles=("analyst",), mode="oidc"),
+        )
+
+        response = client.get("/documents/doc-1/download")
+
+        assert response.status_code == 200
+        assert response.content == b"%PDF-1.4 raw bytes"

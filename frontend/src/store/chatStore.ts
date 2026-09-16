@@ -23,9 +23,10 @@ import {
 } from '@/lib/history'
 import type { AskResponse } from '@/lib/types'
 
-/** The question currently in flight -- drives the full-screen centered
- * "Thinking Ns" takeover (see components/chat/ThinkingOverlay.tsx and
- * TimingBadge.tsx), not an inline chat bubble. `startedAt` is a
+/** The question currently in flight -- rendered by
+ * `components/chat/PendingTurn.tsx` as the next item in the normal
+ * scrolling conversation (a user bubble plus `TimingBadge`'s pulsing
+ * "Thinking Ns…" text), not a popup/overlay. `startedAt` is a
  * `performance.now()` timestamp, not wall-clock, so the live counter is
  * immune to system clock changes mid-request. */
 export interface PendingQuestion {

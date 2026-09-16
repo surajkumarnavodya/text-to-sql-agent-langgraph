@@ -26,6 +26,7 @@ from typing import Any
 
 from sqlalchemy.exc import SQLAlchemyError
 
+from agent.authz import Permission, has_role_permission
 from agent.error_classification import ExecutionErrorCategory, classify_execution_error
 from agent.exceptions import (
     MalformedLLMOutputError,
@@ -34,7 +35,12 @@ from agent.exceptions import (
     SchemaRetrievalError,
 )
 from agent.followup import classify_followup
-from agent.input_guard import NO_RELEVANT_DATA_MESSAGE, check_input, rejection_message
+from agent.input_guard import (
+    NO_RELEVANT_DATA_MESSAGE,
+    check_input,
+    rejection_message,
+    sanitize_conversation_history,
+)
 from agent.insight import is_insight_grounded, should_skip_insight, summarize_result
 from agent.llm_client import (
     generate_insight_from_llm,
@@ -308,6 +314,19 @@ def sanitize_input_node(state: AgentState) -> dict[str, Any]:
     settings = get_settings()
     result = check_input(state["question"], max_length=settings.max_question_length)
 
+    # 2026 Phase 2 security review (finding LLM-01): conversation_history
+    # gets the same normalization/injection-detection treatment as the
+    # live question, here (the graph's true entry point) rather than
+    # later, closest to sanitize_input_node's own "before anything else
+    # touches it" contract -- see sanitize_conversation_history's
+    # docstring for why a match here doesn't reject the request the way
+    # the live question's own match does.
+    sanitized_history = sanitize_conversation_history(
+        state.get("conversation_history") or [],
+        max_length=settings.max_question_length,
+        max_turns=settings.max_conversation_history_turns,
+    )
+
     if not result.passed:
         assert result.reason is not None  # guaranteed when passed is False
         message = rejection_message(result.reason, db_name=settings.db_name)
@@ -326,9 +345,14 @@ def sanitize_input_node(state: AgentState) -> dict[str, Any]:
             "status": "rejected",
             "rejection_reason": result.reason,
             "rejection_message": message,
+            "conversation_history": sanitized_history,
         }
 
-    return {"question": result.cleaned_question, "status": "classifying_followup"}
+    return {
+        "question": result.cleaned_question,
+        "status": "classifying_followup",
+        "conversation_history": sanitized_history,
+    }
 
 
 @_timed_node("classify_followup")
@@ -985,9 +1009,21 @@ def validate_sql_node(state: AgentState) -> dict[str, Any]:
     # model has no way to recover from. Empty by default (the classification
     # file ships with no entries), so this has zero effect until a column is
     # deliberately classified.
+    # 2026 Phase 2 security review: a caller whose role(s) grant
+    # VIEW_RESTRICTED_COLUMNS (see agent/authz.py, docs/AUTHORIZATION.md)
+    # skips this gate entirely -- the classification still exists and
+    # still matters for everyone else, it just isn't a blanket rule
+    # anymore now that per-caller identity exists. `caller_roles` defaults
+    # to `()` for a caller with no elevated permissions (or a script that
+    # never set it), which resolves to "no permission" the same way an
+    # unrecognized role would, so this is a pure narrowing of who gets
+    # blocked, never a widening.
+    caller_can_view_restricted = has_role_permission(
+        state.get("caller_roles", ()), Permission.VIEW_RESTRICTED_COLUMNS
+    )
     classifications = load_sensitive_columns()
     restricted_pairs = {pair for pair, tier in classifications.items() if tier == "restricted"}
-    if restricted_pairs:
+    if restricted_pairs and not caller_can_view_restricted:
         restricted_hits = find_restricted_column_references(
             safe_sql, restricted_pairs, known_tables, dialect=dialect
         )

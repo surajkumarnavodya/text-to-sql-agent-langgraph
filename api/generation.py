@@ -15,18 +15,21 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Depends, Request
 
+from agent.authz import Permission
 from agent.orchestrator.nodes import execute_generation, infer_media_kind
-from api.auth import verify_api_key
+from api.authz import require_permission
 from api.rate_limit import enforce_api_action_rate_limit
 from api.schemas import GenerateConfirmRequest, MediaGenerationResultOut
 from config.settings import get_settings
 
-router = APIRouter(dependencies=[Depends(verify_api_key)])
+router = APIRouter()
 
 
 @router.post("/generate/confirm", response_model=MediaGenerationResultOut)
 def confirm_generation(
-    payload: GenerateConfirmRequest, request: Request
+    payload: GenerateConfirmRequest,
+    request: Request,
+    _identity=Depends(require_permission(Permission.MEDIA_GENERATE)),
 ) -> MediaGenerationResultOut:
     """The human-approval confirmation step for media generation.
 

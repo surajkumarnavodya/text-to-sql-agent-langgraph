@@ -479,6 +479,29 @@ def references_multiple_tables(sql: str, dialect: str | None = DEFAULT_DIALECT) 
     return len(referenced) >= 2
 
 
+def _has_wildcard_projection(statement: exp.Expression) -> bool:
+    """True if any `SELECT` clause in `statement` projects a bare `*` or a
+    qualified `table.*` wildcard, rather than only explicit named columns.
+
+    `find_restricted_column_references` below can only recognize a
+    restricted column by name -- it has no way to know which columns a
+    wildcard actually expands to without a live schema lookup. Without this
+    check, `SELECT * FROM DimCustomer` never mentions `EmailAddress` by
+    name and silently bypassed the restricted-column gate entirely (2026
+    Phase 1 security review finding AUTHZ-01). `COUNT(*)` is not a
+    projection wildcard (it's a function argument, `exp.Count(this=exp.Star())`,
+    never a direct member of `Select.expressions`) and correctly does not
+    match here.
+    """
+    for select in statement.find_all(exp.Select):
+        for projection in select.expressions:
+            if isinstance(projection, exp.Star):
+                return True
+            if isinstance(projection, exp.Column) and isinstance(projection.this, exp.Star):
+                return True
+    return False
+
+
 def find_restricted_column_references(
     sql: str,
     restricted_columns: set[tuple[str, str]],
@@ -501,9 +524,12 @@ def find_restricted_column_references(
             `config.sensitive_columns.load_sensitive_columns()`'s full
             tier map (this function doesn't know about "internal", only
             "restricted").
-        known_tables: Table names actually part of this attempt's
-            retrieved schema context, compared case-insensitively -- same
-            convention as `find_unexpected_table_references`.
+        known_tables: Unused by the matching logic itself (see the "2026
+            Phase 1" note below) -- kept as a parameter so
+            `agent.nodes.validate_sql_node`'s existing call site (which
+            also feeds the same set into `find_unexpected_table_references`
+            for its own, separate detection-only purpose) doesn't need to
+            change shape.
         dialect: sqlglot dialect to parse with.
 
     Returns:
@@ -513,28 +539,48 @@ def find_restricted_column_references(
         `sql` doesn't parse.
 
         Matching is name-based (a restricted column name appearing
-        anywhere in the statement, whose owning table is among
-        `known_tables`), not full table-qualification resolution --
-        deliberately conservative in the safe direction: a false positive
-        only costs a retry (the model gets a chance to drop the column and
-        answer with what remains), while a false negative would let a
-        restricted column through undetected.
+        anywhere in the statement, whose owning table is actually
+        referenced in the statement's own `FROM`/`JOIN` clauses), not full
+        table-qualification resolution -- deliberately conservative in the
+        safe direction: a false positive only costs a retry (the model
+        gets a chance to drop the column and answer with what remains),
+        while a false negative would let a restricted column through
+        undetected. A wildcard projection (`SELECT *`/`SELECT t.*`) flags
+        every restricted column of every table the statement references,
+        since a named-column match can't see through a wildcard.
+
+        2026 Phase 1 security review (finding AUTHZ-02): this used to
+        additionally require the restricted table to be part of
+        `known_tables` -- the caller's *attempt-scoped, RAG-retrieved*
+        schema subset for this one question, not the full configured
+        schema. A restricted table referenced through a join/subquery/
+        golden-example-influenced generation that the retriever simply
+        didn't surface for this particular attempt was therefore never
+        checked at all. Matching is now grounded in the statement's own
+        parsed `FROM`/`JOIN` tables instead, which is strictly more
+        accurate (ground truth from the SQL actually being validated,
+        not a proxy for "tables retrieval happened to consider") and
+        closes that gap without changing behavior for any query that
+        doesn't reference a restricted table at all.
     """
     try:
         statement = sqlglot.parse_one(sql, read=dialect)
     except SqlglotError:
         return []
 
-    known_tables_lower = {name.lower() for name in known_tables}
+    referenced_tables_lower = {
+        table.name.lower() for table in statement.find_all(exp.Table) if table.name
+    }
     referenced_columns_lower = {
         column.name.lower() for column in statement.find_all(exp.Column) if column.name
     }
+    has_wildcard = _has_wildcard_projection(statement)
 
     flagged = {
         (table_name, column_name)
         for table_name, column_name in restricted_columns
-        if table_name.lower() in known_tables_lower
-        and column_name.lower() in referenced_columns_lower
+        if table_name.lower() in referenced_tables_lower
+        and (has_wildcard or column_name.lower() in referenced_columns_lower)
     }
     return sorted(flagged)
 

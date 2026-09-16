@@ -27,6 +27,10 @@ voice/models/
 # --- Extracted video keyframe thumbnails (scripts/build_media_index.py) ---
 media/.thumbnails/
 
+# --- Local media search library (this developer's own MEDIA_LIBRARY_PATH
+# content -- personal images/video, never project source) ---
+media_library/
+
 # --- Local database files (this project connects to a real DB via SQLAlchemy;
 # no bundled/local DB file is ever expected -- see CLAUDE.md's DuckDB history
 # note -- this is defensive, in case one shows up locally during dev) ---

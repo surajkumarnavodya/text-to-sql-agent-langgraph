@@ -47,6 +47,39 @@ services:
       start_period: 20s
       retries: 3
     restart: unless-stopped
+    # 2026 Phase 2 security review: the app already runs as a non-root
+    # user (see the Dockerfile) and needs no Linux capability at all
+    # (it binds port 8000, not a privileged <1024 port, and does no raw
+    # networking/device access) -- dropping every capability and
+    # forbidding privilege-escalation-via-setuid closes off what a
+    # container-escape/RCE exploit chain could otherwise still reach for,
+    # even though neither is believed to be currently exploitable on its
+    # own. `read_only: true` (a fully read-only root filesystem) was
+    # deliberately NOT added here despite being the next natural
+    # hardening step -- this app writes to more paths than the one named
+    # `chroma_index` volume already covers (Piper voice models, video
+    # keyframe thumbnails, faster-whisper's HuggingFace cache, and
+    # whatever ordinary temp-file usage its dependencies do), and getting
+    # every one of those right requires verifying against a real running
+    # container this environment can't do -- see
+    # docs/PHASE2_SECURITY_REPORT.md's Docker section.
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    # Resource limits -- bounds a single container's worst-case CPU/memory
+    # footprint (e.g. under the kind of unbounded-request-concurrency
+    # scenario docs/THREAT_MODEL.md's resource-exhaustion entries
+    # describe) rather than letting it consume the whole host. Sized
+    # generously (this process holds a compiled LangGraph graph, a
+    # ChromaDB client, and -- if media search is enabled -- a local CLIP
+    # model in memory) -- tune to your actual deployment's headroom, not
+    # a value to copy blindly.
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 4G
 
 volumes:
   # Persists the schema embedding index across container restarts/recreates.

@@ -1012,29 +1012,33 @@ leaving the machine, no API key required for voice mode either.
 therefore applies unconditionally, with no separate code path for voice
 input to bypass.
 
-**One voice turn, then back to normal, not a continuous loop or a
-click-record-stop-transcribe-review cycle.**
-`frontend/src/hooks/useVoiceConversation.ts` drives a single
-listen → transcribe → ask → speak cycle (`idle` → `listening` →
-`transcribing` → `thinking` → `speaking` → back to `idle`) per mic-button
-click, matching Google Assistant/ChatGPT's "press to talk, get one
-spoken answer" turn shape rather than either the original single-shot
-"record once, review the transcript in the composer, then press Send"
-design, or a continuously-listening loop. There is deliberately no
-review step: the transcribed question is submitted automatically the
-moment an utterance ends, the answer is spoken automatically once it
-comes back, and the turn then resets itself (`useVoiceConversation`'s
-`reset()`) back to the normal typing composer — the user clicks the mic
-again to ask another question rather than the app re-listening on its
-own. `VoiceConversationBar.tsx` replaces the entire composer only while
-that one turn is in flight (`ChatInput.tsx` swaps it in for the
-textarea); the hook itself is owned by `ChatInput` (not by the bar
-component) so its `MediaRecorder`/`SpeechRecognition` handles survive
-the active/inactive transition rather than being torn down every turn.
-A failed turn (mic denied, transcription error) also resets to idle
-immediately rather than lingering on `VoiceConversationBar` — the error
-message is threaded through to `ChatInput`'s normal (non-voice) view
-instead, since that's what's on screen by the time the reset completes.
+**One voice turn, inline in the composer — record once, review, then the
+user presses Send.** `frontend/src/hooks/useVoiceConversation.ts` drives
+listen → transcribe (`idle` → `listening` → `transcribing` → back to
+`idle`, plus a `speaking` phase while a spoken answer plays back) per
+mic-button click. There is **no separate takeover card** —
+`ChatInput.tsx` keeps its normal textarea/mic/send layout the whole time;
+the mic button itself toggles in place to a stop button while
+`phase === 'listening'` (same position, never a second button), and
+while `isTranscribing`/`isSpeaking` it shows a small spinner/volume icon
+instead. While listening, the textarea is read-only and shows the live
+interim caption (see "Live captions" below) in place of its real value,
+so the box visibly "types" what it hears; once the local
+`POST /voice/transcribe` result comes back, `useVoiceConversation` hands
+its **raw `text` only** (never `corrected_text`, the optional AI-cleaned
+rewrite — see `voice/correction.py`) to `ChatInput` via an
+`onTranscribed` callback, which drops it straight into the textarea,
+exactly as if it had been typed. From there it's an ordinary editable
+question: nothing is auto-submitted, and the existing Send button (or
+Enter) is the only confirmation step — this is what makes "confirm before
+sending" fall out of the same UI a typed question already uses, rather
+than needing a dedicated review screen. `ChatInput` tags the question as
+voice-originated (`QueryHistoryEntry.originatedFromVoice`) as long as the
+box still holds that transcript, including through manual edits — only
+clearing the box and typing fresh from empty drops the tag. A failed turn
+(mic denied, transcription error) surfaces its message inline under the
+composer (`voice.error`) and leaves the textarea usable, rather than
+lingering in any special state.
 
 **Autoplay warm-up for the very first spoken answer.** The gap between
 the mic-button click and the actual `<audio>.play()` call in
@@ -1065,9 +1069,10 @@ the moment it comes back. `continuous: false` on the recognizer is what
 ends listening automatically (the browser's own `onend` fires on
 detected silence) without a manual stop button. Browsers without this API
 (`useSpeechRecognition().isSupported === false`) get no live caption and
-no auto-stop signal — `VoiceConversationBar` falls back to a manual
-"Done speaking" button in that case; local transcription and TTS playback
-are unaffected either way.
+no auto-stop signal — the textarea shows a static "recording" placeholder
+instead, and the mic-turned-stop button is the only way to end listening
+in that case; local transcription and TTS playback are unaffected either
+way.
 
 **Schema-aware transcription accuracy.** `voice.stt._build_vocabulary_hint`
 introspects every configured database's table/column names (reusing
@@ -1096,11 +1101,14 @@ insight feature produced one) → `state.synthesized_answer`/the relevant
 per-source answer (multi-source path) → a row-count fallback ("Found N
 rows.") — never silent on success. Origin tracking is a plain boolean
 (`QueryHistoryEntry.originatedFromVoice` in `frontend/src/lib/history.ts`,
-set only by `useVoiceConversation`'s submit path, never by typing) so a
-typed question can never trigger `POST /voice/synthesize` at all — not a
-runtime check, a structural guarantee. Playback itself happens once,
-automatically, via `useVoiceConversation`'s own `<audio>` element as part
-of the hands-free loop; `TurnCard.tsx` renders the same
+set by `ChatInput.submit()` whenever the textarea still holds a voice
+transcript at send time, never by typing) so a typed question can never
+trigger `POST /voice/synthesize` at all — not a runtime check, a
+structural guarantee. Playback happens once, automatically, via
+`useVoiceConversation`'s own `<audio>` element (`playAnswer`, called by
+`ChatInput.submit()` right after `askQuestion` resolves) using the same
+element `start()` warmed up for the browser's autoplay policy — see
+"Autoplay warm-up" below; `TurnCard.tsx` renders the same
 `entry.spokenAudioUrl` afterward with `controls` only (no `autoPlay`) so
 the user can manually replay it without hearing it spoken twice.
 
