@@ -1,9 +1,11 @@
 import { useEffect } from 'react'
 import { useTranslation } from 'react-i18next'
 import { Route, Routes } from 'react-router-dom'
+import { AuthGate } from '@/components/auth/AuthGate'
 import { AppShell } from '@/components/layout/AppShell'
 import { PwaUpdateBanner } from '@/components/layout/PwaUpdateBanner'
 import { watchSystemTheme, applyThemeMode } from '@/lib/theme'
+import { AuthCallback } from '@/pages/AuthCallback'
 import { Chat } from '@/pages/Chat'
 import { KnowledgeSources } from '@/pages/KnowledgeSources'
 import { MediaSearch } from '@/pages/MediaSearch'
@@ -34,7 +36,17 @@ export function App() {
     <>
       <PwaUpdateBanner />
       <Routes>
-        <Route element={<AppShell />}>
+        {/* Reachable without being signed in -- this is where the identity
+            provider sends the user back to after a successful login, so it
+            must never itself sit behind AuthGate. */}
+        <Route path="/auth/callback" element={<AuthCallback />} />
+        <Route
+          element={
+            <AuthGate>
+              <AppShell />
+            </AuthGate>
+          }
+        >
           <Route path="/" element={<Chat />} />
           <Route path="/knowledge-sources" element={<KnowledgeSources />} />
           <Route path="/media-search" element={<MediaSearch />} />

@@ -146,8 +146,12 @@ def _sample_column(engine: EngineLike, table_name: str, column_name: str) -> tup
     quoted_column = quote(column_name)
     try:
         with engine.connect() as connection:
+            # Bandit's SQL-construction heuristic (B608) can't see that
+            # quoted_table/quoted_column already went through the dialect's
+            # own identifier_preparer.quote() above, exactly the mitigation
+            # this function's own docstring describes.
             cursor_result = connection.execute(
-                text(f"SELECT DISTINCT {quoted_column} FROM {quoted_table}")
+                text(f"SELECT DISTINCT {quoted_column} FROM {quoted_table}")  # nosec B608
             )
             rows = cursor_result.fetchmany(_MAX_DISTINCT_VALUES + 1)
     except SQLAlchemyError as exc:

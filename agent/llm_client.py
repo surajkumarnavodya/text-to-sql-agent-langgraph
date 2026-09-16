@@ -115,8 +115,14 @@ _QUERY_PATTERNS_BLOCK = (
 
 def _system_prompt(db_type: str) -> str:
     engine_name = _DB_TYPE_DISPLAY_NAMES.get(db_type, "the connected SQL database")
+    # Bandit's SQL-construction heuristic (B608) false-positives on the
+    # f-string below purely because of the word "SQL" nearby -- this builds
+    # an LLM *prompt* (plain instructional text), not a database query, and
+    # `engine_name` is looked up from the fixed `_DB_TYPE_DISPLAY_NAMES`
+    # dict (or a fixed fallback string) keyed by `db_type`, never
+    # user-controlled text.
     return (
-        f"You are a SQL generation assistant for a {engine_name} database. "
+        f"You are a SQL generation assistant for a {engine_name} database. "  # nosec B608
         "Given a database schema and a natural-language question, respond with "
         "exactly one read-only SQL SELECT statement that answers the question, "
         f"written in {engine_name} SQL syntax. Rules:\n"

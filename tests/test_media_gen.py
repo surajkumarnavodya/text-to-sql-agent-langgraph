@@ -429,6 +429,9 @@ class _MockStreamResponse:
     def __exit__(self, *exc_info):
         return False
 
+    def close(self):
+        pass
+
     def iter_content(self, chunk_size: int = 1024):
         if self._body:
             yield self._body
@@ -591,6 +594,90 @@ class TestDownloadMediaBytes:
 
         with patch("socket.getaddrinfo", return_value=_PUBLIC_ADDRINFO):
             _validate_download_url("https://cdn.example/img.png")  # must not raise
+
+
+class TestDownloadMediaBytesRedirectHandling:
+    """2026 Phase 3 security review: `_validate_download_url` on the
+    *original* URL is moot if a redirect is then followed blindly -- these
+    confirm every redirect hop is independently re-validated, not just the
+    first URL."""
+
+    def test_redirect_to_public_address_is_followed(self):
+        from media_gen.download import download_media_bytes
+
+        redirect_response = _MockStreamResponse(302, {"Location": "https://cdn2.example/img.png"}, b"")
+        final_response = _MockStreamResponse(200, {"Content-Type": "image/png"}, b"abc")
+        with (
+            patch("socket.getaddrinfo", return_value=_PUBLIC_ADDRINFO),
+            patch("requests.get", side_effect=[redirect_response, final_response]),
+        ):
+            data, content_type = download_media_bytes("https://cdn.example/img.png")
+        assert data == b"abc"
+        assert content_type == "image/png"
+
+    def test_redirect_to_private_address_is_rejected(self):
+        """The redirect target resolves to a private address -- must be
+        caught exactly like a direct request to it would be, even though
+        the original URL's own address was genuinely public."""
+        from media_gen.download import download_media_bytes
+
+        redirect_response = _MockStreamResponse(
+            302, {"Location": "https://internal.example/secrets"}, b""
+        )
+        with (
+            patch(
+                "socket.getaddrinfo",
+                side_effect=[_PUBLIC_ADDRINFO, [(2, 1, 6, "", ("169.254.169.254", 0))]],
+            ),
+            patch("requests.get", return_value=redirect_response),
+            pytest.raises(MediaGenerationError, match="private/internal address"),
+        ):
+            download_media_bytes("https://cdn.example/img.png")
+
+    def test_redirect_to_non_https_is_rejected(self):
+        from media_gen.download import download_media_bytes
+
+        redirect_response = _MockStreamResponse(302, {"Location": "http://cdn2.example/img.png"}, b"")
+        with (
+            patch("socket.getaddrinfo", return_value=_PUBLIC_ADDRINFO),
+            patch("requests.get", return_value=redirect_response),
+            pytest.raises(MediaGenerationError, match="non-HTTPS"),
+        ):
+            download_media_bytes("https://cdn.example/img.png")
+
+    def test_redirect_with_no_location_header_is_rejected(self):
+        from media_gen.download import download_media_bytes
+
+        redirect_response = _MockStreamResponse(302, {}, b"")
+        with (
+            patch("socket.getaddrinfo", return_value=_PUBLIC_ADDRINFO),
+            patch("requests.get", return_value=redirect_response),
+            pytest.raises(MediaGenerationError, match="no Location header"),
+        ):
+            download_media_bytes("https://cdn.example/img.png")
+
+    def test_relative_redirect_location_is_resolved_against_current_url(self):
+        from media_gen.download import download_media_bytes
+
+        redirect_response = _MockStreamResponse(302, {"Location": "/moved/img.png"}, b"")
+        final_response = _MockStreamResponse(200, {"Content-Type": "image/png"}, b"abc")
+        with (
+            patch("socket.getaddrinfo", return_value=_PUBLIC_ADDRINFO),
+            patch("requests.get", side_effect=[redirect_response, final_response]),
+        ):
+            data, _ = download_media_bytes("https://cdn.example/img.png")
+        assert data == b"abc"
+
+    def test_too_many_redirects_is_rejected(self):
+        from media_gen.download import _MAX_REDIRECTS, download_media_bytes
+
+        redirect_response = _MockStreamResponse(302, {"Location": "https://cdn.example/next"}, b"")
+        with (
+            patch("socket.getaddrinfo", return_value=_PUBLIC_ADDRINFO),
+            patch("requests.get", return_value=redirect_response),
+            pytest.raises(MediaGenerationError, match=f"exceeded {_MAX_REDIRECTS}"),
+        ):
+            download_media_bytes("https://cdn.example/img.png")
 
 
 class TestGenerateAudio:

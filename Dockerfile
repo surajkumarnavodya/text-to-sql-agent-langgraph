@@ -42,9 +42,19 @@ FROM python:3.11-slim@sha256:9534e5a8e315485d4061ed659af0fd78a284c015f9b73661b41
 # apt repo) only needed if you're actually connecting to SQL Server; see
 # docs/DEPLOYMENT.md for the optional extra layer that adds it, kept out of
 # this base image so postgres/mysql/oracle-only deployments stay smaller.
+# Kept in the final image (pyodbc's compiled extension needs its runtime
+# lib available, not just at build time).
 # build-essential: some transitive deps compile from source on slim images
-# lacking a matching manylinux wheel; removed after pip install so it
-# doesn't bloat the final image.
+# lacking a matching manylinux wheel -- needed only to build those wheels,
+# not at runtime. Actually purged below (2026 Phase 3 security review: this
+# comment used to claim removal that the Dockerfile never actually
+# performed -- a stale-documentation finding caught during a security
+# audit, not just a size optimization -- an unnecessary compiler toolchain
+# in the final image is needless attack surface for anything that manages
+# to get arbitrary code execution). Purged in the *same* layer as the pip
+# install below (removing it in a later RUN would not shrink the image --
+# Docker layers are additive), so `pip install` and the purge are one
+# RUN block, not two.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends build-essential unixodbc-dev curl \
     && rm -rf /var/lib/apt/lists/*
@@ -62,7 +72,9 @@ WORKDIR /app
 # (see its own header comment), so this build is reproducible.
 COPY requirements.txt .
 RUN pip install --no-cache-dir --upgrade pip \
-    && pip install --no-cache-dir -r requirements.txt
+    && pip install --no-cache-dir -r requirements.txt \
+    && apt-get purge -y --auto-remove build-essential \
+    && rm -rf /var/lib/apt/lists/*
 
 COPY . .
 # Overlays the frontend build stage's output onto the source copied above --

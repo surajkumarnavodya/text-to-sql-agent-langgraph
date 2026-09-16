@@ -413,6 +413,12 @@ class DocumentOut(BaseModel):
     chunk_count: int
     error_message: str | None = None
     has_pdf_bytes: bool
+    # 2026 Phase 3 security review -- see rag.store.DocumentRecord's own
+    # docstring for what each means (uploaded_by: audit trail only, never
+    # used to scope access; restricted_roles: an actual access-control
+    # gate, enforced by rag/graph.py and api/documents.py's download route).
+    uploaded_by: str | None = None
+    restricted_roles: list[str] | None = None
 
 
 class DocumentListResponse(BaseModel):

@@ -3,6 +3,14 @@
     "title": "Panel de Texto a SQL",
     "subtitle": "Haz una pregunta en lenguaje natural — obtén SQL validado y de solo lectura, una tabla de resultados en vivo y un gráfico seleccionado automáticamente."
   },
+  "auth": {
+    "signInRequired": "Inicio de sesión requerido",
+    "signInPrompt": "Este despliegue requiere que inicies sesión con la cuenta de tu organización para continuar.",
+    "signIn": "Iniciar sesión",
+    "signingIn": "Iniciando sesión…",
+    "signInFailed": "Error al iniciar sesión",
+    "signOut": "Cerrar sesión"
+  },
   "nav": {
     "chat": "Chat",
     "knowledgeSources": "Fuentes de conocimiento",

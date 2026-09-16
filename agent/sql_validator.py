@@ -125,6 +125,119 @@ _DANGEROUS_FUNCTION_RE = re.compile(
     re.IGNORECASE,
 )
 
+# 2026 Phase 3 security review: schema/database names that hold system
+# catalog metadata (table/column definitions, user/role grants, server
+# configuration) rather than application data, across every supported
+# dialect. A SELECT naming one of these directly is never a legitimate
+# answer to a business question this app exists to answer -- and unlike an
+# ordinary application table, it can reveal internal schema structure or
+# other users'/roles' grants even under a genuinely read-only DB role (see
+# db.connection.check_write_privileges's docstring: DB-role read-only-ness
+# bounds *writes*, it says nothing about what a SELECT is allowed to
+# *read*). Matched against exp.Table's schema (`.db`) qualifier,
+# case-insensitively -- this also catches an mssql cross-database
+# reference like `master.sys.database_principals` (schema="sys").
+_SYSTEM_CATALOG_SCHEMAS: frozenset[str] = frozenset(
+    {
+        "information_schema",  # ANSI-standard -- postgresql, mysql, mssql
+        "pg_catalog",  # postgresql
+        "mysql",  # mysql's own internal schema
+        "performance_schema",  # mysql
+        "sys",  # mysql 5.7+'s sys schema, and mssql's sys schema
+    }
+)
+
+# Oracle exposes system catalog content as unqualified/pseudo-schema views
+# rather than through a distinctly-named schema the way the other three
+# dialects do -- ALL_*/DBA_*/USER_* data-dictionary views, conventionally
+# queried bare (`SELECT * FROM DBA_USERS`), not schema-qualified.
+#
+# Deliberately matched as {scope prefix} + {a curated, real suffix}, never a
+# blind prefix -- "user_"/"dba_"/"all_" are ordinary English words a real
+# business schema legitimately prefixes tables with (`user_accounts`,
+# `user_preferences`, `dba_notes`), so a bare `name.startswith("user_")`
+# would false-positive on exactly the kind of everyday table this validator
+# must not reject (see the "preserve existing functionality" principle this
+# whole audit pass operates under). Every suffix below is a real, standard
+# Oracle static data-dictionary view -- non-exhaustive (like
+# `_DANGEROUS_FUNCTION_NAMES` above, honestly documented as such, not
+# hidden), but chosen to cover the object types most useful for
+# reconnaissance (tables/columns/privileges/users/roles/source code) while
+# keeping the false-positive rate at effectively zero for ordinary schemas.
+_ORACLE_CATALOG_SCOPE_PREFIXES: tuple[str, ...] = ("all_", "dba_", "user_")
+_ORACLE_CATALOG_SUFFIXES: frozenset[str] = frozenset(
+    {
+        "tables",
+        "tab_columns",
+        "tab_cols",
+        "tab_comments",
+        "col_comments",
+        "views",
+        "indexes",
+        "ind_columns",
+        "constraints",
+        "cons_columns",
+        "objects",
+        "source",
+        "sequences",
+        "triggers",
+        "procedures",
+        "arguments",
+        "tab_privs",
+        "col_privs",
+        "role_privs",
+        "sys_privs",
+        "synonyms",
+        "users",
+        "roles",
+        "segments",
+        "tablespaces",
+        "data_files",
+        "directories",
+    }
+)
+# Oracle's dynamic performance views (`V$SESSION`, `GV$SQL`, ...) -- the
+# `$` makes this prefix unambiguous enough (unlike "user_"/"dba_"/"all_")
+# that a plain prefix match is safe: no ordinary business table is
+# realistically named starting with `v$`/`gv$`.
+_ORACLE_DYNAMIC_VIEW_PREFIXES: tuple[str, ...] = ("v$", "gv$")
+
+
+def _is_oracle_catalog_view_name(name: str) -> bool:
+    if any(name.startswith(prefix) for prefix in _ORACLE_DYNAMIC_VIEW_PREFIXES):
+        return True
+    for prefix in _ORACLE_CATALOG_SCOPE_PREFIXES:
+        if name.startswith(prefix) and name[len(prefix) :] in _ORACLE_CATALOG_SUFFIXES:
+            return True
+    return False
+
+
+def _find_system_catalog_reference(statement: exp.Expression) -> exp.Table | None:
+    """Finds the first `exp.Table` reference (anywhere in the tree, same
+    full-tree-walk posture as `_DISALLOWED_NESTED_TYPES` above) that names a
+    system catalog/data-dictionary object rather than application data.
+    """
+    for table in statement.find_all(exp.Table):
+        schema = (table.db or "").lower()
+        if schema in _SYSTEM_CATALOG_SCHEMAS:
+            return table
+        name = (table.name or "").lower()
+        if _is_oracle_catalog_view_name(name):
+            return table
+        # postgresql's pg_catalog schema is always on the default
+        # search_path, so its views are conventionally queried unqualified
+        # (`SELECT * FROM pg_roles`, not `pg_catalog.pg_roles`) -- a bare-
+        # name check is needed alongside the schema-qualifier check above.
+        # Unlike Oracle's "user_"/"dba_"/"all_" (ordinary English words a
+        # real schema might legitimately prefix a table with), "pg_" is a
+        # reserved-by-convention prefix PostgreSQL itself warns application
+        # schemas away from, so a plain prefix match here carries
+        # negligible false-positive risk.
+        if name.startswith("pg_"):
+            return table
+    return None
+
+
 # None is sqlglot's own "generic/standard SQL" dialect -- used as the default
 # here so this module has no dependency on which real database is configured.
 # Callers on the actual query path (agent/nodes.py, api/main.py) resolve and
@@ -150,6 +263,7 @@ ViolationType = Literal[
     "select_into",
     "embedded_write",
     "dangerous_function",
+    "system_catalog_access",
     "nested_aggregate",
 ]
 
@@ -160,6 +274,7 @@ SAFETY_VIOLATION_TYPES: frozenset[str] = frozenset(
         "select_into",
         "embedded_write",
         "dangerous_function",
+        "system_catalog_access",
     }
 )
 
@@ -269,6 +384,14 @@ def validate_sql(sql: str, dialect: str | None = DEFAULT_DIALECT) -> ValidationR
           the root -- e.g. a data-modifying CTE
           (`WITH x AS (DELETE FROM t RETURNING *) SELECT * FROM x`), whose
           root is an ordinary SELECT even though it deletes real rows.
+        - A reference to a system catalog/data-dictionary object (e.g.
+          `information_schema.columns`, `sys.database_principals`,
+          `pg_catalog.pg_roles`, Oracle's `DBA_USERS`/`V$SESSION`) rather
+          than application data -- see `_SYSTEM_CATALOG_SCHEMAS`/
+          `_ORACLE_CATALOG_PREFIXES` for the full list. This can reveal
+          internal schema structure or other users'/roles' grants even
+          under a genuinely read-only DB role, since DB-role read-only-ness
+          bounds writes, not what a SELECT can read.
         - A call to a known-dangerous function/procedure (e.g. `pg_sleep`,
           `xp_cmdshell`, `OPENQUERY`, `UTL_HTTP.REQUEST`) -- see
           `_DANGEROUS_FUNCTION_NAMES` for the full list and why each is
@@ -383,6 +506,18 @@ def validate_sql(sql: str, dialect: str | None = DEFAULT_DIALECT) -> ValidationR
                 "just querying data."
             ),
             violation_type="dangerous_function",
+        )
+
+    catalog_table = _find_system_catalog_reference(statement)
+    if catalog_table is not None:
+        return ValidationResult(
+            is_valid=False,
+            error=(
+                f"'{catalog_table.sql(dialect=dialect)}' refers to a system catalog/"
+                "data-dictionary object, not application data -- this is not allowed, "
+                "regardless of what information it's used to look up."
+            ),
+            violation_type="system_catalog_access",
         )
 
     nested_aggregate = _find_nested_aggregate(statement)

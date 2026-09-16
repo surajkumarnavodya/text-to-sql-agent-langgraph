@@ -3,6 +3,14 @@
     "title": "Text-to-SQL Dashboard",
     "subtitle": "Ask a question in plain English — get validated, read-only SQL, a live result table, and an auto-picked chart."
   },
+  "auth": {
+    "signInRequired": "Sign in required",
+    "signInPrompt": "This deployment requires you to sign in with your organization account to continue.",
+    "signIn": "Sign in",
+    "signingIn": "Signing in…",
+    "signInFailed": "Sign-in failed",
+    "signOut": "Sign out"
+  },
   "nav": {
     "chat": "Chat",
     "knowledgeSources": "Knowledge Sources",

@@ -133,10 +133,20 @@ class TestUploadDocument:
     def test_uploads_and_ingests_a_pdf(self, monkeypatch, client):
         captured = {}
 
-        def _ingest(file_bytes, filename, collection, sensitivity_category=None, settings=None):
+        def _ingest(
+            file_bytes,
+            filename,
+            collection,
+            sensitivity_category=None,
+            settings=None,
+            uploaded_by=None,
+            restricted_roles=None,
+        ):
             captured["filename"] = filename
             captured["collection"] = collection
             captured["sensitivity_category"] = sensitivity_category
+            captured["uploaded_by"] = uploaded_by
+            captured["restricted_roles"] = restricted_roles
             return IngestionResult(
                 document_id="doc-2", filename=filename, status="ready", chunk_count=5
             )
@@ -155,6 +165,39 @@ class TestUploadDocument:
         assert body["chunk_count"] == 5
         assert captured["collection"] == "policies"
         assert captured["sensitivity_category"] == "compensation"
+        # 2026 Phase 3: the uploader's identity is threaded through as an
+        # audit trail (auth_mode="none" in this test's settings resolves
+        # to the fixed dev-mode identity, api.auth._DEV_MODE_IDENTITY).
+        assert captured["uploaded_by"] == "dev-mode"
+        assert captured["restricted_roles"] is None  # not supplied -> unrestricted
+
+    def test_restricted_roles_form_field_is_parsed_and_passed_through(self, monkeypatch, client):
+        captured = {}
+
+        def _ingest(
+            file_bytes,
+            filename,
+            collection,
+            sensitivity_category=None,
+            settings=None,
+            uploaded_by=None,
+            restricted_roles=None,
+        ):
+            captured["restricted_roles"] = restricted_roles
+            return IngestionResult(
+                document_id="doc-3", filename=filename, status="ready", chunk_count=1
+            )
+
+        monkeypatch.setattr("api.documents.ingest_pdf", _ingest)
+
+        response = client.post(
+            "/documents",
+            files={"file": ("f.pdf", b"%PDF-1.4 ...", "application/pdf")},
+            data={"collection": "documents", "restricted_roles": "analyst, admin"},
+        )
+
+        assert response.status_code == 200
+        assert captured["restricted_roles"] == ("analyst", "admin")
 
     def test_invalid_sensitivity_category_is_rejected_by_request_validation(
         self, monkeypatch, client
@@ -226,7 +269,7 @@ class TestUploadDocument:
         monkeypatch.setattr("api.documents.get_settings", lambda: settings)
         monkeypatch.setattr(
             "api.documents.ingest_pdf",
-            lambda file_bytes, filename, collection, sensitivity_category=None, settings=None: (
+            lambda file_bytes, filename, collection, sensitivity_category=None, settings=None, uploaded_by=None, restricted_roles=None: (
                 IngestionResult(
                     document_id="doc-x", filename=filename, status="ready", chunk_count=1
                 )
@@ -280,6 +323,9 @@ class TestDownloadDocument:
         )
         monkeypatch.setattr(
             "api.documents.get_document_sensitivity", lambda engine, document_id: None
+        )
+        monkeypatch.setattr(
+            "api.documents.get_document_restricted_roles", lambda engine, document_id: None
         )
 
         response = client.get("/documents/doc-1/download")
@@ -336,6 +382,60 @@ class TestDownloadDocument:
         monkeypatch.setattr(
             "api.documents.get_document_sensitivity",
             lambda engine, document_id: "compensation",
+        )
+        import api.authz as api_authz
+        from security.oidc import AuthIdentity
+
+        monkeypatch.setattr(
+            api_authz,
+            "get_auth_identity",
+            lambda request: AuthIdentity(subject="a1", roles=("analyst",), mode="oidc"),
+        )
+        monkeypatch.setattr(
+            "api.documents.get_document_restricted_roles", lambda engine, document_id: None
+        )
+
+        response = client.get("/documents/doc-1/download")
+
+        assert response.status_code == 200
+        assert response.content == b"%PDF-1.4 raw bytes"
+
+    def test_role_restricted_document_requires_matching_role(self, monkeypatch, client):
+        """2026 Phase 3 security review: mirrors the sensitivity-category
+        test above for the more general restricted_roles field."""
+        monkeypatch.setattr(
+            "api.documents.get_document_bytes", lambda engine, document_id: b"%PDF-1.4 raw bytes"
+        )
+        monkeypatch.setattr(
+            "api.documents.get_document_sensitivity", lambda engine, document_id: None
+        )
+        monkeypatch.setattr(
+            "api.documents.get_document_restricted_roles",
+            lambda engine, document_id: ("analyst",),
+        )
+        import api.authz as api_authz
+        from security.oidc import AuthIdentity
+
+        monkeypatch.setattr(
+            api_authz,
+            "get_auth_identity",
+            lambda request: AuthIdentity(subject="u1", roles=("user",), mode="oidc"),
+        )
+
+        response = client.get("/documents/doc-1/download")
+
+        assert response.status_code == 403
+
+    def test_role_restricted_document_is_downloadable_with_matching_role(self, monkeypatch, client):
+        monkeypatch.setattr(
+            "api.documents.get_document_bytes", lambda engine, document_id: b"%PDF-1.4 raw bytes"
+        )
+        monkeypatch.setattr(
+            "api.documents.get_document_sensitivity", lambda engine, document_id: None
+        )
+        monkeypatch.setattr(
+            "api.documents.get_document_restricted_roles",
+            lambda engine, document_id: ("analyst",),
         )
         import api.authz as api_authz
         from security.oidc import AuthIdentity

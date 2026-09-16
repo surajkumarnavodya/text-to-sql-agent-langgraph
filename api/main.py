@@ -29,6 +29,7 @@ from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 import pandas as pd
 from fastapi import Depends, FastAPI, HTTPException, Request, Response, status
@@ -83,17 +84,107 @@ from api.schemas import (
 )
 from api.voice import router as voice_router
 from config.settings import ConfigurationError, configure_logging, get_settings
-from db.connection import get_connection, get_read_only_engine, get_sqlglot_dialect, test_connection
+from db.connection import (
+    check_write_privileges,
+    get_connection,
+    get_read_only_engine,
+    get_sqlglot_dialect,
+    test_connection,
+)
 from db.execution import execute_readonly_sql
 from db.schema_introspection import introspect_schema
 from embeddings.golden_examples import save_golden_example
 from embeddings.schema_indexer import get_chroma_client, get_collection, refresh_all_schema_indexes
-from security.audit_log import get_correlation_id, reset_correlation_id, set_correlation_id
+from security.audit_log import (
+    get_correlation_id,
+    log_security_event,
+    reset_correlation_id,
+    set_correlation_id,
+)
 from security.oidc import AuthIdentity
 from security.redaction import redact_secrets
 
 configure_logging()
 logger = logging.getLogger(__name__)
+
+
+def _enforce_database_write_privileges(db_engines: Mapping[str, Any], settings) -> None:
+    """Runs `db.connection.check_write_privileges` against every
+    successfully-warmed database engine and, in production, refuses to
+    start if any of them appears to hold write privileges.
+
+    2026 Phase 3 security review: `check_write_privileges` existed since
+    Phase 2 but was only ever invoked from the manual
+    `scripts/test_db_connection.py` CLI -- an operator who never runs that
+    script by hand (entirely plausible for a containerized/CI-deployed
+    setup) got no signal at all that their supposedly-read-only `DB_USER`
+    actually holds INSERT/UPDATE/DELETE. Calling this from `lifespan`, once
+    per warmed engine, at startup, closes that gap for every deployment
+    automatically rather than only the ones an operator remembers to check
+    by hand.
+
+    A separate, plain function (not inlined in `lifespan`) specifically so
+    it's unit-testable without spinning up the whole ASGI app/ LangGraph
+    graph -- `lifespan` itself is thin glue calling this.
+
+    Fails open on a database whose check itself couldn't run
+    (`result.checked is False` -- an unsupported `DB_TYPE`, or the role
+    lacking permission to read its own privilege catalog) -- see
+    `check_write_privileges`'s own docstring for why that must never be
+    treated as evidence of anything.
+
+    Raises:
+        ConfigurationError: if `settings.environment == "production"` and
+            at least one database's connected role appears to hold write
+            privileges. Never raises in any other environment -- a
+            `development` deployment only ever gets a warning log line, the
+            same "never breaks local dev" posture every other
+            production-only check in this codebase already has.
+    """
+    writable_databases: list[str] = []
+    for db_name, engine in db_engines.items():
+        db_config = next((db for db in settings.databases if db.name == db_name), None)
+        result = check_write_privileges(engine, db_config)
+        if not result.checked or not result.has_write_privileges:
+            continue
+        writable_databases.append(db_name)
+        log_security_event(
+            "db_write_privileges_detected",
+            "critical",
+            f"The connected database role for database {db_name!r} appears to "
+            "have write privileges (INSERT/UPDATE/DELETE) -- this app only "
+            "ever validates and executes read-only SELECT statements, but the "
+            "database role is the real safety boundary if that validation "
+            "were ever bypassed.",
+            database=db_name,
+        )
+
+    if not writable_databases:
+        return
+
+    if settings.environment == "production":
+        # Fail closed, the same posture `_require_identity_in_production`
+        # already established for authentication -- a production deployment
+        # must never silently come up with its one real safety-boundary
+        # backstop (a genuinely read-only DB role) missing.
+        raise ConfigurationError(
+            "Refusing to start in ENVIRONMENT=production: the connected "
+            f"database role for {', '.join(sorted(writable_databases))} "
+            "appears to have write privileges (INSERT/UPDATE/DELETE). This "
+            "app's SQL validator is not the final protection -- see "
+            "db.connection.check_write_privileges's docstring and "
+            "SECURITY.md's least-privilege guidance. Point DB_USER at a "
+            "genuinely read-only database role before starting this "
+            "deployment again."
+        )
+
+    logger.warning(
+        "[startup] %d database(s) appear to have write privileges: %s -- "
+        "see SECURITY.md's least-privilege guidance. This is a warning "
+        "only because ENVIRONMENT is not 'production'.",
+        len(writable_databases),
+        ", ".join(sorted(writable_databases)),
+    )
 
 
 @asynccontextmanager
@@ -136,6 +227,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 redact_secrets(str(exc), db_config),
             )
     app.state.db_engines = db_engines
+    _enforce_database_write_privileges(db_engines, settings)
 
     app.state.ollama_client = get_ollama_client(settings)
     app.state.compiled_graph = build_graph()
@@ -176,6 +268,111 @@ if _cors_origins:
         allow_methods=["*"],
         allow_headers=["*"],
     )
+
+# 2026 Phase 3 security review: matches what the built React dashboard
+# (frontend/dist/index.html) actually loads -- no inline <script> (Vite
+# bundles every script into an external, hashed file, so `script-src 'self'`
+# needs no `unsafe-inline`/`unsafe-eval`), the Google Fonts stylesheet/font
+# files `index.html` links directly, `blob:` object URLs for generated/
+# fetched media (`MediaResultCard.tsx`, `useVoiceConversation.ts`'s spoken-
+# answer audio), and `data:` URIs for the inline SVG favicon. `style-src`
+# allows `unsafe-inline` -- React's inline `style={{...}}` (used by this
+# app's dynamic accent-color/theme system, `src/lib/theme.ts`) would
+# otherwise be blocked, and unlike `script-src`, an inline-style allowance
+# is a narrow, low-severity relaxation (it cannot execute script) that many
+# production CSPs accept as a pragmatic tradeoff for exactly this reason.
+# `frame-ancestors 'none'` is this policy's clickjacking defense (also
+# covered by the `X-Frame-Options: DENY` header below, for the handful of
+# older browsers that don't honor CSP frame-ancestors).
+#
+# 2026 Phase 3 addition, `frame-src`: `frontend/src/lib/auth.ts`'s OIDC
+# silent-renew (`UserManager`'s `signinSilent()`, `automaticSilentRenew`)
+# loads the identity provider's authorization endpoint in a **hidden
+# iframe** -- unlike the interactive `signinRedirect()` login flow (a full
+# top-level page navigation, which CSP does not restrict at all), an
+# iframe load *is* governed by CSP's `frame-src` directive, and without an
+# explicit entry it inherits `default-src 'self'`, which would silently
+# block every silent-renew attempt and force a full interactive
+# re-login far more often than necessary. Derived from `OIDC_ISSUER`
+# (already backend-config, not duplicated) rather than requiring a second,
+# separately-set value -- covers the overwhelmingly common case where the
+# frontend's `VITE_OIDC_AUTHORITY` (a build-time, frontend-only setting
+# this Python process can't see) is the same identity provider as the
+# backend's own JWT validation. A deployment using two different
+# authorities for some reason needs `CONTENT_SECURITY_POLICY` to override
+# this default explicitly.
+def _default_csp(settings) -> str:
+    frame_src = "'self'"
+    if settings.oidc_issuer:
+        issuer_origin = urlparse(settings.oidc_issuer)
+        if issuer_origin.scheme and issuer_origin.netloc:
+            frame_src = f"'self' {issuer_origin.scheme}://{issuer_origin.netloc}"
+    return (
+        "default-src 'self'; "
+        "script-src 'self'; "
+        "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "
+        "font-src 'self' https://fonts.gstatic.com data:; "
+        "img-src 'self' data: blob:; "
+        "media-src 'self' blob:; "
+        "connect-src 'self'; "
+        f"frame-src {frame_src}; "
+        "object-src 'none'; "
+        "base-uri 'self'; "
+        "form-action 'self'; "
+        "frame-ancestors 'none'"
+    )
+
+
+@app.middleware("http")
+async def _add_security_headers(request: Request, call_next):
+    """Adds a standard set of defensive response headers to every response,
+    on by default (`Settings.enable_security_headers`) -- see this
+    codebase's "no single security control is the final barrier" principle
+    (CLAUDE.md/SECURITY.md): none of these replace an existing control
+    (authentication, authorization, the SQL validator, CORS), they're an
+    additional, independent layer against clickjacking (`X-Frame-Options`/
+    `frame-ancestors`), MIME-sniffing-based content-type confusion
+    (`X-Content-Type-Options`), and script-injection XSS (`Content-Security-
+    Policy`'s `script-src`).
+
+    Uses `setdefault` throughout so a route that already sets one of these
+    itself (`api/documents.py`'s PDF download route sets its own
+    `X-Content-Type-Options`) is never overridden.
+
+    `Settings.content_security_policy` lets an operator override
+    `_default_csp()` entirely (including to the empty string, which omits
+    the CSP header while keeping the others) for a deployment this default
+    doesn't fit -- e.g. one embedding a different font provider, or one
+    that needs to be embeddable in a frame this default's `frame-ancestors
+    'none'` would otherwise block.
+    """
+    response = await call_next(request)
+    settings = get_settings()
+    if not settings.enable_security_headers:
+        return response
+
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("X-Frame-Options", "DENY")
+    response.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
+    response.headers.setdefault(
+        # Deny every sensor/capability this app's own frontend never needs
+        # -- except microphone, which voice mode (`useAudioRecorder.ts`)
+        # genuinely requires for the same origin.
+        "Permissions-Policy",
+        "camera=(), geolocation=(), payment=(), usb=(), microphone=(self)",
+    )
+    response.headers.setdefault(
+        "Strict-Transport-Security",
+        f"max-age={settings.hsts_max_age_seconds}; includeSubDomains",
+    )
+    csp = (
+        settings.content_security_policy
+        if settings.content_security_policy is not None
+        else _default_csp(settings)
+    )
+    if csp:
+        response.headers.setdefault("Content-Security-Policy", csp)
+    return response
 
 
 @app.exception_handler(AgentError)
@@ -673,7 +870,13 @@ def execute(
             status="rejected", database=database_name, error=f"Rejected: {validation.error}"
         )
 
-    assert validation.normalized_sql is not None  # guaranteed when is_valid is True
+    if validation.normalized_sql is None:
+        # 2026 Phase 3 security review (bandit B101): explicit raise, not
+        # `assert` -- stripped under `python -O`. `ValidationResult`'s own
+        # model_validator (agent/sql_validator.py) already guarantees
+        # normalized_sql is set whenever is_valid is True, so this is a
+        # precondition violation, not a real runtime case.
+        raise RuntimeError("validate_sql returned is_valid=True with no normalized_sql")
     safe_sql = enforce_row_limit(
         validation.normalized_sql, settings.max_result_rows, dialect=dialect
     )

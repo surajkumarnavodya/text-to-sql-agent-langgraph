@@ -331,6 +331,8 @@ def ingest_pdf(
     collection: Collection,
     sensitivity_category: SensitivityCategory = None,
     settings: Settings | None = None,
+    uploaded_by: str | None = None,
+    restricted_roles: tuple[str, ...] | None = None,
 ) -> IngestionResult:
     """Runs the full extract -> chunk -> moderate -> embed -> store pipeline
     for one PDF.
@@ -429,6 +431,8 @@ def ingest_pdf(
         collection,
         sensitivity_category=sensitivity_category,
         pdf_bytes=file_bytes if settings.enable_pdf_download else None,
+        uploaded_by=uploaded_by,
+        restricted_roles=restricted_roles,
     )
 
     try:

@@ -1,3 +1,4 @@
+import { getBearerToken } from '@/store/authStore'
 import type {
   AskRequest,
   AskResponse,
@@ -26,14 +27,10 @@ export class ApiError extends Error {
   }
 }
 
-// Set at build time (VITE_API_AUTH_TOKEN) only if the backend is configured
-// with API_AUTH_TOKEN -- most local/single-user deployments leave both
-// unset (see api/auth.py's own no-auth default).
-const API_TOKEN = import.meta.env.VITE_API_AUTH_TOKEN as string | undefined
-
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const headers = new Headers(init?.headers)
-  if (API_TOKEN) headers.set('Authorization', `Bearer ${API_TOKEN}`)
+  const token = getBearerToken()
+  if (token) headers.set('Authorization', `Bearer ${token}`)
   if (init?.body && !(init.body instanceof FormData) && !headers.has('Content-Type')) {
     headers.set('Content-Type', 'application/json')
   }
@@ -118,7 +115,8 @@ export function deleteDocument(documentId: string): Promise<void> {
 
 export async function downloadDocument(documentId: string, filename: string): Promise<void> {
   const headers = new Headers()
-  if (API_TOKEN) headers.set('Authorization', `Bearer ${API_TOKEN}`)
+  const token = getBearerToken()
+  if (token) headers.set('Authorization', `Bearer ${token}`)
   const response = await fetch(`/documents/${documentId}/download`, { headers })
   if (!response.ok) {
     throw new ApiError(`Could not download ${filename}.`, response.status)
@@ -141,7 +139,8 @@ export async function downloadDocument(documentId: string, filename: string): Pr
  * must `URL.revokeObjectURL` the result once it's no longer displayed. */
 export async function fetchMediaBlobUrl(mediaId: string): Promise<string> {
   const headers = new Headers()
-  if (API_TOKEN) headers.set('Authorization', `Bearer ${API_TOKEN}`)
+  const token = getBearerToken()
+  if (token) headers.set('Authorization', `Bearer ${token}`)
   const response = await fetch(`/media/${mediaId}`, { headers })
   if (!response.ok) {
     throw new ApiError('Could not load the generated media.', response.status)
@@ -157,7 +156,8 @@ export async function fetchMediaBlobUrl(mediaId: string): Promise<string> {
  * (`GET /media/library/{id}`, `api/media_library.py`). */
 export async function fetchLibraryMediaBlobUrl(mediaId: string): Promise<string> {
   const headers = new Headers()
-  if (API_TOKEN) headers.set('Authorization', `Bearer ${API_TOKEN}`)
+  const token = getBearerToken()
+  if (token) headers.set('Authorization', `Bearer ${token}`)
   const response = await fetch(`/media/library/${mediaId}`, { headers })
   if (!response.ok) {
     throw new ApiError('Could not load that media item.', response.status)
@@ -195,7 +195,8 @@ export function transcribeAudio(audio: Blob): Promise<TranscribeResponse> {
  * `URL.revokeObjectURL` the result once playback is done. */
 export async function synthesizeSpeechUrl(text: string): Promise<string> {
   const headers = new Headers({ 'Content-Type': 'application/json' })
-  if (API_TOKEN) headers.set('Authorization', `Bearer ${API_TOKEN}`)
+  const token = getBearerToken()
+  if (token) headers.set('Authorization', `Bearer ${token}`)
   const response = await fetch('/voice/synthesize', {
     method: 'POST',
     headers,

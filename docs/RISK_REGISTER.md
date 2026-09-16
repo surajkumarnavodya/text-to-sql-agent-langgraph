@@ -29,24 +29,44 @@ maintainer (`GOVERNANCE.md`'s "Ownership").
 
 ## Open items
 
-### R-001 — No authentication or per-user authorization
+### R-001 — No authentication or per-user authorization by default
 
-**Severity:** Critical (if deployed beyond single-user/local use) · **Status:** Open
+**Severity:** Critical (if deployed beyond single-user/local use) · **Status:** Mitigated
 
-Neither the React dashboard (`frontend/`) nor the API (`api/`) has a login,
-session identity, or per-user authorization model. `api/auth.py`'s optional
-`API_AUTH_TOKEN` is one shared secret, not per-user identity (see
-`docs/API.md`'s "Auth: a lightweight hook, not a full auth system"). This
-is a deliberate, documented scope boundary (`SECURITY.md`: "Not designed
-for multi-tenant or production deployment"), not an oversight — but it is
-the single largest blocker to a genuinely multi-user production deployment.
+**Update (2026 Phase 1/2, restated here since this entry had gone stale):**
+real authentication (`security/oidc.py` — standard OIDC/JWT validation
+against any compliant identity provider, algorithm allowlisting, audience
+validation, bounded clock skew) and real per-user authorization
+(`agent/authz.py`/`api/authz.py` — RBAC, 15 permissions, 4 extensible
+roles, wired into every data-touching route and the multi-source router's
+own source-selection decision) both now exist — see `docs/AUTHENTICATION.md`/
+`docs/AUTHORIZATION.md`. `ENVIRONMENT=production` refuses to start with no
+authentication configured at all.
+**Update (2026 Phase 3, 2026-09-16):** the React dashboard can now
+actually obtain a real per-user OIDC token (`frontend/src/lib/auth.ts`,
+Authorization Code + PKCE) — previously the SPA's only possible credential
+was a static, build-time-baked, admin-granting shared token.
 
-**Mitigation today:** document a reverse-proxy-auth deployment pattern
-(`docs/DEPLOYMENT.md`) and the optional shared-token hook. Not a fix, a
-documented boundary.
+**What's still open, narrower than this entry's original scope:** `none`
+remains the default `auth_mode` (unchanged behavior for local/single-user
+use, so turning this on is an operator decision, not automatic); the
+`static_token`/`none` modes still grant a fixed "admin"-equivalent
+identity, a deliberate, documented continuation of prior behavior, not a
+new gap; there is no per-resource ownership even with RBAC on (any `admin`
+can delete/see any document — see R-009, and `docs/AUTHORIZATION.md`'s
+"Known limitations," a deliberate design choice for a shared knowledge
+base); and the frontend OIDC flow has not been exercised against a live
+identity provider (see `SECURITY_FINAL_REPORT.md`).
 
-**Review date:** revisit if/when more than one trusted user needs access —
-see `docs/PRODUCTION_READINESS_REPORT.md`'s V2 roadmap.
+**Mitigation today:** OIDC + RBAC, when configured, are a real fix, not
+just a documented boundary. The reverse-proxy-auth deployment pattern
+(`docs/DEPLOYMENT.md`) and the shared-token hook remain available as
+lighter-weight alternatives for a trusted-network deployment.
+
+**Review date:** revisit before any deployment reachable beyond a trusted
+local network — confirm `auth_mode` is actually `oidc` (not the default
+`none`) and that roles are assigned deliberately, not left at whatever an
+IdP's default claim happens to produce.
 
 ### R-002 — Sensitive-column classification is unpopulated
 
@@ -194,55 +214,79 @@ this path is material — whichever comes first.
 
 ### R-008 — No independent authorization layer between agent routing decisions and execution
 
-**Severity:** Critical (for a multi-tenant/multi-user deployment) · **Status:** Open
+**Severity:** Critical (for a multi-tenant/multi-user deployment) · **Status:** Mitigated
 
 Seeded from a 2026-09-13 Agentic-AI-focused security audit covering the
 multi-source orchestrator (`agent/orchestrator/`), RAG, web search, and
 media generation added since the 2026-09-01 audit this register was
-originally drawn from. `agent.orchestrator.nodes.classify_sources`'s LLM
-output is trusted directly by `router_node`/`route_after_router` to decide
-which subgraph(s) actually execute — the only gate is
-`get_available_sources`, a *global*, operator-set config flag checked once,
-never a per-request/per-user authorization decision. In this app's current
-single-user/local-trust posture that's an accepted design boundary (same
-reasoning as R-001), but it is the structural root cause of R-009 below
-and would need a real policy-evaluation step (independent of the LLM's own
-reasoning) before this could safely serve more than one trust tier of
-caller.
+originally drawn from. At the time this entry was written,
+`agent.orchestrator.nodes.classify_sources`'s LLM output was trusted
+directly by `router_node`/`route_after_router` to decide which subgraph(s)
+actually execute, gated only by `get_available_sources` (a global config
+flag, never a per-request/per-user decision).
 
-**Mitigation today:** none at the authorization layer specifically — bounded
-only by the same `enable_*` flags and rate limiters everything else in
-this register already describes. `require_generation_approval` (see
-`config/settings.py`) adds a *human*-in-the-loop gate specifically for the
-one source that spends real money (media generation), which narrows this
-risk's most costly instance without being a general fix.
+**Update (2026 Phase 2, restated here since this entry had gone stale):**
+this is fixed. `agent/authz.py`'s RBAC layer is now wired directly into
+`router_node` — the LLM's chosen source(s) are filtered through a
+per-caller permission check (`_SOURCE_PERMISSIONS`) *before* any subgraph
+runs; a source the caller's role doesn't permit is dropped, never silently
+allowed. Confirmed via direct code reading (`agent/orchestrator/nodes.py`),
+not a doc claim — this is the fix `docs/AUTHORIZATION.md` describes and
+`SECURITY_BASELINE.md`'s 2026 Phase 3 audit independently re-verified.
 
-**Review date:** revisit alongside R-001, if/when real multi-user identity
-is ever built.
+**What's still true:** this only matters when authentication/authorization
+is actually turned on (`auth_mode != "none"`, see R-001) — with auth off
+(the default), every caller is effectively the same trust tier, same as
+before. `require_generation_approval` remains a separate, additional
+human-in-the-loop gate for the one source that spends real money.
 
-### R-009 — No per-user authorization on RAG document management
+**Mitigation today:** real, not just partial — RBAC now independently
+authorizes each routing decision. Residual risk is scoped to R-001's own
+"auth is off by default" caveat, not a structural gap in this layer
+itself.
 
-**Severity:** High (for a multi-tenant deployment) · **Status:** Open
+**Review date:** re-confirm alongside any future change to
+`agent/orchestrator/nodes.py`'s routing logic that this gate isn't
+bypassed by a new code path.
 
-`api/documents.py`'s upload/delete routes are gated only by the same
-shared `API_AUTH_TOKEN` (or nothing, if unset — see R-001) as every other
-route — there is no ownership check, no per-user scoping, and delete is
-unconditional and irreversible. Pre-existing since this router was built;
-named explicitly here following the 2026-09-13 audit rather than left
-implicit inside R-001.
+### R-009 — No per-resource ownership on RAG document management
 
-**Mitigation today:** none beyond the shared token. Same posture as the
-Knowledge Sources page (`frontend/src/pages/KnowledgeSources.tsx`) this
-API mirrors (already disclosed in `SECURITY.md`'s "Multi-source RAG and
-web search" section).
+**Severity:** High (for a multi-tenant deployment) · **Status:** Mitigated (partially, deliberately)
 
-**Review date:** alongside R-001 — this is a real, separate fix once
-per-user identity exists (scope delete/upload to the uploading user or an
-explicit content-admin role), not automatically solved by R-001's fix alone.
+`api/documents.py`'s upload/delete routes were originally gated only by
+the same shared `API_AUTH_TOKEN` (or nothing, if unset) as every other
+route — no ownership check, no per-user scoping, delete unconditional and
+irreversible.
+
+**Update (2026 Phase 2):** RBAC now gates each route by permission
+(`DOCUMENTS_WRITE`/`DOCUMENTS_DELETE`/`DOCUMENTS_READ`/
+`DOCUMENTS_READ_SENSITIVE`), not just "any caller with the shared token."
+**Update (2026 Phase 3, 2026-09-16):** `rag.store.DocumentRecord` gained
+`restricted_roles` (an optional, operator-set per-document role
+restriction, checked by `rag/graph.py::_generate_node` before the LLM sees
+the chunk and by the download route) and `uploaded_by` (audit-trail only).
+
+**What's still true, and now a confirmed deliberate design choice rather
+than an unaddressed gap:** there is still no per-resource *ownership* —
+any caller holding `DOCUMENTS_DELETE` can delete any document, not just
+ones they uploaded. `docs/AUTHORIZATION.md`'s "Known limitations" section
+states this is intentional for this app's shared-knowledge-base model, not
+a tracked-for-fixing gap: `restricted_roles` is the access-control
+mechanism this app supports (role-based), and per-uploader isolation was
+deliberately not built since it would turn a shared assistant into
+per-user file storage.
+
+**Mitigation today:** RBAC (permission-gated routes) + optional
+per-document `restricted_roles`. No ownership model, by design.
+
+**Review date:** only revisit if this app's shared-knowledge-base scope
+itself changes — see `docs/AUTHORIZATION.md`'s own framing before treating
+"add ownership" as a bug fix rather than a scope change.
 
 ### R-010 — Dependency vulnerability backlog (pip-audit)
 
-**Severity:** Medium · **Status:** Open
+**Severity:** Medium-High (largest fix requires a breaking major-version
+migration) · **Status:** Open
 
 A `pip-audit -r requirements.txt` run on 2026-09-13 (added to CI as a
 report-only step, `continue-on-error: true` — see
@@ -251,21 +295,41 @@ packages, most transitive/tooling rather than this app's own code
 (`chromadb`, `langgraph`/`langgraph-checkpoint`/`langgraph-sdk`,
 `streamlit`, `langchain-core`, `pillow`, `python-dotenv`, `pytest`,
 `black`). `streamlit` was removed from `requirements.txt` on 2026-09-13
-(the app it backed was deleted — see `README.md`'s News and Updates),
-which should reduce this backlog by whatever advisories were specific to
-it, but the count above hasn't been re-verified with a fresh `pip-audit`
-run since — treat 65/10 as the last-measured figure, not a live one. Not
-triaged individually as part of that pass — several fixes are
-major-version bumps (e.g. `pillow` 11→12, `langgraph` 0.2→1.0) with their
-own regression risk, and `requirements.txt`'s exact pins already
-have an open, related gap (R-004: verified against Python 3.14, not 3.11).
+(the app it backed was deleted — see `README.md`'s News and Updates).
 
-**Mitigation today:** none beyond visibility — the CI step surfaces the
-current list on every run so it can't silently grow unnoticed, but nothing
-blocks a merge on it yet.
+**Update (2026-09-16, re-run as part of the 2026 Phase 3 security
+review):** a fresh `pip-audit` now measures **24 known vulnerabilities
+across 7 backend packages** — `langgraph` (0.2.62, needs 1.0.10, a major
+rewrite), `chromadb`, `pytest`, `black`, `langchain-core`,
+`langgraph-checkpoint`, `langgraph-sdk` — down from 65/10, largely
+reflecting the `streamlit` removal and interim patch-level bumps, but
+still not triaged/fixed. `npm audit` (frontend): 0 vulnerabilities, both
+in the 2026 Phase 2 and Phase 3 passes. Every remaining backend advisory
+requires a major-version bump; `langgraph` 0.2→1.0 in particular touches
+the entire compiled-graph architecture (`agent/graph.py`,
+`agent/orchestrator/graph.py`, every node function) and was deliberately
+not attempted without dedicated regression-testing time (see
+`SECURITY_FINAL_REPORT.md`'s §17/§28). `requirements.txt`'s exact pins
+also still have the open, related R-004 gap (verified against Python
+3.14, not 3.11).
 
-**Review date:** before the next dependency-bump pass; flip
-`continue-on-error` off once the backlog is triaged and pins updated.
+**Also open, from the same 2026 Phase 3 pass, logged here rather than as
+separate entries since they share this item's "known, not yet closed"
+character:** CI's `gitleaks`/`trivy` jobs remain `continue-on-error: true`
+— neither could be run to establish a clean baseline in that pass's
+environment, so flipping them to blocking has not happened; the Dockerfile
+purge fix (`docs/security-changelog.md`'s 2026-09-16 entry) was not
+confirmed via a successful `docker build` in that environment either —
+verify both before relying on them in a real deployment.
+
+**Mitigation today:** visibility only — the CI step surfaces the current
+list on every run so it can't silently grow unnoticed, but nothing blocks
+a merge on it yet.
+
+**Review date:** before the next dependency-bump pass, and specifically
+before scheduling the `langgraph` 1.0 migration as its own project; flip
+`continue-on-error` off once the gitleaks/Trivy/pip-audit backlog is
+triaged and pins updated.
 
 ### R-011 — Session-scoped expensive-source cost ceiling is a cost control, not an access-control boundary
 
@@ -372,6 +436,31 @@ disclosure.
 **Review date:** if a specific, evaluated synthetic-media detector
 (cloud or local) becomes available with a stated accuracy profile worth
 building a real (still soft-flag) check around.
+
+### R-015 — Frontend OIDC login never verified against a live identity provider
+
+**Severity:** Medium · **Status:** Open
+
+`frontend/src/lib/auth.ts`/`store/authStore.ts` (2026 Phase 3, see
+`docs/AUTHENTICATION.md`'s "Frontend OIDC login" section) implement a real
+Authorization Code + PKCE flow via `oidc-client-ts`, but no live identity
+provider or browser automation tooling was available to click through the
+interactive flow end-to-end (real login redirect, consent screen,
+silent-renew-via-hidden-iframe behavior, sign-out-at-IdP) in the
+environment this feature was built in.
+
+**Mitigation today:** `tsc --noEmit`, `oxlint`, and `npm run build` all
+pass; the implementation follows `oidc-client-ts`'s documented API and
+PKCE flow shape. This is meaningful but not equivalent to an end-to-end
+run — a subtle misconfiguration (redirect URI mismatch, scope issue,
+silent-renew iframe blocked by a CSP or browser setting) would not have
+been caught by static checks alone.
+
+**Review date:** before enabling `VITE_OIDC_AUTHORITY`/`VITE_OIDC_CLIENT_ID`
+in any real deployment — exercise the full flow against your actual
+identity provider (Auth0/Okta/Azure AD/Keycloak/other) first, including
+sign-out and a forced token-expiry silent-renew, not just the happy-path
+login.
 
 ## Accepted exceptions
 

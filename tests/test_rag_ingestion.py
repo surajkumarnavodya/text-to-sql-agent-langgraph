@@ -50,7 +50,7 @@ def _mock_rag_plumbing(monkeypatch, *, document_id: str = "doc-1"):
     monkeypatch.setattr("rag.ingestion.ensure_rag_schema", lambda engine: None)
     monkeypatch.setattr(
         "rag.ingestion.insert_document",
-        lambda engine, filename, collection, sensitivity_category=None, pdf_bytes=None: document_id,
+        lambda engine, filename, collection, sensitivity_category=None, pdf_bytes=None, uploaded_by=None, restricted_roles=None: document_id,
     )
     status_updates: list[dict] = []
     monkeypatch.setattr(

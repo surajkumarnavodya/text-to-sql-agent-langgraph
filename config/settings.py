@@ -1069,6 +1069,19 @@ class Settings(BaseSettings):
             ".env, e.g. CORS_ALLOWED_ORIGINS=http://localhost:5173."
         ),
     )
+    # 2026 Phase 3 security review: on by default -- these headers are
+    # cheap, have no functional downside for a normal browser session, and
+    # (per this codebase's own "no single control is the final barrier"
+    # posture) are a real, if secondary, layer against clickjacking, MIME-
+    # sniffing, and script-injection XSS even where other controls already
+    # exist. `content_security_policy` lets an operator override the
+    # built-in default entirely (see `api/main.py`'s `_DEFAULT_CSP`) --
+    # an escape hatch for a deployment this default doesn't fit, without
+    # needing a code change; set it to the empty string to omit the CSP
+    # header altogether while keeping the other headers.
+    enable_security_headers: bool = True
+    content_security_policy: str | None = None
+    hsts_max_age_seconds: int = Field(default=31_536_000, ge=0)  # 1 year
     project_root: Path = PROJECT_ROOT
     databases: tuple[DatabaseConnectionConfig, ...] = ()
 
@@ -1099,6 +1112,33 @@ class Settings(BaseSettings):
         setting most users will only ever set to zero or one origin."""
         if isinstance(value, str):
             return tuple(origin.strip() for origin in value.split(",") if origin.strip())
+        return value
+
+    @field_validator("cors_allowed_origins", mode="after")
+    @classmethod
+    def _reject_wildcard_cors_origin(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        """2026 Phase 3 security review: `api/main.py`'s `CORSMiddleware` is
+        always added with `allow_credentials=True` (so the OIDC/static
+        bearer token still reaches the API for the one legitimate
+        cross-origin case, a separate dev-mode Vite server) -- combining
+        that with a wildcard origin (`CORS_ALLOWED_ORIGINS=*`) is a
+        real misconfiguration a browser itself refuses at runtime (the
+        Fetch spec forbids `Access-Control-Allow-Origin: *` alongside
+        `Access-Control-Allow-Credentials: true`), but this app's own
+        "don't rely on a single control, including one browsers happen to
+        enforce" posture means it shouldn't be reachable at all -- caught
+        here, at config time, the same as `_validate_oidc_algorithms`
+        catches `alg: none` before it can ever matter.
+        """
+        if "*" in value:
+            raise ConfigurationError(
+                "CORS_ALLOWED_ORIGINS must not include '*' -- this app's CORS "
+                "middleware always sets allow_credentials=True, and a wildcard "
+                "origin combined with credentials is rejected by browsers "
+                "anyway (and should never be relied on to enforce that). List "
+                "the specific origin(s) that need cross-origin access instead, "
+                "e.g. CORS_ALLOWED_ORIGINS=http://localhost:5173."
+            )
         return value
 
     @field_validator("chroma_persist_dir", mode="before")

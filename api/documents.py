@@ -26,6 +26,7 @@ from rag.store import (
     delete_document,
     ensure_schema,
     get_document_bytes,
+    get_document_restricted_roles,
     get_document_sensitivity,
     get_rag_engine,
     list_documents,
@@ -78,6 +79,8 @@ def list_documents_route(
                 chunk_count=doc.chunk_count,
                 error_message=doc.error_message,
                 has_pdf_bytes=doc.has_pdf_bytes,
+                uploaded_by=doc.uploaded_by,
+                restricted_roles=list(doc.restricted_roles) if doc.restricted_roles else None,
             )
             for doc in list_documents(engine, collection=collection)
         ]
@@ -90,7 +93,15 @@ async def upload_document(
     file: UploadFile = File(...),
     collection: Collection = Form(...),
     sensitivity_category: SensitivityCategory = Form(default=None),
-    _identity=Depends(require_permission(Permission.DOCUMENTS_WRITE)),
+    # 2026 Phase 3 security review: an optional, admin-set comma-separated
+    # role list restricting this document beyond the fixed sensitivity
+    # categories above -- see rag/store.py's DocumentRecord docstring and
+    # rag/graph.py's role-restriction gate. Empty/unset means "unrestricted"
+    # (the pre-existing, shared-knowledge-base default), matching this
+    # form's existing sensitivity_category convention of "None means no
+    # restriction."
+    restricted_roles: str | None = Form(default=None),
+    identity=Depends(require_permission(Permission.DOCUMENTS_WRITE)),
 ) -> DocumentUploadResponse:
     """Ingests one PDF into the "documents" or "policies" collection --
     mirrors the Knowledge Sources page's upload form, including the
@@ -121,6 +132,12 @@ async def upload_document(
             detail="Only PDF files are supported (the uploaded file isn't PDF-shaped).",
         )
 
+    parsed_restricted_roles = (
+        tuple(role.strip() for role in restricted_roles.split(",") if role.strip())
+        if restricted_roles
+        else None
+    ) or None
+
     try:
         result = ingest_pdf(
             file_bytes,
@@ -128,6 +145,8 @@ async def upload_document(
             collection,
             sensitivity_category=sensitivity_category,
             settings=settings,
+            uploaded_by=identity.subject,
+            restricted_roles=parsed_restricted_roles,
         )
     except (RagStoreNotConfiguredError, ModerationNotConfiguredError) as exc:
         raise HTTPException(
@@ -195,6 +214,14 @@ def download_document(
     existing "no PDF stored" 404 behavior for a genuinely missing document
     exactly as it was) the lookup runs after `get_document_bytes` rather
     than instead of it.
+
+    2026 Phase 3 security review: the same shape of check, for the more
+    general `restricted_roles` field (`rag/store.py::DocumentRecord`'s
+    docstring) -- a document restricted to specific roles is just as
+    downloadable-by-anyone as a sensitivity-tagged one was before the Phase
+    2 fix above, unless this route independently enforces it too (the
+    `rag/graph.py` chat-answer gate is, as noted above, a narrower control
+    that doesn't cover this route).
     """
     try:
         engine = get_rag_engine(get_settings())
@@ -220,6 +247,22 @@ def download_document(
             required_permission=Permission.DOCUMENTS_READ_SENSITIVE.value,
             document_id=document_id,
             sensitivity_category=sensitivity,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You do not have permission to download this document.",
+        )
+
+    restricted_roles = get_document_restricted_roles(engine, document_id)
+    if restricted_roles and not (set(restricted_roles) & set(identity.roles)):
+        log_security_event(
+            "authz_denied",
+            "warning",
+            "A request to download a role-restricted document was denied.",
+            subject=identity.subject,
+            roles=list(identity.roles),
+            document_id=document_id,
+            restricted_roles=list(restricted_roles),
         )
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,

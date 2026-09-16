@@ -107,7 +107,45 @@ distributed multi-tenant rate limiter. See `SECURITY.md`,
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `API_AUTH_TOKEN` | *(unset)* | Optional shared bearer token required on `/ask`/`/schema/tables`. A lightweight hook, not real auth — see `docs/API.md`. |
+| `API_AUTH_TOKEN` | *(unset)* | Optional shared bearer token, checked when no OIDC identity is present. Grants a fixed admin-equivalent identity — see `docs/AUTHENTICATION.md`. Can be set alongside OIDC below ("Combining modes"). |
+| `ENVIRONMENT` | `development` | `development` or `production`. Only consequence today: `production` refuses to start at all if neither `API_AUTH_TOKEN` nor `OIDC_ISSUER` is configured, and refuses to start if any configured database's role appears to hold write privileges — see `docs/AUTHENTICATION.md`. |
+
+### Authentication (OIDC/JWT) and authorization (see [`docs/AUTHENTICATION.md`](AUTHENTICATION.md) / [`docs/AUTHORIZATION.md`](AUTHORIZATION.md))
+
+Off entirely unless `OIDC_ISSUER` is set — leaving it blank (the default)
+is a complete no-op, identical behavior to before this feature existed.
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `OIDC_ISSUER` | *(unset)* | Your identity provider's issuer URL. Setting this turns OIDC mode on. |
+| `OIDC_AUDIENCE` | *(unset)* | Required whenever `OIDC_ISSUER` is set (refuses to start otherwise) — the API identifier your IdP mints access tokens for. |
+| `OIDC_JWKS_URL` | *(blank = discovered)* | Only needed if your provider doesn't support standard `/.well-known/openid-configuration` discovery. |
+| `OIDC_ALGORITHMS` | `RS256` | Comma-separated server-side algorithm allowlist — never read from the token's own `alg` header. Must never include `none` (refuses to start if it does). |
+| `OIDC_CLOCK_SKEW_SECONDS` | `60` | Leeway for ordinary clock drift when checking token expiration/not-before. |
+| `OIDC_ROLE_CLAIM` | `roles` | Which JWT claim carries the caller's role(s) — see `docs/AUTHORIZATION.md` for the role → permission mapping (`agent/authz.py`). |
+| `ENABLE_SECURITY_HEADERS` | `true` | HSTS/CSP/X-Frame-Options/X-Content-Type-Options/Referrer-Policy/Permissions-Policy on every response — see `SECURITY.md`. |
+| `CONTENT_SECURITY_POLICY` | *(unset = built-in default)* | Overrides the built-in CSP entirely (set to an empty string to omit the CSP header while keeping the others). |
+| `HSTS_MAX_AGE_SECONDS` | `31536000` (1 year) | `Strict-Transport-Security` header's `max-age`. |
+| `CORS_ALLOWED_ORIGINS` | *(unset)* | Comma-separated allowed origins for cross-origin requests (e.g. a separate Vite dev server). Must never contain `*` — refuses to start if it does, since this app's CORS middleware always sets `allow_credentials=True`. |
+
+### Frontend OIDC login (`frontend/`, build-time Vite env vars — see [`frontend/src/lib/auth.ts`](../frontend/src/lib/auth.ts))
+
+**Not read by the Python backend** — these are baked into the built JS at
+`npm run build`/`npm run dev`, and are not secrets (a public OIDC client,
+Authorization Code + PKCE, no `client_secret`, is designed to be embedded
+in a public SPA). Leaving `VITE_OIDC_AUTHORITY`/`VITE_OIDC_CLIENT_ID`
+unset (the default) leaves the dashboard's login screen off entirely — it
+falls back to `VITE_API_AUTH_TOKEN` or no auth, exactly as before this
+feature existed.
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `VITE_OIDC_AUTHORITY` | *(unset)* | Your identity provider's issuer URL. Must be registered as a separate public/SPA OIDC client there. |
+| `VITE_OIDC_CLIENT_ID` | *(unset)* | The SPA's own client id at the identity provider. |
+| `VITE_OIDC_SCOPE` | `openid profile` | OAuth scopes requested. |
+| `VITE_OIDC_REDIRECT_URI` | `<origin>/auth/callback` | Must be registered as an allowed redirect URI at the identity provider. |
+| `VITE_OIDC_POST_LOGOUT_REDIRECT_URI` | `<origin>` | Where the IdP sends the user after sign-out. |
+| `VITE_API_AUTH_TOKEN` | *(unset)* | A build-time copy of `API_AUTH_TOKEN` above, used as a fallback when OIDC isn't configured (or as the sole credential for a trusted-network/single-operator deployment). |
 
 ## Multi-source router (optional, off by default)
 

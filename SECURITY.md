@@ -15,6 +15,27 @@ RAG-poisoning detection scan, and closing a process-wide result-cache
 cross-session risk). Everything below is written to still be accurate after
 that pass, not a separate "what's new" list bolted on top.
 
+**2026 Phase 3 update (2026-09-16):** real authentication (OIDC/JWT, plus
+a now-usable frontend login flow) and RBAC authorization landed in the
+sessions between the update above and this one — see "Authentication and
+authorization" below, which this document previously didn't mention at
+all. This pass itself added: security headers (HSTS/CSP/X-Frame-Options/
+etc., on by default), a SQL-validator block on system-catalog/
+data-dictionary access, a startup check that refuses to boot in production
+if a configured database's role isn't actually read-only, SSRF
+redirect-hop re-validation for media generation, a CORS wildcard rejection,
+and a per-document RBAC restriction option for RAG content. Full audit
+trail: `SECURITY_FINAL_REPORT.md`, `SECURITY_BASELINE.md`,
+`SECURITY_CHANGELOG.md`, `SECURITY_PRODUCTION_CHECKLIST.md` (repo root).
+**That report's own conclusion: this platform is not production-ready as
+shipped** — 24 known CVEs across 7 backend dependencies remain unresolved
+(the largest needs a `langgraph` major-version migration), the frontend
+OIDC flow has not been exercised against a live identity provider, and
+several other items in that report's own checklist are still open. Treat
+this document as describing what's *implemented*, not a claim that
+everything here has been independently verified end-to-end — where a
+control is unverified, it's said so explicitly.
+
 ## What's actually enforced
 
 - Generated SQL is restricted to a single read-only `SELECT` (or
@@ -122,6 +143,40 @@ that pass, not a separate "what's new" list bolted on top.
   calls per minute (process-wide, so a question's own retry loop can't
   multiply load past it). See "Resource exhaustion / abuse protections"
   below for the scope and limits of both.
+- **2026 Phase 3:** generated SQL naming a system catalog/data-dictionary
+  object — `information_schema`, `pg_catalog`, mysql's internal schemas,
+  mssql `sys`, Oracle `ALL_*`/`DBA_*`/`USER_*`/`V$`/`GV$` — is rejected the
+  same way an unsafe statement type is (`agent/sql_validator.py`'s
+  `_find_system_catalog_reference`, `system_catalog_access` violation
+  type). These are syntactically ordinary `SELECT`s that passed every
+  other check, but can reveal internal schema structure or other
+  users'/roles' grants even under a genuinely read-only DB role. Oracle
+  matching uses a curated suffix list (`all_tables`, `dba_users`, ...), not
+  a blind `user_`/`dba_`/`all_` prefix, to avoid false-positiving on an
+  ordinary business table like `user_accounts`.
+- **2026 Phase 3:** the write-privilege check described above is now
+  startup-enforced, not just a manual CLI/UI check —
+  `api/main.py::_enforce_database_write_privileges` runs it for every
+  configured database when the app starts, and refuses to start at all
+  (`ConfigurationError`) if `ENVIRONMENT=production` and any database's
+  connected role appears to hold write privileges (warns otherwise). A
+  deployment that never ran `scripts/test_db_connection.py` by hand
+  previously got no signal at all that its "read-only" role wasn't.
+- **2026 Phase 3:** a standard set of defensive HTTP response headers is
+  on by default (`Settings.enable_security_headers`,
+  `api/main.py::_add_security_headers`) —
+  `Strict-Transport-Security`, `X-Content-Type-Options: nosniff`,
+  `X-Frame-Options: DENY`, `Referrer-Policy`, `Permissions-Policy` (every
+  sensor denied except `microphone=(self)`, for voice mode), and a
+  `Content-Security-Policy` scoped to what the built dashboard actually
+  loads. None of these replace an existing control — they're an
+  additional, independent layer against clickjacking, MIME-sniffing, and
+  script-injection XSS. `Settings.content_security_policy` overrides the
+  built-in default for a deployment it doesn't fit.
+  `config/settings.py` also refuses to start if `CORS_ALLOWED_ORIGINS`
+  contains `*` — meaningless, and rejected by browsers anyway, combined
+  with this app's CORS middleware always setting
+  `allow_credentials=True`; caught at config time instead.
 - A validated query gets a non-executing cost estimate (`EXPLAIN`/
   `SET SHOWPLAN_XML`, per engine — see `db/query_cost.py`) before it
   ever runs. An estimate far outside normal bounds is treated as a
@@ -183,16 +238,22 @@ that pass, not a separate "what's new" list bolted on top.
   output; `str()`/f-string interpolation of the wrapped value still yields
   the real secret, since call sites that legitimately need it (building the
   actual connection) still have to get it.
-- **Not designed for multi-tenant or production deployment.** No
-  authentication, no per-user authorization. `security/audit_log.py` gives
-  every rejection/violation a structured log line a real deployment could
-  ship to a SIEM, but it's still just structured *application* logging, not
-  a tamper-evident audit trail with per-user identity behind it. Rate
-  limiting exists (see below) but is a basic, in-memory, single-process
-  safeguard sized for one local user, not a substitute for real
-  multi-tenant rate limiting (a distributed store, per-user identity,
-  coordinated limits across processes) if this were ever deployed for more
-  than one person at a time. The dashboard's own repeated-question cache
+- **Real authentication and authorization exist (OIDC/JWT + RBAC — see
+  "Authentication and authorization" below), but both are off by default**
+  (`Settings.auth_mode == "none"`), which is still this project's common
+  local/single-user configuration. Not designed for multi-tenant
+  deployment even with auth turned on: there is no per-resource ownership
+  (any `admin` can delete/see any document, for example — a deliberate
+  design choice for a shared knowledge base, not a bug, see
+  `docs/AUTHORIZATION.md`), and `security/audit_log.py` gives every
+  rejection/violation a structured log line a real deployment could ship
+  to a SIEM, but it's still just structured *application* logging, not a
+  tamper-evident audit trail. Rate limiting exists (see below) but is a
+  basic, in-memory, single-process safeguard sized for one local user, not
+  a substitute for real multi-tenant rate limiting (a distributed store,
+  per-user identity, coordinated limits across processes) if this were
+  ever deployed for more than one person at a time. The dashboard's own
+  repeated-question cache
   (`frontend/src/store/chatStore.ts`'s `nlQuestionCache`) is a plain
   client-side `Map` in that browser tab's own memory, never sent to or
   shared by the server — a strictly weaker, but also strictly safer,
@@ -255,6 +316,44 @@ it as untrusted data in the system prompt, and don't rely on either of
 those alone — the SELECT-only allowlist and read-only connection are what
 actually bound the consequences if a poisoned value ever does influence
 what the model generates.
+
+## Authentication and authorization
+
+Off by default (`Settings.auth_mode == "none"`, unchanged behavior for
+local/single-user use), but real when turned on — this section previously
+didn't exist in this document even after both landed, which was itself a
+documentation gap; the detail below has existed in `docs/AUTHENTICATION.md`/
+`docs/AUTHORIZATION.md` for longer than it's been summarized here.
+
+- **Authentication** (`security/oidc.py` + `api/auth.py`) — `none`
+  (default) / `static_token` (`API_AUTH_TOKEN`, one shared bearer secret,
+  constant-time compared, grants a fixed admin-equivalent identity) /
+  `oidc` (`OIDC_ISSUER` set — standard JWT validation against any
+  compliant identity provider: server-side algorithm allowlist that never
+  trusts the token's own `alg`, mandatory audience validation, bounded
+  clock skew, no raw token/claim ever logged). `ENVIRONMENT=production`
+  refuses to start with no authentication configured at all. Full detail:
+  [`docs/AUTHENTICATION.md`](docs/AUTHENTICATION.md).
+- **Authorization** (`agent/authz.py` + `api/authz.py`) — RBAC, 15
+  fine-grained permissions, 4 extensible roles, fail-closed on an
+  unrecognized role, wired into every data-touching/expensive route and
+  into the multi-source router's own source-selection decision (an LLM
+  routing choice can request a source, never unilaterally grant access to
+  it). Full detail and the resource-to-permission mapping:
+  [`docs/AUTHORIZATION.md`](docs/AUTHORIZATION.md).
+- **Frontend OIDC login** (2026 Phase 3, `frontend/src/lib/auth.ts` +
+  `store/authStore.ts`) — a real Authorization Code + PKCE flow, in-memory
+  token storage only. Closes a real prior gap: before this, the only
+  credential the SPA could present was a static, build-time-baked, shared
+  token extractable from the public JS bundle. **Not yet verified against
+  a live identity provider** — see `docs/AUTHENTICATION.md`'s own
+  disclosure before relying on it in production.
+- **RAG per-document `restricted_roles`** (2026 Phase 3, `rag/store.py` +
+  `rag/graph.py`) — an optional, operator-set role restriction on a
+  specific document, additive to (not a replacement for) the fixed
+  `sensitivity_category` gate described under "Multi-source RAG and web
+  search" below. Full detail: `docs/AUTHORIZATION.md`'s "Per-document role
+  restriction" section.
 
 ## Multi-source RAG and web search (optional, off by default)
 
@@ -346,7 +445,11 @@ others don't need.
   and the resolved address is rejected if it falls in a private/loopback/
   link-local/reserved range (`media_gen/download.py::_validate_download_url`).
   Closes a real path for a compromised/malicious provider response to make
-  this server reach internal infrastructure.
+  this server reach internal infrastructure. **2026 Phase 3:** redirects
+  are now followed manually (max 5 hops), re-validated at each hop before
+  being followed — closes a gap where the original URL's validation became
+  moot the instant that URL's server issued a redirect, since `requests`
+  follows redirects transparently by default.
 - **Content-policy check is a heuristic, not real moderation** — say so
   plainly rather than implying otherwise. `_basic_prompt_safety_check`
   blocks a broadened-but-still-partial keyword list (explicit/sexual
@@ -608,12 +711,13 @@ enforced" above; none of this replaces those).
 `api/main.py`'s `POST /ask` calls the same `agent.graph.run_agent` the UI
 calls — every control described above (validator, rate limits, row cap,
 timeout, sensitive-column blocking) applies identically, there is no
-parallel, weaker code path. The API adds exactly one new control, an
-optional shared-bearer-token check (`API_AUTH_TOKEN`) — explicitly **not**
-real per-user authentication; see `docs/API.md`'s "Auth" section and
-`docs/RISK_REGISTER.md`'s R-001. Anything reachable beyond a trusted local
-network, UI or API, needs a real authenticating reverse proxy in front of
-it — see `docs/DEPLOYMENT.md`.
+parallel, weaker code path. The API's own auth/authz layer is the
+"Authentication and authorization" section above — a static shared token
+remains the simplest option (see `docs/API.md`'s "Auth" section) but OIDC
++ RBAC are real alternatives now, not a documented-but-unbuilt aspiration.
+Anything reachable beyond a trusted local network, UI or API, should still
+either use OIDC or sit behind a real authenticating reverse proxy — see
+`docs/DEPLOYMENT.md`.
 
 **2026-09-13 addition:** `POST /execute`, `POST /schema/refresh`, and the
 mutating `/documents` routes previously had no rate limit at all (only

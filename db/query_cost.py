@@ -45,10 +45,18 @@ import json
 import logging
 import re
 import threading
-import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from typing import Literal
 
+# 2026 Phase 3 security review: `defusedxml`, not stdlib `xml.etree`
+# (bandit B405/B314) -- the parsed XML here is MSSQL's own SHOWPLAN_XML
+# response, not attacker-controlled input in any *normal* request path, but
+# parsing untrusted-shaped XML with the stdlib parser is a real, if
+# second-order, XXE/billion-laughs exposure if a query's execution plan
+# were ever influenced by adversarial input in a way that reaches this
+# parse call -- cheap to close outright rather than argue the threat model
+# is narrow enough to accept.
+import defusedxml.ElementTree as ET
 from pydantic import BaseModel, ConfigDict
 from sqlalchemy import Engine, text
 

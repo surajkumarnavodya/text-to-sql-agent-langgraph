@@ -22,9 +22,9 @@
 
 <!-- Newest first, sourced from real commit history. Keep no more than the three most recent entries. -->
 
+- **2026-09-16** — Security hardening pass: real OIDC login for the React dashboard (Authorization Code + PKCE), per-document RBAC for RAG content, a startup check that refuses to boot in production with a misconfigured (writable) database role, security headers (HSTS/CSP/etc.), and a SQL-validator block on system-catalog access — see [`SECURITY.md`](SECURITY.md)
 - **2026-09-13** — Added optional media search — content-based search over an untagged local image/video library (local CLIP embeddings, scene-detected video segments, Whisper transcription, OCR, optional Ollama vision captioning), off by default
 - **2026-09-13** — Added optional voice mode — local speech-to-text (faster-whisper) and text-to-speech (Piper), schema-aware transcription, off by default
-- **2026-09-13** — Removed the Streamlit UI now that the React dashboard has full feature parity; the FastAPI app serves the dashboard directly (single container, single port)
 
 <a id="example-usage"></a>
 
@@ -320,6 +320,7 @@ connectivity and reverse-proxy placement.
 | See the latest measured benchmark accuracy | [`docs/EVALUATION.md`](docs/EVALUATION.md) |
 | Diagnose a common failure mode | [`docs/TROUBLESHOOTING.md`](docs/TROUBLESHOOTING.md) |
 | Understand this project's security posture | [`SECURITY.md`](SECURITY.md) |
+| Set up OIDC login and RBAC roles | [`docs/AUTHENTICATION.md`](docs/AUTHENTICATION.md), [`docs/AUTHORIZATION.md`](docs/AUTHORIZATION.md) |
 | Check production readiness before deploying | [`docs/PRODUCTION_CHECKLIST.md`](docs/PRODUCTION_CHECKLIST.md), [`docs/PRODUCTION_READINESS_REPORT.md`](docs/PRODUCTION_READINESS_REPORT.md) |
 | Governance, compliance, responsible-AI, risk tracking | [`docs/GOVERNANCE.md`](docs/GOVERNANCE.md), [`docs/COMPLIANCE.md`](docs/COMPLIANCE.md), [`docs/RESPONSIBLE_AI.md`](docs/RESPONSIBLE_AI.md), [`docs/RISK_REGISTER.md`](docs/RISK_REGISTER.md) |
 | Contribute a change or an eval case | [`CONTRIBUTING.md`](CONTRIBUTING.md) |

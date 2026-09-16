@@ -194,8 +194,11 @@ below, and `docs/MULTI_SOURCE_GUIDE.md` for how to configure each source.
   rewrite), `graph.py` (`build_rag_subgraph`/`run_rag` — retrieve → grade →
   rewrite/retry (bounded) → generate-with-citations, or an
   insufficient-information fallback; a "policies" chunk carrying a
-  `sensitivity_category` is never summarized into an answer — this app has
-  no per-user authorization system, so generation fails closed instead).
+  `sensitivity_category` is never summarized into an answer — a fixed,
+  reviewed category this app hard-blocks regardless of caller role, layered
+  underneath the newer per-document `restricted_roles` RBAC gate — see
+  "Authentication, authorization, and the 2026 security hardening passes"
+  below).
 - `search/` — live web search, `web_search.py`: a provider-name → call-
   function dict (`SUPPORTED_SEARCH_PROVIDERS`), shaped exactly like
   `db.connection.SUPPORTED_DB_TYPES` — swapping `WEB_SEARCH_PROVIDER` is a
@@ -577,10 +580,22 @@ connection pool with a configured database.
 Policy sensitivity (`compensation`/`disciplinary`/`legal`, set per-document
 at upload time — `rag/store.py`'s `SensitivityCategory`) is enforced by
 `rag/graph.py`'s `generate_node` refusing to summarize a sensitive chunk
-into an answer at all, since this app has no per-user authorization system
-to check who's allowed to see it — the same fail-closed philosophy as
-`agent/sql_validator.py`'s `SAFETY_VIOLATION_TYPES`, applied to a different
-data shape (a document/chunk tag instead of a `(table, column)` pair).
+into an answer at all — a fixed, reviewed set of categories this app has
+no per-caller override for, hard-blocked regardless of role, the same
+fail-closed philosophy as `agent/sql_validator.py`'s
+`SAFETY_VIOLATION_TYPES`, applied to a different data shape (a
+document/chunk tag instead of a `(table, column)` pair). **2026 Phase 3:**
+a second, independent gate, `DocumentRecord.restricted_roles` (an optional,
+operator-set role list, entered at upload time), layers actual RBAC
+(`agent/authz.py`, see "Authentication, authorization, and the 2026
+security hardening passes" below) on top of this for documents that need
+finer-grained restriction than the three fixed categories — checked by the
+same `generate_node` before the LLM ever sees the chunk, and by
+`api/documents.py`'s download route. Both gates are independent and
+additive; a document can carry either, both, or neither. `uploaded_by` was
+added alongside `restricted_roles` but is audit-trail only, never used to
+scope retrieval/download/delete — this remains a shared knowledge base by
+design, not per-uploader private storage.
 
 Retrieved chunk text is framed as **untrusted data, never instructions**
 in `rag/graph.py`'s `_GENERATE_SYSTEM_PROMPT` — the same "SQL is untrusted
@@ -660,7 +675,10 @@ opting in. Two design points worth knowing if you touch this:
   CDN URL.** `execute_generation` (the function that actually calls IMA —
   see "Human-in-the-loop approval gate" below) downloads the bytes once
   (`media_gen.download.download_media_bytes`, SSRF-hardened — see its own
-  module docstring) and stores them under an opaque id in a bounded,
+  module docstring; **2026 Phase 3:** redirects are now followed manually,
+  re-validated hop-by-hop up to 5 times, closing a gap where a redirect
+  response from an otherwise-validated URL reached an unvalidated address
+  with no check at all) and stores them under an opaque id in a bounded,
   process-lifetime in-memory cache (`media_gen.cache.MediaCache`, FIFO
   eviction past 100 entries, not persisted — a restart loses in-flight
   generated media, an accepted tradeoff same as this app's other
@@ -1128,11 +1146,104 @@ like theme/accent) when the server says the feature is actually
 available — the "all-or-nothing infra flag, plus a per-session UI switch"
 shape.
 
+### Authentication, authorization, and the 2026 security hardening passes
+Two independent layers, both worth understanding before touching `api/`,
+`agent/orchestrator/`, or `rag/` — the "no per-user authorization system"
+phrasing that appears in a couple of older notes elsewhere in this file
+predates both and is no longer accurate for anything gated by
+`agent/authz.py`'s permissions:
+
+- **Authentication** (`security/oidc.py` + `api/auth.py`) — one dispatch
+  point, `Settings.auth_mode`: `none` (default; unchanged behavior for
+  local/single-user use), `static_token` (`API_AUTH_TOKEN`, a shared
+  bearer secret, constant-time compared — grants a fixed "admin"-equivalent
+  identity, since a single shared secret has no natural sub-identity to
+  scope down), or `oidc` (`OIDC_ISSUER` set — validates a JWT against any
+  standard-compliant identity provider: server-side algorithm allowlist
+  never trusting the token's own `alg`, mandatory audience validation,
+  bounded clock skew, no raw token/claim ever logged). `ENVIRONMENT=production`
+  fails closed at startup (`config/settings.py::_require_identity_in_production`)
+  if neither is configured. Full detail: `docs/AUTHENTICATION.md`.
+- **Authorization** (`agent/authz.py` + `api/authz.py`) — RBAC: 15
+  fine-grained permissions, 4 extensible default roles (`viewer`/`user`/
+  `analyst`/`admin`), an unrecognized role grants zero permissions (fail
+  closed). Wired into every data-touching/expensive route **and** the
+  multi-source router itself — `agent/orchestrator/nodes.py`'s
+  `router_node` filters the LLM's own source selection through a
+  permission check *before* any subgraph runs, so a routing decision the
+  LLM makes can request access but never unilaterally grant it. Full
+  detail and the resource-to-permission mapping: `docs/AUTHORIZATION.md`.
+- **Frontend OIDC login** (2026 Phase 3, `frontend/src/lib/auth.ts` +
+  `store/authStore.ts`) — a real Authorization Code + PKCE flow
+  (`oidc-client-ts`), in-memory-only token storage (`InMemoryWebStorage`,
+  never `localStorage`/`sessionStorage`, so an XSS payload can't read a
+  persisted token — the tradeoff is a hard refresh clears it, so app load
+  always attempts a silent hidden-iframe re-auth against the IdP's own
+  session first). Closes a real gap: before this, the SPA's only possible
+  credential was `VITE_API_AUTH_TOKEN`, a build-time-baked, admin-granting
+  shared secret extractable from the public JS bundle. A pure pass-through
+  (`AuthGate.tsx` renders `children` directly) unless
+  `VITE_OIDC_AUTHORITY`/`VITE_OIDC_CLIENT_ID` are set — zero behavior
+  change for the common local/single-operator deployment. **Not yet
+  verified against a live identity provider** in this environment — passes
+  every static check available (`tsc`, `oxlint`, `npm run build`) and
+  follows `oidc-client-ts`'s documented API shape, but no real IdP/browser
+  was reachable to exercise the interactive flow end-to-end; see
+  `docs/AUTHENTICATION.md`'s own disclosure before relying on it.
+- **DB write-privilege check is now startup-enforced, not just a manual
+  CLI check** (2026 Phase 3, `api/main.py::_enforce_database_write_privileges`).
+  `db.connection.check_write_privileges` existed since an earlier phase but
+  was only ever called from `scripts/test_db_connection.py` — a deployment
+  that never ran that script by hand got no signal that its supposedly
+  read-only `DB_USER` wasn't. Now runs once per configured database at
+  `lifespan` startup; refuses to start (`ConfigurationError`) if
+  `ENVIRONMENT=production` and any database's connected role appears to
+  hold write privileges, warns otherwise. Doesn't change the layering
+  described in "True read-only enforcement is layered, not just
+  code-level" below — it makes a misconfigured DB-role layer detectable
+  and startup-blocking instead of silent.
+- **Security headers / CSP** (2026 Phase 3, `api/main.py::_add_security_headers`,
+  on by default via `Settings.enable_security_headers`) — HSTS,
+  `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`,
+  `Referrer-Policy`, `Permissions-Policy` (every sensor denied except
+  `microphone=(self)`, for voice mode), and a `Content-Security-Policy`
+  scoped to what the built dashboard actually loads (no inline `<script>`,
+  Google Fonts, `blob:`/`data:` for generated media). `frame-src` is
+  derived from `OIDC_ISSUER` when set, since OIDC silent-renew loads the
+  IdP in a hidden iframe that a bare `default-src 'self'` would otherwise
+  silently block. Override via `Settings.content_security_policy` for a
+  deployment this default doesn't fit. Also new this pass:
+  `config/settings.py` rejects `CORS_ALLOWED_ORIGINS=*` at startup — a
+  wildcard is meaningless (and browser-rejected) combined with this app's
+  `allow_credentials=True` CORS setup, caught at config time rather than
+  relied on to fail at request time.
+
+See `SECURITY_FINAL_REPORT.md` / `SECURITY_BASELINE.md` /
+`SECURITY_CHANGELOG.md` at the repo root for the full 2026 Phase 3 audit
+trail (per-control PASS/PARTIAL/FAIL findings, what was fixed vs. what
+remains open — notably 24 known CVEs across 7 backend dependencies,
+requiring a `langgraph` 0.2→1.0 migration this pass deliberately didn't
+attempt) and `SECURITY_PRODUCTION_CHECKLIST.md` for an operator-facing
+go/no-go list. `docs/security-changelog.md` carries the dated changelog
+entry for this pass alongside every earlier change-controlled security
+decision.
+
 ### SQL is untrusted output, always
 The LLM's SQL is never trusted at face value. `agent/sql_validator.py`
 parses it with `sqlglot` (in the dialect matching `DB_TYPE`) and rejects
 anything that isn't a single `SELECT`/`UNION`/`EXCEPT`/`INTERSECT` statement
 (explicit allowlist of the parsed statement type, not a regex blocklist).
+**2026 Phase 3:** also rejects a reference to a system catalog/
+data-dictionary object — `information_schema`, `pg_catalog`, mysql's
+internal schemas, mssql `sys`, Oracle `ALL_*`/`DBA_*`/`USER_*`/`V$`/`GV$`
+(`_find_system_catalog_reference`, new `system_catalog_access` violation
+type in `SAFETY_VIOLATION_TYPES`) — a syntactically ordinary `SELECT` that
+passed every prior check but could reveal internal schema structure or
+other users'/roles' grants even under a genuinely read-only DB role, since
+DB-role read-only-ness bounds writes, not what a SELECT can read. Uses
+curated suffix matching for Oracle (`all_tables`, `dba_users`, ...), not a
+blind `user_`/`dba_`/`all_` prefix match, specifically to avoid
+false-positiving on an ordinary business table like `user_accounts`.
 Execution happens on a read-only-by-convention SQLAlchemy engine
 (`db.connection.get_read_only_engine()`), with a row cap (`MAX_RESULT_ROWS`,
 enforced *both* via `LIMIT` in the SQL text and independently via
@@ -1163,6 +1274,10 @@ role/account (documented in README's Security section, not silently
 assumed). If you're asked to "harden" this further, that's the layer to
 push on — a DB-level read-only user, not more code-level checks, since the
 validator is already an AST-based allowlist rather than a blocklist.
+`db.connection.check_write_privileges` is a best-effort detector for layer
+(2) being misconfigured, and — since 2026 Phase 3 — is startup-enforced,
+not just a manual CLI check; see "Authentication, authorization, and the
+2026 security hardening passes" above.
 
 ### Pydantic-based configuration and validation
 `config.settings.Settings` is a `pydantic_settings.BaseSettings` (not a

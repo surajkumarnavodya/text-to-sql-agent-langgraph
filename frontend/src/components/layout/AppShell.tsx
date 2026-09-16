@@ -1,10 +1,12 @@
-import { BookOpen, Database, ImageIcon, MessageSquare, Settings } from 'lucide-react'
+import { BookOpen, Database, ImageIcon, LogOut, MessageSquare, Settings } from 'lucide-react'
 import { useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { NavLink, Outlet } from 'react-router-dom'
 import { ThemeToggle } from '@/components/settings/ThemeToggle'
 import { Button } from '@/components/ui/button'
+import { isOidcConfigured } from '@/lib/auth'
 import { cn } from '@/lib/utils'
+import { useAuthStore } from '@/store/authStore'
 import { HistoryDrawer } from './HistoryDrawer'
 
 /** Full-viewport application shell. The history drawer has exactly one
@@ -15,6 +17,8 @@ import { HistoryDrawer } from './HistoryDrawer'
 export function AppShell() {
   const { t } = useTranslation()
   const [isHistoryOpen, setIsHistoryOpen] = useState(false)
+  const authStatus = useAuthStore((state) => state.status)
+  const signOut = useAuthStore((state) => state.signOut)
 
   return (
     <div className="h-screen w-screen overflow-hidden bg-[var(--background)] text-[var(--foreground)]">
@@ -37,6 +41,17 @@ export function AppShell() {
           </nav>
 
           <div className="ml-auto flex items-center gap-1.5">
+            {isOidcConfigured && authStatus === 'authenticated' && (
+              <Button
+                variant="ghost"
+                size="icon"
+                onClick={() => void signOut()}
+                aria-label={t('auth.signOut')}
+                title={t('auth.signOut')}
+              >
+                <LogOut className="h-4 w-4" />
+              </Button>
+            )}
             <ThemeToggle />
             <Button
               variant="ghost"

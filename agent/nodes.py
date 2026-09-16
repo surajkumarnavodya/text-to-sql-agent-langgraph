@@ -161,9 +161,14 @@ def _selected_db_name(state: AgentState) -> str:
     -- so a None here is a precondition violation, not a real runtime case.
     """
     selected_database = state["selected_database"]
-    assert (
-        selected_database is not None
-    ), "reached with no selected_database; retrieve_schema_node must run first"
+    if selected_database is None:
+        # 2026 Phase 3 security review (bandit B101): an explicit raise, not
+        # `assert` -- `assert` is stripped entirely under `python -O`,
+        # which would turn this precondition violation into a confusing
+        # downstream `None`-related error instead of a clear one here.
+        raise RuntimeError(
+            "reached with no selected_database; retrieve_schema_node must run first"
+        )
     return selected_database
 
 
@@ -328,7 +333,11 @@ def sanitize_input_node(state: AgentState) -> dict[str, Any]:
     )
 
     if not result.passed:
-        assert result.reason is not None  # guaranteed when passed is False
+        if result.reason is None:
+            # 2026 Phase 3 security review (bandit B101): explicit raise,
+            # not `assert` -- see agent.nodes.execute_sql_node's identical
+            # fix for why (stripped under `python -O`).
+            raise RuntimeError("GuardResult.passed is False but reason is None")
         message = rejection_message(result.reason, db_name=settings.db_name)
         logger.info(
             "[sanitize_input] rejected reason=%s -- see agent.input_guard logs for detail",
@@ -1219,7 +1228,11 @@ def execute_sql_node(state: AgentState) -> dict[str, Any]:
     settings = get_settings()
     db_config = get_connection(settings, _selected_db_name(state))
     sql = state["sql"]
-    assert sql is not None, "execute_sql_node reached with no SQL; validate_sql_node must run first"
+    if sql is None:
+        # 2026 Phase 3 security review (bandit B101): explicit raise, not
+        # `assert` -- stripped entirely under `python -O`, which would turn
+        # this precondition violation into a confusing downstream error.
+        raise RuntimeError("execute_sql_node reached with no SQL; validate_sql_node must run first")
     retry_count = state.get("retry_count", 0)
     attempt_number = retry_count + 1
 

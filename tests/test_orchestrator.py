@@ -646,7 +646,7 @@ class TestDocumentAndPolicyRagNodes:
         monkeypatch.setattr(
             rag.graph,
             "run_rag",
-            lambda question, collection: {
+            lambda question, collection, **kwargs: {
                 "answer": "Found it.",
                 "citations": [{"filename": "a.pdf", "chunk_index": 0, "page_number": 1}],
                 "status": "succeeded",
@@ -662,7 +662,11 @@ class TestDocumentAndPolicyRagNodes:
         monkeypatch.setattr(
             rag.graph,
             "run_rag",
-            lambda question, collection: {"answer": "x", "citations": [], "status": "succeeded"},
+            lambda question, collection, **kwargs: {
+                "answer": "x",
+                "citations": [],
+                "status": "succeeded",
+            },
         )
         result = policy_rag_node({"question": "what is the leave policy?"})
         # collection is "policies" (plural, matches rag.store.Collection), but
@@ -671,11 +675,28 @@ class TestDocumentAndPolicyRagNodes:
         # down that translation happens correctly.
         assert result["sources_used"] == ["policy"]
 
+    def test_document_rag_node_threads_caller_roles_through(self, monkeypatch):
+        """2026 Phase 3 security review: caller_roles must reach run_rag,
+        not just be read from state and discarded -- otherwise
+        rag/graph.py's restricted_roles gate would silently never see the
+        real caller when reached through the orchestrator."""
+        import rag.graph
+
+        captured = {}
+
+        def _run_rag(question, collection, **kwargs):
+            captured["caller_roles"] = kwargs.get("caller_roles")
+            return {"answer": "x", "citations": [], "status": "succeeded"}
+
+        monkeypatch.setattr(rag.graph, "run_rag", _run_rag)
+        document_rag_node({"question": "x", "caller_roles": ("analyst", "user")})
+        assert captured["caller_roles"] == ("analyst", "user")
+
     def test_document_rag_node_degrades_gracefully_when_store_not_configured(self, monkeypatch):
         import rag.graph
         from rag.store import RagStoreNotConfiguredError
 
-        def _raise(question, collection):
+        def _raise(question, collection, **kwargs):
             raise RagStoreNotConfiguredError("not configured")
 
         monkeypatch.setattr(rag.graph, "run_rag", _raise)
@@ -1466,7 +1487,7 @@ class TestRunOrchestrated:
         monkeypatch.setattr(
             rag.graph,
             "run_rag",
-            lambda question, collection: {
+            lambda question, collection, **kwargs: {
                 "answer": "Policy allows 20 days leave.",
                 "citations": [],
                 "status": "succeeded",

@@ -2,15 +2,30 @@
 
 `build_rag_subgraph(collection)` is a factory, not two separate
 implementations -- "documents" and "policies" get the exact same graph,
-parameterized by which `rag.store` collection to search. The only behavioral
-difference between them is in `generate_node`: a "policies" chunk carrying a
-`sensitivity_category` (compensation/disciplinary/legal -- see
-`rag/store.py`) is never summarized into an answer, since this app has no
-per-user authorization system to check "is this caller allowed to see
-compensation policy" (the same "lightweight hook, not a full auth system"
-posture `config.settings.Settings.api_auth_token` already documents) --
-failing closed here mirrors `agent.sql_validator`'s SAFETY_VIOLATION_TYPES
-philosophy: not a mistake worth working around, a gate that does not open.
+parameterized by which `rag.store` collection to search. `generate_node`
+has two independent access-control gates, both checked before any chunk
+content reaches the LLM (never after -- see this module's own "untrusted
+data" note below, and CLAUDE.md's RAG section for why filtering must
+happen before context construction, not just before the *answer* is
+shown):
+
+1. A "policies" chunk carrying a `sensitivity_category`
+   (compensation/disciplinary/legal -- see `rag/store.py`) is never
+   summarized into an answer -- a fixed, reviewed set of categories this
+   app treats as requiring authorization it cannot itself verify.
+2. 2026 Phase 3 security review: a chunk whose document carries
+   `restricted_roles` (any operator-set list of role names, not just the
+   three fixed categories -- see `rag/store.py::DocumentRecord`'s
+   docstring) is blocked the same way unless the caller holds at least one
+   of those roles. This is a genuine authorization check (this app now has
+   `agent.authz`'s RBAC layer, unlike when the sensitivity-category gate
+   above was first written) -- deliberately additive to, not a replacement
+   for, the fixed-category gate, which stays a hard block regardless of
+   role for content this app has no per-caller override for.
+
+Both gates fail closed the same way `agent.sql_validator`'s
+`SAFETY_VIOLATION_TYPES` does: not a mistake worth working around, a gate
+that does not open.
 
 Retrieved chunk text is untrusted data, not instructions, exactly like
 generated SQL is untrusted relative to the validator (CLAUDE.md's "SQL is
@@ -28,6 +43,7 @@ from langgraph.graph import END, StateGraph
 
 from config.settings import Settings, get_settings
 from rag.store import ChunkResult, Collection, get_rag_engine
+from security.audit_log import log_security_event
 
 logger = logging.getLogger(__name__)
 
@@ -47,6 +63,17 @@ _RESTRICTED_MESSAGE_TEMPLATE = (
     "requires authorization this application does not check (it has no "
     "per-user access-control system -- see SECURITY.md). The answer cannot "
     "be shown here; consult HR/the policy owner directly."
+)
+
+# 2026 Phase 3 security review: the message for the more general
+# restricted_roles gate -- deliberately does not name which role(s) would
+# grant access (an anonymous caller probing what's restricted learns
+# nothing actionable from the refusal, the same anti-oracle principle
+# agent.input_guard._MESSAGES already applies to its own rejection text).
+_ROLE_RESTRICTED_MESSAGE = (
+    "This question touches document content restricted to specific roles "
+    "this caller does not hold. The answer cannot be shown here; contact "
+    "the document owner for access."
 )
 
 # Deliberately doesn't name the collection ("documents"/"policies" is an
@@ -87,6 +114,14 @@ class RagState(TypedDict, total=False):
     search_query: str  # current query text -- question, or a rewrite of it
     retry_count: int
     chunks: list[ChunkResult]
+    # 2026 Phase 3 security review: the caller's roles (`AuthIdentity.roles`,
+    # threaded through from `agent.orchestrator.nodes._run_rag_node` the
+    # same way `OrchestratorState["caller_roles"]` already is for the
+    # router's own source-authorization check), read only by
+    # `_generate_node`'s `restricted_roles` gate. Defaults to `()` (no
+    # roles) when a caller doesn't supply it -- fail closed, never fail
+    # open on a missing value.
+    caller_roles: tuple[str, ...]
     # Set by _grade_node, read only by _route_after_grade -- not part of the
     # subgraph's "public" result shape, but still a declared field: an
     # undeclared key returned by a node isn't guaranteed to survive
@@ -143,6 +178,27 @@ def _rewrite_node(state: RagState, *, settings: Settings) -> dict[str, Any]:
 
 def _generate_node(state: RagState, *, settings: Settings) -> dict[str, Any]:
     chunks = state.get("chunks", [])
+    caller_roles = set(state.get("caller_roles", ()))
+
+    role_restricted = next(
+        (c for c in chunks if c.restricted_roles and not (set(c.restricted_roles) & caller_roles)),
+        None,
+    )
+    if role_restricted is not None:
+        log_security_event(
+            "rag_role_restricted_content_blocked",
+            "warning",
+            "A RAG answer was blocked because a retrieved document is restricted to "
+            "roles the caller does not hold.",
+            document_id=role_restricted.document_id,
+            restricted_roles=list(role_restricted.restricted_roles or ()),
+            caller_roles=sorted(caller_roles),
+        )
+        return {
+            "answer": _ROLE_RESTRICTED_MESSAGE,
+            "citations": [],
+            "status": "restricted",
+        }
 
     restricted = next((c for c in chunks if c.sensitivity_category), None)
     if restricted is not None:
@@ -211,11 +267,22 @@ def build_rag_subgraph(collection: Collection, settings: Settings | None = None)
     return graph.compile()
 
 
-def run_rag(question: str, collection: Collection, settings: Settings | None = None) -> RagState:
+def run_rag(
+    question: str,
+    collection: Collection,
+    settings: Settings | None = None,
+    caller_roles: tuple[str, ...] = (),
+) -> RagState:
     """Runs one question through the given collection's RAG subgraph.
 
     Single public entry point, mirroring `agent.graph.run_agent`'s role for
     the SQL pipeline.
+
+    Args:
+        caller_roles: The caller's roles (`AuthIdentity.roles`), read by
+            `_generate_node`'s `restricted_roles` gate. Defaults to `()` --
+            a caller that doesn't pass this holds no roles, fail closed
+            against any role-restricted content, never fail open.
     """
     settings = settings or get_settings()
     compiled = build_rag_subgraph(collection, settings)
@@ -227,5 +294,6 @@ def run_rag(question: str, collection: Collection, settings: Settings | None = N
         "answer": None,
         "citations": [],
         "error_history": [],
+        "caller_roles": caller_roles,
     }
     return compiled.invoke(initial_state)

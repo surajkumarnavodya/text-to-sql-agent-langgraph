@@ -460,8 +460,16 @@ def _run_rag_node(state: OrchestratorState, collection: str, result_key: str) ->
     """Shared body for document_rag_node/policy_rag_node -- same subgraph, different collection."""
     from rag.graph import run_rag
 
+    # 2026 Phase 3 security review: threads the caller's roles into the RAG
+    # subgraph's own restricted_roles gate (rag/graph.py::_generate_node),
+    # the same `OrchestratorState["caller_roles"]` already used by this
+    # node's own router-level source-authorization check (router_node,
+    # above) -- without this, a role-restricted document's content would
+    # never be blocked from a multi-source question, only from a
+    # single-collection call that happened to pass caller_roles explicitly.
+    caller_roles = tuple(state.get("caller_roles", ()))
     try:
-        rag_state = run_rag(state["question"], collection)  # type: ignore[arg-type]
+        rag_state = run_rag(state["question"], collection, caller_roles=caller_roles)  # type: ignore[arg-type]
     except RagStoreNotConfiguredError as exc:
         logger.error("[%s] not configured: %s", collection, exc)
         return {

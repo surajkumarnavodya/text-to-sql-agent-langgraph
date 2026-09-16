@@ -391,6 +391,94 @@ not attempted in this pass).
 
 ---
 
+## 2026-09-16 — Phase 3 security review: RAG per-document RBAC, frontend OIDC login, DB write-privilege startup check, system-catalog validator block
+
+**Change:** A targeted audit + hardening pass (full trail:
+`SECURITY_BASELINE.md`, `SECURITY_FINAL_REPORT.md`, `SECURITY_CHANGELOG.md`,
+`SECURITY_PRODUCTION_CHECKLIST.md` — repo root) found and closed four P0
+gaps and six P1/P2 gaps:
+
+1. **RAG per-document access control, in this changelog's stated scope
+   (extends the sensitivity-classification mechanism).** `rag.store.
+   DocumentRecord` gained `restricted_roles` (an optional, operator-set
+   role list, additive to the existing fixed `sensitivity_category` gate)
+   and `uploaded_by` (audit-trail only, never used to scope access — this
+   remains a shared knowledge base by design). `rag/graph.py::_generate_node`
+   blocks summarizing a role-restricted chunk into an answer unless the
+   caller holds a matching role, checked before the LLM sees the content;
+   `api/documents.py`'s download route enforces the same check.
+2. **New validator check, `agent/sql_validator.py`'s allowlist.** A new
+   `system_catalog_access` violation type (added to `SAFETY_VIOLATION_TYPES`)
+   blocks `information_schema`/`pg_catalog`/mysql internal schemas/mssql
+   `sys`/Oracle `ALL_*`/`DBA_*`/`USER_*`/`V$`/`GV$` references — ordinary
+   `SELECT`s that passed every prior check but could reveal internal schema
+   structure or other users'/roles' grants even under a read-only DB role.
+   Curated Oracle suffix matching (not a blind prefix) to avoid
+   false-positiving on tables like `user_accounts`.
+3. **Frontend OIDC login** (new, not previously in this changelog's scope
+   since the frontend had no prior auth mechanism to change): a real
+   Authorization Code + PKCE flow (`oidc-client-ts`), in-memory-only token
+   storage. Closes a real gap — the SPA's only prior credential was a
+   static, build-time-baked, admin-granting token extractable from the
+   public JS bundle. Not yet verified against a live identity provider.
+4. **DB write-privilege check now startup-enforced.** `db.connection.
+   check_write_privileges` existed since an earlier phase but was only
+   ever invoked from the manual `scripts/test_db_connection.py` CLI.
+   `api/main.py::_enforce_database_write_privileges` now runs it for every
+   configured database at startup; refuses to start
+   (`ENVIRONMENT=production`) if any database's role appears writable,
+   warns otherwise. New `critical`-severity audit event,
+   `db_write_privileges_detected`.
+5. **SSRF: redirect re-validation.** `media_gen/download.py::download_media_bytes`
+   now follows redirects manually (max 5 hops), re-running
+   `_validate_download_url` against each hop before following it — closes
+   a gap where the original URL's validation became moot the instant that
+   URL's server issued a redirect.
+6. **Security headers middleware**, on by default
+   (`Settings.enable_security_headers`): HSTS, CSP, X-Frame-Options,
+   X-Content-Type-Options, Referrer-Policy, Permissions-Policy.
+   `Content-Security-Policy`'s `frame-src` derives from `OIDC_ISSUER` when
+   set (OIDC silent-renew's hidden iframe needs it).
+7. **CORS wildcard rejection.** `CORS_ALLOWED_ORIGINS=*` now refuses to
+   start — meaningless (and browser-rejected) combined with this app's
+   `allow_credentials=True` CORS setup, caught at config time.
+8. **SAST run for the first time (bandit).** 10 findings, all triaged: 2
+   real issues fixed (XXE-hardened `defusedxml` for MSSQL `SHOWPLAN_XML`
+   parsing; 4 `assert`-based invariant checks converted to explicit raises,
+   since `assert` is stripped under `python -O`), 4 confirmed false
+   positives suppressed with inline `# nosec` justification. Zero findings
+   on re-run.
+9. **Dockerfile stale-comment fix.** A comment claimed `build-essential`
+   was purged post-install to shrink the image; no such step existed —
+   added the actual `apt-get purge --auto-remove` in the same layer as the
+   `pip install` (a later layer would not shrink the image). Image build
+   was not confirmed to complete successfully in this pass's environment —
+   verify before relying on it.
+
+**Not remediated in this pass, logged as open risk rather than silently
+left:** `pip-audit` found 24 known CVEs across 7 backend dependencies,
+largest requiring a `langgraph` 0.2→1.0 migration — too large/breaking to
+attempt without dedicated regression time. `docs/RISK_REGISTER.md`'s R-010
+updated with the current count.
+
+**Why:** Requested as a security audit + hardening pass over an already
+security-conscious codebase (OIDC, RBAC, SQL AST validation, content
+moderation, audit logging all pre-existing from earlier phases) — this
+pass verified those controls against the running code rather than
+documentation claims, and closed the gaps that verification surfaced.
+
+**Status:** Permanent (all nine items above). Dependency-CVE remediation
+and live-IdP verification of the frontend OIDC flow are tracked as open
+follow-ups, not closed by this entry. New regression coverage:
+`tests/test_rag_graph.py` (new), `tests/test_sql_validator_hardening.py`
+(extended), `tests/test_startup_write_privilege_enforcement.py` (new),
+`tests/test_media_gen.py` (extended), `tests/test_security_headers.py`
+(new), `tests/test_rag_pdf_download.py` (extended),
+`tests/test_orchestrator.py` (extended), `tests/test_api_documents.py`
+(extended) — 79 net new tests (1033 → 1112).
+
+---
+
 <!--
 Template for new entries — copy this block:
 

@@ -90,6 +90,19 @@ class DocumentRecord:
     chunk_count: int
     error_message: str | None
     has_pdf_bytes: bool
+    # 2026 Phase 3 security review: `uploaded_by` is audit-trail-only (the
+    # uploader's `AuthIdentity.subject`) -- this app remains a *shared*
+    # knowledge base by design (see docs/AUTHORIZATION.md's "no per-resource
+    # ownership" note), so retrieval/download/delete are never scoped to
+    # "documents this caller uploaded." `restricted_roles`, unlike
+    # `uploaded_by`, IS an access-control field: when set, only a caller
+    # holding at least one of these roles may have this document's content
+    # summarized into an answer or downloaded -- a more general, per-
+    # document mechanism alongside (not replacing) the existing fixed
+    # `sensitivity_category` gate, for content that needs restricting but
+    # doesn't fit "compensation"/"disciplinary"/"legal".
+    uploaded_by: str | None = None
+    restricted_roles: tuple[str, ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -104,6 +117,23 @@ class ChunkResult:
     page_number: int | None
     sensitivity_category: str | None
     has_pdf_bytes: bool
+    restricted_roles: tuple[str, ...] | None = None
+
+
+def _roles_to_csv(roles: tuple[str, ...] | None) -> str | None:
+    """Comma-joins `roles` for storage, or None for "no restriction" --
+    mirrors `config.settings.Settings`'s own comma-separated-list-in-a-
+    single-column convention (`cors_allowed_origins`, `oidc_algorithms`)."""
+    if not roles:
+        return None
+    return ",".join(roles)
+
+
+def _parse_roles_csv(value: str | None) -> tuple[str, ...] | None:
+    if not value:
+        return None
+    parsed = tuple(role.strip() for role in value.split(",") if role.strip())
+    return parsed or None
 
 
 def _require_connection_string(settings: Settings) -> str:
@@ -170,6 +200,8 @@ def ensure_schema(engine: Engine) -> None:
                     error_message NVARCHAR(MAX) NULL,
                     source_metadata NVARCHAR(MAX) NULL,
                     pdf_bytes VARBINARY(MAX) NULL,
+                    uploaded_by NVARCHAR(200) NULL,
+                    restricted_roles NVARCHAR(500) NULL,
                     CONSTRAINT PK_rag_documents PRIMARY KEY (id)
                 )
                 """
@@ -188,6 +220,31 @@ def ensure_schema(engine: Engine) -> None:
                     WHERE object_id = OBJECT_ID('rag.documents') AND name = 'pdf_bytes'
                 )
                 ALTER TABLE rag.documents ADD pdf_bytes VARBINARY(MAX) NULL
+                """
+            )
+        )
+        # 2026 Phase 3 security review: same idempotent-migration pattern
+        # as pdf_bytes above, for the two new document-access-control
+        # columns (see DocumentRecord's docstring for what each is for).
+        conn.execute(
+            text(
+                """
+                IF NOT EXISTS (
+                    SELECT 1 FROM sys.columns
+                    WHERE object_id = OBJECT_ID('rag.documents') AND name = 'uploaded_by'
+                )
+                ALTER TABLE rag.documents ADD uploaded_by NVARCHAR(200) NULL
+                """
+            )
+        )
+        conn.execute(
+            text(
+                """
+                IF NOT EXISTS (
+                    SELECT 1 FROM sys.columns
+                    WHERE object_id = OBJECT_ID('rag.documents') AND name = 'restricted_roles'
+                )
+                ALTER TABLE rag.documents ADD restricted_roles NVARCHAR(500) NULL
                 """
             )
         )
@@ -219,6 +276,8 @@ def insert_document(
     sensitivity_category: SensitivityCategory = None,
     source_metadata: dict | None = None,
     pdf_bytes: bytes | None = None,
+    uploaded_by: str | None = None,
+    restricted_roles: tuple[str, ...] | None = None,
 ) -> str:
     """Inserts a new `rag.documents` row with status "processing" and returns its id.
 
@@ -229,6 +288,23 @@ def insert_document(
             column, this needs none of `_VECTOR_CAST`'s ntext-vs-nvarchar
             workaround, since that quirk is specific to casting a long JSON
             string into `VECTOR`.
+        uploaded_by: The uploader's `AuthIdentity.subject` -- audit-trail
+            only, never used to scope retrieval/download/delete (see
+            `DocumentRecord`'s docstring: this app is a shared knowledge
+            base by design).
+        restricted_roles: If set, only a caller holding at least one of
+            these role names may have this document summarized into an
+            answer or download it (`rag/graph.py::_generate_node`,
+            `api/documents.py::download_document`) -- a more general
+            access-control mechanism than the fixed `sensitivity_category`
+            enum, for content that needs restricting but doesn't fit one of
+            the three reviewed categories. Role names are not validated
+            against `agent.authz.ROLE_PERMISSIONS` here -- that mapping is
+            deliberately extensible/operator-editable (see that module's
+            own docstring), so an unrecognized role name here isn't
+            necessarily a mistake; it just means no current caller can see
+            this document until a role granting access exists, which is a
+            safe (fail-closed, not fail-open) default for a typo.
 
     Raises:
         ValueError: if `sensitivity_category` isn't one of the reviewed
@@ -249,9 +325,11 @@ def insert_document(
             text(
                 """
                 INSERT INTO rag.documents
-                    (filename, collection, sensitivity_category, source_metadata, pdf_bytes)
+                    (filename, collection, sensitivity_category, source_metadata, pdf_bytes,
+                     uploaded_by, restricted_roles)
                 OUTPUT inserted.id
-                VALUES (:filename, :collection, :sensitivity_category, :source_metadata, :pdf_bytes)
+                VALUES (:filename, :collection, :sensitivity_category, :source_metadata, :pdf_bytes,
+                        :uploaded_by, :restricted_roles)
                 """
             ),
             {
@@ -260,6 +338,8 @@ def insert_document(
                 "sensitivity_category": sensitivity_category,
                 "source_metadata": json.dumps(source_metadata) if source_metadata else None,
                 "pdf_bytes": pdf_bytes,
+                "uploaded_by": uploaded_by,
+                "restricted_roles": _roles_to_csv(restricted_roles),
             },
         )
         return str(result.scalar_one())
@@ -308,12 +388,18 @@ def insert_chunks(
     with engine.begin() as conn:
         for chunk_text_value, chunk_index, embedding, page_number in chunks:
             conn.execute(
+                # Bandit's SQL-construction heuristic (B608) false-positives
+                # here -- `_VECTOR_CAST` is a fixed module-level constant
+                # (see its own docstring: EMBEDDING_DIMENSIONS baked in, not
+                # user input), every real value is bound as a parameter
+                # (:document_id etc.), never interpolated. Single-line
+                # f-strings (not one multi-line triple-quoted string) purely
+                # so the `# nosec` marker below can sit outside the string
+                # literal itself, rather than inside it (a multi-line
+                # f-string's `# nosec` would have become literal SQL text).
                 text(
-                    f"""
-                    INSERT INTO rag.chunks (document_id, chunk_index, chunk_text, embedding, page_number)
-                    VALUES (:document_id, :chunk_index, :chunk_text,
-                            {_VECTOR_CAST}, :page_number)
-                    """
+                    "INSERT INTO rag.chunks (document_id, chunk_index, chunk_text, embedding, page_number) "  # nosec B608
+                    f"VALUES (:document_id, :chunk_index, :chunk_text, {_VECTOR_CAST}, :page_number)"
                 ),
                 {
                     "document_id": document_id,
@@ -337,7 +423,8 @@ def list_documents(engine: Engine, collection: Collection | None = None) -> list
     query = """
         SELECT id, filename, collection, sensitivity_category, upload_date,
                status, chunk_count, error_message,
-               CASE WHEN pdf_bytes IS NOT NULL THEN 1 ELSE 0 END AS has_pdf_bytes
+               CASE WHEN pdf_bytes IS NOT NULL THEN 1 ELSE 0 END AS has_pdf_bytes,
+               uploaded_by, restricted_roles
         FROM rag.documents
     """
     params: dict[str, str] = {}
@@ -359,6 +446,8 @@ def list_documents(engine: Engine, collection: Collection | None = None) -> list
             chunk_count=row.chunk_count,
             error_message=row.error_message,
             has_pdf_bytes=bool(row.has_pdf_bytes),
+            uploaded_by=row.uploaded_by,
+            restricted_roles=_parse_roles_csv(row.restricted_roles),
         )
         for row in rows
     ]
@@ -389,6 +478,23 @@ def get_document_sensitivity(engine: Engine, document_id: str) -> str | None:
     if row is None:
         return None
     return row.sensitivity_category
+
+
+def get_document_restricted_roles(engine: Engine, document_id: str) -> tuple[str, ...] | None:
+    """Fetches one document's `restricted_roles` -- the same purpose as
+    `get_document_sensitivity` above, for the more general role-restriction
+    mechanism (`DocumentRecord`'s docstring). `api/documents.py`'s download
+    route uses this alongside `get_document_sensitivity` so both access-
+    control fields gate a raw-bytes download the same way they already gate
+    a chat-answer summary (`rag/graph.py::_generate_node`)."""
+    with engine.connect() as conn:
+        row = conn.execute(
+            text("SELECT restricted_roles FROM rag.documents WHERE id = :document_id"),
+            {"document_id": document_id},
+        ).fetchone()
+    if row is None:
+        return None
+    return _parse_roles_csv(row.restricted_roles)
 
 
 def get_document_bytes(engine: Engine, document_id: str) -> bytes | None:
@@ -436,18 +542,24 @@ def similarity_search(
     """
     with engine.connect() as conn:
         rows = conn.execute(
+            # Bandit's SQL-construction heuristic (B608) false-positives
+            # here -- same reasoning as insert_chunks above: `_VECTOR_CAST`
+            # is a fixed module-level constant, every real value is bound
+            # as a parameter (:top_k/:collection/:embedding), never
+            # interpolated. Single-line concatenated string literals (not
+            # one multi-line triple-quoted f-string) so `# nosec` can sit
+            # outside the string itself.
             text(
-                f"""
-                SELECT TOP (:top_k)
-                    c.chunk_text, c.chunk_index, c.page_number,
-                    d.id AS document_id, d.filename, d.sensitivity_category,
-                    CASE WHEN d.pdf_bytes IS NOT NULL THEN 1 ELSE 0 END AS has_pdf_bytes,
-                    VECTOR_DISTANCE('cosine', c.embedding, {_VECTOR_CAST}) AS distance
-                FROM rag.chunks c
-                JOIN rag.documents d ON d.id = c.document_id
-                WHERE d.collection = :collection AND d.status = 'ready'
-                ORDER BY distance ASC
-                """
+                "SELECT TOP (:top_k) "  # nosec B608
+                "c.chunk_text, c.chunk_index, c.page_number, "
+                "d.id AS document_id, d.filename, d.sensitivity_category, "
+                "CASE WHEN d.pdf_bytes IS NOT NULL THEN 1 ELSE 0 END AS has_pdf_bytes, "
+                "d.restricted_roles, "
+                f"VECTOR_DISTANCE('cosine', c.embedding, {_VECTOR_CAST}) AS distance "
+                "FROM rag.chunks c "
+                "JOIN rag.documents d ON d.id = c.document_id "
+                "WHERE d.collection = :collection AND d.status = 'ready' "
+                "ORDER BY distance ASC"
             ),
             {
                 "top_k": top_k,
@@ -465,6 +577,7 @@ def similarity_search(
             page_number=row.page_number,
             sensitivity_category=row.sensitivity_category,
             has_pdf_bytes=bool(row.has_pdf_bytes),
+            restricted_roles=_parse_roles_csv(row.restricted_roles),
         )
         for row in rows
     ]

@@ -125,6 +125,67 @@ class TestDangerousFunctionsAreRejected:
         assert "pg_sleep" in result.error.lower()
 
 
+class TestSystemCatalogAccessIsRejected:
+    """2026 Phase 3 security review finding: a SELECT naming a system
+    catalog/data-dictionary object (information_schema, pg_catalog, mysql's
+    internal schemas, mssql's sys schema, Oracle's ALL_/DBA_/USER_/V$
+    views) is syntactically an ordinary, harmless-looking SELECT -- no
+    write, no dangerous function call -- so it passed every check that
+    existed before this one. It can still reveal internal schema structure
+    or other users'/roles' grants even under a genuinely read-only DB role
+    (db.connection.check_write_privileges' docstring: read-only-ness bounds
+    writes, not what a SELECT can read)."""
+
+    @pytest.mark.parametrize(
+        "dialect,sql",
+        [
+            ("postgres", "SELECT * FROM information_schema.columns"),
+            ("postgres", "SELECT rolname FROM pg_catalog.pg_roles"),
+            ("postgres", "SELECT * FROM pg_roles"),  # pg_catalog is on the default search_path
+            ("mysql", "SELECT * FROM information_schema.user_privileges"),
+            ("mysql", "SELECT * FROM mysql.user"),
+            ("mysql", "SELECT * FROM performance_schema.accounts"),
+            ("tsql", "SELECT name FROM sys.database_principals"),
+            ("tsql", "SELECT * FROM information_schema.tables"),
+            ("tsql", "SELECT * FROM master.sys.databases"),  # cross-database catalog reference
+            ("oracle", "SELECT username, password FROM dba_users"),
+            ("oracle", "SELECT * FROM all_tab_privs"),
+            ("oracle", "SELECT * FROM user_tab_columns"),
+            ("oracle", "SELECT sql_text FROM v$sql"),
+            ("oracle", "SELECT * FROM gv$session"),
+        ],
+    )
+    def test_system_catalog_reference_is_rejected(self, dialect, sql):
+        result = validate_sql(sql, dialect=dialect)
+        assert not result.is_valid, f"expected rejection for: {sql}"
+        assert result.violation_type == "system_catalog_access"
+        assert result.violation_type in SAFETY_VIOLATION_TYPES
+
+    def test_ordinary_business_table_still_accepted(self):
+        """Sanity check: the denylist must not sweep up everyday tables."""
+        result = validate_sql("SELECT * FROM customers")
+        assert result.is_valid
+
+    @pytest.mark.parametrize(
+        "table_name",
+        ["user_accounts", "system_events", "sys_config_log"],
+    )
+    def test_table_name_merely_containing_a_catalog_word_is_not_flagged(self, table_name):
+        """A business table whose *name* happens to share a word with a
+        catalog schema/prefix, but isn't actually schema-qualified into one
+        (or a bare Oracle-style pseudo-view name), must not be rejected --
+        `sys_config_log` isn't the `sys` schema, `user_accounts` isn't the
+        `user_` view-name prefix (no underscore-adjacent boundary match, and
+        it isn't schema-qualified as `user.accounts` either)."""
+        result = validate_sql(f"SELECT * FROM {table_name}")
+        assert result.is_valid
+
+    def test_error_message_names_the_offending_reference(self):
+        result = validate_sql("SELECT * FROM information_schema.columns", dialect="postgres")
+        assert result.error is not None
+        assert "information_schema" in result.error.lower()
+
+
 class TestMalformedInputFailsCleanlyInsteadOfCrashing:
     """Regression coverage for a real crash discovered while authoring the
     Text-to-SQL benchmark: a malformed LLM response (an off-topic-sentinel

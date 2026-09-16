@@ -3,6 +3,14 @@
     "title": "Tableau de bord Texte-vers-SQL",
     "subtitle": "Posez une question en langage naturel — obtenez du SQL validé et en lecture seule, un tableau de résultats en direct et un graphique choisi automatiquement."
   },
+  "auth": {
+    "signInRequired": "Connexion requise",
+    "signInPrompt": "Ce déploiement nécessite de vous connecter avec le compte de votre organisation pour continuer.",
+    "signIn": "Se connecter",
+    "signingIn": "Connexion en cours…",
+    "signInFailed": "Échec de la connexion",
+    "signOut": "Se déconnecter"
+  },
   "nav": {
     "chat": "Chat",
     "knowledgeSources": "Sources de connaissances",

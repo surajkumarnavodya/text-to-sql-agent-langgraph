@@ -29,6 +29,12 @@ chromadb==1.5.9
 # pure-Python, no system dependency (unlike e.g. poppler-based extractors).
 pypdf==6.18.0
 
+# XXE/billion-laughs-hardened XML parsing for db/query_cost.py's MSSQL
+# SHOWPLAN_XML parsing -- was already present transitively but pinned
+# explicitly now that it's imported directly (2026 Phase 3 security review,
+# same reasoning pymupdf's own comment below gives for its own pinning).
+defusedxml==0.7.1
+
 # --- Content moderation gate (mandatory whenever ENABLE_MEDIA_SEARCH or
 # ENABLE_DOCUMENT_RAG/ENABLE_POLICY_RAG is on -- see moderation/, .env.example's
 # moderation section) ---

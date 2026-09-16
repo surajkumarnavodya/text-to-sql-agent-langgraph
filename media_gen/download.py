@@ -28,7 +28,7 @@ from __future__ import annotations
 
 import ipaddress
 import socket
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 
 import requests
 
@@ -114,6 +114,13 @@ def _validate_download_url(url: str) -> None:
 _DEFAULT_MAX_DOWNLOAD_BYTES = 200 * 1024 * 1024  # matches Settings.media_max_file_mb's default
 _DOWNLOAD_CHUNK_SIZE = 1024 * 1024
 
+_REDIRECT_STATUS_CODES = frozenset({301, 302, 303, 307, 308})
+# 2026 Phase 3 security review: a small, finite cap on how many redirect
+# hops are ever followed -- both to bound the work a single call can do and
+# because each hop is itself a fresh SSRF check (see below), so an
+# unbounded chain would also mean unbounded validation work.
+_MAX_REDIRECTS = 5
+
 
 def download_media_bytes(
     url: str, timeout: float = 30.0, max_bytes: int = _DEFAULT_MAX_DOWNLOAD_BYTES
@@ -131,6 +138,17 @@ def download_media_bytes(
     generate-then-download flow. `_validate_download_url` runs first --
     see this module's docstring for the SSRF risk it closes.
 
+    2026 Phase 3 security review: redirects are followed manually
+    (`allow_redirects=False`, up to `_MAX_REDIRECTS` hops), re-running
+    `_validate_download_url` against each hop's `Location` header before
+    following it. Without this, `_validate_download_url`'s check on the
+    *original* URL would be moot the moment that URL's server returned a
+    redirect -- `requests` follows redirects transparently by default, so a
+    provider CDN URL that (via compromise, a bug, or an attacker-influenced
+    response) redirected to an internal address would reach that address
+    with no check at all, even though the original URL looked completely
+    safe.
+
     2026 Phase 2 security review: streams the response and aborts once
     `max_bytes` is exceeded (checked both against a declared
     `Content-Length`, before reading any body at all, and against the
@@ -147,14 +165,37 @@ def download_media_bytes(
     second, independent limit for a conceptually identical "how big a
     media file may this app hold in memory at once" question.
     """
-    _validate_download_url(url)
+    current_url = url
+    _validate_download_url(current_url)
 
-    try:
-        response = requests.get(url, timeout=timeout, stream=True)
-    except requests.RequestException as exc:
+    for _ in range(_MAX_REDIRECTS):
+        try:
+            response = requests.get(current_url, timeout=timeout, stream=True, allow_redirects=False)
+        except requests.RequestException as exc:
+            raise MediaGenerationError(
+                f"Network error downloading generated media: {redact_secrets(str(exc))}"
+            ) from exc
+
+        if response.status_code not in _REDIRECT_STATUS_CODES:
+            break
+
+        location = response.headers.get("Location")
+        response.close()
+        if not location:
+            raise MediaGenerationError(
+                f"Refusing to follow redirect from {current_url!r}: response has no "
+                "Location header"
+            )
+        # Resolves a relative Location against the current URL, same as a
+        # browser/requests itself would -- then re-validated exactly like
+        # the original URL was (HTTPS-only, resolved address not
+        # private/internal).
+        current_url = urljoin(current_url, location)
+        _validate_download_url(current_url)
+    else:
         raise MediaGenerationError(
-            f"Network error downloading generated media: {redact_secrets(str(exc))}"
-        ) from exc
+            f"Refusing to download generated media: exceeded {_MAX_REDIRECTS} redirect(s)"
+        )
 
     with response:
         if response.status_code >= 400:
