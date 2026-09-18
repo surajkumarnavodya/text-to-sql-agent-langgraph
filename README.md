@@ -22,9 +22,9 @@
 
 <!-- Newest first, sourced from real commit history. Keep no more than the three most recent entries. -->
 
-- **2026-09-16** — Security hardening pass: real OIDC login for the React dashboard (Authorization Code + PKCE), per-document RBAC for RAG content, a startup check that refuses to boot in production with a misconfigured (writable) database role, security headers (HSTS/CSP/etc.), and a SQL-validator block on system-catalog access — see [`SECURITY.md`](SECURITY.md)
-- **2026-09-13** — Added optional media search — content-based search over an untagged local image/video library (local CLIP embeddings, scene-detected video segments, Whisper transcription, OCR, optional Ollama vision captioning), off by default
-- **2026-09-13** — Added optional voice mode — local speech-to-text (faster-whisper) and text-to-speech (Piper), schema-aware transcription, off by default
+- **2026-09-18** — Added a `MalwareScanner` abstraction (ClamAV, opt-in, fail-closed once configured), flipped CI's security gates (bandit/pip-audit/detect-secrets) from report-only to blocking, re-verified dependency CVE reachability, and ran a first end-to-end production-readiness gate — verdict **NOT READY** (live-IdP OIDC and DAST testing still outstanding) — see [`docs/security/PRODUCTION_SECURITY_READINESS_REPORT.md`](docs/security/PRODUCTION_SECURITY_READINESS_REPORT.md)
+- **2026-09-18** — Marked the project **Beta — security hardened**; added a local-machine setup guide PDF
+- **2026-09-18** — Added business-context vector retrieval (glossary/metric/SQL-example/documentation chunks over the same ChromaDB), optional self-hosted user accounts (Argon2id + JWT, RBAC-integrated), and universal server-side chat history that follows a signed-in user across browsers/devices
 
 <a id="example-usage"></a>
 
