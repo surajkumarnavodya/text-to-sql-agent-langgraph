@@ -23,16 +23,64 @@ jobs:
           fetch-depth: 0
 
       - name: Secret scan (gitleaks)
-        # Report-only for now (continue-on-error), same reasoning as the
-        # pip-audit step below: this is gitleaks' first run against this
-        # repository's full history, and its findings (if any) haven't
-        # been triaged yet -- flip to a hard gate once a clean baseline
-        # run confirms there's nothing pre-existing to triage first. A
-        # *newly introduced* secret in a PR diff is exactly the kind of
-        # finding this step exists to catch even while report-only, since
-        # the job output is still visible on every run.
+        # Still report-only: gitleaks itself (a Go binary) could not be
+        # installed/run in the sandboxed environment this pass was done in
+        # to triage its actual findings against this repo's history -- see
+        # docs/security/CVE_TRIAGE.md's "Secret scanning" section. Flip to
+        # blocking once a run's output has actually been read by a human
+        # (or an environment where it can be run) and confirmed clean/
+        # baselined. NOT a substitute for the detect-secrets step below,
+        # which *was* fully run and triaged this pass and covers the exact
+        # same tracked-file set with a checked-in baseline.
         uses: gitleaks/gitleaks-action@v2
         continue-on-error: true
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Secret scan (detect-secrets, against a reviewed baseline)
+        # Blocking. Unlike gitleaks above, this was actually run against
+        # this repository this pass: `detect-secrets scan $(git ls-files)`
+        # found 46 matches across 20 tracked files, each spot-checked and
+        # confirmed a false positive (an example connection string in
+        # .env.example/docs, security/redaction.py's own docstring
+        # describing what it redacts, identity/password_policy.py's
+        # *rejection* blocklist of known-weak passwords, Alembic revision-
+        # ID hex strings) -- see docs/security/CVE_TRIAGE.md. All 20 are
+        # recorded in .secrets.baseline (committed, forward-slash paths --
+        # verified this matters: detect-secrets writes OS-native path
+        # separators, so a baseline generated on Windows has to be
+        # normalized before it matches a Linux runner's own scan output,
+        # or every path would look "new" on every single run).
+        #
+        # `detect-secrets scan --baseline FILE` rewrites FILE in place,
+        # merging in only genuinely new findings -- but it also always
+        # rewrites FILE's own `generated_at` timestamp, so a naive `git
+        # diff --exit-code .secrets.baseline` would fail on *every* run
+        # even with zero new secrets (verified locally this pass -- the
+        # first version of this step had exactly that bug). The Python
+        # snippet below compares both baselines with `generated_at`
+        # stripped, so this step only fails on an actual new finding
+        # (verified locally too: a planted fake PEM private key in a new
+        # file was correctly caught by this exact comparison).
+        run: |
+          pip install detect-secrets
+          cp .secrets.baseline /tmp/baseline_before.json
+          detect-secrets scan $(git ls-files) --baseline .secrets.baseline
+          python -c "
+          import json, sys
+          with open('/tmp/baseline_before.json') as f:
+              before = json.load(f)
+          with open('.secrets.baseline') as f:
+              after = json.load(f)
+          before.pop('generated_at', None)
+          after.pop('generated_at', None)
+          if before != after:
+              print('New, un-baselined finding(s) detected -- review with '
+                    '`detect-secrets audit .secrets.baseline` and commit the result.')
+              sys.exit(1)
+          "
 
   test:
     runs-on: ubuntu-latest
@@ -58,20 +106,16 @@ jobs:
         run: mypy .
 
       - name: SAST (bandit)
-        # Report-only for now (continue-on-error) -- same reasoning as the
-        # pip-audit step below: bandit has never run against this codebase
-        # before, so its findings haven't been triaged. Scoped to this
-        # project's own first-party packages (`agent`, `api`, `config`,
-        # `db`, `security`, `media_gen`, `moderation`, `rag`, `search`,
-        # `voice`, `media`, `embeddings`) -- excludes `tests/` (test code
-        # legitimately does things bandit flags, e.g. constructing SQL
-        # strings/tokens for fixtures) and `.venv`/`frontend` (not Python
-        # source this project owns). Remove `continue-on-error` once the
-        # backlog is triaged.
+        # Blocking. Actually run against this codebase this pass (not just
+        # wired and left report-only): 0 issues across 18,123 first-party
+        # lines (agent/api/config/db/security/media_gen/moderation/rag/
+        # search/voice/media/embeddings) -- see docs/security/CVE_TRIAGE.md
+        # for the full run output. Nothing to triage, so nothing justifies
+        # staying report-only; a future finding should block, not silently
+        # join an ignored backlog.
         run: |
           pip install bandit
           bandit -r agent api config db security media_gen moderation rag search voice media embeddings -f txt
-        continue-on-error: true
 
       # Only the mocked unit test suite runs in CI -- scripts/run_eval.py and
       # scripts/integration_test.py both require a live database + a running
@@ -81,21 +125,35 @@ jobs:
         run: pytest
 
       - name: Dependency vulnerability scan (pip-audit)
-        # Report-only for now (continue-on-error) -- a first run against
-        # this project's actual pinned versions found real advisories
-        # across several packages (mostly transitive/tooling -- chromadb,
-        # langgraph, pillow, and others; see docs/RISK_REGISTER.md's R-008).
-        # Flipping this to a hard gate immediately would break CI for
-        # pre-existing reasons this pass didn't introduce and wasn't scoped
-        # to fix -- upgrading that backlog is a real, separate effort with
-        # its own regression risk (several are major-version bumps). This
-        # step exists to make the backlog visible in every CI run from now
-        # on, not to hide it -- remove `continue-on-error` once that
-        # backlog is triaged and the pinned versions are updated.
+        # Blocking, with a specific, individually-justified --ignore-vuln
+        # per advisory rather than a blanket continue-on-error. Verified
+        # this pass (not just carried forward from docs/DEPENDENCY_SECURITY.md's
+        # 2026-09-16 analysis -- independently re-confirmed by re-grepping
+        # this exact checkout for Checkpointer/BaseCheckpointSaver usage,
+        # a langgraph_sdk import, and chromadb.HttpClient/AsyncHttpClient
+        # usage: none found, so the "not reachable" reasoning below still
+        # holds today): 24 raw findings (16 unique advisories) across 7
+        # packages remain, every one of them either (a) in the
+        # langgraph/langgraph-checkpoint/langgraph-sdk/langchain-core/
+        # chromadb family, verified NOT REACHABLE -- this app never uses a
+        # LangGraph checkpointer, never imports langgraph_sdk, and never
+        # constructs a chromadb HttpClient/AsyncHttpClient (PersistentClient
+        # only) -- or (b) pytest/black, dev-only tooling never installed in
+        # the production Docker image. See docs/security/CVE_TRIAGE.md for
+        # the full per-CVE table. A genuinely new, reachable advisory in
+        # any *other* package still fails this step -- the ignore list
+        # below is an allowlist of specific IDs, not a severity threshold.
         run: |
           pip install pip-audit
-          pip-audit -r requirements.txt --desc
-        continue-on-error: true
+          pip-audit -r requirements.txt --desc \
+            --ignore-vuln PYSEC-2026-83 --ignore-vuln PYSEC-2026-2194 \
+            --ignore-vuln PYSEC-2026-311 --ignore-vuln PYSEC-2026-3814 \
+            --ignore-vuln PYSEC-2026-3815 --ignore-vuln PYSEC-2026-3813 \
+            --ignore-vuln PYSEC-2026-1845 \
+            --ignore-vuln PYSEC-2026-2121 --ignore-vuln PYSEC-2026-2120 \
+            --ignore-vuln PYSEC-2026-2193 --ignore-vuln PYSEC-2026-2562 \
+            --ignore-vuln PYSEC-2026-1527 --ignore-vuln PYSEC-2026-2574 \
+            --ignore-vuln PYSEC-2026-2573 --ignore-vuln PYSEC-2026-2575
 
   frontend:
     runs-on: ubuntu-latest

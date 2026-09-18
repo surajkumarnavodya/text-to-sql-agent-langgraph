@@ -1095,6 +1095,48 @@ new intent — a deliberately accepted tradeoff for the common case (skip
 redundant moderation/embedding entirely for a true duplicate), not
 silently mishandled.
 
+### Malware scanning (`security/malware_scanner.py`)
+Added in a 2026 dependency/CI-hardening pass, closing what every prior
+file-upload security document in this repo (`docs/FILE_UPLOAD_FINAL_REPORT.md`,
+`SECURITY_FINAL_REPORT.md`) named as the single most significant
+remaining gap: no `MalwareScanner` abstraction existed anywhere in
+source. Scans a file's **raw bytes**, before any parser
+(`pypdf`/`pymupdf`/Pillow/PySceneDetect) touches them — a real, separate
+concern from `moderation/gate.py`'s content-harm checks, which only run
+*after* parsing/extraction. Wired into both `rag/ingestion.py::ingest_pdf`
+and `media/ingest.py::ingest_file`, right after the existing
+dedupe-by-hash check and before any real parsing begins.
+
+Pluggable the same `SUPPORTED_..._PROVIDERS`-dict way every other external
+integration in this codebase is (`moderation/provider.py`,
+`search/web_search.py`) — `Settings.malware_scan_provider`
+(`"disabled"`/`"clamav"`). Only ClamAV is implemented, spoken to directly
+over `clamd`'s own `INSTREAM` wire protocol via a plain socket (no
+`pyclamd`/vendor SDK, matching this codebase's usual "call the provider's
+own protocol directly" convention).
+
+**Deliberately off by default (`"disabled"`) — the one real difference
+from `moderation_provider`'s "mandatory, no feature flag" posture**, and a
+conscious choice, not an oversight: no scanning capability existed before
+this module, so defaulting it "on" would have silently broken every
+existing document/media upload path for any deployment that hasn't stood
+up a ClamAV daemon (most deployments, today). Once an operator opts in
+(`MALWARE_SCAN_PROVIDER=clamav`), behavior is genuinely fail-closed: an
+infected result, an unreachable/timed-out daemon, and a malformed
+response are all treated as a rejection (`security.malware_scanner
+.ScanResult.blocked`) — "unknown" is never silently treated as "clean."
+`"disabled"` is still audit-logged per upload (`malware_scan_skipped`),
+not silently skipped.
+
+**Known limitation, named rather than hidden**: this abstraction's
+fail-closed logic is unit-tested against a mocked `clamd` socket
+(`tests/security/test_malware_scanner_gate.py`, 18 tests) but has never
+been exercised against a real `clamd` daemon in this project's own
+history — see `docs/security/FINAL_PRODUCTION_GATE.md`'s Malware Scanning
+row (`PARTIAL`, a named P0 for any deployment that enables
+`ENABLE_DOCUMENT_RAG`/`ENABLE_POLICY_RAG`/`ENABLE_MEDIA_SEARCH` without
+also configuring a real scanner).
+
 ### Voice mode (speech input/output) (`voice/`)
 Optional, **on by default** (`ENABLE_VOICE_MODE=true`) — unlike media
 generation, this feature spends no money and makes no external network
@@ -1328,6 +1370,34 @@ attempt) and `SECURITY_PRODUCTION_CHECKLIST.md` for an operator-facing
 go/no-go list. `docs/security-changelog.md` carries the dated changelog
 entry for this pass alongside every earlier change-controlled security
 decision.
+
+**A later, separate engagement (`docs/security/`, not the repo-root
+`SECURITY_*.md` files above) picked this up further**: a CI-gate-hardening
+pass (bandit/pip-audit/a new `detect-secrets` gate all flipped from
+report-only to actually blocking, each backed by an evidence trail rather
+than a bare flag flip — see `docs/security/CVE_TRIAGE.md`), the malware
+scanner described above, a from-scratch dependency-CVE reachability
+re-verification (`docs/security/DEPENDENCY_SECURITY_FINAL_REPORT.md`), a
+first Trivy container scan this project has ever had run
+(`docs/security/CVE_TRIAGE.md` §4 — 29 new CRITICAL/HIGH findings, 4
+confirmed not-reachable, ~17 OS-level only partially verified), and a
+final production-readiness gate
+(`docs/security/FINAL_PRODUCTION_GATE.md` / `PRODUCTION_SECURITY_READINESS_REPORT.md`)
+whose verdict is **NOT READY** — not because a vulnerability was found in
+any of the above, but because DAST and a live-IdP OIDC end-to-end test
+have never been run in any environment this project has had access to
+(`docs/security/DAST_REPORT.md`/`OIDC_E2E_TEST.md`, both honestly
+`NOT VERIFIED` rather than assumed), and the malware scanner immediately
+above is real but real-world-unverified. `docs/security/INCIDENT_RESPONSE.md`
+(previously fully absent, a named gap in every earlier pass) and a
+`langgraph` 0.2→1.0 migration assessment
+(`docs/security/LANGGRAPH_UPGRADE_SECURITY_ASSESSMENT.md` — assessed, the
+migration itself still deliberately not attempted) were also produced in
+this engagement. Read `docs/security/PRODUCTION_SECURITY_READINESS_REPORT.md`
+first if you're deciding whether this project is ready to deploy
+somewhere real — it is the most current, most rigorously-sourced answer
+to that question in this repository, superseding the repo-root
+`SECURITY_*.md` files' own bottom line where the two differ.
 
 ### Universal server-side chat history (`identity/repositories/history.py`, `api/chat_history.py`)
 For a locally-authenticated user (see above), every conversation and
@@ -1635,6 +1705,38 @@ Equivalent `make test`, `make lint`, `make format` targets exist in the
 `Makefile` for anyone on WSL/macOS/Linux. All pytest tests are fully mocked
 (no real DB, no Ollama) — `scripts/integration_test.py` is the separate,
 manual, real-DB-required script; it is never run by `pytest` or CI.
+
+**`tests/security/`** is a small, deliberately additive directory (not a
+reorganization — see its own `README.md`) for adversarial-scenario
+regression tests that don't fit any single module's own
+`tests/test_<module>.py` file: encoded/multilingual prompt-injection
+bypass regression, rate-limit header-spoofing lock-in, and the malware
+scanner's fail-closed contract. Check whether a scenario already has
+coverage under its own module's test file before adding a new one here.
+
+**CI security gates are now blocking, not report-only** — `ruff check .`,
+`black --check .`, `mypy .`, `bandit`, `pytest`, and (new) `pip-audit`
+(with a specific, individually-justified `--ignore-vuln` allowlist, not a
+severity threshold) and `detect-secrets` (baseline-backed,
+`.secrets.baseline` committed at the repo root) all fail the build on a
+new finding. Only `gitleaks` and the Trivy container scan remain
+`continue-on-error: true`, each with a dated, reasoned comment explaining
+why (tooling/timing, not an unreviewed exception) — see
+`docs/security/CVE_TRIAGE.md`.
+
+**Known, pre-existing CI-hygiene gaps, found but not fixed (out of scope
+for the pass that found them — flagged here so a future session doesn't
+have to rediscover them):** `mypy .` (the exact CI invocation, run from
+the repo root) currently fails immediately with a module-resolution error
+(`scripts/build_user_guide_pdf.py: error: Source file found twice under
+different module names`) on a clean checkout, before producing any
+per-file type-error list — reproduced via `git stash`, confirmed unrelated
+to any session's own changes. Separately, `ruff check .`/`black --check .`
+across the *whole* repo currently report ~9-10 pre-existing findings, none
+in files any recent session touched (also confirmed via `git stash`) —
+`moderation/types.py`, `moderation/gate.py`, `moderation/provider.py`,
+`media_gen/download.py`, `scripts/build_media_index.py`, and a handful of
+test files.
 
 ## Common commands
 

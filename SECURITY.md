@@ -36,6 +36,22 @@ this document as describing what's *implemented*, not a claim that
 everything here has been independently verified end-to-end — where a
 control is unverified, it's said so explicitly.
 
+**2026 dependency/CI-hardening + final-gate update:** a later engagement
+(`docs/security/`, not the repo-root files above) flipped CI's SAST/
+dependency-scan/secret-scan gates from report-only to actually blocking,
+added a `MalwareScanner` abstraction (opt-in, fail-closed once
+configured — `security/malware_scanner.py`), and ran a first
+production-readiness gate against the current codebase end-to-end. **Its
+verdict: `NOT READY`** — see
+`docs/security/PRODUCTION_SECURITY_READINESS_REPORT.md` for the current,
+authoritative answer. Not because a new vulnerability was found (the
+tested architecture — SQL validation, RBAC, IDOR, SSRF — holds up), but
+because DAST has never been run against this app, the OIDC flow (see
+above) still hasn't been exercised against a live IdP, and the new
+malware scanner has never been tested against a real scanner daemon. This
+supersedes the "not production-ready as shipped" conclusion cited above
+where the two differ — read the newer document, not just this paragraph.
+
 ## What's actually enforced
 
 - Generated SQL is restricted to a single read-only `SELECT` (or

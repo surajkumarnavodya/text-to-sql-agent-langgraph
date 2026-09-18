@@ -1044,6 +1044,39 @@ class Settings(BaseSettings):
             imagery specifically) is how those two are covered; drug
             imagery has no visual signal in this implementation at all,
             text-mentions only.
+        malware_scan_provider: Which binary-malware scanner
+            `security/malware_scanner.py` uses to check an upload's raw
+            bytes before any parser (`pypdf`/`pymupdf`/Pillow/PySceneDetect)
+            ever touches them -- structured the same `SUPPORTED_..._PROVIDERS`
+            pattern as `moderation_provider`/`web_search_provider`. Unlike
+            `moderation_provider`, this is **not** mandatory-by-default:
+            `"disabled"` (the default) preserves this codebase's pre-existing
+            upload behavior for every deployment that hasn't stood up a
+            scanner yet -- no `MalwareScanner` abstraction existed at all
+            before this setting was added, so defaulting it to "on" would
+            silently break every existing document/media upload path the
+            moment this shipped, for infrastructure (a ClamAV daemon) most
+            deployments don't have. When set to `"clamav"`, scanning is
+            genuinely fail-closed: an infected result, an unreachable/timed-
+            out daemon, and a malformed response are all treated as a
+            rejection (see `security.malware_scanner.ScanResult.blocked`) --
+            never silently treated as "clean". `"disabled"` is audit-logged
+            per upload (`malware_scan_skipped`) rather than silently
+            skipped, so the gap is visible in the security event log even
+            while off.
+        clamav_host: Hostname/IP of the `clamd` daemon (ClamAV's scanning
+            daemon), spoken to directly over its own `INSTREAM` wire
+            protocol via a plain socket -- no `pyclamd`/vendor SDK
+            dependency, matching how `moderation/provider.py`/
+            `search/web_search.py`/`media_gen/client.py` all call their own
+            provider's protocol directly rather than pulling in a client
+            library. Only read when `malware_scan_provider="clamav"`.
+        clamav_port: TCP port `clamd` listens on. ClamAV's own documented
+            default (3310).
+        malware_scan_timeout_seconds: Socket timeout for one `clamd`
+            INSTREAM round trip. A large upload against an overloaded
+            daemon timing out is treated as a scan **error**, not "clean" --
+            see `malware_scan_provider`'s fail-closed note above.
         moderation_store_connection_string: Full SQLAlchemy connection
             string for the moderation decision/metadata store
             (`moderation/store.py`'s `moderation.media_assets` table) -- a
@@ -1350,6 +1383,10 @@ class Settings(BaseSettings):
     azure_content_safety_key: SecretStr | None = None
     moderation_severity_threshold: int = Field(default=4, ge=0, le=7)
     moderation_blocklist_path: Path | None = None
+    malware_scan_provider: Literal["clamav", "disabled"] = "disabled"
+    clamav_host: str = "localhost"
+    clamav_port: int = Field(default=3310, gt=0)
+    malware_scan_timeout_seconds: float = Field(default=15.0, gt=0)
     moderation_store_connection_string: SecretStr | None = None
     moderation_store_odbc_driver: str = "ODBC Driver 17 for SQL Server"
     moderation_store_pool_size: int = Field(default=10, gt=0)

@@ -63,6 +63,20 @@ severity vulnerability was found.**
 
 ## Controls intentionally not implemented, and why
 
+**Update (2026 dependency/CI-hardening pass):** malware/AV scanning below
+is **no longer accurate as "not implemented"** — `security/malware_scanner.py`
+(a ClamAV `INSTREAM`-protocol abstraction, wired into both
+`rag/ingestion.py::ingest_pdf` and `media/ingest.py::ingest_file` before
+any parser touches uploaded bytes) now exists, is fail-closed once
+enabled, and is unit-tested (`tests/security/test_malware_scanner_gate.py`,
+18 tests). It remains a real, disclosed gap in a narrower sense: it
+defaults to `disabled` and has never been run against a real `clamd`
+daemon — see `docs/security/FINAL_PRODUCTION_GATE.md`'s Malware Scanning
+row (`PARTIAL`, a named P0 for any deployment enabling upload features
+without also configuring `MALWARE_SCAN_PROVIDER=clamav`). The paragraph
+below is left as originally written, describing the state at the time
+this report was produced, not silently edited.
+
 See `docs/FILE_UPLOAD_SECURITY_REPORT.md`'s "Not implemented, and why" section for the
 full reasoning on each: malware/AV scanning (real gap, needs a new external service,
 not built speculatively), per-user storage quotas (not justified at this app's stated
@@ -142,10 +156,13 @@ formal ASVS certification.
 
 ## Remaining risks (ranked)
 
-1. **No malware/AV scanning** (RED) — the most significant remaining gap. Low
-   real-world severity today given the narrow accepted-format set and that nothing is
-   ever executed by this app, but a real gap before accepting uploads from a genuinely
-   adversarial population.
+1. **No malware/AV scanning** (RED at the time this report was written — now **AMBER**:
+   see the Update note under "Controls intentionally not implemented" above.
+   `security/malware_scanner.py` exists and is fail-closed once configured, but ships
+   disabled by default and has never been verified against a real scanner) — was the
+   most significant remaining gap. Low real-world severity today given the narrow
+   accepted-format set and that nothing is ever executed by this app, but a real gap
+   before accepting uploads from a genuinely adversarial population.
 2. **No per-user/tenant storage quota** (RED) — acceptable at today's stated
    single-user scale; a real gap for multi-tenant deployment.
 3. **No frontend test coverage at all** (AMBER, broader than just this fix) — the CSV

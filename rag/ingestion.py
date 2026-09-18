@@ -1,10 +1,21 @@
-"""PDF extraction -> chunking -> moderation -> embedding -> storage pipeline.
+"""PDF malware scan -> extraction -> chunking -> moderation -> embedding -> storage pipeline.
 
 The full "upload a PDF" path (`api/documents.py`'s upload route calls
 `ingest_pdf` directly) -- extraction and chunking are pure functions
 (`extract_pdf_pages`/`chunk_pages`), independently testable without a real
 database or embedding model, and `ingest_pdf` wires them together with
 `rag/store.py` and the pre-ingestion moderation gate (`moderation/gate.py`).
+
+**Malware scan (opt-in -- see `Settings.malware_scan_provider`'s docstring),
+runs first, before any parser touches the bytes.** `security.malware_scanner
+.scan_upload` checks `file_bytes` for a known malware signature before
+`extract_pdf_pages`/`pymupdf.open` ever runs -- feeding attacker-crafted
+bytes into a PDF parser is itself part of this app's attack surface,
+independent of whatever the parsed content would later moderate as. An
+infected or (once a scanner is actually configured) unscannable result
+rejects the file the same way a moderation rejection does: no
+`rag.documents` row, `moderation.store.record_asset` records only the
+hash/outcome, and the raw bytes are never persisted.
 
 **Moderation gate (mandatory, not a feature flag -- see
 `config/settings.py`'s `moderation_provider` docstring).** Before this
@@ -74,6 +85,7 @@ from rag.store import (
 )
 from security.audit_log import log_security_event
 from security.injection_patterns import INJECTION_PATTERNS
+from security.malware_scanner import scan_upload
 from security.sanitization import normalize_text
 
 logger = logging.getLogger(__name__)
@@ -382,6 +394,29 @@ def ingest_pdf(
             filename=filename,
             status="ready",
             chunk_count=existing.chunk_count,
+        )
+
+    scan_result = scan_upload(file_hash, file_bytes, settings)
+    if scan_result.blocked:
+        record_asset(
+            moderation_engine,
+            file_hash,
+            "pdf",
+            "rejected",
+            {"malware_scan_status": scan_result.status, "provider": scan_result.provider},
+            source_path=filename,
+        )
+        error_message = (
+            "This file was rejected because it appears to contain malware."
+            if scan_result.status == "infected"
+            else "This file could not be scanned for malware and was not accepted. Please try again shortly."
+        )
+        return IngestionResult(
+            document_id=None,
+            filename=filename,
+            status="failed",
+            chunk_count=0,
+            error_message=error_message,
         )
 
     pages = extract_pdf_pages(file_bytes, max_pages=settings.max_document_pages)

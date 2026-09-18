@@ -443,13 +443,28 @@ security headers/CSP, and SSRF/CORS hardening — see
 [`SECURITY_BASELINE.md`](SECURITY_BASELINE.md), and
 [`SECURITY_CHANGELOG.md`](SECURITY_CHANGELOG.md) for the full, cited audit
 trail, and [`SECURITY_PRODUCTION_CHECKLIST.md`](SECURITY_PRODUCTION_CHECKLIST.md)
-for what still needs operator action before a production deployment
-(notably: known CVEs across several backend dependencies, and the
-frontend OIDC flow, which passes every static check available but hasn't
-been exercised against a live identity provider yet). See
-[Known limitations](#known-limitations) below for the honest current
-state of answer accuracy — that has not changed as part of this security
-work and remains the main gap between "beta" and "production-grade."
+for what still needs operator action before a production deployment.
+
+**A later engagement went further** ([`docs/security/`](docs/security/),
+distinct from the repo-root `SECURITY_*.md` files above): CI's
+security gates (SAST, dependency scanning, secret scanning) are now
+blocking, not just report-only; a `MalwareScanner` abstraction was added
+(opt-in, fail-closed once configured — see
+[`docs/security/FINAL_PRODUCTION_GATE.md`](docs/security/FINAL_PRODUCTION_GATE.md));
+and a first production-readiness gate was run end-to-end. **Its verdict
+is `NOT READY`** — not because a vulnerability was found (the tested
+security architecture — auth, RBAC, SQL validation, SSRF, IDOR — holds up
+well), but because three things this project has never had the
+infrastructure to verify remain open: the frontend OIDC flow still hasn't
+been exercised against a live identity provider, DAST has never been run
+against this app at all, and the malware scanner above has never been
+tested against a real scanner daemon. See
+[`docs/security/PRODUCTION_SECURITY_READINESS_REPORT.md`](docs/security/PRODUCTION_SECURITY_READINESS_REPORT.md)
+for the full, current, evidence-cited answer to "is this production
+ready" — it supersedes this section and the checklist linked above where
+they differ. See [Known limitations](#known-limitations) below for the
+honest current state of answer accuracy — that has not changed as part of
+any of this security work and remains a separate, equally real gap.
 
 <a id="known-limitations"></a>
 

@@ -322,14 +322,44 @@ purge fix (`docs/security-changelog.md`'s 2026-09-16 entry) was not
 confirmed via a successful `docker build` in that environment either —
 verify both before relying on them in a real deployment.
 
-**Mitigation today:** visibility only — the CI step surfaces the current
-list on every run so it can't silently grow unnoticed, but nothing blocks
-a merge on it yet.
+**Update (2026 dependency/CI-hardening pass — status changed, not just
+re-measured):** `pip-audit` still finds the same 24/16-unique/14-CVE
+count (zero drift — no new advisories, no new fixes published), but every
+one was independently re-verified reachable/not-reachable this pass with
+file:line grep evidence (not re-cited from this entry) — see
+`docs/security/CVE_TRIAGE.md`. **`pip-audit` is now a blocking CI gate**
+(`continue-on-error` removed), via a specific, individually-justified
+`--ignore-vuln` allowlist of exactly these already-triaged IDs, not a
+severity threshold — a genuinely new or newly-reachable advisory still
+fails the build. `detect-secrets` (a runnable local equivalent to
+gitleaks) was added as a second, blocking secret-scan gate with a
+committed `.secrets.baseline`. **Still open, unchanged:** `gitleaks`
+itself remains `continue-on-error: true` (the Go binary was never
+installable in either engagement's sandboxed environment — it runs
+natively on GitHub's own Actions runners regardless, just never locally
+verified). **Newly closed, this pass:** the Dockerfile build that
+`docker build` verification note above flagged as unconfirmed did
+successfully build and was scanned with Trivy for the first time this
+project has ever had that done — 29 new CRITICAL/HIGH findings (OS
+packages in the Debian base image + 4 Python-ecosystem findings `pip-audit`
+doesn't see at all), 4 confirmed not-reachable, ~17 OS-level only
+partially reachability-verified — see `docs/security/CVE_TRIAGE.md` §4.
+The `langgraph` 0.2→1.0 migration itself remains **not attempted**,
+across three separate engagements now, each deliberately deferring it for
+the same reason — see the dedicated
+`docs/security/LANGGRAPH_UPGRADE_SECURITY_ASSESSMENT.md`.
+
+**Mitigation today:** `pip-audit`/`bandit`/`detect-secrets` now actually
+block a merge on a new finding, not just surface one. `gitleaks`/Trivy
+remain visibility-only in CI specifically (though Trivy has now been run
+and triaged manually once, outside CI).
 
 **Review date:** before the next dependency-bump pass, and specifically
 before scheduling the `langgraph` 1.0 migration as its own project; flip
-`continue-on-error` off once the gitleaks/Trivy/pip-audit backlog is
-triaged and pins updated.
+`gitleaks`'s `continue-on-error` off once it's been run somewhere that
+can actually execute it (this project's own sandboxed dev environments
+have not been able to, twice now); consider flipping the Trivy CI step
+too now that a real local run exists to baseline against.
 
 ### R-011 — Session-scoped expensive-source cost ceiling is a cost control, not an access-control boundary
 
@@ -461,6 +491,116 @@ in any real deployment — exercise the full flow against your actual
 identity provider (Auth0/Okta/Azure AD/Keycloak/other) first, including
 sign-out and a forced token-expiry silent-renew, not just the happy-path
 login.
+
+**Update (2026 production-readiness gate):** independently re-confirmed
+still open — no live IdP became available in this sandboxed environment
+either. This gap is severe enough on its own to be one of three named
+reasons the gate's own verdict was `NOT READY` rather than
+`READY WITH DOCUMENTED ACCEPTED RISKS` — see
+`docs/security/OIDC_E2E_TEST.md` for the exact click-through procedure
+that would close it, and `docs/security/FINAL_PRODUCTION_GATE.md`.
+
+### R-016 — Malware scanning exists but ships disabled by default and is real-world-unverified
+
+**Severity:** Medium (was previously "no abstraction at all exists" —
+Low/informational since there was nothing to misconfigure; now a
+narrower, more specific gap) · **Status:** Open
+
+`security/malware_scanner.py` (ClamAV `INSTREAM` protocol, added in the
+2026 dependency/CI-hardening pass) closes the "no `MalwareScanner`
+abstraction exists" gap every prior file-upload security document in this
+repo named as the most significant remaining one
+(`docs/FILE_UPLOAD_FINAL_REPORT.md`, `SECURITY_FINAL_REPORT.md` §12).
+Fail-closed logic (infected/timeout/unreachable/malformed all reject) is
+real and unit-tested against a mocked socket
+(`tests/security/test_malware_scanner_gate.py`, 18 tests). It has never
+been run against a real `clamd` daemon, and `Settings.malware_scan_provider`
+defaults to `"disabled"` — a deliberate choice (defaulting to "on" would
+have silently changed upload behavior for every existing deployment
+without a ClamAV daemon), but it means an operator who enables
+`ENABLE_DOCUMENT_RAG`/`ENABLE_POLICY_RAG`/`ENABLE_MEDIA_SEARCH` without
+*also* separately setting `MALWARE_SCAN_PROVIDER=clamav` gets zero
+malware scanning, with only an audit-log line (`malware_scan_skipped`) as
+the visible signal.
+
+**Mitigation today:** the content-moderation gate (mandatory, Azure
+Content Safety + text blocklist) and magic-byte/size/page-count validation
+all still run regardless — this isn't the *only* upload control, just the
+one specifically aimed at binary malware signatures.
+
+**Review date:** before any deployment enables file-upload features for a
+genuinely adversarial/untrusted population — stand up a real `clamd`
+daemon, set `MALWARE_SCAN_PROVIDER=clamav`, and verify with at least an
+EICAR test string before relying on this.
+
+### R-017 — DAST has never been run against this application
+
+**Severity:** Medium-High (unknown unknowns by definition) · **Status:** Open
+
+No dynamic application security testing (OWASP ZAP or equivalent) has
+been performed at any point in this repository's history, across three
+separate security-focused engagements now. Each has independently
+disclosed this rather than papering over it (`SECURITY_FINAL_REPORT.md`
+§18, and now `docs/security/DAST_REPORT.md`). No staging environment or
+live Ollama+database instance has been available in any sandboxed session
+this work has been done in.
+
+**Mitigation today:** `TestClient`-driven HTTP-level tests exist for
+security headers, auth status codes, and IDOR (real request/response
+cycles, not pure unit tests) — explicitly documented in
+`docs/security/DAST_REPORT.md` as dynamic-*adjacent*, not a substitute.
+
+**Review date:** before any production deployment — this is one of the
+three named reasons `docs/security/FINAL_PRODUCTION_GATE.md`'s verdict is
+`NOT READY`, not a lower-priority nice-to-have. See that document's own
+procedure section for exactly what running this would involve.
+
+### R-018 — No distributed rate limiting (process-local only)
+
+**Severity:** Medium (only material for a horizontally-scaled deployment)
+· **Status:** Open
+
+`agent/rate_limit.py`'s own docstring already discloses this
+("Deliberately simple: no persistence, no distributed coordination,
+resets on every app restart... not a substitute for real rate limiting in
+a multi-tenant deployment"). Confirmed via grep this pass: zero Redis
+usage anywhere in this codebase or `requirements.txt`. A single-instance
+deployment is fully protected by the existing limiter (independently
+re-verified this pass to also be immune to `X-Forwarded-For`/`X-Real-IP`
+header-spoofing bypass attempts —
+`tests/security/test_rate_limit_header_spoofing.py`); a multi-instance
+deployment's *per-instance* limits each still individually hold, but the
+*intended global* budget can be exceeded by an attacker spread across
+instances.
+
+**Mitigation today:** none beyond the existing per-instance limiter.
+
+**Review date:** before any horizontally-scaled (multi-instance)
+production deployment.
+
+### R-019 — Incident response documentation was fully absent; first draft now exists, unrehearsed
+
+**Severity:** Low (a documentation/process gap, not a technical
+vulnerability) · **Status:** Partially mitigated
+
+`SECURITY_FINAL_REPORT.md` §25 explicitly recorded `docs/INCIDENT_RESPONSE.md`
+as "NOT PRODUCED" — carried as an open, named gap across every prior pass
+until the 2026 production-readiness gate produced a first version
+(`docs/security/INCIDENT_RESPONSE.md`), grounded in this app's actual,
+grep-confirmed `log_security_event` inventory rather than generic
+boilerplate. One real, concrete gap was found and disclosed while writing
+it: SSRF rejections (`media_gen/download.py::_validate_download_url`)
+raise an exception but never call `log_security_event`, unlike every
+other rejection class documented.
+
+**Mitigation today:** the document exists and is specific to this
+codebase's real signals, not a template.
+
+**Review date:** before relying on this for a real incident — it has
+never been tabletop-tested against a simulated scenario with an actual
+on-call owner. Also: wire `log_security_event` into
+`_validate_download_url`'s rejection paths (a small, concrete follow-up
+named in the incident-response document itself).
 
 ## Accepted exceptions
 

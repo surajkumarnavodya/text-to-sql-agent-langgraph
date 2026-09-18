@@ -44,6 +44,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
+from moderation.gate import decision_summary, moderate_chunks
+from moderation.store import ensure_schema, get_asset_by_hash, get_moderation_engine, record_asset
+from moderation.types import ModerationChunk
+
 from config.settings import Settings
 from media import embedding, store
 from media.captioning import generate_caption
@@ -51,9 +55,7 @@ from media.exceptions import MediaFileTooLargeError, UnsupportedMediaTypeError
 from media.keyframes import extract_keyframes
 from media.ocr import extract_text
 from media.transcription import transcribe_video, transcript_for_range
-from moderation.gate import decision_summary, moderate_chunks
-from moderation.store import ensure_schema, get_asset_by_hash, get_moderation_engine, record_asset
-from moderation.types import ModerationChunk
+from security.malware_scanner import scan_upload
 
 logger = logging.getLogger(__name__)
 
@@ -205,7 +207,9 @@ def _ingest_image(
     with Image.open(path) as image:
         width, height = image.size
 
-    chunk_paths, temp_files = _tile_image_for_moderation(path, settings.media_image_tile_threshold_px)
+    chunk_paths, temp_files = _tile_image_for_moderation(
+        path, settings.media_image_tile_threshold_px
+    )
     try:
         chunks = [
             ModerationChunk(chunk_index=i, content_type="image", image_path=tile_path)
@@ -229,7 +233,10 @@ def _ingest_image(
             source_path=str(path),
         )
         return IngestResult(
-            media_id=content_hash, media_type="image", segments_indexed=0, moderation_status="rejected"
+            media_id=content_hash,
+            media_type="image",
+            segments_indexed=0,
+            moderation_status="rejected",
         )
 
     vector = embedding.embed_image(path, settings)
@@ -286,13 +293,19 @@ def _ingest_video(
             caption or transcript_text or ocr_text or "Video segment (no detected text or speech)."
         )
         combined_text = " ".join(filter(None, [caption, transcript_text, ocr_text])).strip()
-        preps.append(_SegmentPrep(keyframe=keyframe, display_text=display_text, combined_text=combined_text))
+        preps.append(
+            _SegmentPrep(keyframe=keyframe, display_text=display_text, combined_text=combined_text)
+        )
 
         chunks.append(
-            ModerationChunk(chunk_index=index, content_type="image", image_path=keyframe.thumbnail_path)
+            ModerationChunk(
+                chunk_index=index, content_type="image", image_path=keyframe.thumbnail_path
+            )
         )
         if combined_text:
-            chunks.append(ModerationChunk(chunk_index=index, content_type="text", text=combined_text))
+            chunks.append(
+                ModerationChunk(chunk_index=index, content_type="text", text=combined_text)
+            )
 
     decision = moderate_chunks(content_hash, chunks, settings)
     engine = get_moderation_engine(settings)
@@ -308,7 +321,10 @@ def _ingest_video(
             source_path=str(path),
         )
         return IngestResult(
-            media_id=content_hash, media_type="video", segments_indexed=0, moderation_status="rejected"
+            media_id=content_hash,
+            media_type="video",
+            segments_indexed=0,
+            moderation_status="rejected",
         )
 
     # Phase 2: every segment passed -- embed and store, unchanged from the
@@ -317,7 +333,9 @@ def _ingest_video(
     vector_ids: list[str] = []
     for prep in preps:
         keyframe = prep.keyframe
-        text_embedding = embedding.embed_text(prep.combined_text, settings) if prep.combined_text else None
+        text_embedding = (
+            embedding.embed_text(prep.combined_text, settings) if prep.combined_text else None
+        )
         image_embedding = embedding.embed_image(keyframe.thumbnail_path, settings)
 
         segment_id = _segment_id(content_hash, keyframe.segment_start, keyframe.segment_end)
@@ -407,6 +425,36 @@ def ingest_file(path: Path, settings: Settings, *, force: bool = False) -> Inges
                 media_type=media_type,
                 segments_indexed=existing.chunk_count if media_type == "video" else 0,
             )
+
+    # Malware scan (opt-in -- see Settings.malware_scan_provider's
+    # docstring), runs before any parser (PySceneDetect/Pillow/
+    # faster-whisper/Tesseract) ever touches the file's bytes -- mirrors
+    # rag/ingestion.py::ingest_pdf's own scan-before-parse ordering.
+    file_bytes = path.read_bytes()
+    scan_result = scan_upload(content_hash, file_bytes, settings)
+    if scan_result.blocked:
+        engine = get_moderation_engine(settings)
+        ensure_schema(engine)
+        record_asset(
+            engine,
+            content_hash,
+            media_type,
+            "rejected",
+            {"malware_scan_status": scan_result.status, "provider": scan_result.provider},
+            source_path=str(path),
+        )
+        logger.warning(
+            "[media] %s rejected by malware scan (status=%s), skipping ingestion",
+            path,
+            scan_result.status,
+        )
+        return IngestResult(
+            media_id=content_hash,
+            media_type=media_type,
+            segments_indexed=0,
+            moderation_status="rejected",
+        )
+    del file_bytes  # only needed for the scan above; the rest of this pipeline reads from `path`
 
     if media_type == "image":
         return _ingest_image(path, content_hash, settings, force=force)
