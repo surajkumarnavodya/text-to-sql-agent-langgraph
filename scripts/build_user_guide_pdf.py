@@ -18,6 +18,10 @@ fenced code block) -- not a general-purpose markdown renderer. If
 USER_GUIDE.md's formatting grows beyond this subset, extend `_parse_body`
 rather than reaching for a markdown library; the whole point of this
 script is a small, auditable, exact mapping for one specific document.
+`build()` also takes keyword-only cover/footer/title overrides so
+`scripts/build_setup_guide_pdf.py` can reuse this exact rendering pipeline
+for a second, unrelated document (SETUP_GUIDE.md) without a second
+copy of the cover/TOC/footer/markdown-parsing machinery.
 
 Usage:
     python scripts/build_user_guide_pdf.py
@@ -466,6 +470,12 @@ class _NumberedCanvas(canvas_module.Canvas):
     total page count isn't known until the whole document has been laid
     out once."""
 
+    #: Overridden per-document by `_make_canvas_class` below -- kept as a
+    #: plain class attribute (rather than a constructor argument) because
+    #: reportlab's `multiBuild(..., canvasmaker=...)` instantiates this
+    #: class itself and controls the constructor arguments entirely.
+    FOOTER_LABEL = "Text-to-SQL Dashboard — User Guide"
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._saved_states: list = []
@@ -489,9 +499,19 @@ class _NumberedCanvas(canvas_module.Canvas):
         self.drawCentredString(
             LETTER[0] / 2, 0.55 * inch, f"Page {self._pageNumber} of {total_pages}"
         )
-        self.drawString(0.75 * inch, 0.55 * inch, "Text-to-SQL Dashboard — User Guide")
+        self.drawString(0.75 * inch, 0.55 * inch, self.FOOTER_LABEL)
         self.setStrokeColor(_RULE)
         self.line(0.75 * inch, 0.72 * inch, LETTER[0] - 0.75 * inch, 0.72 * inch)
+
+
+def _make_canvas_class(footer_label: str) -> type[_NumberedCanvas]:
+    """Returns a `_NumberedCanvas` subclass bound to a specific footer label.
+
+    `multiBuild`'s `canvasmaker` hook only ever calls `canvasmaker(filename,
+    ...)` -- there's no way to pass an extra argument through it, so the
+    label is baked into a small per-call subclass instead.
+    """
+    return type("_BoundNumberedCanvas", (_NumberedCanvas,), {"FOOTER_LABEL": footer_label})
 
 
 class _GuideDocTemplate(BaseDocTemplate):
@@ -534,8 +554,29 @@ def _cover_and_toc_page(canvas_obj, doc) -> None:
     canvas_obj.restoreState()
 
 
-def build(source_path: Path = SOURCE_MD, output_path: Path = OUTPUT_PDF) -> int:
-    """Builds the PDF. Returns the final page count."""
+def build(
+    source_path: Path = SOURCE_MD,
+    output_path: Path = OUTPUT_PDF,
+    *,
+    cover_subtitle: str = (
+        "Ask a question in plain English — get validated, read-only SQL, "
+        "a live result table, and an auto-picked chart."
+    ),
+    footer_label: str = "Text-to-SQL Dashboard — User Guide",
+    pdf_title: str = "Text-to-SQL Dashboard — User Guide",
+    pdf_author: str = "Suraj Kumar",
+    script_label: str = "scripts/build_user_guide_pdf.py",
+) -> int:
+    """Builds the PDF. Returns the final page count.
+
+    The keyword-only parameters exist so a sibling script (e.g.
+    `scripts/build_setup_guide_pdf.py`) can reuse this exact rendering
+    pipeline -- cover/TOC/footer layout, the markdown subset, the
+    two-pass TOC build -- for a *different* source markdown file without
+    duplicating any of it; only the cover/footer text and source/output
+    paths change. Every default below reproduces this function's original,
+    USER_GUIDE.md-only behavior exactly.
+    """
     styles = _build_styles()
     markdown_text = source_path.read_text(encoding="utf-8")
     title, cover_blurb, preface_story, body_story = _parse_source(markdown_text, styles)
@@ -545,13 +586,7 @@ def build(source_path: Path = SOURCE_MD, output_path: Path = OUTPUT_PDF) -> int:
     # --- Cover page ---
     story.append(Spacer(1, 1.6 * inch))
     story.append(Paragraph(title, styles["CoverTitle"]))
-    story.append(
-        Paragraph(
-            "Ask a question in plain English — get validated, read-only SQL, "
-            "a live result table, and an auto-picked chart.",
-            styles["CoverSubtitle"],
-        )
-    )
+    story.append(Paragraph(cover_subtitle, styles["CoverSubtitle"]))
     story.append(Spacer(1, 0.35 * inch))
     story.append(Paragraph(_inline(cover_blurb), styles["CoverBody"]))
     story.append(Spacer(1, 0.9 * inch))
@@ -559,8 +594,8 @@ def build(source_path: Path = SOURCE_MD, output_path: Path = OUTPUT_PDF) -> int:
     story.append(
         Paragraph(
             f'Generated {build_date} by <font face="Courier">'
-            f'scripts/build_user_guide_pdf.py</font> from <font face="Courier">'
-            f"USER_GUIDE.md</font> — the single source of truth for this document. "
+            f'{script_label}</font> from <font face="Courier">'
+            f"{source_path.name}</font> — the single source of truth for this document. "
             f"Re-run the script after editing the markdown; do not hand-edit this PDF.",
             styles["CoverMeta"],
         )
@@ -602,8 +637,8 @@ def build(source_path: Path = SOURCE_MD, output_path: Path = OUTPUT_PDF) -> int:
         rightMargin=0.75 * inch,
         topMargin=0.85 * inch,
         bottomMargin=0.9 * inch,
-        title="Text-to-SQL Dashboard — User Guide",
-        author="Suraj Kumar",
+        title=pdf_title,
+        author=pdf_author,
     )
     cover_frame = Frame(doc.leftMargin, doc.bottomMargin, doc.width, doc.height, id="cover")
     body_frame = Frame(doc.leftMargin, doc.bottomMargin, doc.width, doc.height, id="body")
@@ -613,7 +648,7 @@ def build(source_path: Path = SOURCE_MD, output_path: Path = OUTPUT_PDF) -> int:
             PageTemplate(id="body", frames=[body_frame]),
         ]
     )
-    doc.multiBuild(story, canvasmaker=_NumberedCanvas)
+    doc.multiBuild(story, canvasmaker=_make_canvas_class(footer_label))
 
     # Report the actual page count back to the caller/CLI rather than
     # re-deriving it — multiBuild already knows it internally, but doesn't

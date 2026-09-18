@@ -8,11 +8,11 @@
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 [![Docs](https://img.shields.io/badge/docs-available-blue.svg)](USER_GUIDE.md)
-[![Status](https://img.shields.io/badge/status-alpha-yellow.svg)](#-project-status)
+[![Status](https://img.shields.io/badge/status-beta%20--%20security%20hardened-brightgreen.svg)](#-project-status)
 
 </div>
 
-> **Alpha — actively evolving.** The React dashboard (`frontend/`) is now
+> **Beta — security hardened.** The React dashboard (`frontend/`) is now
 > the only UI this project ships; the original Streamlit app has been
 > removed. See [Project status](#-project-status).
 
@@ -432,11 +432,24 @@ vulnerability rather than filing a public issue.
 
 ## 🧪 Project status
 
-This project is **alpha** and evolving quickly. The React dashboard is now
+This project is **beta — security hardened**. The React dashboard is now
 the only UI — a previous Streamlit app was removed once the dashboard
-reached full feature parity with it. See [Known limitations](#known-limitations)
-below for the honest current state of accuracy and production-readiness,
-not a marketing claim.
+reached full feature parity with it. Three completed security review
+passes (referenced throughout this codebase as "2026 Phase 1/2/3") have
+covered authentication (OIDC + this app's own self-hosted accounts),
+RBAC, the AST-based SQL validator, content moderation, audit logging,
+security headers/CSP, and SSRF/CORS hardening — see
+[`SECURITY_FINAL_REPORT.md`](SECURITY_FINAL_REPORT.md),
+[`SECURITY_BASELINE.md`](SECURITY_BASELINE.md), and
+[`SECURITY_CHANGELOG.md`](SECURITY_CHANGELOG.md) for the full, cited audit
+trail, and [`SECURITY_PRODUCTION_CHECKLIST.md`](SECURITY_PRODUCTION_CHECKLIST.md)
+for what still needs operator action before a production deployment
+(notably: known CVEs across several backend dependencies, and the
+frontend OIDC flow, which passes every static check available but hasn't
+been exercised against a live identity provider yet). See
+[Known limitations](#known-limitations) below for the honest current
+state of answer accuracy — that has not changed as part of this security
+work and remains the main gap between "beta" and "production-grade."
 
 <a id="known-limitations"></a>
 
