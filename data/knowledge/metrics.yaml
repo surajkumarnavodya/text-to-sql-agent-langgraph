@@ -1,0 +1,113 @@
+# Metric definitions -- retrieval/chunking.py::metric_chunks_from_yaml.
+#
+# DISCLOSURE: same as glossary.yaml -- table/column names are real
+# (verified via live introspection of this project's "adventureworks"
+# sample database); formulas/grains/definitions below are illustrative,
+# written for demonstration, not sourced from an actual finance/BI team.
+# Replace with your own reviewed metric catalog before relying on it.
+#
+# Schema (one entry per metric):
+#   name: <canonical metric name>
+#   definition: <plain-English definition>
+#   formula: <a SQL-expression-shaped hint, not literal executable SQL>
+#   aggregation: <SUM | AVG | COUNT | ...>
+#   grain: <what one row of the aggregation represents>
+#   valid_filters: [columns commonly used to filter this metric]
+#   source_tables: [tables this metric is computed from]
+#   source_columns: [table.column pairs]
+#   time_period_interpretation: <how a "this year"/"last quarter" style
+#     filter on this metric should be interpreted>
+#   tags: [free-form labels]
+
+metrics:
+  - name: gross sales amount
+    definition: >
+      The total dollar amount of sales before tax and freight, summed
+      across order lines. For internet sales this is FactInternetSales
+      .SalesAmount; for reseller sales it is FactResellerSales.SalesAmount.
+    formula: "SUM(SalesAmount)"
+    aggregation: SUM
+    grain: one row per order line (SalesOrderNumber + SalesOrderLineNumber)
+    valid_filters: ["OrderDate", "SalesTerritoryKey", "ProductKey"]
+    source_tables: ["FactInternetSales", "FactResellerSales"]
+    source_columns: ["FactInternetSales.SalesAmount", "FactResellerSales.SalesAmount"]
+    time_period_interpretation: >
+      Filter on OrderDate (or join DimDate via OrderDateKey and filter
+      DimDate.CalendarYear/CalendarQuarter) -- not ShipDate or DueDate,
+      which represent fulfillment, not when the sale was made.
+    tags: ["sales", "revenue"]
+
+  - name: total product cost
+    definition: >
+      The company's own cost basis for the products sold in an order line
+      (not the price the customer paid) -- used to compute gross margin.
+    formula: "SUM(TotalProductCost)"
+    aggregation: SUM
+    grain: one row per order line
+    valid_filters: ["OrderDate", "ProductKey"]
+    source_tables: ["FactInternetSales", "FactResellerSales"]
+    source_columns: ["FactInternetSales.TotalProductCost", "FactResellerSales.TotalProductCost"]
+    time_period_interpretation: "Same as gross sales amount -- filter on OrderDate."
+    tags: ["sales", "cost"]
+
+  - name: gross margin
+    definition: >
+      Gross sales amount minus total product cost, for a given slice of
+      orders -- a pre-aggregated computation, never a nested aggregate.
+    formula: "SUM(SalesAmount) - SUM(TotalProductCost)"
+    aggregation: SUM
+    grain: computed from two already-aggregated sums over the same grouping
+    valid_filters: ["OrderDate", "SalesTerritoryKey", "ProductKey"]
+    source_tables: ["FactInternetSales", "FactResellerSales"]
+    source_columns:
+      ["FactInternetSales.SalesAmount", "FactInternetSales.TotalProductCost"]
+    time_period_interpretation: "Same as gross sales amount -- filter on OrderDate."
+    tags: ["sales", "profitability"]
+
+  - name: order count
+    definition: >
+      The number of distinct sales orders (not order lines) in a given
+      slice -- must count distinct SalesOrderNumber, not raw row count,
+      since one order can have multiple line items.
+    formula: "COUNT(DISTINCT SalesOrderNumber)"
+    aggregation: COUNT DISTINCT
+    grain: one row per order line, deduplicated to distinct order number
+    valid_filters: ["OrderDate", "SalesTerritoryKey"]
+    source_tables: ["FactInternetSales", "FactResellerSales"]
+    source_columns: ["FactInternetSales.SalesOrderNumber"]
+    time_period_interpretation: "Filter on OrderDate."
+    tags: ["sales", "volume"]
+
+  - name: average order value
+    definition: >
+      Gross sales amount divided by order count for the same slice --
+      compute both aggregates in a CTE first, then divide in the outer
+      query; never nest COUNT/SUM inside AVG or vice versa.
+    formula: "SUM(SalesAmount) / COUNT(DISTINCT SalesOrderNumber)"
+    aggregation: derived (SUM / COUNT DISTINCT)
+    grain: computed from two already-aggregated values over the same grouping
+    valid_filters: ["OrderDate", "SalesTerritoryKey"]
+    source_tables: ["FactInternetSales", "FactResellerSales"]
+    source_columns:
+      ["FactInternetSales.SalesAmount", "FactInternetSales.SalesOrderNumber"]
+    time_period_interpretation: "Filter on OrderDate."
+    tags: ["sales", "revenue"]
+
+  - name: sales quota attainment
+    definition: >
+      An employee's actual sales amount for a period, compared against
+      their assigned quota (FactSalesQuota) for the matching CalendarYear/
+      CalendarQuarter.
+    formula: "SUM(FactResellerSales.SalesAmount) / SUM(FactSalesQuota.SalesAmountQuota)"
+    aggregation: derived ratio
+    grain: one employee, one calendar quarter
+    valid_filters: ["CalendarYear", "CalendarQuarter", "EmployeeKey"]
+    source_tables: ["FactSalesQuota", "FactResellerSales", "DimEmployee"]
+    source_columns:
+      ["FactSalesQuota.SalesAmountQuota", "FactResellerSales.SalesAmount"]
+    time_period_interpretation: >
+      FactSalesQuota is already at calendar-year/quarter grain
+      (CalendarYear, CalendarQuarter columns) -- join actual sales
+      aggregated to the same grain via DimDate, do not compare a quota
+      quarter against a full year of actuals or vice versa.
+    tags: ["sales", "performance"]

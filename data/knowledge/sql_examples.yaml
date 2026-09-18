@@ -1,0 +1,120 @@
+# Curated SQL examples -- retrieval/chunking.py::sql_example_chunks_from_yaml.
+#
+# DISCLOSURE: written and reviewed by this repo (not by an end user's
+# "Confirm and Run" feedback loop -- that's embeddings/golden_examples.py,
+# a separate store with its own lifecycle). Table/column names are real,
+# verified against this project's own "adventureworks" sample database
+# (SQL Server / T-SQL dialect, matching that database's configured
+# DB_TYPE=mssql) via live schema introspection. These are illustrative
+# demonstration examples, not a production-reviewed query library -- see
+# docs/vector-retrieval-design.md.
+#
+# validation_status: "reviewed" here means "a person checked this SQL
+# parses and matches real column names as of when this file was written,"
+# not "executed against a live database and confirmed correct" -- a
+# genuinely execution-verified example should instead go through the
+# existing thumbs-up feedback loop (embeddings/golden_examples.py), which
+# stores the exact SQL a user actually ran successfully.
+#
+# Schema (one entry per example):
+#   question: <a natural-language question this SQL answers>
+#   sql: <the SQL text>
+#   explanation: <why it's written this way>
+#   tables_used: [tables referenced]
+#   columns_used: [notable columns referenced]
+#   tags: [free-form labels]
+#   validation_status: reviewed | unreviewed
+
+examples:
+  - question: "What were total internet sales by product category last year?"
+    sql: |
+      SELECT pc.EnglishProductCategoryName, SUM(fis.SalesAmount) AS TotalSales
+      FROM FactInternetSales fis
+      JOIN DimProduct p ON fis.ProductKey = p.ProductKey
+      JOIN DimProductSubcategory psc ON p.ProductSubcategoryKey = psc.ProductSubcategoryKey
+      JOIN DimProductCategory pc ON psc.ProductCategoryKey = pc.ProductCategoryKey
+      JOIN DimDate d ON fis.OrderDateKey = d.DateKey
+      WHERE d.CalendarYear = 2013
+      GROUP BY pc.EnglishProductCategoryName
+      ORDER BY TotalSales DESC;
+    explanation: >
+      Joins through the full product hierarchy (DimProduct ->
+      DimProductSubcategory -> DimProductCategory) rather than assuming a
+      direct FK from DimProduct to DimProductCategory, since none exists --
+      and filters the time period via DimDate (joined on OrderDateKey), not
+      a raw date column comparison.
+    tables_used:
+      ["FactInternetSales", "DimProduct", "DimProductSubcategory", "DimProductCategory", "DimDate"]
+    columns_used: ["SalesAmount", "EnglishProductCategoryName", "CalendarYear"]
+    tags: ["sales", "product"]
+    validation_status: reviewed
+
+  - question: "Top 3 resellers by sales amount in each sales territory region"
+    sql: |
+      WITH ranked AS (
+          SELECT
+              st.SalesTerritoryRegion,
+              r.ResellerName,
+              SUM(frs.SalesAmount) AS TotalSales,
+              ROW_NUMBER() OVER (
+                  PARTITION BY st.SalesTerritoryRegion
+                  ORDER BY SUM(frs.SalesAmount) DESC
+              ) AS rn
+          FROM FactResellerSales frs
+          JOIN DimReseller r ON frs.ResellerKey = r.ResellerKey
+          JOIN DimSalesTerritory st ON frs.SalesTerritoryKey = st.SalesTerritoryKey
+          GROUP BY st.SalesTerritoryRegion, r.ResellerName
+      )
+      SELECT SalesTerritoryRegion, ResellerName, TotalSales
+      FROM ranked
+      WHERE rn <= 3
+      ORDER BY SalesTerritoryRegion, rn;
+    explanation: >
+      A "top N per group" question -- uses ROW_NUMBER() partitioned by the
+      grouping column, never TOP N combined with a plain GROUP BY (which
+      would only limit the total result to N rows, not N per region).
+    tables_used: ["FactResellerSales", "DimReseller", "DimSalesTerritory"]
+    columns_used: ["SalesAmount", "SalesTerritoryRegion", "ResellerName"]
+    tags: ["sales", "ranking", "reseller"]
+    validation_status: reviewed
+
+  - question: "Year-over-year growth in internet sales by calendar year"
+    sql: |
+      WITH yearly AS (
+          SELECT d.CalendarYear, SUM(fis.SalesAmount) AS TotalSales
+          FROM FactInternetSales fis
+          JOIN DimDate d ON fis.OrderDateKey = d.DateKey
+          GROUP BY d.CalendarYear
+      )
+      SELECT
+          CalendarYear,
+          TotalSales,
+          TotalSales - LAG(TotalSales) OVER (ORDER BY CalendarYear) AS ChangeVsPriorYear
+      FROM yearly
+      ORDER BY CalendarYear;
+    explanation: >
+      Pre-aggregates sales per calendar year in a CTE first, then uses
+      LAG() to bring the prior year's total into the same row -- never
+      nests SUM inside another aggregate to compute a period-over-period
+      difference.
+    tables_used: ["FactInternetSales", "DimDate"]
+    columns_used: ["SalesAmount", "CalendarYear"]
+    tags: ["sales", "trend"]
+    validation_status: reviewed
+
+  - question: "Which employees are sales territory managers, with their region?"
+    sql: |
+      SELECT e.FirstName, e.LastName, e.Title, st.SalesTerritoryRegion
+      FROM DimEmployee e
+      JOIN DimSalesTerritory st ON e.SalesTerritoryKey = st.SalesTerritoryKey
+      WHERE e.SalesPersonFlag = 1
+      ORDER BY st.SalesTerritoryRegion;
+    explanation: >
+      Joins DimEmployee directly to DimSalesTerritory via
+      DimEmployee.SalesTerritoryKey (a direct foreign key) -- filters on
+      SalesPersonFlag rather than guessing at Title text, since Title is a
+      free-text job title column, not a reliable coded flag.
+    tables_used: ["DimEmployee", "DimSalesTerritory"]
+    columns_used: ["SalesTerritoryKey", "SalesPersonFlag", "Title"]
+    tags: ["employee", "territory"]
+    validation_status: reviewed

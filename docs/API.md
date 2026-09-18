@@ -241,25 +241,57 @@ equivalent) also exist (`api/main.py`, `api/documents.py`, `api/media.py`)
 — not yet given their own subsection here; see each module's own
 docstrings for the authoritative contract in the meantime.
 
-## Auth: a lightweight hook, not a full auth system
+**Local-account auth** (`api/identity_auth.py`, only reachable when
+`LOCAL_AUTH_ENABLED=true` — 404s otherwise, not 503, see that router's own
+docstring): `POST /auth/register`, `POST /auth/login`, `POST /auth/refresh`,
+`POST /auth/logout`(`-all`), `GET`/`PATCH /auth/me`, `POST
+/auth/change-password`, `POST /auth/forgot-password`, `POST
+/auth/reset-password`, `POST /auth/verify-email`, `POST
+/auth/resend-verification`, `GET /auth/sessions`, `DELETE
+/auth/sessions/{id}`. See `docs/AUTHENTICATION.md` and
+`docs/authentication-and-password-policy.md`.
 
-`API_AUTH_TOKEN` (`.env`, unset by default) is an optional shared bearer
-token: when set, every route requires a matching `Authorization: Bearer
-<token>` header (checked with a constant-time comparison — see
-`api/auth.py`) *except* `GET /health`, which never requires it (health
-checks typically need to be reachable by an orchestrator with no API
-key). This is **one shared secret, not per-user identity** — there is no
-login, no token issuance, no session, no authorization model beyond "has
-the token or doesn't." It exists so this isn't wide open by default the
-moment it's reachable from more than localhost, not as a substitute for
-real auth.
+**Server-side chat history** (`api/chat_history.py`, same
+`LOCAL_AUTH_ENABLED` gate): `GET`/`POST /conversations`, `GET`/`PATCH`/
+`DELETE /conversations/{id}`, `GET`/`POST /conversations/{id}/messages`,
+`GET /chat/search?q=`. Every route requires a local account and is
+ownership-scoped to the caller — see `docs/chat-history-architecture.md`
+and `docs/chat-history-search.md`.
 
-**For anything beyond local/trusted-network use, put this behind a real
-authenticating reverse proxy** (e.g. `oauth2-proxy`, your platform's
-managed auth) regardless of whether `API_AUTH_TOKEN` is set — see
-`docs/DEPLOYMENT.md`. This mirrors the same posture `SECURITY.md` already
-states for the whole app: this project is not designed for multi-user
-authorization, and adding a shared token doesn't change that.
+## Auth: from a lightweight hook to real per-user identity, depending on configuration
+
+`Settings.auth_mode` resolves to one of four values, in priority order —
+see `api/auth.py::verify_api_key` and `docs/AUTHENTICATION.md` for the
+full picture:
+
+1. **`local`** (`LOCAL_AUTH_ENABLED=true`) — this app's own accounts
+   (`identity/`): real login/registration, per-user sessions (rotating
+   refresh tokens), and RBAC roles that feed into the same permission
+   checks every route below already enforces. **This is real per-user
+   identity and per-user data isolation** — chat history
+   (`api/chat_history.py`) is strictly scoped to the authenticated
+   caller's own `user_id`, never trusting a client-supplied value (see
+   `docs/chat-history-architecture.md`).
+2. **`oidc`** (`OIDC_ISSUER` set) — validates a JWT against any
+   standard-compliant external identity provider. See
+   `docs/AUTHENTICATION.md`.
+3. **`static_token`** (`API_AUTH_TOKEN` set, `local`/`oidc` both unset) —
+   the original lightweight hook: one shared bearer secret, checked with a
+   constant-time comparison, granting a fixed admin-equivalent identity
+   with **no per-user identity, no session, no chat-history persistence**
+   (there's no stable per-caller `user_id` to attach a conversation to).
+4. **`none`** (nothing configured, the default) — no auth at all,
+   suitable for local/trusted-network use only.
+
+`GET /health` never requires auth regardless of mode (health checks
+typically need to be reachable by an orchestrator with no credential).
+
+**For anything beyond local/trusted-network use, either configure `local`
+or `oidc` auth, or put the API behind a real authenticating reverse proxy**
+(e.g. `oauth2-proxy`, your platform's managed auth) — see
+`docs/DEPLOYMENT.md`. Modes 3 and 4 above are still appropriate only for a
+single-operator/trusted-network deployment, per `SECURITY.md`'s posture;
+mode 1 or 2 is what a genuinely multi-user deployment should configure.
 
 ## Correlation IDs
 
@@ -275,8 +307,15 @@ it. See `security/audit_log.py`.
 
 ## What this is not
 
-- Not a multi-tenant API — no per-user identity, no per-user data
-  isolation, no authorization model beyond the single shared token above.
+- Not a multi-tenant API in the "isolated customer workspaces" sense —
+  every authenticated user shares the same configured business
+  database(s) and schema/business-context retrieval index. Per-user
+  identity, session management, RBAC, and per-user chat-history isolation
+  *do* exist when `local`/`oidc` auth is configured (see above) — this
+  project outgrew the "no per-user identity at all" characterization this
+  section used to have as more of `identity/`/`agent/authz.py` was built;
+  what's still true is that it has no concept of separate tenants/
+  organizations sharing one deployment.
 - Not a stable, versioned public API contract — it's young and scoped to
   this project's own needs; expect it to evolve alongside the agent.
 - Not a replacement for reading `SECURITY.md` before pointing either

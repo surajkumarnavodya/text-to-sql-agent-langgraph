@@ -14,6 +14,7 @@ import {
   newHistoryEntry,
   nlCacheKey,
   replaceEntry,
+  serverMessagesToQueryHistory,
   withConfirmedError,
   withConfirmedResult,
   withGenerationResult,
@@ -21,7 +22,15 @@ import {
   type ConversationSummary,
   type QueryHistoryEntry,
 } from '@/lib/history'
+import {
+  deleteConversationOnServer,
+  getConversation as apiGetConversation,
+  listConversations as apiListConversations,
+  listMessages as apiListMessages,
+  renameConversationOnServer,
+} from '@/lib/identityApi'
 import type { AskResponse } from '@/lib/types'
+import { useLocalAuthStore } from './localAuthStore'
 
 /** The question currently in flight -- rendered by
  * `components/chat/PendingTurn.tsx` as the next item in the normal
@@ -44,11 +53,22 @@ interface ChatState {
   nlQuestionCache: Map<string, AskResponse>
 
   /** The conversation currently shown on the Chat page. Every conversation
-   * ever started this session (including the active one) lives in
+   * this session knows about (including the active one) lives in
    * `conversations`, keyed by id -- the history drawer reads that map,
-   * `queryHistory` above is just "whichever one is on screen right now". */
+   * `queryHistory` above is just "whichever one is on screen right now".
+   * For a locally-authenticated user this map is hydrated from, and kept
+   * in sync with, the server (`identityApi.ts`'s conversation endpoints)
+   * -- see `hydrateHistoryFromServer`/`loadConversation` below and
+   * `docs/chat-history-architecture.md`. */
   activeConversationId: string
   conversations: Record<string, ConversationSummary>
+  /** True once the server conversation list has loaded at least once this
+   * session (local auth only) -- lets the history panel show a genuine
+   * "loading" state on first mount instead of flashing an empty-state
+   * message before the real list arrives. */
+  isHistoryHydrated: boolean
+  isLoadingConversation: boolean
+  historyError: string | null
 
   setEnableInsight: (value: boolean) => void
   setEditableSql: (entryId: string, sql: string) => void
@@ -67,9 +87,27 @@ interface ChatState {
   giveGoldenFeedback: (entryId: string, thumbsUp: boolean) => Promise<void>
 
   startNewChat: () => void
-  loadConversation: (id: string) => void
-  renameConversation: (id: string, title: string) => void
-  deleteConversation: (id: string) => void
+  /** Async: for a server-backed conversation whose messages haven't been
+   * fetched yet, this loads them from the server first (see
+   * `ConversationSummary.messagesLoaded`) -- callers that don't need to
+   * wait for that (e.g. a plain click handler) can call it without
+   * awaiting, `isLoadingConversation` drives the loading UI either way. */
+  loadConversation: (id: string) => Promise<void>
+  renameConversation: (id: string, title: string) => Promise<void>
+  deleteConversation: (id: string) => Promise<void>
+  /** Fetches the authenticated user's conversation list from the server --
+   * called once after a local-auth login/session-restore succeeds
+   * (`AuthGate.tsx`), and safe to call again any time (e.g. a manual
+   * refresh). A no-op, not an error, when local auth isn't the active
+   * credential -- see this function's own guard. */
+  hydrateHistoryFromServer: () => Promise<void>
+  /** Clears every in-memory conversation/message/pending-turn — called on
+   * logout and on switching to a different authenticated user. Never
+   * calls a delete API: this only clears what THIS browser tab is holding
+   * in memory, the server-side history itself is untouched (see
+   * `docs/chat-history-architecture.md`'s "chat history must not be
+   * deleted on logout" requirement). */
+  clearHistory: () => void
 }
 
 /** Every mutation to `queryHistory` goes through this so the active entry
@@ -91,6 +129,7 @@ function commitQueryHistory(
         title: existing?.title ?? deriveConversationTitle(queryHistory[0].question),
         updatedAt: new Date().toISOString(),
         entries: queryHistory,
+        messagesLoaded: true,
       },
     },
   }
@@ -112,6 +151,7 @@ function freshConversationState(): Pick<
 function emptyAskResponse(message: string): AskResponse {
   return {
     session_id: '',
+    conversation_id: null,
     status: 'failed',
     database: null,
     sql: null,
@@ -143,6 +183,16 @@ function emptyAskResponse(message: string): AskResponse {
   }
 }
 
+/** Whether server-side chat history applies at all right now -- see every
+ * exported function/action in this file that checks it before touching
+ * the network. False for a plain no-auth/OIDC-only deployment, or before
+ * a local-auth sign-in has completed; in that case this store behaves
+ * exactly as it did before this feature existed (a purely in-memory,
+ * session-only conversation list). */
+function isServerHistoryActive(): boolean {
+  return useLocalAuthStore.getState().status === 'authenticated'
+}
+
 export const useChatStore = create<ChatState>((set, get) => ({
   queryHistory: [],
   pendingQuestion: null,
@@ -153,6 +203,9 @@ export const useChatStore = create<ChatState>((set, get) => ({
   nlQuestionCache: new Map(),
   activeConversationId: crypto.randomUUID(),
   conversations: {},
+  isHistoryHydrated: false,
+  isLoadingConversation: false,
+  historyError: null,
 
   setEnableInsight: (value) => set({ enableInsight: value }),
 
@@ -165,13 +218,23 @@ export const useChatStore = create<ChatState>((set, get) => ({
     ),
 
   askQuestion: async (question, options) => {
-    const { queryHistory, enableInsight, nlQuestionCache } = get()
+    const { queryHistory, enableInsight, nlQuestionCache, activeConversationId, conversations } = get()
     const startedAt = performance.now()
     set({ pendingQuestion: { question, startedAt } })
 
     const priorQuestions = queryHistory.map((entry) => entry.question)
     const cacheKey = nlCacheKey(question, priorQuestions, enableInsight)
     const cached = nlQuestionCache.get(cacheKey)
+    // Only pass conversation_id once the server has actually confirmed this
+    // id exists (i.e. we've already gotten it back from a prior /ask call,
+    // or it came from hydrateHistoryFromServer) -- a brand-new, purely
+    // client-generated id must never be sent as if it were a real
+    // server-side conversation, since /ask would just silently start a new
+    // one anyway (see api/chat_persistence.py) but sending it needlessly
+    // muddies the request.
+    const knownServerConversationId = conversations[activeConversationId]?.messagesLoaded
+      ? activeConversationId
+      : undefined
 
     let finalState: AskResponse
     try {
@@ -181,6 +244,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
           question,
           conversation_history: buildConversationHistory(queryHistory),
           enable_insight: enableInsight,
+          conversation_id: knownServerConversationId,
         }))
     } catch (error) {
       const message = error instanceof ApiError ? error.message : 'The agent could not be reached.'
@@ -195,9 +259,29 @@ export const useChatStore = create<ChatState>((set, get) => ({
       options?.originatedFromVoice ?? false,
     )
 
+    // If the server assigned/confirmed a real conversation id (a
+    // locally-authenticated caller), and it differs from the client-side
+    // placeholder id this chat started under, migrate the active
+    // conversation's key so every subsequent action (rename, delete,
+    // loadConversation) operates on the real, permanent id.
+    const serverConversationId = finalState.conversation_id
+    set((state) => {
+      const withHistory = commitQueryHistory(state, [...state.queryHistory, entry])
+      if (!serverConversationId || serverConversationId === state.activeConversationId) {
+        return { ...withHistory, pendingQuestion: null }
+      }
+      const migrated = { ...withHistory.conversations }
+      const current = migrated[state.activeConversationId]
+      delete migrated[state.activeConversationId]
+      if (current) migrated[serverConversationId] = { ...current, id: serverConversationId, messagesLoaded: true }
+      return {
+        conversations: migrated,
+        queryHistory: withHistory.queryHistory,
+        activeConversationId: serverConversationId,
+        pendingQuestion: null,
+      }
+    })
     set((state) => ({
-      ...commitQueryHistory(state, [...state.queryHistory, entry]),
-      pendingQuestion: null,
       nlQuestionCache: cached ? state.nlQuestionCache : new Map(state.nlQuestionCache).set(cacheKey, finalState),
     }))
 
@@ -292,27 +376,132 @@ export const useChatStore = create<ChatState>((set, get) => ({
 
   startNewChat: () => set(freshConversationState()),
 
-  loadConversation: (id) =>
-    set((state) => {
-      const conversation = state.conversations[id]
-      if (!conversation) return state
-      return { ...freshConversationState(), activeConversationId: id, queryHistory: conversation.entries }
-    }),
+  loadConversation: async (id) => {
+    let existing = get().conversations[id]
+    // A search result can name a conversation that hydrateHistoryFromServer's
+    // own (capped) initial page didn't include -- fetch its metadata on
+    // demand rather than silently no-oping, so opening a search hit always
+    // works regardless of how far back it is in the user's full history.
+    if (!existing && isServerHistoryActive()) {
+      set({ isLoadingConversation: true, historyError: null })
+      try {
+        const fetched = await apiGetConversation(id)
+        existing = {
+          id: fetched.id,
+          title: fetched.title ?? 'New conversation',
+          updatedAt: fetched.last_message_at ?? fetched.created_at,
+          entries: [],
+          messagesLoaded: false,
+        }
+        set((state) => ({ conversations: { ...state.conversations, [id]: existing! } }))
+      } catch (error) {
+        const message = error instanceof ApiError ? error.message : 'Could not load this conversation.'
+        set({ historyError: message, isLoadingConversation: false })
+        return
+      }
+    }
+    if (!existing) return
+    if (existing.messagesLoaded || !isServerHistoryActive()) {
+      set({ ...freshConversationState(), activeConversationId: id, queryHistory: existing.entries })
+      return
+    }
 
-  renameConversation: (id, title) =>
-    set((state) => {
-      const conversation = state.conversations[id]
-      if (!conversation) return state
-      const trimmed = title.trim()
-      if (!trimmed) return state
-      return { conversations: { ...state.conversations, [id]: { ...conversation, title: trimmed } } }
-    }),
+    // Show the conversation immediately with whatever's cached (possibly
+    // empty) while its real messages load, rather than a blank screen.
+    set({ ...freshConversationState(), activeConversationId: id, queryHistory: existing.entries })
+    set({ isLoadingConversation: true, historyError: null })
+    try {
+      const response = await apiListMessages(id)
+      const entries = serverMessagesToQueryHistory(response.messages)
+      set((state) => {
+        // The user may have navigated away from this conversation while the
+        // fetch was in flight -- only apply the result if it's still the
+        // active one, so a late response can never clobber what's on screen.
+        if (state.activeConversationId !== id) return state
+        return {
+          queryHistory: entries,
+          conversations: {
+            ...state.conversations,
+            [id]: { ...state.conversations[id], entries, messagesLoaded: true },
+          },
+        }
+      })
+    } catch (error) {
+      const message = error instanceof ApiError ? error.message : 'Could not load this conversation.'
+      set({ historyError: message })
+    } finally {
+      set({ isLoadingConversation: false })
+    }
+  },
 
-  deleteConversation: (id) =>
+  renameConversation: async (id, title) => {
+    const conversation = get().conversations[id]
+    if (!conversation) return
+    const trimmed = title.trim()
+    if (!trimmed) return
+    set((state) => ({
+      conversations: { ...state.conversations, [id]: { ...conversation, title: trimmed } },
+    }))
+    if (!isServerHistoryActive() || !conversation.messagesLoaded) return
+    try {
+      await renameConversationOnServer(id, trimmed)
+    } catch {
+      // The optimistic local rename already applied; a failed server-side
+      // rename is a minor, silently-degraded UX miss (the title reverts on
+      // next hydrate), never worth surfacing as a blocking error for a
+      // rename action.
+    }
+  },
+
+  deleteConversation: async (id) => {
+    const wasActive = get().activeConversationId === id
     set((state) => {
       const remaining = { ...state.conversations }
       delete remaining[id]
-      if (state.activeConversationId !== id) return { conversations: remaining }
+      if (!wasActive) return { conversations: remaining }
       return { ...freshConversationState(), conversations: remaining }
+    })
+    if (!isServerHistoryActive()) return
+    try {
+      await deleteConversationOnServer(id)
+    } catch (error) {
+      const message = error instanceof ApiError ? error.message : 'Could not delete this conversation.'
+      set({ historyError: message })
+    }
+  },
+
+  hydrateHistoryFromServer: async () => {
+    if (!isServerHistoryActive()) return
+    set({ historyError: null })
+    try {
+      const response = await apiListConversations({ limit: 100 })
+      set((state) => {
+        const next: Record<string, ConversationSummary> = {}
+        for (const conversation of response.conversations) {
+          const existing = state.conversations[conversation.id]
+          next[conversation.id] = {
+            id: conversation.id,
+            title: conversation.title ?? 'New conversation',
+            updatedAt: conversation.last_message_at ?? conversation.created_at,
+            entries: existing?.entries ?? [],
+            messagesLoaded: existing?.messagesLoaded ?? false,
+          }
+        }
+        return { conversations: next, isHistoryHydrated: true }
+      })
+    } catch (error) {
+      const message = error instanceof ApiError ? error.message : 'Could not load your chat history.'
+      set({ historyError: message, isHistoryHydrated: true })
+    }
+  },
+
+  clearHistory: () =>
+    set({
+      ...freshConversationState(),
+      conversations: {},
+      isHistoryHydrated: false,
+      historyError: null,
+      nlQuestionCache: new Map(),
+      goldenFeedbackGiven: new Set(),
     }),
 }))

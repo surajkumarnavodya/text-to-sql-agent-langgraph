@@ -5,6 +5,7 @@ import type {
   ConversationExchange,
   MediaGenerationResult,
   PlotlyFigure,
+  ServerMessage,
 } from './types'
 
 /** One full chat turn -- question + everything about its answer. Holds its
@@ -47,17 +48,116 @@ export interface QueryHistoryEntry {
   spokenAudioUrl: string | null
 }
 
-/** One saved chat session for the history drawer -- a conversation is just
- * a named, addressable snapshot of a `queryHistory` array at a point in
- * time, kept in the same in-memory-only store as everything else in
- * chatStore (no backend/localStorage persistence exists for chat state
- * today, so a full page reload still clears it -- consistent with the
- * app's existing session-only behavior, not a new limitation). */
+/** One conversation as shown in the history drawer.
+ *
+ * For a locally-authenticated user (`useLocalAuthStore`), this is now a
+ * *server-backed* record: `id` is the real, permanent
+ * `identity.models.Conversation.id`, and `entries` is lazily populated
+ * from `GET /conversations/{id}/messages` the first time the conversation
+ * is opened (`messagesLoaded` distinguishes "not fetched yet" from
+ * "genuinely has zero messages") -- see `chatStore.ts`'s
+ * `hydrateHistoryFromServer`/`loadConversation`. For everyone else (local
+ * auth not configured/not signed in), this remains a purely in-memory,
+ * session-only snapshot, exactly as before this feature existed -- see
+ * `docs/chat-history-architecture.md`'s "Known limitations" for why this
+ * isn't extended to OIDC/unauthenticated sessions in this pass. */
 export interface ConversationSummary {
   id: string
   title: string
   updatedAt: string
   entries: QueryHistoryEntry[]
+  /** True once `entries` reflects the server's own message list (even if
+   * that list is empty) -- undefined/false means "not fetched yet," not
+   * "empty." Always true for a purely local (non-server-backed) conversation. */
+  messagesLoaded?: boolean
+}
+
+/** Turns a server-backed conversation's raw message rows
+ * (`GET /conversations/{id}/messages`) into the same `QueryHistoryEntry`
+ * shape a live, in-session turn produces -- so `TurnCard.tsx` and friends
+ * render a reloaded-from-another-device conversation identically to one
+ * asked in the current tab, with one honest exception: a reloaded turn
+ * only has whatever this app chose to persist (the answer text, and the
+ * SQL if the turn produced one, via `metadata.sql`) -- not the full
+ * `AskResponse` (charts, per-source citations, schema DDL shown, ...),
+ * since that was never durably stored. See `docs/chat-history-architecture.md`'s
+ * "Known limitations" for the full disclosure.
+ *
+ * Pairs consecutive `user`/`assistant` rows by `sequence_number` (assigned
+ * server-side by `identity.repositories.history.append_turn`, always
+ * adjacent for one turn) -- a user message with no matching assistant
+ * reply yet (a truncated/failed persistence) still renders as its own
+ * entry, with a "pending"-shaped empty answer, rather than being dropped.
+ */
+export function serverMessagesToQueryHistory(rows: ServerMessage[]): QueryHistoryEntry[] {
+  const sorted = [...rows].sort((a, b) => a.sequence_number - b.sequence_number)
+  const entries: QueryHistoryEntry[] = []
+  let index = 0
+  while (index < sorted.length) {
+    const userRow = sorted[index]
+    if (userRow.role !== 'user') {
+      index += 1
+      continue
+    }
+    const assistantRow = sorted[index + 1]?.role === 'assistant' ? sorted[index + 1] : undefined
+    const sql = assistantRow?.metadata?.sql ?? null
+    const succeeded = assistantRow ? assistantRow.status !== 'failed' : false
+    const finalState: AskResponse = {
+      session_id: '',
+      conversation_id: userRow.conversation_id,
+      status: assistantRow ? (succeeded ? 'succeeded' : 'failed') : 'pending',
+      database: null,
+      sql,
+      result_columns: null,
+      result_rows: null,
+      row_count: null,
+      retry_count: 0,
+      attempt_history: [],
+      insight: null,
+      cost_notice: null,
+      low_confidence_notice: null,
+      rejection_reason: null,
+      rejection_message: null,
+      rate_limit_message: null,
+      clarification_message: null,
+      failure_explanation: succeeded ? null : (assistantRow?.content ?? null),
+      error_history: [],
+      sources_used: [],
+      synthesized_answer: succeeded ? (assistantRow?.content ?? null) : null,
+      document_result: null,
+      policy_result: null,
+      web_result: null,
+      generation_result: null,
+      media_search_result: null,
+      query_plan: null,
+      schema_tables: [],
+      followup_classification: null,
+      followup_resolved_against: null,
+    }
+    entries.push({
+      entryId: userRow.id,
+      question: userRow.content,
+      sql,
+      agentStatus: finalState.status,
+      retryCount: 0,
+      rowCount: null,
+      tables: [],
+      timestamp: userRow.created_at,
+      finalState,
+      answerDurationMs: 0,
+      editableSql: sql ?? '',
+      confirmedColumns: null,
+      confirmedRows: null,
+      confirmedError: null,
+      confirmedSql: null,
+      confirmedChart: null,
+      confirmedDurationMs: null,
+      originatedFromVoice: false,
+      spokenAudioUrl: null,
+    })
+    index += assistantRow ? 2 : 1
+  }
+  return entries
 }
 
 /** First question, trimmed and capped, so a conversation reads like a real

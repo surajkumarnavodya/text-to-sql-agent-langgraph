@@ -7,6 +7,7 @@ import { Button } from '@/components/ui/button'
 import { isOidcConfigured } from '@/lib/auth'
 import { cn } from '@/lib/utils'
 import { useAuthStore } from '@/store/authStore'
+import { useLocalAuthStore } from '@/store/localAuthStore'
 import { HistoryDrawer } from './HistoryDrawer'
 
 /** Full-viewport application shell. The history drawer has exactly one
@@ -19,6 +20,8 @@ export function AppShell() {
   const [isHistoryOpen, setIsHistoryOpen] = useState(false)
   const authStatus = useAuthStore((state) => state.status)
   const signOut = useAuthStore((state) => state.signOut)
+  const localAuthStatus = useLocalAuthStore((state) => state.status)
+  const localSignOut = useLocalAuthStore((state) => state.logout)
 
   return (
     <div className="h-screen w-screen overflow-hidden bg-[var(--background)] text-[var(--foreground)]">
@@ -41,16 +44,29 @@ export function AppShell() {
           </nav>
 
           <div className="ml-auto flex items-center gap-1.5">
-            {isOidcConfigured && authStatus === 'authenticated' && (
+            {localAuthStatus === 'authenticated' ? (
               <Button
                 variant="ghost"
                 size="icon"
-                onClick={() => void signOut()}
+                onClick={() => void localSignOut()}
                 aria-label={t('auth.signOut')}
                 title={t('auth.signOut')}
               >
                 <LogOut className="h-4 w-4" />
               </Button>
+            ) : (
+              isOidcConfigured &&
+              authStatus === 'authenticated' && (
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  onClick={() => void signOut()}
+                  aria-label={t('auth.signOut')}
+                  title={t('auth.signOut')}
+                >
+                  <LogOut className="h-4 w-4" />
+                </Button>
+              )
             )}
             <ThemeToggle />
             <Button

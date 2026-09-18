@@ -77,6 +77,65 @@ if it bothers you.
   changes — re-run `build_embeddings.py` explicitly (it's cheap to run
   when nothing changed, since it skips re-embedding on a fingerprint match).
 
+## Business-context retrieval (`retrieval/`)
+
+- **"Business-context index is empty for this database" (a
+  `retrieval_warnings` entry, not an error the UI shows):** the collection
+  hasn't been ingested yet — run
+  `python -m scripts.ingest_schema --database-id <name>`. The agent keeps
+  working without it (see `docs/vector-retrieval-design.md`'s "Fallback
+  behavior" section) — this is an accuracy aid, not a requirement.
+- **A knowledge-file edit (`data/knowledge/*.yaml`) doesn't seem to take
+  effect:** re-run `python -m scripts.ingest_schema --database-id <name>`
+  — unlike `config/table_descriptions.yaml` (re-read fresh on every
+  question), business-context knowledge files are only re-read when
+  ingestion runs.
+- **`RETRIEVAL_EMBEDDING_DIMENSIONS: ... does not match ...`
+  (`ValueError` at ingestion/retrieval time):** you've explicitly set
+  `RETRIEVAL_EMBEDDING_DIMENSIONS` and it no longer matches the configured
+  embedding provider/model's real output width (e.g. after changing
+  `EMBEDDING_MODEL_NAME`). Either unset `RETRIEVAL_EMBEDDING_DIMENSIONS` or
+  update it to match, then run `python -m scripts.rebuild_index
+  --database-id <name>` if any chunks were already embedded under the old
+  dimension.
+- **Ingestion is slow the first time, fast every time after:** expected —
+  only changed chunks are re-embedded on a re-run (see the design doc's
+  "Ingestion strategy" section); a full-schema first ingest embeds every
+  table/column/relationship chunk once.
+- **Want to see exactly what was retrieved for a question:** inspect
+  `state["retrieved_context"]`/`state["retrieval_sources"]`/
+  `state["retrieval_metadata"]` (e.g. via `agent.graph.run_agent()`
+  directly, or the `[retrieve_business_context] ...` log line each
+  question produces) — not yet surfaced in the REST API response or the
+  React dashboard (see the design doc's "Known limitations").
+
+## Chat history (`identity/repositories/history.py`, `api/chat_history.py`)
+
+- **A conversation doesn't appear on another browser/device:** confirm
+  you're signed in with the same **local account** (not OIDC, and not a
+  different email) on both — chat history is only server-side/universal
+  for a locally-authenticated user, see
+  `docs/chat-history-authentication-audit.md`'s "Known limitations."
+- **New questions aren't showing up in history at all:** check the API
+  logs for a `[chat_persistence] failed to persist /ask turn` warning —
+  persistence never fails the `/ask` response itself (see
+  `docs/chat-history-architecture.md` §4), so the question was still
+  answered even if this happened; the warning names the underlying
+  identity-database error.
+- **`relation "conversations" does not exist` / a chat-history column is
+  missing:** the identity database's migrations haven't been applied — run
+  `alembic -c identity/alembic.ini upgrade head`.
+- **Search returns nothing for a term you know is there:** search is
+  case-insensitive substring matching (`ILIKE '%term%'`) across
+  conversation titles and message content — confirm the term is spelled
+  exactly as it appears (it does partial-match, but not fuzzy/typo-tolerant
+  matching), and that you're searching from the same account the
+  conversation belongs to.
+- **A rename/delete doesn't seem to persist:** confirm you're signed in
+  as a local account and the request didn't fail silently — open the
+  browser's network tab and check the `PATCH`/`DELETE
+  /conversations/{id}` response status.
+
 ## Windows / ODBC (`DB_TYPE=mssql`)
 
 Requires the Microsoft ODBC Driver for SQL Server installed as a *system*

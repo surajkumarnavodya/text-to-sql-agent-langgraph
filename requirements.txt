@@ -82,6 +82,24 @@ fastapi==0.141.1
 # POST /documents (PDF upload) is the only route that needs it.
 python-multipart==0.0.32
 
+# --- Local user accounts / identity database (optional, off by default --
+# see identity/, docs/AUTH_USER_MANAGEMENT.md, LOCAL_AUTH_ENABLED) ---
+# Argon2id password hashing, this feature's own preferred algorithm --
+# called directly (argon2.PasswordHasher), no passlib wrapper (unmaintained,
+# and this project's convention is to call a real implementation directly
+# rather than through a vendor/wrapper library where avoidable).
+argon2-cffi==25.1.0
+# Real, version-controlled schema migrations for the identity database only
+# -- every other DB-backed module in this repo (db/, rag/store.py,
+# moderation/store.py) uses raw SQLAlchemy Core + a hand-written idempotent
+# ensure_schema() instead; Alembic is deliberately scoped to identity/ (a
+# greenfield database with genuine roll-forward/roll-back needs), not
+# adopted repo-wide.
+alembic==1.14.0
+# Pydantic's EmailStr (identity/schemas.py's RegisterRequest/LoginRequest)
+# needs this extra explicitly -- not bundled with pydantic's base install.
+email-validator==2.2.0
+
 # --- Production authentication (optional, see security/oidc.py, docs/AUTHENTICATION.md) ---
 # OIDC/JWT validation for `AUTH_MODE` beyond the legacy static bearer token
 # (api/auth.py's pre-existing API_AUTH_TOKEN check, kept unchanged and still

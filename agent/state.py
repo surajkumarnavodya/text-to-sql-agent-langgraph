@@ -224,6 +224,47 @@ class AgentState(TypedDict, total=False):
     # generate_sql's prompt via agent.llm_client._build_golden_examples_block.
     golden_examples: list[GoldenExample] | None
 
+    # Set by retrieve_business_context_node, which runs between
+    # retrieve_golden_examples and plan_query (see agent/graph.py) -- the
+    # ranked business-context chunks (retrieval.models.ScoredChunk.to_context_dict()
+    # shape) retrieval.retriever.retrieve_business_context found for this
+    # question: table/column/relationship descriptions, glossary terms,
+    # metric definitions, curated SQL examples, and documentation snippets.
+    # Always a plain list of dicts, never the pydantic Chunk/ScoredChunk
+    # objects themselves -- same "TypedDict state holds plain dicts, not
+    # model instances" convention TableSchema/AttemptRecord already follow.
+    # Empty list (not None) when retrieval found nothing, was disabled, or
+    # failed -- see retrieval_warnings below for *why* it's empty. Reused
+    # unchanged across every generate_sql retry for this question (only
+    # recomputed if retrieve_schema itself reruns), exactly like
+    # golden_examples/query_plan above -- injected into generate_sql's
+    # prompt via agent.llm_client._build_business_context_block.
+    retrieved_context: list[dict]
+    # The exact text retrieval.retriever.retrieve_business_context embedded
+    # as its query -- normally just `question` itself, kept separately on
+    # state (rather than re-read from `question`) so a future caller can
+    # tell "this is literally what was searched for" apart from the
+    # original question text without assuming the two always match.
+    retrieval_query: str | None
+    # chunk_id of every chunk that made it into retrieved_context, in the
+    # same order -- for traceability (e.g. an admin UI or eval script
+    # tying a generation back to exactly which knowledge-base entries
+    # informed it) independent of parsing retrieved_context itself.
+    retrieval_sources: list[str]
+    # Non-empty whenever business-context retrieval degraded for any reason
+    # (disabled, empty/missing collection, embedding failure, vector-store
+    # failure, or nothing cleared the similarity threshold) -- see
+    # retrieval.retriever.retrieve_business_context's docstring for the
+    # full fallback contract. Never a reason status becomes "failed":
+    # retrieval is an accuracy aid, exactly like golden_examples/query_plan.
+    retrieval_warnings: list[str]
+    # Observability-only counters from the retrieval call (candidate/final
+    # chunk counts, per-type breakdown, duration_ms) -- never read by any
+    # node's own logic, purely for logging/debugging a retrieval decision,
+    # the same role agent.state.DatabaseSelection.scores_by_db plays for
+    # multi-database routing.
+    retrieval_metadata: dict
+
     # Set by plan_query_node, which runs between retrieve_schema and
     # generate_sql -- an ordered list of concrete steps the model judged
     # necessary to answer the question (grouping, metrics, filters, whether

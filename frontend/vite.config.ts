@@ -21,6 +21,7 @@ const BACKEND_ROUTES = [
   '/generate',
   '/voice',
   '/search',
+  '/auth',
 ]
 
 export default defineConfig({

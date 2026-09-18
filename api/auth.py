@@ -1,4 +1,4 @@
-"""Authentication for `api/` endpoints -- dispatches across the three
+"""Authentication for `api/` endpoints -- dispatches across four possible
 `Settings.auth_mode` values (see that property's own docstring):
 
 - **"none"** (default, dev-only): no credential required at all. Unchanged
@@ -12,11 +12,20 @@
   down, so a valid token is treated as full admin access, same as it
   implicitly always was before role checks (`agent/authz.py`) existed.
 - **"oidc"**: real per-user identity via `security/oidc.py`'s JWT
-  validation -- the production-grade option, see `docs/AUTHENTICATION.md`.
-  Can be configured *alongside* a static token (interactive users via
-  OIDC, service/CI callers via the static token, both accepted) --
-  `verify_api_key` tries OIDC first when an OIDC-shaped bearer token is
-  presented, and falls back to the static-token check.
+  validation against an *external* identity provider -- see
+  `docs/AUTHENTICATION.md`.
+- **"local"**: this app's own self-hosted accounts (`identity/`,
+  `api/identity_auth.py`) -- a JWT this process itself issued
+  (`identity.security.create_access_token`), validated against
+  `Settings.jwt_secret_key`/`jwt_private_key_path`, never an external
+  provider's key.
+
+All four can be configured *simultaneously* -- `verify_api_key` tries
+local first (a request bearing a locally-issued token never wastes an
+attempt against OIDC's key/algorithm, and vice versa -- see
+`identity.security.looks_like_local_token`), then OIDC, then falls back to
+the static-token check, matching this module's pre-existing "OIDC + static
+token can coexist" posture, just extended by one more link in the chain.
 
 Every successful authentication (including the "none" no-op) attaches a
 `security.oidc.AuthIdentity` to `request.state.auth_identity` --
@@ -30,6 +39,8 @@ from __future__ import annotations
 import hmac
 
 from fastapi import Header, HTTPException, Request, status
+from identity.exceptions import LocalTokenValidationError
+from identity.security import looks_like_local_token, validate_local_token
 
 from config.settings import get_settings
 from security.audit_log import log_security_event
@@ -96,7 +107,40 @@ def verify_api_key(request: Request, authorization: str | None = Header(default=
             headers={"WWW-Authenticate": "Bearer"},
         )
 
-    if settings.auth_mode == "oidc":
+    if settings.local_auth_enabled:
+        token = (
+            authorization[len(_BEARER_PREFIX) :]
+            if authorization.startswith(_BEARER_PREFIX)
+            else None
+        )
+        # looks_like_local_token checks the (unverified) `iss` claim before
+        # attempting a real, signature-verifying decode -- so a request
+        # bearing an externally-issued OIDC token, or the static token
+        # (not a JWT shape at all), never wastes a doomed validation
+        # attempt against this app's own signing key/algorithm; see that
+        # function's own docstring.
+        if token is not None and looks_like_local_token(token, settings):
+            try:
+                claims = validate_local_token(token, settings)
+            except LocalTokenValidationError:
+                claims = None
+            if claims is not None:
+                request.state.auth_identity = AuthIdentity(
+                    subject=claims.subject, roles=claims.roles, mode="local"
+                )
+                return
+        # Falls through to OIDC/static-token below -- a token that isn't
+        # locally issued (or fails local validation) may still be valid
+        # under one of those, exactly like OIDC's own fall-through to the
+        # static token already works.
+
+    if settings.oidc_issuer is not None:
+        # Checked directly against `oidc_issuer` (not `settings.auth_mode`)
+        # -- `auth_mode` now reports "local" whenever local auth is also
+        # enabled (see that property's own docstring: it summarizes the
+        # *highest-priority* mechanism, not "the only one"), and OIDC must
+        # still be attempted here even when local auth is configured
+        # alongside it.
         token = (
             authorization[len(_BEARER_PREFIX) :]
             if authorization.startswith(_BEARER_PREFIX)

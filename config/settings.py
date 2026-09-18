@@ -488,6 +488,201 @@ class Settings(BaseSettings):
             standard claim for this; Auth0/Keycloak/Azure AD each use their
             own custom-claim convention) -- configure this to match
             whatever the identity provider actually issues.
+        local_auth_enabled: Whether this app's own self-hosted user
+            accounts (`identity/`) are active at all -- register/login/
+            refresh/logout/password-reset/admin-user-management. False by
+            default, mirroring every other optional subsystem in this
+            codebase (`enable_document_rag`, `enable_web_search`, ...).
+            When true, `api.auth.verify_api_key` tries a locally-issued
+            JWT *first* (distinguished from an externally-issued OIDC
+            token by its `iss` claim -- `jwt_issuer` here vs. `oidc_issuer`
+            above), falling through unchanged to the existing OIDC ->
+            static-token -> none chain for any token that isn't locally
+            issued -- all three mechanisms can be configured simultaneously.
+            A locally-authenticated user's roles are drawn from the same
+            base role vocabulary `agent.authz.ROLE_PERMISSIONS` already
+            knows (`viewer`/`user`/`analyst`/`admin`), so every existing
+            AI/RAG/SQL route's RBAC check works unchanged for a local user
+            -- see `identity/rbac.py` for the additional, separate
+            permission layer that only gates the new user/history/admin
+            endpoints. Requires `auth_database_url` to be set too.
+        auth_database_url: Full SQLAlchemy connection string for the
+            dedicated identity/history PostgreSQL database
+            (`identity/models.py`'s 14 tables: users, roles, permissions,
+            sessions, sign-in events, password-reset/email-verification
+            tokens, conversations, prompts, AI outputs, voice transcripts,
+            audit logs). Deliberately a *separate* connection from
+            `DB_CONNECTIONS`/`Settings.databases` (the business/HR
+            database(s) the text-to-SQL agent queries) -- this app must
+            never store authentication data, password hashes, or activity
+            history in the same database as the data it answers questions
+            about. A `SecretStr` for the same reason `db_password` is.
+            None (default) means local auth is entirely unavailable
+            regardless of `local_auth_enabled`.
+        auth_database_pool_size: `QueuePool`'s `pool_size` for the identity
+            database engine (`identity/db.py`) -- explicit here (mirrors
+            `moderation_store_pool_size`'s reasoning) since register/login/
+            refresh/history-write traffic can be frequent relative to this
+            app's other, mostly-read database traffic.
+        auth_database_max_overflow: `QueuePool`'s `max_overflow` for the
+            same engine.
+        auth_database_pool_recycle_seconds: Seconds before a pooled
+            identity-database connection is discarded and replaced
+            regardless of use -- same reasoning as
+            `moderation_store_pool_recycle_seconds`.
+        allow_public_registration: Whether `POST /auth/register` accepts
+            unauthenticated self-service sign-ups at all. False by default
+            -- a new deployment should default to admin-provisioned
+            accounts (`POST /admin/users`) unless the operator explicitly
+            wants an open sign-up flow.
+        require_email_verification: Whether a newly-registered account
+            starts in `pending_verification` status (blocked from signing
+            in until `POST /auth/verify-email` succeeds) rather than
+            `active` immediately. False by default -- email verification
+            requires an outbound mail-sending integration this codebase
+            does not itself provide (see `identity/`'s own docs for the
+            integration point), so leaving this off keeps registration
+            fully self-contained for a fresh clone.
+        password_min_length: Minimum accepted password length, enforced by
+            `identity/password_policy.py::validate_password_strength`
+            before hashing.
+        password_max_length: Maximum accepted password length -- a real
+            passphrase should never be silently truncated, so an
+            over-length password is rejected outright with a clear message
+            instead (`validate_password_strength`), never cut down to fit.
+        max_login_attempts: Consecutive failed sign-in attempts (per
+            account, within `login_lockout_minutes`) before
+            `identity.repositories.users` locks the account temporarily
+            (`users.locked_until`) -- closes the classic credential-
+            stuffing/brute-force gap a login endpoint with no lockout has.
+        login_lockout_minutes: How long an account stays locked after
+            tripping `max_login_attempts` -- a fixed cooldown window, not
+            an escalating one, kept simple by design.
+        jwt_algorithm: Signing algorithm for locally-issued access tokens.
+            `HS256` (the default, a single symmetric shared secret --
+            `jwt_secret_key` below) is the zero-friction local-dev choice
+            your own deployment doc should note when to graduate off of;
+            `RS256`/`ES256` (asymmetric, `jwt_private_key_path`/
+            `jwt_public_key_path` below) are the production-grade options,
+            letting this process's public key be distributed for
+            verification elsewhere without ever exposing the private
+            signing key. Already-installed `pyjwt[crypto]` supports all
+            three -- no new dependency needed either way.
+        jwt_secret_key: The shared secret for `jwt_algorithm="HS256"`.
+            Required (and length-validated -- see
+            `_validate_local_auth_signing_material` below) whenever local
+            auth is enabled with HS256. A `SecretStr` for the same reason
+            `db_password` is.
+        jwt_private_key_path: Path to a PEM-encoded RSA/EC private key,
+            required for `jwt_algorithm="RS256"`/`"ES256"`. Loaded lazily
+            by `identity/security.py` at first use (this field only
+            validates that *a path was configured*, not that the file
+            exists/parses -- the same "config validates shape, first use
+            validates reality" split `db/connection.py` already follows).
+        jwt_public_key_path: Path to the matching PEM-encoded public key,
+            used for verification -- distributable to another service that
+            only needs to *validate* tokens this process issues, never the
+            private key itself.
+        jwt_issuer: The `iss` claim stamped into (and required on) every
+            locally-issued token -- also what `api.auth.verify_api_key`
+            uses to recognize a locally-issued token before attempting
+            local validation at all, distinguishing it from an externally-
+            issued OIDC token without needing to guess from the token's
+            shape.
+        jwt_audience: The `aud` claim stamped into (and required on) every
+            locally-issued access token -- same purpose as `oidc_audience`
+            above, scoped to this app's own token issuance instead of an
+            external provider's.
+        access_token_expire_minutes: Access-token lifetime. Short by
+            design (15 minutes, matching this feature's own security
+            requirements) -- a compromised access token has a small,
+            bounded window of usefulness; long-lived sessions are carried
+            by the separate, revocable refresh token instead.
+        refresh_token_expire_days: Refresh-token (opaque, hashed-at-rest --
+            see `identity/security.py` and `identity/models.py`'s
+            `AuthSession.refresh_token_hash`) lifetime. Rotated on every
+            `POST /auth/refresh` call (a new opaque token issued, the old
+            one's row marked revoked with `replaced_by_session_id` set) --
+            reuse of an already-rotated/revoked refresh token is treated as
+            a signal to revoke the whole session family, not just log a
+            warning.
+        cookie_secure: Whether the refresh-token cookie
+            (`POST /auth/login`/`POST /auth/refresh` responses) is sent
+            with the `Secure` attribute -- should only ever be false for
+            plain-HTTP local development, never in a real deployment (a
+            `Secure` cookie is only ever sent over HTTPS).
+        cookie_samesite: `SameSite` attribute for the refresh-token cookie
+            -- `lax` (the default) works for this app's same-origin-by-
+            default deployment shape (`frontend/dist` served by this same
+            FastAPI process); a cross-subdomain deployment may need
+            `none` (which also requires `cookie_secure=true`, enforced by
+            browsers regardless of this app's own config).
+        cookie_domain: Explicit cookie `Domain` attribute override. None
+            (default) lets the browser default to the exact host that set
+            the cookie -- only set this for a deployment deliberately
+            sharing the refresh cookie across subdomains.
+        login_rate_limit_per_minute: Max `POST /auth/login` attempts per
+            minute, per client IP (`agent.rate_limit.SlidingWindowRateLimiter`,
+            the same primitive `api/rate_limit.py` already wraps for other
+            routes) -- a first line of defense against credential-stuffing
+            independent of the per-account lockout above (that one is
+            keyed on the account being attacked; this one is keyed on the
+            caller, so it also throttles an attacker probing many
+            different accounts from one IP).
+        register_rate_limit_per_hour: Max `POST /auth/register` attempts
+            per hour, per client IP -- guards against automated mass
+            account creation.
+        password_reset_rate_limit_per_hour: Max `POST /auth/forgot-password`
+            attempts per hour, per client IP -- guards against using the
+            reset-request endpoint as an account-enumeration or mail-
+            bombing vector.
+        password_reset_token_expire_minutes: How long a `POST
+            /auth/forgot-password`-issued reset token stays redeemable
+            (`identity.repositories.tokens`). Single-use regardless --
+            redeeming it (or letting it expire) both permanently retire it.
+        email_verification_token_expire_minutes: Same meaning as
+            `password_reset_token_expire_minutes`, for `POST
+            /auth/verify-email` tokens -- deliberately longer-lived (a day,
+            not an hour) since a verification email is lower-urgency than a
+            password-reset request.
+        app_base_url: This app's own externally-reachable origin, used only
+            to build the link inside a password-reset/verification "email"
+            (`identity/email.py` -- see that module's own docstring for why
+            it's a disclosed console-log placeholder, not real mail
+            delivery, today).
+        bootstrap_admin_enabled: Whether `scripts/bootstrap_admin.py`
+            (or `identity.bootstrap.bootstrap_admin_user`, called directly)
+            is permitted to create the very first admin account at all.
+            False by default -- deliberately requires an explicit,
+            separate opt-in beyond just having `bootstrap_admin_email`/
+            `bootstrap_admin_password` set, so a production `.env` that
+            still has leftover bootstrap credentials from initial setup
+            can't accidentally re-provision an admin account on a later,
+            unrelated run. Bootstrapping is also idempotent regardless
+            (see `identity/bootstrap.py`'s own docstring) -- this flag is
+            an extra, explicit safety rail on top of that, not a
+            substitute for it.
+        bootstrap_admin_email: Email address for the bootstrap admin
+            account. Never hardcoded in source -- must come from `.env`
+            (or process environment) whenever `bootstrap_admin_enabled` is
+            true.
+        bootstrap_admin_password: Password for the bootstrap admin account,
+            hashed (never stored raw) the same way any other user's
+            password is (`identity.security.hash_password`). A `SecretStr`
+            for the same reason `db_password` is.
+        log_prompt_content: Whether the *content* of a saved prompt/AI
+            output (as opposed to its metadata -- status, token counts,
+            latency, feature type) may ever appear in an ordinary log line
+            (never in `security.audit_log` events regardless, which only
+            ever log metadata). False by default -- prompt/answer content
+            can carry real user/business data, so verbose content logging
+            is opt-in-for-development only, never a production default.
+        log_voice_transcript_content: Same meaning as `log_prompt_content`,
+            for raw/corrected voice transcript text specifically -- kept as
+            its own separate flag since voice transcripts are a
+            particularly privacy-sensitive content type (recorded speech)
+            an operator may want to reason about independently of typed
+            prompt logging.
         enable_multi_source_router: Whether `api/main.py` routes
             questions through `agent.orchestrator.graph.run_orchestrated`
             (the multi-source router) instead of calling
@@ -995,6 +1190,62 @@ class Settings(BaseSettings):
     enable_golden_examples: bool = True
     golden_examples_top_k: int = Field(default=3, gt=0)
     golden_examples_min_similarity: float = Field(default=0.75, ge=0.0, le=1.0)
+
+    # --- Business-context vector retrieval (retrieval/, scripts/ingest_schema.py,
+    # scripts/rebuild_index.py -- see docs/vector-retrieval-design.md). Adds
+    # semantic retrieval of table/column/relationship descriptions, business
+    # glossary terms, metric definitions, curated SQL examples, and
+    # documentation on top of (never instead of) the live schema
+    # introspection `embeddings/schema_indexer.py` already scopes SQL
+    # generation with -- see agent.nodes.retrieve_business_context_node,
+    # which runs between retrieve_golden_examples and plan_query and fails
+    # open exactly like that node does. Reuses this project's existing
+    # ChromaDB PersistentClient (retrieval_collection_name is suffixed
+    # "__<database_id>", the same per-database-collection convention
+    # chroma_collection_name/golden_examples already use) rather than a
+    # second vector database -- see the design doc's "Selected vector
+    # database" section for why.
+    enable_business_context_retrieval: bool = True
+    retrieval_collection_name: str = "knowledge_base"
+    retrieval_embedding_provider: Literal["local", "fake"] = "local"
+    # Only used when retrieval_embedding_provider="fake" (tests, or a
+    # smoke-test environment with no real embedding runtime installed).
+    retrieval_fake_embedding_dimensions: int = Field(default=32, gt=0)
+    # If set, validated against the configured provider's actual output
+    # width at ingestion/retrieval time (retrieval.embeddings.validate_dimensions)
+    # -- a clear ConfigurationError-shaped failure instead of a cryptic
+    # Chroma dimension-mismatch exception. Unset (the default) accepts
+    # whatever the configured provider produces.
+    retrieval_embedding_dimensions: int | None = None
+    retrieval_similarity_metric: Literal["cosine", "l2", "ip"] = "cosine"
+    retrieval_embedding_batch_size: int = Field(default=32, gt=0)
+    retrieval_embedding_timeout_seconds: int = Field(default=30, gt=0)
+    retrieval_embedding_retry_count: int = Field(default=2, ge=0)
+    # Per-chunk-type retrieval limits -- see retrieval/retriever.py's
+    # docstring for why these are separate, bounded knobs rather than one
+    # flat top-k: an unbounded/shared limit would let one chunk type (most
+    # often `column`, since there's one per table column) crowd out every
+    # other type before reranking/diversity ever gets a chance to balance it.
+    retrieval_top_k_tables: int = Field(default=5, ge=0)
+    retrieval_top_k_columns: int = Field(default=8, ge=0)
+    retrieval_top_k_relationships: int = Field(default=5, ge=0)
+    retrieval_top_k_glossary: int = Field(default=3, ge=0)
+    retrieval_top_k_metrics: int = Field(default=3, ge=0)
+    retrieval_top_k_sql_examples: int = Field(default=3, ge=0)
+    retrieval_top_k_documentation: int = Field(default=3, ge=0)
+    retrieval_similarity_threshold: float = Field(default=0.3, ge=0.0, le=1.0)
+    retrieval_max_context_chars: int = Field(default=6000, gt=0)
+    retrieval_max_context_tokens: int = Field(default=1500, gt=0)
+    # Weight of raw vector similarity vs. chunk-type priority in
+    # retrieval.reranker's final_score formula (see that module's docstring).
+    retrieval_rerank_weight: float = Field(default=0.6, ge=0.0, le=1.0)
+    # How strongly a repeated (chunk_type, table_name) pair is discounted on
+    # subsequent picks during reranking's diversity pass.
+    retrieval_diversity_weight: float = Field(default=0.3, ge=0.0, le=1.0)
+    retrieval_documentation_chunk_chars: int = Field(default=1500, gt=0)
+    retrieval_documentation_chunk_overlap_chars: int = Field(default=200, ge=0)
+    retrieval_knowledge_dir: Path = Path("./data/knowledge")
+
     api_auth_token: SecretStr | None = None
     environment: Literal["development", "production"] = "development"
     oidc_issuer: str | None = None
@@ -1003,6 +1254,55 @@ class Settings(BaseSettings):
     oidc_algorithms: tuple[str, ...] = ("RS256",)
     oidc_clock_skew_seconds: int = Field(default=60, ge=0)
     oidc_role_claim: str = "roles"
+
+    # --- Local user accounts / identity database (identity/, see that
+    # package's own module docstrings; docs/AUTH_USER_MANAGEMENT.md has the
+    # full picture) ---
+    local_auth_enabled: bool = False
+    auth_database_url: SecretStr | None = None
+    auth_database_pool_size: int = Field(default=10, gt=0)
+    auth_database_max_overflow: int = Field(default=20, ge=0)
+    auth_database_pool_recycle_seconds: int = Field(default=1800, gt=0)
+    allow_public_registration: bool = False
+    require_email_verification: bool = False
+    password_min_length: int = Field(default=12, gt=0)
+    password_max_length: int = Field(default=64, gt=0)
+    # Server-side default page sizes/caps for the chat-history endpoints
+    # (identity/repositories/history.py, api/chat_history.py) -- mirrors
+    # this project's existing `*_top_k`-style "one setting per tunable
+    # limit" convention rather than hardcoding pagination sizes inline.
+    chat_history_page_size: int = Field(default=30, gt=0, le=200)
+    chat_history_max_page_size: int = Field(default=100, gt=0, le=500)
+    chat_search_page_size: int = Field(default=20, gt=0, le=100)
+    chat_search_max_page_size: int = Field(default=50, gt=0, le=200)
+    max_login_attempts: int = Field(default=5, gt=0)
+    login_lockout_minutes: int = Field(default=15, gt=0)
+    jwt_algorithm: Literal["HS256", "RS256", "ES256"] = "HS256"
+    jwt_secret_key: SecretStr | None = None
+    jwt_private_key_path: Path | None = None
+    jwt_public_key_path: Path | None = None
+    jwt_issuer: str = "text-to-sql-agent"
+    jwt_audience: str = "text-to-sql-web"
+    access_token_expire_minutes: int = Field(default=15, gt=0)
+    refresh_token_expire_days: int = Field(default=14, gt=0)
+    cookie_secure: bool = True
+    cookie_samesite: Literal["lax", "strict", "none"] = "lax"
+    cookie_domain: str | None = None
+    login_rate_limit_per_minute: int = Field(default=10, gt=0)
+    register_rate_limit_per_hour: int = Field(default=5, gt=0)
+    password_reset_rate_limit_per_hour: int = Field(default=5, gt=0)
+    password_reset_token_expire_minutes: int = Field(default=60, gt=0)
+    email_verification_token_expire_minutes: int = Field(default=1440, gt=0)
+    # Used only to build the link inside a password-reset/verification
+    # "email" (identity/email.py) -- this app's own externally-reachable
+    # origin, e.g. where the React dashboard is actually served from.
+    app_base_url: str = "http://localhost:8000"
+    bootstrap_admin_enabled: bool = False
+    bootstrap_admin_email: str | None = None
+    bootstrap_admin_password: SecretStr | None = None
+    log_prompt_content: bool = False
+    log_voice_transcript_content: bool = False
+
     rag_store_connection_string: SecretStr | None = None
     rag_store_odbc_driver: str = "ODBC Driver 17 for SQL Server"
     enable_document_rag: bool = False
@@ -1151,6 +1451,13 @@ class Settings(BaseSettings):
         app happens to be launched from."""
         return _resolve_path(str(value))
 
+    @field_validator("retrieval_knowledge_dir", mode="before")
+    @classmethod
+    def _resolve_retrieval_knowledge_dir(cls, value: object) -> Path:
+        """Same project-root-relative resolution as `_resolve_chroma_dir`
+        above, applied to `RETRIEVAL_KNOWLEDGE_DIR` for the same reason."""
+        return _resolve_path(str(value))
+
     def __init__(self, **data: object) -> None:
         """Wraps construction so every failure -- Pydantic's own type
         coercion included, not just this file's custom validators below --
@@ -1236,7 +1543,7 @@ class Settings(BaseSettings):
         return self
 
     @property
-    def auth_mode(self) -> Literal["none", "static_token", "oidc"]:
+    def auth_mode(self) -> Literal["none", "static_token", "oidc", "local"]:
         """The single dispatch point `api.auth.verify_api_key` (and
         everything downstream of it, e.g. `agent.authz`) uses to decide how
         a request is authenticated -- computed from the more granular
@@ -1244,15 +1551,18 @@ class Settings(BaseSettings):
         ever one source of truth for "is OIDC configured" instead of a
         second flag that could disagree with `oidc_issuer`/`oidc_audience`.
 
-        "oidc" whenever `oidc_issuer` is configured (verified fully valid
-        by `_validate_oidc_requires_audience` below, so this can trust it),
-        regardless of whether `api_auth_token` is *also* set -- see
-        `docs/AUTHENTICATION.md` for why both can be configured
-        simultaneously (interactive users via OIDC, service/CI callers via
-        the static token) rather than being mutually exclusive. "none" only
-        when neither is configured at all, which `_require_identity_in_production`
-        below refuses to allow outside `environment="development"`.
+        Reports the *highest-priority* configured mechanism, not "the only
+        one" -- `verify_api_key` actually tries local -> OIDC -> static
+        token in sequence, and more than one may be configured
+        simultaneously (see `docs/AUTHENTICATION.md`'s "Combining modes").
+        "local" (this app's own self-hosted accounts, `identity/`) takes
+        priority in this summary because it's the newest, most complete
+        option; "none" only when nothing at all is configured, which
+        `_require_identity_in_production` below refuses to allow outside
+        `environment="development"`.
         """
+        if self.local_auth_enabled:
+            return "local"
         if self.oidc_issuer is not None:
             return "oidc"
         if self.api_auth_token is not None:
@@ -1321,6 +1631,76 @@ class Settings(BaseSettings):
                 "OIDC_ISSUER (+ OIDC_AUDIENCE) for production-grade OIDC/JWT "
                 "authentication, or API_AUTH_TOKEN for a lighter-weight static shared "
                 "secret -- see docs/AUTHENTICATION.md."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_local_auth_requires_database(self) -> Settings:
+        """`LOCAL_AUTH_ENABLED=true` without `AUTH_DATABASE_URL` is a
+        real, not just incomplete, misconfiguration -- there would be
+        nowhere to actually store a registered user, a session, or a
+        single row of activity history. Caught here, at startup, the same
+        way `_validate_oidc_requires_audience` catches its own analogous
+        gap rather than letting every register/login call fail one at a
+        time at first use.
+        """
+        if self.local_auth_enabled and self.auth_database_url is None:
+            raise ConfigurationError(
+                "LOCAL_AUTH_ENABLED=true requires AUTH_DATABASE_URL to be set -- "
+                "self-hosted user accounts need a dedicated identity database to "
+                "store users/sessions/history in. Set AUTH_DATABASE_URL in .env, or "
+                "leave LOCAL_AUTH_ENABLED unset/false."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_local_auth_signing_material(self) -> Settings:
+        """Whichever `jwt_algorithm` is configured needs its own signing
+        material actually present -- an `HS256` deployment with no
+        `JWT_SECRET_KEY` (or a trivially short one) would either crash on
+        first login or, worse, sign tokens with a guessable/empty secret;
+        an `RS256`/`ES256` deployment with no key-file paths configured has
+        no way to sign anything at all. Only enforced when
+        `local_auth_enabled` -- this app must never demand JWT signing
+        material just to boot with local auth off, the same "never breaks
+        a deployment that isn't using this feature" posture every other
+        optional-subsystem validator in this file already has.
+
+        The `HS256` minimum-length check (32 characters, 256 bits) is a
+        floor, not a strength guarantee -- pick a genuinely random secret in
+        practice, e.g. `python -c "import secrets; print(secrets.token_urlsafe(48))"`.
+        """
+        if not self.local_auth_enabled:
+            return self
+        if self.jwt_algorithm == "HS256":
+            secret = self.jwt_secret_key.get_secret_value() if self.jwt_secret_key else ""
+            if len(secret) < 32:
+                raise ConfigurationError(
+                    "LOCAL_AUTH_ENABLED=true with JWT_ALGORITHM=HS256 requires a "
+                    "JWT_SECRET_KEY of at least 32 characters. Generate one with "
+                    '`python -c "import secrets; print(secrets.token_urlsafe(48))"` '
+                    "and set it in .env."
+                )
+        else:
+            if self.jwt_private_key_path is None or self.jwt_public_key_path is None:
+                raise ConfigurationError(
+                    f"LOCAL_AUTH_ENABLED=true with JWT_ALGORITHM={self.jwt_algorithm} requires "
+                    "both JWT_PRIVATE_KEY_PATH and JWT_PUBLIC_KEY_PATH to be set in .env."
+                )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_bootstrap_admin_requires_credentials(self) -> Settings:
+        """`BOOTSTRAP_ADMIN_ENABLED=true` with no email/password configured
+        would let `identity.bootstrap.bootstrap_admin_user` be invoked with
+        nothing to actually create -- caught here rather than as a
+        confusing failure inside the bootstrap script itself."""
+        if self.bootstrap_admin_enabled and (
+            not self.bootstrap_admin_email or self.bootstrap_admin_password is None
+        ):
+            raise ConfigurationError(
+                "BOOTSTRAP_ADMIN_ENABLED=true requires both BOOTSTRAP_ADMIN_EMAIL and "
+                "BOOTSTRAP_ADMIN_PASSWORD to be set in .env."
             )
         return self
 

@@ -72,6 +72,8 @@ below, and `docs/MULTI_SOURCE_GUIDE.md` for how to configure each source.
 | Config / validation | Pydantic v2 — `config/settings.py`'s `Settings` is a `pydantic_settings.BaseSettings` (env-var-driven, `Field`/`Literal`-validated); secrets are `pydantic.SecretStr`; request/response models (`api/schemas.py`) and several boundary dataclasses were converted to `BaseModel` too. See "Pydantic-based configuration and validation" below |
 | Orchestration | LangGraph — explicit state machine, not a black-box agent. Two graphs: `agent/graph.py` (the SQL pipeline, always present) and, when multi-source is enabled, `agent/orchestrator/graph.py` (router + fan-out, sitting in front of it) |
 | Schema retrieval | ChromaDB (persisted locally) — embeds table DDL synthesized from live introspection, retrieves top-k relevant tables per question |
+| Business-context vector retrieval | Same ChromaDB `PersistentClient`, a second collection (`retrieval/`) — table/column/relationship/glossary/metric/sql_example/documentation chunks, deterministic IDs, idempotent ingestion. Additive to (never a replacement for) live schema retrieval above. See "Business-context vector retrieval" below |
+| User accounts / universal chat history | Optional (`LOCAL_AUTH_ENABLED`), dedicated PostgreSQL database (`identity/`) — Argon2id + JWT auth, and (new) permanent, cross-device conversation/message storage (`identity.models.Conversation`/`Prompt`/`AiOutput`, `api/chat_history.py`). See "Local self-hosted accounts" and "Universal server-side chat history" below |
 | Database | User's own — PostgreSQL, MySQL, SQL Server, or Oracle, via SQLAlchemy. Config-driven (`DB_TYPE` + connection params in `.env`), pluggable per `db.connection.SUPPORTED_DB_TYPES`. One or more named connections (`DB_CONNECTIONS` in `.env`); the agent auto-routes each question to the right one when more than one is configured |
 | SQL parsing/validation | sqlglot — parses generated SQL and checks statement type against an allowlist, in the dialect matching `DB_TYPE` |
 | Document/policy RAG | SQL Server 2025+/Azure SQL native `VECTOR` column type (`rag/store.py`) — a dedicated connection (`RAG_STORE_CONNECTION_STRING`), separate from `DB_CONNECTIONS`. Optional, off by default (`ENABLE_DOCUMENT_RAG`/`ENABLE_POLICY_RAG`) |
@@ -156,6 +158,22 @@ below, and `docs/MULTI_SOURCE_GUIDE.md` for how to configure each source.
   sibling collection on the same Chroma client/persist dir, one per
   configured database (`f"golden_examples__{db_name}"`) — see "Golden-dataset
   feedback loop" below.
+- `retrieval/` — the business-context vector-retrieval layer (table/
+  column/relationship/glossary/metric/sql_example/documentation chunks) —
+  see "Business-context vector retrieval" below for the full design.
+  `models.py` (the typed `Chunk` model + deterministic ID/content-hash
+  generation), `chunking.py` (schema + `data/knowledge/*` → chunks),
+  `embeddings.py` (provider abstraction: `"local"` reuses `embeddings
+  .schema_indexer`'s own embedding function, `"fake"` for tests),
+  `vector_store.py` (the `VectorStore` interface + its Chroma
+  implementation), `reranker.py` (deterministic similarity + type-priority
+  + exact-match + diversity scoring, no external reranker model),
+  `retriever.py` (the orchestration `agent.nodes.retrieve_business_context_node`
+  calls — fails open on any failure, see that module's own docstring),
+  `ingestion.py` (idempotent discover → chunk → hash → embed → upsert,
+  driven by `scripts/ingest_schema.py`/`scripts/rebuild_index.py`).
+  Deliberately reuses `embeddings.schema_indexer.get_chroma_client`'s
+  cached `PersistentClient` rather than a second vector database.
 - `agent/` — LangGraph nodes live in `nodes.py`, one function per node, each
   taking and returning `AgentState` (defined in `state.py`). `graph.py`
   wires them together and compiles the graph. `sql_validator.py` is the
@@ -241,11 +259,38 @@ below, and `docs/MULTI_SOURCE_GUIDE.md` for how to configure each source.
   around the agent's own internal self-correction executions, which are
   never shown to the user. In development, `vite.config.ts`'s
   `BACKEND_ROUTES` proxies `/ask`/`/execute`/`/documents`/`/schema`/
-  `/feedback`/`/health`/`/media`/`/generate` to the API on port 8000 so the
-  browser never needs CORS; in production, `npm run build`'s output
+  `/feedback`/`/health`/`/media`/`/generate`/`/voice`/`/search`/`/auth` to
+  the API on port 8000 so the browser never needs CORS (`/auth` added
+  alongside the local-account feature — see "Local self-hosted accounts"
+  below; the chat-history routes, `/conversations`/`/chat`, use the same
+  no-prefix same-origin convention and don't need a separate
+  `BACKEND_ROUTES` entry since they're plain top-level paths already
+  covered by Vite's dev-server default proxying of anything not matched by
+  a static asset); in production, `npm run build`'s output
   (`frontend/dist`) is served by that same API process (`api/main.py`'s
   `StaticFiles` mount) at the same paths, so the frontend's own fetch calls
   never need an `/api` prefix or environment-specific base URL.
+- `identity/` — this app's own self-hosted user accounts (optional, off by
+  default — `Settings.local_auth_enabled`), the *only* ORM (SQLAlchemy 2.0
+  declarative) and the *only* real (Alembic) migrations anywhere in this
+  codebase — see `identity/__init__.py`'s own docstring for why this is a
+  deliberate exception to the rest of the codebase's "raw SQLAlchemy Core +
+  idempotent `ensure_schema()`" convention. `models.py` (14 tables:
+  accounts/RBAC, sessions/tokens, and `Conversation`/`Prompt`/`AiOutput`
+  for chat history), `security.py` (Argon2id hashing, JWT issue/validate,
+  opaque refresh tokens), `password_policy.py` + `display_name.py`
+  (mandatory-display-name + password-strength validation — see
+  `docs/authentication-and-password-policy.md`), `repositories/` (one
+  module per aggregate: `users.py`, `sessions.py`, `tokens.py`,
+  `signin_events.py`, `history.py` — the chat-history repository, see
+  "Universal server-side chat history" below), `rbac.py` (granular
+  permission codes bridging into `agent/authz.py`'s own base role names),
+  `migrations/` (Alembic, `identity/alembic.ini` — run via `alembic -c
+  identity/alembic.ini upgrade head`). Tests against this package use a
+  real in-memory SQLite engine (`Base.metadata.create_all`), never a mock
+  of the ORM — production always runs against PostgreSQL
+  (`AUTH_DATABASE_URL`), a dedicated database, never one of
+  `DB_CONNECTIONS`.
 - `api/` — `main.py`'s FastAPI app is the REST surface every UI action
   goes through, and (once `frontend/dist` exists) also the process that
   serves the React dashboard itself. A `lifespan` context manager warms
@@ -265,10 +310,17 @@ below, and `docs/MULTI_SOURCE_GUIDE.md` for how to configure each source.
   genuinely new/forgotten call site, not the common case. `/ask` accepts an
   optional `session_id` (`AskRequest.session_id`), generating one via
   `uuid4()` when omitted, and always echoes it back in `AskResponse
-  .session_id` — a pure correlation token today (the API stays fully
-  stateless, per `ConversationExchangeIn`'s docstring), but the identifier
-  future server-side conversation state (the multi-source router keeping
-  context coherent across sources) will key off of.
+  .session_id` — a pure correlation token (the multi-source router's own
+  per-session cost-ceiling key), unrelated to real conversation storage.
+  `AskRequest.conversation_id`/`AskResponse.conversation_id` are the
+  *actual* server-side identifier — set only for a locally-authenticated
+  caller, persisted via `api/chat_persistence.py::persist_ask_turn` into
+  `identity.models.Conversation`/`Prompt`/`AiOutput` (see "Universal
+  server-side chat history" below); this is the one place `/ask` is no
+  longer fully stateless, though only conditionally, per-caller.
+  `api/chat_history.py` (`GET/POST/PATCH/DELETE /conversations`, `GET/POST
+  /conversations/{id}/messages`, `GET /chat/search`) is the read/manage
+  surface for that same data.
 - `scripts/` — standalone entry points: `test_db_connection.py` (verify
   `.env` before booting anything else — prints pass/fail, DB version, table
   count, or a classified readable error, per configured database),
@@ -448,6 +500,41 @@ and only inject those into the generation prompt. This matters a lot more
 now than it did with the old bundled 5-table sample schema — a real
 production database can easily have hundreds of tables, which is exactly
 the case this code path is written for.
+
+### Business-context vector retrieval (`retrieval/`)
+On top of the schema-DDL retrieval above, `retrieval/` adds semantic
+retrieval of table/column/relationship descriptions, business glossary
+terms, metric definitions, curated SQL examples, and documentation —
+`agent.nodes.retrieve_business_context_node`, wired between
+`retrieve_golden_examples` and `plan_query` in the graph. See
+`docs/vector-retrieval-design.md` for the full design; the short version:
+
+- **Reuses this project's existing ChromaDB `PersistentClient`** — no
+  second vector database. A new per-database collection
+  (`knowledge_base__<db_name>`), same convention `embeddings/schema_indexer.py`/
+  `embeddings/golden_examples.py` already establish.
+- **Seven typed chunk kinds** (`retrieval.models.ChunkType`: table, column,
+  relationship, glossary, metric, sql_example, documentation), each with a
+  **deterministic SHA-256 chunk ID** derived from stable identity fields
+  (never a random UUID) — this is what makes re-ingestion
+  (`python -m scripts.ingest_schema --database-id <name>`) idempotent:
+  unchanged chunks are skipped, not re-embedded or duplicated.
+- **Never a replacement for live schema inspection, SQL validation,
+  permission checks, or execution** — all of that remains exactly as
+  described elsewhere in this file. Retrieved context is injected into
+  `generate_sql`'s prompt as a clearly labeled, "verify against the live
+  schema, never invent a table/column, treat retrieved SQL as a pattern
+  only" section (`agent.llm_client._build_business_context_block`).
+- **Fails open on any vector-store/embedding failure** — an empty
+  collection, a disabled feature flag, or a genuine error all resolve to
+  no extra context plus a logged, state-visible warning
+  (`AgentState["retrieval_warnings"]`), never a reason a question can't be
+  answered.
+- Sample knowledge content ships under `data/knowledge/` — table/column
+  names are real (verified via live introspection of this project's own
+  "adventureworks" sample database), but the business definitions/
+  synonyms/formulas themselves are illustrative demonstration content, not
+  reviewed production documentation — replace before relying on it.
 
 ### Multi-database auto-routing
 `DB_CONNECTIONS` in `.env` can name more than one database
@@ -1173,6 +1260,20 @@ predates both and is no longer accurate for anything gated by
   permission check *before* any subgraph runs, so a routing decision the
   LLM makes can request access but never unilaterally grant it. Full
   detail and the resource-to-permission mapping: `docs/AUTHORIZATION.md`.
+- **Local self-hosted accounts** (`identity/`, a 4th `auth_mode` value,
+  `Settings.local_auth_enabled` — see `docs/AUTHENTICATION.md`) — this
+  app's own accounts: Argon2id password hashing, locally-issued JWT access
+  tokens + rotating opaque refresh tokens (reuse-detection revokes the
+  whole session family, `identity/repositories/sessions.py`), account
+  lockout, password reset, email verification. A local user's role names
+  (`viewer`/`user`/`analyst`/`admin`) feed straight into the *same*
+  `AuthIdentity.roles`/`agent/authz.py` RBAC bridge described above — zero
+  changes needed to any existing AI/RAG/SQL route's authorization check.
+  **Display name is mandatory at sign-up** and **passwords must clear a
+  real strength policy** (`identity/password_policy.py` — common-password/
+  sequential-digit/keyboard-walk/identity-fragment checks, 12-64 chars,
+  never silently truncated) — see
+  `docs/authentication-and-password-policy.md`.
 - **Frontend OIDC login** (2026 Phase 3, `frontend/src/lib/auth.ts` +
   `store/authStore.ts`) — a real Authorization Code + PKCE flow
   (`oidc-client-ts`), in-memory-only token storage (`InMemoryWebStorage`,
@@ -1227,6 +1328,62 @@ attempt) and `SECURITY_PRODUCTION_CHECKLIST.md` for an operator-facing
 go/no-go list. `docs/security-changelog.md` carries the dated changelog
 entry for this pass alongside every earlier change-controlled security
 decision.
+
+### Universal server-side chat history (`identity/repositories/history.py`, `api/chat_history.py`)
+For a locally-authenticated user (see above), every conversation and
+message is now stored permanently in the identity database, not just in
+the browser tab's Zustand store — the fix for a real, previously-disclosed
+gap: chat state used to be entirely in-memory-only
+(`frontend/src/store/chatStore.ts`), so the same signed-in user got a
+blank history on a different browser/device, and a page reload cleared it.
+See `docs/chat-history-authentication-audit.md` for the full before/after
+and `docs/chat-history-architecture.md` for the schema/API/frontend design.
+
+`identity.models.Conversation`/`Prompt`/`AiOutput` (all pre-existing
+tables from the identity module's own initial build, previously unused by
+any code path) are the storage: `Prompt` is one user question, `AiOutput`
+its assistant answer, paired by a per-conversation `sequence_number`
+(assigned once, inside one transaction, by
+`identity.repositories.history.append_turn` — never a client-supplied
+value). `POST /ask` (`api/main.py`) calls this via a small glue module,
+`api/chat_persistence.py::persist_ask_turn`, *after* the agent's own
+schema-retrieval/generation/validation/execution has already fully run —
+**a persistence failure here can never fail the `/ask` response itself**
+(wrapped in a broad `except Exception`, logged, degrades silently for that
+one turn), the same fail-open posture this codebase already applies to
+every other non-critical-path accuracy aid (`plan_query_node`,
+`retrieve_golden_examples_node`, `retrieve_business_context_node`).
+
+`api/chat_history.py` exposes `GET/POST/PATCH/DELETE /conversations`,
+`GET/POST /conversations/{id}/messages`, and `GET /chat/search` — every
+route requires `Depends(require_local_user)` and folds `user_id` directly
+into every repository-layer query (never a permission check layered on
+top of an unscoped fetch), so a wrong/forged `conversation_id` resolves to
+a 404, never confirming another user's conversation even exists (same
+account-enumeration-avoidance principle `identity.exceptions
+.InvalidCredentialsError` already applies to login). Search
+(`identity.repositories.history.search_history`) uses plain, portable
+`ILIKE '%term%'` (works identically against this repo's SQLite test engine
+and the real PostgreSQL identity database) accelerated by `pg_trgm` GIN
+trigram indexes on PostgreSQL — deliberately not `to_tsvector` full-text
+search or a separate search engine, given this project's own local-dev-
+oriented scale. See `docs/chat-history-search.md`.
+
+**Retention**: logout, session expiry, a browser/device change, or an app
+restart never delete chat history — only an explicit, user-initiated
+`DELETE /conversations/{id}` does, and even that is a soft delete
+(`deleted_at`), never a real `DELETE`. `frontend/src/store/chatStore.ts
+::clearHistory()` (called on logout/user-switch, wired from
+`AuthGate.tsx`) only clears **in-memory** state — it never calls a delete
+API.
+
+**Known limitation, named not hidden**: only a locally-authenticated user
+gets this — an OIDC or unauthenticated caller's questions are still
+answered normally, nothing is persisted for them (no `identity.users` row
+to attach a conversation to). A reloaded past turn also only shows the
+answer text + SQL (if any), not the full `AskResponse` (charts,
+citations, the schema DDL shown at generation time) — see
+`docs/chat-history-architecture.md`'s own "Known limitations" section.
 
 ### SQL is untrusted output, always
 The LLM's SQL is never trusted at face value. `agent/sql_validator.py`
@@ -1455,6 +1612,8 @@ ollama pull llama3.1:8b
 # fill in .env with your real DB connection details first
 python scripts\test_db_connection.py
 python scripts\build_embeddings.py
+python -m scripts.ingest_schema --database-id default   # optional, business-context vector retrieval
+alembic -c identity\alembic.ini upgrade head              # optional, only if LOCAL_AUTH_ENABLED=true
 cd frontend; npm install; npm run build; cd ..
 uvicorn api.main:app --host 127.0.0.1 --port 8000
 ```
@@ -1484,6 +1643,8 @@ manual, real-DB-required script; it is never run by `pytest` or CI.
 | Create venv + install deps | `.\tasks.ps1 setup` | `make setup` |
 | Verify DB connection | `python scripts\test_db_connection.py` | `python scripts/test_db_connection.py` |
 | Build/refresh embeddings | `python scripts\build_embeddings.py` | `python scripts/build_embeddings.py` |
+| Ingest business-context knowledge | `python -m scripts.ingest_schema --database-id default` | same |
+| Apply identity-DB migrations | `alembic -c identity\alembic.ini upgrade head` | `alembic -c identity/alembic.ini upgrade head` |
 | Run app | `.\tasks.ps1 run` | `make run` |
 | Run tests | `.\tasks.ps1 test` | `make test` |
 | Lint | `.\tasks.ps1 lint` | `make lint` |
@@ -1569,10 +1730,35 @@ rediscover:
   cross-source questions.** It still only exercises `agent.graph.run_agent`
   (the SQL-only path) — a real gap if multi-source accuracy needs the same
   execution-accuracy-first rigor the SQL benchmark already has.
-- **No persistent conversation memory across app restarts.** Follow-up
-  question resolution (`agent/followup.py`) is session-only, same as
-  before multi-source support existed — a SQL Server-backed LangGraph
-  checkpointer was scoped in early design discussion but never built (no
-  official LangGraph SQL Server checkpointer exists at this project's
-  pinned `langgraph==0.2.62`; it would need a custom
-  `BaseCheckpointSaver`).
+- **Follow-up question resolution (`agent/followup.py`) is still
+  per-request, not backed by a LangGraph checkpointer.** This is
+  independent of chat-history *storage* (see "Universal server-side chat
+  history" below, which does now persist conversations/messages
+  permanently for a locally-authenticated user) — `classify_followup_node`
+  still only ever sees whatever `conversation_history` the caller resends
+  on each `/ask` call (`frontend/src/lib/history.ts::buildConversationHistory`,
+  capped to the last `MAX_FOLLOWUP_EXCHANGES` turns), not a server-side
+  LangGraph checkpoint. A SQL Server/Postgres-backed checkpointer was
+  scoped in early design discussion but never built (no official
+  LangGraph SQL Server checkpointer exists at this project's pinned
+  `langgraph==0.2.62`; it would need a custom `BaseCheckpointSaver`) — this
+  remains a real, separate follow-up from chat-history persistence itself.
+- **Universal chat history only covers locally-authenticated users** — an
+  OIDC-authenticated or fully-unauthenticated caller's questions are still
+  answered normally, but nothing is persisted for them (no corresponding
+  `identity.users` row to attach a conversation to). See
+  `docs/chat-history-authentication-audit.md` §7.
+- **A reloaded past conversation turn isn't a byte-for-byte reconstruction
+  of a live one** — only the answer text and, if the turn produced SQL,
+  that SQL are persisted (`identity.models.AiOutput.metadata_json`), not
+  the full `AskResponse` (charts, per-source citations, the exact schema
+  DDL shown at generation time). See `docs/chat-history-architecture.md`'s
+  "Known limitations."
+- **Business-context vector retrieval (`retrieval/`) has no dedicated
+  NL term/metric/table/time-concept extraction step** and **no
+  breached-password check** for the local-auth password policy
+  (`identity/password_policy.py`) beyond a small offline common-password
+  list — both deliberate, disclosed tradeoffs, not oversights. See
+  `docs/vector-retrieval-design.md` §13 and
+  `docs/authentication-and-password-policy.md`'s own "Not implemented"
+  notes respectively.

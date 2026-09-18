@@ -24,6 +24,7 @@ import time
 from collections.abc import Callable
 from typing import Any
 
+from retrieval.retriever import retrieve_business_context
 from sqlalchemy.exc import SQLAlchemyError
 
 from agent.authz import Permission, has_role_permission
@@ -166,9 +167,7 @@ def _selected_db_name(state: AgentState) -> str:
         # `assert` -- `assert` is stripped entirely under `python -O`,
         # which would turn this precondition violation into a confusing
         # downstream `None`-related error instead of a clear one here.
-        raise RuntimeError(
-            "reached with no selected_database; retrieve_schema_node must run first"
-        )
+        raise RuntimeError("reached with no selected_database; retrieve_schema_node must run first")
     return selected_database
 
 
@@ -632,6 +631,70 @@ def retrieve_golden_examples_node(state: AgentState) -> dict[str, Any]:
     return {"golden_examples": examples or None, "status": "generating"}
 
 
+@_timed_node("retrieve_business_context")
+def retrieve_business_context_node(state: AgentState) -> dict[str, Any]:
+    """Looks up semantically-relevant business context -- table/column/
+    relationship descriptions, glossary terms, metric definitions, curated
+    SQL examples, and documentation snippets (see `retrieval/`) -- and
+    stores the ranked result for `generate_sql_node` to inject as an
+    additional, clearly-labeled prompt block.
+
+    Runs between `retrieve_golden_examples` and `plan_query` (see
+    `agent/graph.py`): by this point `state["selected_database"]` is
+    already resolved (needed to pick the right collection), and this node's
+    own output has no bearing on golden-example retrieval or query planning,
+    so the ordering relative to those two doesn't matter functionally --
+    placed here so every downstream prompt-building step
+    (`plan_query_node`, `generate_sql_node`) can see the *complete* set of
+    retrieved context in one place.
+
+    This is an accuracy aid, never a gate: `retrieval.retriever
+    .retrieve_business_context` already never raises (see that function's
+    own fail-open contract), so the `except Exception` here is
+    defense-in-depth against anything unexpected surfacing from this call
+    site specifically -- the same posture `retrieve_golden_examples_node`
+    right above takes for its own Chroma-backed lookup. The live database
+    schema (`state["schema_context_text"]`, from `retrieve_schema_node`)
+    remains the sole authority on what tables/columns actually exist --
+    this node only ever *adds* optional business-meaning context on top,
+    never replaces or overrides it (see `docs/vector-retrieval-design.md`).
+    """
+    settings = get_settings()
+    question = state["question"]
+    db_name = state.get("selected_database") or "default"
+    caller_roles = state.get("caller_roles", ())
+
+    try:
+        result = retrieve_business_context(question, db_name, caller_roles, settings)
+    except Exception as exc:  # noqa: BLE001 - an accuracy aid must never block the run
+        logger.warning(
+            "[retrieve_business_context] unexpected failure, proceeding without: %s", exc
+        )
+        return {
+            "retrieved_context": [],
+            "retrieval_query": question,
+            "retrieval_sources": [],
+            "retrieval_warnings": [f"Business-context retrieval failed unexpectedly: {exc}"],
+            "retrieval_metadata": {},
+            "status": "generating",
+        }
+
+    logger.info(
+        "[retrieve_business_context] database=%r retrieved %d chunk(s), warnings=%s",
+        db_name,
+        len(result.items),
+        result.warnings,
+    )
+    return {
+        "retrieved_context": [item.to_context_dict() for item in result.items],
+        "retrieval_query": result.query,
+        "retrieval_sources": result.sources,
+        "retrieval_warnings": result.warnings,
+        "retrieval_metadata": result.metadata,
+        "status": "generating",
+    }
+
+
 @_timed_node("plan_query")
 def plan_query_node(state: AgentState) -> dict[str, Any]:
     """Produces an up-front, ordered plan for a question judged non-trivial.
@@ -756,6 +819,7 @@ def generate_sql_node(state: AgentState) -> dict[str, Any]:
             followup_context=followup_context,
             query_plan=state.get("query_plan"),
             golden_examples=state.get("golden_examples"),
+            retrieved_context=state.get("retrieved_context"),
         )
     except OffTopicQuestionError as exc:
         # Defense-in-depth backstop, not the normal path: agent.input_guard's

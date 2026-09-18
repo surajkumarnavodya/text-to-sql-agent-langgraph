@@ -254,6 +254,68 @@ python scripts/test_db_connection.py
 python scripts/build_embeddings.py
 ```
 
+### Business-context vector retrieval (optional, recommended)
+
+On top of the schema index above, the agent can also retrieve business
+glossary terms, metric definitions, table/column/relationship descriptions,
+curated SQL examples, and documentation — see
+[`docs/vector-retrieval-design.md`](docs/vector-retrieval-design.md) for
+the full design. It's additive and fails open (the app works identically
+with none of this ingested — see that doc's "Fallback behavior" section),
+but improves context recall once ingested:
+
+```bash
+# Preview what would be ingested, without embedding or writing anything:
+python -m scripts.ingest_schema --database-id default --dry-run
+
+# Actually ingest (safe to re-run any time -- only changed chunks are
+# re-embedded; see the design doc's "Ingestion strategy" section):
+python -m scripts.ingest_schema --database-id default
+```
+
+(`--database-id` matches one of `Settings.databases`' names — `default`
+for a plain single-database `.env`, or the name you gave it under
+`DB_CONNECTIONS` for a multi-database setup.)
+
+Sample glossary/metric/SQL-example/documentation content lives under
+[`data/knowledge/`](data/knowledge/) — replace it with your own before
+relying on this in production (the shipped samples are clearly labeled
+demonstration content, not reviewed business documentation).
+
+If you ever need to fully rebuild a database's business-context index
+(e.g. after changing `RETRIEVAL_SIMILARITY_METRIC`, which — like the
+schema-DDL collection above — is fixed at collection-creation time):
+
+```bash
+python -m scripts.rebuild_index --database-id default
+```
+
+### User accounts, universal chat history & password policy (optional)
+
+Set `LOCAL_AUTH_ENABLED=true` (plus `AUTH_DATABASE_URL`, a dedicated
+PostgreSQL database, and `JWT_SECRET_KEY` — see `.env.example`) to enable
+this app's own self-hosted accounts. See
+[`docs/AUTHENTICATION.md`](docs/AUTHENTICATION.md) for the full picture;
+this section covers only what's new in this pass:
+
+- **Display name is mandatory at sign-up** and **passwords must clear a
+  real strength policy** (12+ characters, no common/patterned passwords,
+  nothing containing your email/name) — see
+  [`docs/authentication-and-password-policy.md`](docs/authentication-and-password-policy.md).
+- **Chat history is server-side and universal**: once signed in with a
+  local account, every conversation is stored in the identity database and
+  follows you across browsers and devices — logging out, a session
+  expiring, or an app restart never deletes it. See
+  [`docs/chat-history-architecture.md`](docs/chat-history-architecture.md)
+  and [`docs/chat-history-search.md`](docs/chat-history-search.md).
+
+Run the identity database's migrations before first use (or after pulling
+an update that touches `identity/models.py`):
+
+```bash
+alembic -c identity/alembic.ini upgrade head
+```
+
 ### Run it
 
 **Build and serve the React dashboard (recommended):**
@@ -297,6 +359,7 @@ cp .env.example .env   # then edit .env as above
 docker compose build
 docker compose up -d
 docker compose exec api python scripts/build_embeddings.py
+docker compose exec api python -m scripts.ingest_schema --database-id default   # optional, see below
 ```
 
 This builds the React dashboard (a Node build stage) and bakes it into the
@@ -313,6 +376,8 @@ connectivity and reverse-proxy placement.
 |---|---|
 | Just use the app | [`USER_GUIDE.md`](USER_GUIDE.md) |
 | Understand the LangGraph node design and retry logic | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) |
+| Understand business-context vector retrieval (glossary/metrics/SQL examples) | [`docs/vector-retrieval-design.md`](docs/vector-retrieval-design.md) |
+| Evaluate retrieval quality | [`docs/retrieval-evaluation.md`](docs/retrieval-evaluation.md) |
 | Turn on document RAG, policy RAG, or web search | [`docs/MULTI_SOURCE_GUIDE.md`](docs/MULTI_SOURCE_GUIDE.md) |
 | Look up REST API endpoints and auth | [`docs/API.md`](docs/API.md) |
 | Find every `.env` variable | [`docs/CONFIGURATION.md`](docs/CONFIGURATION.md) |
@@ -321,6 +386,9 @@ connectivity and reverse-proxy placement.
 | Diagnose a common failure mode | [`docs/TROUBLESHOOTING.md`](docs/TROUBLESHOOTING.md) |
 | Understand this project's security posture | [`SECURITY.md`](SECURITY.md) |
 | Set up OIDC login and RBAC roles | [`docs/AUTHENTICATION.md`](docs/AUTHENTICATION.md), [`docs/AUTHORIZATION.md`](docs/AUTHORIZATION.md) |
+| Understand universal server-side chat history | [`docs/chat-history-architecture.md`](docs/chat-history-architecture.md), [`docs/chat-history-search.md`](docs/chat-history-search.md) |
+| Understand the display-name/password-strength requirements | [`docs/authentication-and-password-policy.md`](docs/authentication-and-password-policy.md) |
+| See what the chat-history feature replaced and why | [`docs/chat-history-authentication-audit.md`](docs/chat-history-authentication-audit.md) |
 | Check production readiness before deploying | [`docs/PRODUCTION_CHECKLIST.md`](docs/PRODUCTION_CHECKLIST.md), [`docs/PRODUCTION_READINESS_REPORT.md`](docs/PRODUCTION_READINESS_REPORT.md) |
 | Governance, compliance, responsible-AI, risk tracking | [`docs/GOVERNANCE.md`](docs/GOVERNANCE.md), [`docs/COMPLIANCE.md`](docs/COMPLIANCE.md), [`docs/RESPONSIBLE_AI.md`](docs/RESPONSIBLE_AI.md), [`docs/RISK_REGISTER.md`](docs/RISK_REGISTER.md) |
 | Contribute a change or an eval case | [`CONTRIBUTING.md`](CONTRIBUTING.md) |

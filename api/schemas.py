@@ -64,6 +64,18 @@ class AskRequest(BaseModel):
             "conversation state (e.g. the multi-source router) will key off of."
         ),
     )
+    conversation_id: str | None = Field(
+        default=None,
+        max_length=64,
+        description=(
+            "Server-side conversation id (identity.models.Conversation.id) to persist this "
+            "turn under -- only meaningful for a locally-authenticated caller (see "
+            "api/chat_persistence.py); ignored otherwise. Omit on the first turn of a new "
+            "conversation -- one is created automatically and returned in AskResponse. "
+            "Unrelated to session_id above: this is real, permanent server-side storage, "
+            "not a correlation token."
+        ),
+    )
 
 
 class AttemptRecordOut(BaseModel):
@@ -195,6 +207,17 @@ class AskResponse(BaseModel):
             "caller didn't supply one -- pass this back on the next request "
             "in the same conversation."
         )
+    )
+    conversation_id: str | None = Field(
+        default=None,
+        description=(
+            "The server-side conversation this turn was persisted under -- set only for a "
+            "locally-authenticated caller (see api/chat_persistence.py); null for an "
+            "OIDC/static-token/unauthenticated caller, or if persistence itself failed "
+            "(never a reason this response's own status/sql/result fields are affected). "
+            "Pass this back as AskRequest.conversation_id on the next turn of the same "
+            "conversation."
+        ),
     )
     status: AgentStatus
     database: str | None = Field(
@@ -373,6 +396,14 @@ class HealthResponse(BaseModel):
     ollama: ComponentHealth
     voice_enabled: bool
     media_search_enabled: bool
+    # Capability discovery for the React dashboard's login gate
+    # (frontend/src/store/localAuthStore.ts) -- same "an infra flag the
+    # frontend reads from GET /health, not a build-time guess" shape as
+    # voice_enabled/media_search_enabled above. `Settings.local_auth_enabled`
+    # alone (not whether AUTH_DATABASE_URL is *reachable*) -- the same
+    # "configured, not necessarily healthy" contract those two fields
+    # already have.
+    local_auth_enabled: bool
 
 
 class ColumnOut(BaseModel):

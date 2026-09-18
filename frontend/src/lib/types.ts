@@ -85,10 +85,19 @@ export interface AskRequest {
   conversation_history?: ConversationExchange[]
   enable_insight?: boolean
   session_id?: string | null
+  // Server-side conversation id (identity.models.Conversation.id) -- only
+  // meaningful for a locally-authenticated caller (see
+  // api/chat_persistence.py). Omit on the first turn of a new conversation.
+  conversation_id?: string | null
 }
 
 export interface AskResponse {
   session_id: string
+  // Set only for a locally-authenticated caller whose turn was actually
+  // persisted server-side -- null otherwise (OIDC/static-token/unauthenticated
+  // caller, or a persistence failure, which never affects the rest of this
+  // response). See docs/chat-history-architecture.md.
+  conversation_id: string | null
   status: AgentStatus
   database: string | null
   sql: string | null
@@ -173,6 +182,7 @@ export interface HealthResponse {
   ollama: ComponentHealth
   voice_enabled: boolean
   media_search_enabled: boolean
+  local_auth_enabled: boolean
 }
 
 export interface ColumnOut {
@@ -229,4 +239,109 @@ export interface TranscribeResponse {
   text: string
   corrected_text: string | null
   stt_duration_ms: number
+}
+
+// --- Local auth (identity/, api/identity_auth.py) -- mirrors identity/schemas.py ---
+
+export interface LocalUser {
+  id: string
+  email: string
+  username: string | null
+  display_name: string | null
+  // True only for an account created before display_name became mandatory
+  // at sign-up -- drives the one-time "complete your profile" prompt.
+  needs_profile_completion: boolean
+  status: string
+  is_email_verified: boolean
+  roles: string[]
+  created_at: string
+  last_login_at: string | null
+}
+
+export interface TokenResponse {
+  access_token: string
+  token_type: string
+  expires_in: number
+  user: LocalUser
+}
+
+export interface MessageResponse {
+  message: string
+}
+
+export interface AuthSessionOut {
+  id: string
+  device_name: string | null
+  user_agent: string | null
+  ip_address: string | null
+  created_at: string
+  last_used_at: string
+  expires_at: string
+  is_current: boolean
+}
+
+// --- Server-side chat history (identity/repositories/history.py,
+// api/chat_history.py) -- mirrors identity/schemas.py's own new models.
+// This is the *permanent, cross-device* store -- see
+// docs/chat-history-architecture.md. Only reachable for a locally-
+// authenticated user (local_auth_enabled + signed in via useLocalAuthStore).
+
+export interface ServerConversation {
+  id: string
+  title: string | null
+  feature_type: string
+  status: string
+  created_at: string
+  updated_at: string
+  last_message_at: string | null
+  archived_at: string | null
+}
+
+export interface ConversationListResponse {
+  conversations: ServerConversation[]
+  total: number
+  limit: number
+  offset: number
+}
+
+export type MessageRole = 'user' | 'assistant'
+
+export interface ServerMessage {
+  id: string
+  conversation_id: string
+  role: MessageRole
+  content: string
+  sequence_number: number
+  created_at: string
+  status: string | null
+  model_name: string | null
+  error_code: string | null
+  // An assistant row's own metadata (e.g. { sql: "..." }, set when the turn
+  // produced SQL) -- lets a reloaded past turn show its SQL again, not just
+  // the plain answer text. Always null for a user row.
+  metadata: { sql?: string | null } | null
+}
+
+export interface MessageListResponse {
+  messages: ServerMessage[]
+  total_turns: number
+  limit: number
+  offset: number
+}
+
+export interface SearchHit {
+  conversation_id: string
+  title: string | null
+  matched_in: 'title' | 'message'
+  snippet: string
+  message_id: string | null
+  updated_at: string
+}
+
+export interface SearchResponse {
+  results: SearchHit[]
+  total: number
+  limit: number
+  offset: number
+  query: string
 }

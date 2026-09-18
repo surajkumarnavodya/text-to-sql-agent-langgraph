@@ -1,0 +1,109 @@
+# Business glossary -- retrieval/chunking.py::glossary_chunks_from_yaml.
+#
+# DISCLOSURE: table/column names referenced below (DimProduct, DimCustomer,
+# FactInternetSales, SalesTerritoryRegion, ...) are REAL, verified against
+# this project's own "adventureworks" sample database (AdventureWorksDW-
+# shaped) via live schema introspection at the time this file was written --
+# see docs/vector-retrieval-design.md's "Known limitations" section.
+# The DEFINITIONS/SYNONYMS/AMBIGUITY NOTES themselves are illustrative,
+# written for this project's own demonstration purposes -- they were not
+# sourced from an actual business stakeholder or data-governance review, and
+# must not be treated as real production business rules. Replace this file's
+# contents with your own reviewed glossary before relying on it.
+#
+# Schema (one entry per business term):
+#   term: <the canonical business term>
+#   synonyms: [alternate phrasings a user might type]
+#   definition: <plain-English definition>
+#   mapped_tables: [tables this term is grounded in]
+#   mapped_columns: [table.column pairs, informally]
+#   common_filters: [typical WHERE-clause filters associated with this term]
+#   ambiguity_notes: <anything a model should be careful about>
+#   tags: [free-form labels]
+
+terms:
+  - term: reseller
+    synonyms: ["dealer", "partner", "distributor"]
+    definition: >
+      A business that buys products from this company and resells them to
+      end customers, as distinct from a direct retail customer. Reseller
+      orders are recorded separately from direct/online sales.
+    mapped_tables: ["DimReseller", "FactResellerSales"]
+    mapped_columns: ["DimReseller.ResellerName", "DimReseller.BusinessType"]
+    common_filters: ["DimReseller.BusinessType"]
+    ambiguity_notes: >
+      Do not confuse with "customer" -- a customer (DimCustomer) is an
+      individual end buyer in FactInternetSales; a reseller is a business
+      buyer in FactResellerSales. The two fact tables are never unioned by
+      default since their grain and dimensions differ.
+    tags: ["sales", "channel"]
+
+  - term: internet sales
+    synonyms: ["online sales", "direct sales", "web orders"]
+    definition: >
+      Orders placed directly by individual customers (DimCustomer) through
+      the online sales channel, recorded in FactInternetSales -- as
+      distinct from reseller/channel sales in FactResellerSales.
+    mapped_tables: ["FactInternetSales", "DimCustomer"]
+    mapped_columns: ["FactInternetSales.SalesAmount", "FactInternetSales.OrderQuantity"]
+    common_filters: ["FactInternetSales.OrderDate", "FactInternetSales.SalesTerritoryKey"]
+    ambiguity_notes: >
+      "Sales" alone is ambiguous between internet and reseller sales --
+      when a question just says "sales" with no other qualifier, both
+      FactInternetSales and FactResellerSales may need to be considered or
+      the question should be answered from whichever channel the retrieved
+      schema/columns most directly support.
+    tags: ["sales", "channel"]
+
+  - term: sales territory
+    synonyms: ["region", "territory", "sales region"]
+    definition: >
+      A geographic sales grouping (e.g. "Northwest", "France") that both
+      customers/resellers and employees are associated with, used to slice
+      sales figures by where they were sold rather than where the product
+      was made.
+    mapped_tables: ["DimSalesTerritory"]
+    mapped_columns:
+      ["DimSalesTerritory.SalesTerritoryRegion", "DimSalesTerritory.SalesTerritoryCountry"]
+    common_filters: ["DimSalesTerritory.SalesTerritoryGroup"]
+    ambiguity_notes: >
+      SalesTerritoryRegion is the fine-grained value (e.g. "Canada",
+      "Northwest"); SalesTerritoryGroup is coarser (e.g. "North America",
+      "Europe", "Pacific"). Pick the grain that matches what the question
+      actually asks for.
+    tags: ["geography", "sales"]
+
+  - term: product category
+    synonyms: ["category", "product line", "product family"]
+    definition: >
+      The top level of the three-level product hierarchy
+      (DimProductCategory -> DimProductSubcategory -> DimProduct), e.g.
+      "Bikes", "Components", "Clothing", "Accessories".
+    mapped_tables: ["DimProductCategory", "DimProductSubcategory", "DimProduct"]
+    mapped_columns: ["DimProductCategory.EnglishProductCategoryName"]
+    common_filters: ["DimProductCategory.EnglishProductCategoryName"]
+    ambiguity_notes: >
+      Do not confuse "category" with "subcategory" (DimProductSubcategory,
+      e.g. "Road Bikes", "Helmets") -- a question naming a specific
+      product type ("helmets") almost always means subcategory, not
+      category.
+    tags: ["product"]
+
+  - term: discount
+    synonyms: ["promotion", "markdown", "promo"]
+    definition: >
+      A price reduction applied to a sale, tracked either as a percentage
+      (UnitPriceDiscountPct) or an absolute amount (DiscountAmount) on the
+      relevant fact table, and optionally tied to a named promotion
+      (DimPromotion) with its own date range and discount percentage.
+    mapped_tables: ["DimPromotion", "FactInternetSales", "FactResellerSales"]
+    mapped_columns:
+      ["DimPromotion.DiscountPct", "FactInternetSales.DiscountAmount"]
+    common_filters: ["DimPromotion.EnglishPromotionName"]
+    ambiguity_notes: >
+      DimPromotion.DiscountPct is the promotion's *stated* discount rate;
+      FactInternetSales/FactResellerSales.DiscountAmount is the *actual*
+      dollar amount discounted on one order line. They answer different
+      questions ("what discount does this promotion offer" vs. "how much
+      was actually discounted").
+    tags: ["sales", "pricing"]

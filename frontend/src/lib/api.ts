@@ -27,7 +27,11 @@ export class ApiError extends Error {
   }
 }
 
-async function request<T>(path: string, init?: RequestInit): Promise<T> {
+/** Exported so `frontend/src/lib/identityApi.ts` can reuse the exact same
+ * fetch/error-handling/auth-header logic for `/auth/*` calls, rather than
+ * duplicating it -- every other function in this file is just a thin
+ * wrapper around this one. */
+export async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const headers = new Headers(init?.headers)
   const token = getBearerToken()
   if (token) headers.set('Authorization', `Bearer ${token}`)

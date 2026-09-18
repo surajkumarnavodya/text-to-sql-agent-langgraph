@@ -1,6 +1,7 @@
 import type { User } from 'oidc-client-ts'
 import { create } from 'zustand'
 import { getUserManager, isOidcConfigured } from '@/lib/auth'
+import { getLocalBearerToken } from '@/store/localAuthStore'
 
 /** `AuthGate.tsx` renders based on this:
  * - `"unconfigured"`: OIDC isn't set up at all -- render the app exactly
@@ -91,12 +92,17 @@ export const useAuthStore = create<AuthState>((set) => ({
 }))
 
 /** The bearer token every `frontend/src/lib/api.ts` call attaches, if any.
- * OIDC's own per-user access token takes priority when configured and a
- * user is signed in; `STATIC_API_TOKEN` is the fallback (service/CI
- * callers, or OIDC not configured at all) -- never both, and never a
- * token pulled from `localStorage`/`sessionStorage` (see `lib/auth.ts`'s
- * own docstring for why). */
+ * Priority order: this app's own local account (`localAuthStore.ts`, if
+ * signed in) -> OIDC's per-user access token (if configured and signed
+ * in) -> `STATIC_API_TOKEN` (service/CI callers, or neither is
+ * configured) -- never more than one at a time, and never a token pulled
+ * from `localStorage`/`sessionStorage` (see `lib/auth.ts`'s own docstring
+ * for why). Local auth is checked first since it's this app's own,
+ * most-specific credential -- mirrors `api/auth.py::verify_api_key`'s own
+ * local-JWT-first dispatch order. */
 export function getBearerToken(): string | undefined {
+  const localToken = getLocalBearerToken()
+  if (localToken) return localToken
   if (isOidcConfigured) {
     return useAuthStore.getState().user?.access_token ?? STATIC_API_TOKEN
   }

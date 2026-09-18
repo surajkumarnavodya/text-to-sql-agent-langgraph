@@ -109,7 +109,7 @@ class AuthIdentity:
 
     subject: str
     roles: tuple[str, ...]
-    mode: Literal["none", "static_token", "oidc"]
+    mode: Literal["none", "static_token", "oidc", "local"]
 
 
 def extract_roles(claims: Mapping[str, Any], role_claim: str) -> tuple[str, ...]:

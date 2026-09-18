@@ -1,0 +1,200 @@
+"""Integration tests: the retrieval layer wired into the actual LangGraph
+node/prompt-construction path, from a user question through
+`retrieve_business_context_node` to the assembled SQL-generation prompt.
+
+Uses a fake database schema (a hand-built `TableSchemaInfo`, no real DB
+connection), `FakeEmbeddingProvider` (no network/model), `InMemoryVectorStore`
+(no chromadb), and a mocked LLM call (`agent.llm_client.generate_sql_from_llm`
+patched to a fixed fake response) -- no network access, no paid API, per
+this project's existing `tests/` convention (see `tests/test_agent_nodes.py`'s
+own docstring for the same "external dependencies mocked" contract this
+test follows for the two *new* nodes this feature adds).
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+from unittest.mock import MagicMock
+
+from retrieval.chunking import glossary_chunks_from_yaml, table_chunks_from_schema
+from retrieval.embeddings import FakeEmbeddingProvider
+
+from agent.graph import build_graph
+from agent.nodes import generate_sql_node, retrieve_business_context_node
+from agent.state import AgentState
+from config.settings import Settings
+from db.schema_introspection import ColumnInfo, TableSchemaInfo
+from security.secrets import SecretStr
+from tests._retrieval_fakes import InMemoryVectorStore
+
+
+def _fake_settings(tmp_path: Path) -> Settings:
+    return Settings(
+        db_type="postgresql",
+        db_connection_string=SecretStr("postgresql://user:pass@localhost/db"),
+        chroma_persist_dir=tmp_path / "chroma",
+        retrieval_embedding_provider="fake",
+        retrieval_knowledge_dir=tmp_path / "knowledge",
+        retrieval_similarity_threshold=0.0,
+        enable_query_planning=False,
+        enable_golden_examples=False,
+    )
+
+
+def _fake_schema() -> list[TableSchemaInfo]:
+    return [
+        TableSchemaInfo(
+            table_name="FactWidgetSales",
+            columns=(
+                ColumnInfo(
+                    name="WidgetSalesKey", type="INTEGER", nullable=False, is_primary_key=True
+                ),
+                ColumnInfo(
+                    name="SalesAmount", type="DECIMAL", nullable=False, is_primary_key=False
+                ),
+            ),
+            foreign_keys=(),
+            ddl="CREATE TABLE FactWidgetSales (\n    WidgetSalesKey INTEGER PRIMARY KEY,\n    SalesAmount DECIMAL\n);",
+        )
+    ]
+
+
+def _seed_store(
+    tmp_path: Path, settings: Settings
+) -> tuple[InMemoryVectorStore, FakeEmbeddingProvider]:
+    store = InMemoryVectorStore()
+    provider = FakeEmbeddingProvider(dimensions=16)
+
+    tables = _fake_schema()
+    table_chunks = table_chunks_from_schema(
+        tables, "default", provider.model_name, provider.dimensions
+    )
+
+    glossary_path = tmp_path / "knowledge" / "glossary.yaml"
+    glossary_path.parent.mkdir(parents=True, exist_ok=True)
+    glossary_path.write_text(
+        "terms:\n"
+        "  - term: widget revenue\n"
+        "    definition: 'Total SalesAmount from FactWidgetSales.'\n"
+        "    mapped_tables: ['FactWidgetSales']\n",
+        encoding="utf-8",
+    )
+    glossary_chunks = glossary_chunks_from_yaml(
+        glossary_path, "default", provider.model_name, provider.dimensions
+    )
+
+    all_chunks = table_chunks + glossary_chunks
+    vectors = provider.embed_batch([c.text for c in all_chunks])
+    store.create_collection_if_missing("default")
+    store.upsert_documents("default", all_chunks, vectors)
+    return store, provider
+
+
+class TestRetrievalNodeIntegration:
+    def test_retrieve_business_context_node_populates_state_from_real_pipeline(
+        self, tmp_path: Path, monkeypatch
+    ):
+        settings = _fake_settings(tmp_path)
+        store, provider = _seed_store(tmp_path, settings)
+
+        monkeypatch.setattr("agent.nodes.get_settings", lambda: settings)
+        monkeypatch.setattr("retrieval.retriever.get_vector_store", lambda s: store)
+        monkeypatch.setattr("retrieval.retriever.get_embedding_provider", lambda s: provider)
+
+        state: AgentState = {
+            "question": "What is total widget revenue?",
+            "selected_database": "default",
+            "caller_roles": (),
+        }
+        update = retrieve_business_context_node(state)
+
+        assert update["retrieval_warnings"] == []
+        assert len(update["retrieved_context"]) > 0
+        chunk_types = {item["chunk_type"] for item in update["retrieved_context"]}
+        assert "table" in chunk_types or "glossary" in chunk_types
+        assert update["retrieval_sources"]
+        assert update["status"] == "generating"
+
+    def test_business_context_flows_into_the_generation_prompt(self, tmp_path: Path, monkeypatch):
+        """The full path this feature adds: retrieval -> state ->
+        generate_sql_node's prompt. The LLM call itself is mocked (a fake,
+        fixed SQL response) -- what's under test is that the retrieved
+        business context actually reaches the assembled prompt text, not
+        the model's own SQL-writing quality."""
+        settings = _fake_settings(tmp_path)
+        store, provider = _seed_store(tmp_path, settings)
+
+        monkeypatch.setattr("agent.nodes.get_settings", lambda: settings)
+        monkeypatch.setattr("retrieval.retriever.get_vector_store", lambda s: store)
+        monkeypatch.setattr("retrieval.retriever.get_embedding_provider", lambda s: provider)
+
+        state: AgentState = {
+            "question": "What is total widget revenue?",
+            "selected_database": "default",
+            "caller_roles": (),
+        }
+        retrieval_update = retrieve_business_context_node(state)
+        state.update(retrieval_update)
+        state["schema_context_text"] = _fake_schema()[0].ddl
+        state["retry_count"] = 0
+        state["error_history"] = []
+
+        captured_kwargs = {}
+
+        def _fake_generate_sql_from_llm(**kwargs):
+            captured_kwargs.update(kwargs)
+            return "SELECT SUM(SalesAmount) FROM FactWidgetSales"
+
+        monkeypatch.setattr("agent.nodes.generate_sql_from_llm", _fake_generate_sql_from_llm)
+        monkeypatch.setattr(
+            "agent.nodes.get_llm_call_limiter",
+            lambda *_: MagicMock(check=lambda: MagicMock(allowed=True)),
+        )
+
+        result = generate_sql_node(state)
+
+        assert result["sql"] == "SELECT SUM(SalesAmount) FROM FactWidgetSales"
+        assert captured_kwargs["retrieved_context"] == state["retrieved_context"]
+        # Confirm the retrieved business context actually made it into the
+        # real assembled prompt text, not just passed through as a kwarg.
+        from agent.llm_client import _build_user_prompt
+
+        prompt = _build_user_prompt(
+            question=state["question"],
+            schema_context=state["schema_context_text"],
+            previous_sql=None,
+            error_feedback=None,
+            retrieved_context=state["retrieved_context"],
+        )
+        assert "Retrieved business context" in prompt
+        assert "widget revenue" in prompt.lower() or "FactWidgetSales" in prompt
+
+
+class TestGraphStructure:
+    def test_retrieve_business_context_is_wired_between_golden_examples_and_plan_query(self):
+        graph = build_graph()
+        node_names = set(graph.get_graph().nodes.keys())
+        assert "retrieve_business_context" in node_names
+
+        edges = {(edge.source, edge.target) for edge in graph.get_graph().edges}
+        assert ("retrieve_golden_examples", "retrieve_business_context") in edges
+        assert ("retrieve_business_context", "plan_query") in edges
+
+    def test_existing_nodes_are_all_still_present(self):
+        """Adding the new node must never remove an existing one."""
+        graph = build_graph()
+        node_names = set(graph.get_graph().nodes.keys())
+        for expected in (
+            "sanitize_input",
+            "classify_followup",
+            "retrieve_schema",
+            "retrieve_golden_examples",
+            "plan_query",
+            "generate_sql",
+            "review_sql",
+            "validate_sql",
+            "estimate_cost",
+            "execute_sql",
+            "generate_insight",
+        ):
+            assert expected in node_names

@@ -52,8 +52,11 @@ from agent.result_charting import build_chart
 from agent.sql_validator import enforce_row_limit, qualify_table_schema, validate_sql
 from agent.state import ConversationExchange
 from api.authz import require_permission
+from api.chat_history import router as chat_history_router
+from api.chat_persistence import persist_ask_turn
 from api.documents import router as documents_router
 from api.generation import router as generation_router
+from api.identity_auth import router as identity_auth_router
 from api.media import router as media_router
 from api.media_library import router as media_library_router
 from api.media_search import router as media_search_router
@@ -254,6 +257,8 @@ app.include_router(generation_router)
 app.include_router(voice_router)
 app.include_router(media_search_router)
 app.include_router(media_library_router)
+app.include_router(identity_auth_router)
+app.include_router(chat_history_router)
 
 # No-op when Settings.cors_allowed_origins is empty (the default) -- a
 # same-origin deployment (the built React app served by this same FastAPI
@@ -268,6 +273,7 @@ if _cors_origins:
         allow_methods=["*"],
         allow_headers=["*"],
     )
+
 
 # 2026 Phase 3 security review: matches what the built React dashboard
 # (frontend/dist/index.html) actually loads -- no inline <script> (Vite
@@ -566,7 +572,9 @@ def _followup_resolved_against_out(
     )
 
 
-def _ask_response_from_state(state: Mapping[str, Any], session_id: str) -> AskResponse:
+def _ask_response_from_state(
+    state: Mapping[str, Any], session_id: str, conversation_id: str | None = None
+) -> AskResponse:
     # Typed as a plain Mapping, not AgentState, since `run_orchestrated` can
     # return either an AgentState (router off) or an OrchestratorState
     # (router on) -- the latter's extra keys (sources_used, document_result,
@@ -575,6 +583,7 @@ def _ask_response_from_state(state: Mapping[str, Any], session_id: str) -> AskRe
     result_rows = state.get("result_rows")
     return AskResponse(
         session_id=session_id,
+        conversation_id=conversation_id,
         status=state.get("status", "failed"),
         database=state.get("selected_database"),
         sql=state.get("sql"),
@@ -681,6 +690,7 @@ def health(response: Response) -> HealthResponse:
         ollama=ollama_health,
         voice_enabled=settings.enable_voice_mode,
         media_search_enabled=settings.enable_media_search,
+        local_auth_enabled=settings.local_auth_enabled,
     )
 
 
@@ -829,7 +839,23 @@ def ask(
         )
         final_state = {"status": "failed", "error_history": [exc.safe_message]}
 
-    return _ask_response_from_state(final_state, session_id)
+    persisted_conversation_id: str | None = None
+    try:
+        persisted_conversation_id = persist_ask_turn(
+            identity=identity,
+            conversation_id=payload.conversation_id,
+            question=payload.question,
+            final_state=final_state,
+            settings=settings,
+        )
+    except Exception as exc:  # noqa: BLE001 - see api/chat_persistence.py's own docstring
+        logger.warning(
+            "[api] /ask: chat-history persistence failed unexpectedly (session_id=%s): %s",
+            session_id,
+            exc,
+        )
+
+    return _ask_response_from_state(final_state, session_id, persisted_conversation_id)
 
 
 @app.post("/execute", response_model=ExecuteResponse)

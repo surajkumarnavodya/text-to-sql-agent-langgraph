@@ -18,13 +18,52 @@ below restores test isolation by stripping every env var one of
 tests that want to exercise real env-var parsing (e.g.
 `DB_CONNECTIONS`) call `monkeypatch.setenv`/`setattr` themselves,
 after this fixture has already cleared the slate.
+
+**A second, narrower gap the per-test fixture alone cannot close, found
+while enabling `LOCAL_AUTH_ENABLED=true` in this machine's own `.env` for
+real end-to-end testing:** ~20 test files (`tests/test_api_*.py`,
+`tests/test_connection.py`, others) build a **module-level**
+`_BASE_SETTINGS = Settings(...)` constant, executed once at module import
+time -- which, per pytest's own collection order, happens *before* any
+test in that module has run, and therefore before the autouse fixture
+below has ever fired even once. Any `Settings` field that module-level
+call doesn't explicitly pass still reads the real, polluted `os.environ`
+at that one import moment, and gets baked permanently into
+`_BASE_SETTINGS.__dict__` -- every test in the file that rebuilds via
+`Settings(**{**_BASE_SETTINGS.__dict__, **overrides})` (this codebase's
+own documented pattern, see e.g. `tests/test_connection.py::_settings`'s
+docstring) then inherits that one-time-polluted value on every call,
+completely bypassing the per-test `monkeypatch.delenv` below, since the
+value is being passed as an explicit constructor kwarg, not read from
+`os.environ` again. Concretely: `LOCAL_AUTH_ENABLED=true` in this
+developer's `.env` made `Settings.auth_mode` silently resolve to
+`"local"` instead of the value ~77 tests across 11 files actually
+expected (`"none"`/`"static_token"`/`"oidc"`), since `auth_mode` prioritizes
+`local_auth_enabled` first (see that property's own docstring) --
+discovered, not hypothetical.
+
+Fixed the only way a *module-level* snapshot can be protected from a
+*per-test* fixture: strip the same env vars here too, as plain top-level
+code in this file, so it runs once at collection time -- pytest always
+imports a directory's `conftest.py` before collecting sibling test
+modules in that directory, so this runs before any file's own
+module-level `Settings(...)` call does. The fixture below remains
+necessary on top of this: it also undoes whatever a test's own
+`monkeypatch.setenv` call did, between tests within a session, which a
+one-time strip at collection can't.
 """
 
 from __future__ import annotations
 
+import os
+
 import pytest
 
 from config.settings import Settings
+
+for _field_name in Settings.model_fields:
+    os.environ.pop(_field_name.upper(), None)
+del _field_name
 
 
 @pytest.fixture(autouse=True)
@@ -53,14 +92,18 @@ def _clear_process_singleton_caches() -> None:
     shows up as a flaky, hard-to-explain failure depending on which tests
     ran first, not as a clear assertion mismatch.
     """
+    from identity.db import _cached_identity_engine, _cached_session_factory
+    from moderation.store import _cached_moderation_engine
+
     from agent.graph import build_graph
     from agent.llm_client import _get_ollama_client
     from agent.orchestrator.graph import build_orchestrator_graph
     from embeddings.schema_indexer import _cached_chroma_client
-    from moderation.store import _cached_moderation_engine
 
     build_graph.cache_clear()
     build_orchestrator_graph.cache_clear()
     _get_ollama_client.cache_clear()
     _cached_chroma_client.cache_clear()
     _cached_moderation_engine.cache_clear()
+    _cached_identity_engine.cache_clear()
+    _cached_session_factory.cache_clear()

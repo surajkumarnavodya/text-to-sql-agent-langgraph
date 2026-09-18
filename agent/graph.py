@@ -26,7 +26,24 @@ Fails open exactly like `plan_query`/`review_sql` below -- disabled via
 clearing the threshold all resolve to "no examples," never a reason a
 question can't be answered. See `agent.nodes.retrieve_golden_examples_node`.
 
-`plan_query` (between `retrieve_golden_examples` and `generate_sql`) and `review_sql`
+`retrieve_business_context` (between `retrieve_golden_examples` and
+`plan_query`) looks up semantically-relevant business context -- table/
+column/relationship descriptions, glossary terms, metric definitions,
+curated SQL examples, and documentation snippets -- from the vector
+retrieval layer in `retrieval/` (see `docs/vector-retrieval-design.md`),
+injecting whatever it finds into `generate_sql`'s prompt as a clearly
+labeled, "verify against the live schema" block
+(`agent.llm_client._build_business_context_block`). This is additive
+context only: the live schema (`schema_context_text`, from
+`retrieve_schema` above) remains the sole authority on what tables/columns
+actually exist, and SQL validation/execution are completely unaffected by
+whatever this node returns. Fails open exactly like `retrieve_golden_examples`
+right above it -- a disabled feature flag, an empty/missing collection, or
+any retrieval error all resolve to `retrieved_context = []` plus a logged,
+state-visible warning (`retrieval_warnings`), never a reason a question
+can't be answered. See `agent.nodes.retrieve_business_context_node`.
+
+`plan_query` (between `retrieve_business_context` and `generate_sql`) and `review_sql`
 (between `generate_sql` and `validate_sql`) are the agentic query-
 decomposition + plan-conformance self-correction pair: `plan_query_node`
 makes an up-front LLM call that breaks a *non-trivial* question (one that
@@ -111,6 +128,7 @@ from agent.nodes import (
     generate_insight_node,
     generate_sql_node,
     plan_query_node,
+    retrieve_business_context_node,
     retrieve_golden_examples_node,
     retrieve_schema_node,
     review_sql_node,
@@ -156,6 +174,7 @@ def build_graph():
     graph.add_node("classify_followup", classify_followup_node)
     graph.add_node("retrieve_schema", retrieve_schema_node)
     graph.add_node("retrieve_golden_examples", retrieve_golden_examples_node)
+    graph.add_node("retrieve_business_context", retrieve_business_context_node)
     graph.add_node("plan_query", plan_query_node)
     graph.add_node("generate_sql", generate_sql_node)
     graph.add_node("review_sql", review_sql_node)
@@ -182,7 +201,8 @@ def build_graph():
         },
     )
     graph.add_edge("retrieve_schema", "retrieve_golden_examples")
-    graph.add_edge("retrieve_golden_examples", "plan_query")
+    graph.add_edge("retrieve_golden_examples", "retrieve_business_context")
+    graph.add_edge("retrieve_business_context", "plan_query")
     graph.add_edge("plan_query", "generate_sql")
     graph.add_conditional_edges(
         "generate_sql",
@@ -308,6 +328,11 @@ def run_agent(
         "followup_resolved_against": None,
         "clarification_message": None,
         "selected_database": None,
+        "retrieved_context": [],
+        "retrieval_query": None,
+        "retrieval_sources": [],
+        "retrieval_warnings": [],
+        "retrieval_metadata": {},
         "query_plan": None,
         "plan_review_passed": None,
         "plan_review_feedback": None,
