@@ -13,7 +13,9 @@ from __future__ import annotations
 
 import contextlib
 import re
+import statistics as _statistics
 from decimal import Decimal
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict
 
@@ -44,6 +46,19 @@ class ColumnStat(BaseModel):
         minimum / maximum / total: Only set when `is_numeric` is True.
         distinct_count: Only set when `is_numeric` is False -- how many
             distinct values the column took across the result.
+        stddev: Population standard deviation (`statistics.pstdev`, not the
+            sample variant -- a query result is the *entire* population
+            being asked about, not a sample of some larger population).
+            Only set when `is_numeric` is True and there are >= 2 rows
+            (stddev of a single value is degenerate, left `None` rather
+            than reported as a misleading `0.0`).
+        coefficient_of_variation: `stddev / |mean|`, a scale-independent
+            "how spread out is this, relative to its own size" measure --
+            lets a caller compare variability across columns/questions
+            with very different magnitudes (a stddev of 500 means very
+            different things for a column averaging 600 vs. averaging
+            600,000). `None` when `stddev` is `None` or the mean is 0
+            (division would be meaningless, not just zero).
     """
 
     model_config = ConfigDict(frozen=True)
@@ -54,6 +69,58 @@ class ColumnStat(BaseModel):
     maximum: float | None = None
     total: float | None = None
     distinct_count: int | None = None
+    stddev: float | None = None
+    coefficient_of_variation: float | None = None
+
+
+class TrendStat(BaseModel):
+    """A deterministic period-over-period comparison, computed the same
+    "Python does the arithmetic, the LLM only narrates it" way as
+    `ResultSummary.top_label`/`top_share_percent` above -- this is the
+    part of "AI Data Analyst" that answers a trend/growth-shaped question
+    (e.g. "how did sales change over time") without ever asking the LLM to
+    compute a percentage change itself.
+
+    Deliberately based on **row order as returned by the SQL**, not a
+    parsed/re-sorted chronology -- a query answering a trend question
+    already orders by the natural period column (`ORDER BY year`, `ORDER
+    BY month`, ...) as part of answering the question correctly in the
+    first place; re-deriving that ordering here would risk silently
+    disagreeing with what the SQL itself expresses.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    label_column: str
+    value_column: str
+    first_period: str
+    first_value: float
+    last_period: str
+    last_value: float
+    change_percent: float
+    direction: Literal["up", "down", "flat"]
+
+
+class OutlierStat(BaseModel):
+    """One label whose value is a statistical outlier (more than
+    `OUTLIER_STDDEV_THRESHOLD` population-standard-deviations from the
+    mean) among the per-label totals for the result's value column --
+    a deterministic anomaly-detection signal, not an LLM judgment call."""
+
+    model_config = ConfigDict(frozen=True)
+
+    label: str
+    value: float
+    column: str
+    deviations_from_mean: float
+
+
+#: How many population standard deviations from the mean counts as an
+#: outlier. 2.0 is a common, conservative default (roughly the top/bottom
+#: ~5% of a normal distribution) -- not tuned against this project's own
+#: eval set, since no outlier-detection eval cases exist yet (a disclosed,
+#: separate gap from this feature itself).
+OUTLIER_STDDEV_THRESHOLD = 2.0
 
 
 class ResultSummary(BaseModel):
@@ -86,6 +153,17 @@ class ResultSummary(BaseModel):
     top_value_column: str | None = None
     top_value: float | None = None
     top_share_percent: float | None = None
+    #: Set only when the result has a natural label/value pair (the same
+    #: one `top_label`/`top_value` are derived from) and at least two
+    #: distinct labels to compare -- see `TrendStat`'s own docstring.
+    #: `None` is a real, common outcome (e.g. a single-row aggregate has
+    #: nothing to trend), not a computation failure.
+    trend: TrendStat | None = None
+    #: Every per-label total more than `OUTLIER_STDDEV_THRESHOLD` standard
+    #: deviations from the mean, for the same label/value pair -- empty
+    #: (not `None`) when there's nothing to flag, so a caller can always
+    #: iterate it without a `None` check.
+    outliers: tuple[OutlierStat, ...] = ()
 
     def allowed_values(self) -> set[float]:
         """Every plain (non-percent) number the insight is allowed to state.
@@ -96,7 +174,13 @@ class ResultSummary(BaseModel):
         """
         numbers = {float(self.row_count)}
         for stat in self.column_stats:
-            for value in (stat.minimum, stat.maximum, stat.total, stat.distinct_count):
+            for value in (
+                stat.minimum,
+                stat.maximum,
+                stat.total,
+                stat.distinct_count,
+                stat.stddev,
+            ):
                 if value is not None:
                     numbers.add(round(float(value), 2))
         if self.top_value is not None:
@@ -108,11 +192,21 @@ class ResultSummary(BaseModel):
             # groundable too.
             with contextlib.suppress(ValueError):
                 numbers.add(round(float(self.top_label), 2))
+        if self.trend is not None:
+            numbers.add(round(self.trend.first_value, 2))
+            numbers.add(round(self.trend.last_value, 2))
+        for outlier in self.outliers:
+            numbers.add(round(outlier.value, 2))
         return numbers
 
     def allowed_percents(self) -> set[float]:
         """Every percentage the insight is allowed to state."""
-        return {round(self.top_share_percent, 1)} if self.top_share_percent is not None else set()
+        percents = set()
+        if self.top_share_percent is not None:
+            percents.add(round(self.top_share_percent, 1))
+        if self.trend is not None:
+            percents.add(round(self.trend.change_percent, 1))
+        return percents
 
 
 def should_skip_insight(columns: list[str], rows: list[tuple]) -> bool:
@@ -147,6 +241,18 @@ def summarize_result(columns: list[str], rows: list[tuple]) -> ResultSummary:
         values = [row[idx] for row in rows]
         if idx in numeric_col_indices:
             nums = [float(v) for v in values]
+            # pstdev (population, not sample) needs >= 1 value and is a
+            # real statistics.StatisticsError below 1 -- guarded by the
+            # `rows` truthiness already required to reach `numeric_col_indices`
+            # at all, but a single-row result makes "spread" degenerate
+            # (nothing to spread), so it's left `None` rather than a
+            # trivially-true `0.0` that looks like a real "no variance"
+            # finding.
+            stddev = _statistics.pstdev(nums) if len(nums) >= 2 else None
+            mean = sum(nums) / len(nums)
+            coefficient_of_variation = (
+                round(stddev / abs(mean), 4) if stddev is not None and mean != 0 else None
+            )
             column_stats.append(
                 ColumnStat(
                     name=name,
@@ -154,6 +260,8 @@ def summarize_result(columns: list[str], rows: list[tuple]) -> ResultSummary:
                     minimum=min(nums),
                     maximum=max(nums),
                     total=sum(nums),
+                    stddev=round(stddev, 4) if stddev is not None else None,
+                    coefficient_of_variation=coefficient_of_variation,
                 )
             )
         else:
@@ -181,6 +289,8 @@ def summarize_result(columns: list[str], rows: list[tuple]) -> ResultSummary:
             # numeric-vs-numeric result could never support a top/share
             # claim at all, even though the relationship is just as real.
             label_idx = next((i for i in range(len(columns)) if i != value_idx), None)
+    trend: TrendStat | None = None
+    outliers: tuple[OutlierStat, ...] = ()
     if value_idx is not None and label_idx is not None:
         totals_by_label: dict[str, float] = {}
         for row in rows:
@@ -198,6 +308,9 @@ def summarize_result(columns: list[str], rows: list[tuple]) -> ResultSummary:
         if grand_total:
             top_share_percent = round(100 * top_value / grand_total, 1)
 
+        trend = _compute_trend(totals_by_label, top_label_column, top_value_column)
+        outliers = _compute_outliers(totals_by_label, top_value_column)
+
     return ResultSummary(
         row_count=row_count,
         columns=tuple(columns),
@@ -207,7 +320,78 @@ def summarize_result(columns: list[str], rows: list[tuple]) -> ResultSummary:
         top_value_column=top_value_column,
         top_value=top_value,
         top_share_percent=top_share_percent,
+        trend=trend,
+        outliers=outliers,
     )
+
+
+def _compute_trend(
+    totals_by_label: dict[str, float], label_column: str, value_column: str
+) -> TrendStat | None:
+    """First-vs-last period comparison, in the label's original row/insertion
+    order (a Python `dict` preserves insertion order) -- see `TrendStat`'s
+    own docstring for why this deliberately trusts the SQL's own ordering
+    rather than re-deriving a chronology.
+
+    Returns `None` when there are fewer than two distinct labels (nothing
+    to compare) or the first period's value is exactly zero (a percentage
+    change from zero is undefined, not a real "infinite growth" finding
+    worth stating).
+    """
+    if len(totals_by_label) < 2:
+        return None
+    labels = list(totals_by_label)
+    first_period, last_period = labels[0], labels[-1]
+    first_value, last_value = totals_by_label[first_period], totals_by_label[last_period]
+    if first_value == 0:
+        return None
+    change_percent = round(100 * (last_value - first_value) / abs(first_value), 1)
+    direction: Literal["up", "down", "flat"] = (
+        "up" if change_percent > 0 else "down" if change_percent < 0 else "flat"
+    )
+    return TrendStat(
+        label_column=label_column,
+        value_column=value_column,
+        first_period=first_period,
+        first_value=first_value,
+        last_period=last_period,
+        last_value=last_value,
+        change_percent=change_percent,
+        direction=direction,
+    )
+
+
+def _compute_outliers(
+    totals_by_label: dict[str, float], value_column: str
+) -> tuple[OutlierStat, ...]:
+    """Flags any per-label total more than `OUTLIER_STDDEV_THRESHOLD`
+    population-standard-deviations from the mean.
+
+    Requires at least 3 distinct labels -- with only two, one value is
+    always exactly as far above the mean as the other is below, which
+    isn't a meaningful "this one stands out" signal, just an artifact of
+    there being two numbers.
+    """
+    if len(totals_by_label) < 3:
+        return ()
+    values = list(totals_by_label.values())
+    mean = sum(values) / len(values)
+    stddev = _statistics.pstdev(values)
+    if stddev == 0:
+        return ()
+    outliers = []
+    for label, value in totals_by_label.items():
+        deviations = (value - mean) / stddev
+        if abs(deviations) > OUTLIER_STDDEV_THRESHOLD:
+            outliers.append(
+                OutlierStat(
+                    label=label,
+                    value=value,
+                    column=value_column,
+                    deviations_from_mean=round(deviations, 2),
+                )
+            )
+    return tuple(outliers)
 
 
 # Matches a plain number, optionally $-prefixed and comma-grouped, with an

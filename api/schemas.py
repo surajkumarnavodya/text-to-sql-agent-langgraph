@@ -369,6 +369,49 @@ class SchemaRefreshResponse(BaseModel):
     databases: list[SchemaRefreshResult]
 
 
+class StageMetricOut(BaseModel):
+    """One LangGraph node's rolled-up timing distribution over the current
+    in-process window -- see `observability.metrics.StageSummary`, which
+    this mirrors field-for-field."""
+
+    model_config = ConfigDict(frozen=True)
+
+    stage: str
+    count: int
+    mean_ms: float
+    p50_ms: float
+    p95_ms: float
+    max_ms: float
+    total_ms: float
+
+
+class RequestMetricOut(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    count: int
+    mean_ms: float
+    p50_ms: float
+    p95_ms: float
+    max_ms: float
+
+
+class PerformanceMetricsResponse(BaseModel):
+    """`GET /metrics/performance` -- a live rollup of the same per-stage
+    timing data `agent.nodes._timed_node` has always logged, aggregated by
+    `observability.metrics` into a queryable snapshot instead of raw log
+    lines. See that module's own docstring for the single-process/
+    resets-on-restart limits this deliberately does not claim to solve."""
+
+    model_config = ConfigDict(frozen=True)
+
+    started_at: str
+    window_requests: int
+    max_window_requests: int
+    requests: RequestMetricOut
+    stages: list[StageMetricOut]
+    status_counts: dict[str, int]
+
+
 class ComponentHealth(BaseModel):
     model_config = ConfigDict(frozen=True)
 

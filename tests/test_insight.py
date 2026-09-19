@@ -8,6 +8,7 @@ number-extraction/matching against hand-built ResultSummary instances.
 from __future__ import annotations
 
 from decimal import Decimal
+from statistics import pstdev as _pstdev
 
 from agent.insight import (
     ResultSummary,
@@ -90,6 +91,136 @@ class TestSummarizeResult:
     def test_row_count_matches_input(self):
         summary = summarize_result(["x"], [(1,), (2,), (3,)])
         assert summary.row_count == 3
+
+
+class TestVarianceStats:
+    """The "AI Data Analyst depth" pass -- deterministic stddev/coefficient
+    of variation alongside the existing min/max/total, computed the same
+    Python-does-the-arithmetic way as top_share_percent."""
+
+    def test_numeric_column_gets_a_population_stddev(self):
+        summary = summarize_result(["Region", "Sales"], [("A", 10.0), ("B", 20.0), ("C", 30.0)])
+        sales_stat = next(s for s in summary.column_stats if s.name == "Sales")
+        assert sales_stat.stddev == round(_pstdev([10.0, 20.0, 30.0]), 4)
+
+    def test_coefficient_of_variation_is_stddev_over_mean(self):
+        summary = summarize_result(["Region", "Sales"], [("A", 10.0), ("B", 20.0), ("C", 30.0)])
+        sales_stat = next(s for s in summary.column_stats if s.name == "Sales")
+        expected = round(_pstdev([10.0, 20.0, 30.0]) / 20.0, 4)
+        assert sales_stat.coefficient_of_variation == expected
+
+    def test_single_row_has_no_stddev_rather_than_a_misleading_zero(self):
+        summary = summarize_result(["Region", "Sales"], [("A", 10.0)])
+        sales_stat = next(s for s in summary.column_stats if s.name == "Sales")
+        assert sales_stat.stddev is None
+        assert sales_stat.coefficient_of_variation is None
+
+    def test_zero_mean_gives_no_coefficient_of_variation(self):
+        summary = summarize_result(["Region", "Delta"], [("A", -5.0), ("B", 5.0)])
+        delta_stat = next(s for s in summary.column_stats if s.name == "Delta")
+        assert delta_stat.stddev is not None
+        assert delta_stat.coefficient_of_variation is None
+
+
+class TestTrend:
+    def test_two_periods_computes_change_percent_and_direction(self):
+        summary = summarize_result(["Year", "Revenue"], [(2023, 100.0), (2024, 150.0)])
+        assert summary.trend is not None
+        assert summary.trend.first_period == "2023"
+        assert summary.trend.last_period == "2024"
+        assert summary.trend.change_percent == 50.0
+        assert summary.trend.direction == "up"
+
+    def test_a_decline_is_direction_down_with_a_negative_change_percent(self):
+        summary = summarize_result(["Year", "Revenue"], [(2023, 200.0), (2024, 100.0)])
+        assert summary.trend is not None
+        assert summary.trend.change_percent == -50.0
+        assert summary.trend.direction == "down"
+
+    def test_no_change_is_direction_flat(self):
+        summary = summarize_result(["Year", "Revenue"], [(2023, 100.0), (2024, 100.0)])
+        assert summary.trend is not None
+        assert summary.trend.direction == "flat"
+        assert summary.trend.change_percent == 0.0
+
+    def test_uses_first_and_last_period_across_more_than_two_rows(self):
+        summary = summarize_result(
+            ["Year", "Revenue"], [(2021, 100.0), (2022, 120.0), (2023, 140.0)]
+        )
+        assert summary.trend is not None
+        assert summary.trend.first_period == "2021"
+        assert summary.trend.last_period == "2023"
+        assert summary.trend.change_percent == 40.0
+
+    def test_a_single_row_has_no_trend_nothing_to_compare(self):
+        summary = summarize_result(["Year", "Revenue"], [(2023, 100.0)])
+        assert summary.trend is None
+
+    def test_a_zero_first_value_has_no_trend_percent_change_is_undefined(self):
+        summary = summarize_result(["Year", "Revenue"], [(2023, 0.0), (2024, 100.0)])
+        assert summary.trend is None
+
+    def test_trend_values_are_reflected_in_allowed_values_and_percents(self):
+        """The grounding gate (`is_insight_grounded`) must be able to
+        verify a claim about the trend, not just the pre-existing
+        top-label/share numbers."""
+        summary = summarize_result(["Year", "Revenue"], [(2023, 100.0), (2024, 150.0)])
+        assert 100.0 in summary.allowed_values()
+        assert 150.0 in summary.allowed_values()
+        assert 50.0 in summary.allowed_percents()
+
+
+class TestOutliers:
+    def test_flags_a_value_far_from_the_mean(self):
+        # 5 tightly-clustered values plus one far outlier -- with only a
+        # handful of points, population stddev is sensitive to how many
+        # "normal" points anchor the mean, so this uses enough of them
+        # that the one real outlier clears the 2-stddev threshold without
+        # dragging the mean/stddev up to swallow its own signal.
+        summary = summarize_result(
+            ["Region", "Sales"],
+            [
+                ("A", 100.0),
+                ("B", 100.0),
+                ("C", 100.0),
+                ("D", 100.0),
+                ("E", 100.0),
+                ("F", 1000.0),
+            ],
+        )
+        outlier_labels = {o.label for o in summary.outliers}
+        assert outlier_labels == {"F"}
+
+    def test_no_outliers_when_values_are_close_together(self):
+        summary = summarize_result(
+            ["Region", "Sales"], [("A", 100.0), ("B", 102.0), ("C", 99.0), ("D", 101.0)]
+        )
+        assert summary.outliers == ()
+
+    def test_fewer_than_three_labels_never_reports_outliers(self):
+        """Two points are always symmetric around their own mean --
+        nothing meaningful to flag."""
+        summary = summarize_result(["Region", "Sales"], [("A", 1.0), ("B", 1000.0)])
+        assert summary.outliers == ()
+
+    def test_identical_values_have_zero_stddev_and_no_outliers(self):
+        summary = summarize_result(["Region", "Sales"], [("A", 50.0), ("B", 50.0), ("C", 50.0)])
+        assert summary.outliers == ()
+
+    def test_outlier_values_are_groundable(self):
+        summary = summarize_result(
+            ["Region", "Sales"],
+            [
+                ("A", 100.0),
+                ("B", 100.0),
+                ("C", 100.0),
+                ("D", 100.0),
+                ("E", 100.0),
+                ("F", 1000.0),
+            ],
+        )
+        assert len(summary.outliers) == 1
+        assert summary.outliers[0].value in summary.allowed_values()
 
 
 class TestExtractNumbers:

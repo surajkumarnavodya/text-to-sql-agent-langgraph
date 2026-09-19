@@ -1,8 +1,16 @@
 # Chat History Search
 
-How `GET /chat/search` and the history drawer's search box work — see
+How `GET /chat/search` and the search box work — see
 `docs/chat-history-architecture.md` for the broader chat-history model this
-sits on top of.
+sits on top of. **UI note:** the search box now lives in `Sidebar.tsx`
+(the persistent left rail / mobile drawer), not the old combined
+"history drawer" this document's examples below still say — that surface
+was replaced 2026-09-18 (see `docs/chat-history-ui.md`,
+`docs/navigation-and-actions.md`). The backend design below is unchanged
+and was re-verified end-to-end, live, on 2026-09-19 —
+`docs/functional-ui-audit.md` §2 has the full trace (request→auth→
+ownership-scoped query→result→selecting a result loading the *correct*
+conversation, not stale frontend state).
 
 ## Backend: `identity.repositories.history.search_history`
 

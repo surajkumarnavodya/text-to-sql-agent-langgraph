@@ -17,6 +17,15 @@ interface SettingsState {
    * Persisted like theme/accent/font (a device preference), not
    * session-only like `chatStore`'s `enableInsight`. */
   voiceModeEnabled: boolean
+  /** Desktop (`lg:`+) left-rail collapse preference -- the single source of
+   * truth for "is the persistent sidebar a full list or an icon rail."
+   * Deliberately NOT the same state as MobileNav's own `open` (whether the
+   * off-canvas drawer overlay is showing) -- that's ephemeral per-visit
+   * interaction state, not a preference, and always starts closed on a
+   * fresh page load regardless of this value. Persisted like
+   * theme/accent/font (`sidebarCollapsed=true`/`false` in localStorage) --
+   * a non-sensitive UI preference only, never chat content. */
+  sidebarCollapsed: boolean
   setThemeMode: (mode: ThemeMode) => void
   setAccent: (accentId: string) => void
   setFont: (fontId: string) => void
@@ -24,6 +33,7 @@ interface SettingsState {
   setVoiceModeEnabled: (enabled: boolean) => void
   toggleSection: (sectionId: string) => void
   isSectionCollapsed: (sectionId: string) => boolean
+  toggleSidebarCollapsed: () => void
 }
 
 /** Applies the persisted (or default) appearance to the DOM immediately --
@@ -44,7 +54,9 @@ export const useSettingsStore = create<SettingsState>()(
       language: 'en',
       collapsedSections: {},
       voiceModeEnabled: true,
+      sidebarCollapsed: false,
       setVoiceModeEnabled: (enabled) => set({ voiceModeEnabled: enabled }),
+      toggleSidebarCollapsed: () => set((state) => ({ sidebarCollapsed: !state.sidebarCollapsed })),
       setThemeMode: (mode) => {
         applyThemeMode(mode)
         set({ themeMode: mode })

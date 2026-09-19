@@ -22,9 +22,9 @@
 
 <!-- Newest first, sourced from real commit history. Keep no more than the three most recent entries. -->
 
-- **2026-09-18** — Added a `MalwareScanner` abstraction (ClamAV, opt-in, fail-closed once configured), flipped CI's security gates (bandit/pip-audit/detect-secrets) from report-only to blocking, re-verified dependency CVE reachability, and ran a first end-to-end production-readiness gate — verdict **NOT READY** (live-IdP OIDC and DAST testing still outstanding) — see [`docs/security/PRODUCTION_SECURITY_READINESS_REPORT.md`](docs/security/PRODUCTION_SECURITY_READINESS_REPORT.md)
-- **2026-09-18** — Marked the project **Beta — security hardened**; added a local-machine setup guide PDF
-- **2026-09-18** — Added business-context vector retrieval (glossary/metric/SQL-example/documentation chunks over the same ChromaDB), optional self-hosted user accounts (Argon2id + JWT, RBAC-integrated), and universal server-side chat history that follows a signed-in user across browsers/devices
+- **2026-09-19** — Settings modal fully opaque in dark mode: the panel and backdrop could let background chat content (SQL, tables, buttons) visibly bleed through, because the panel reused `--card`'s deliberate dark-mode "glass" transparency and the backdrop was only 40% opaque. Fixed with dedicated, always-fully-opaque `--modal-backdrop`/`--modal-surface` tokens (shared by every `Dialog`/`Drawer` in the app) plus `inert` on the background while a modal is open; verified live across desktop/tablet/mobile and both themes — see [`docs/settings-modal-visual-bug.md`](docs/settings-modal-visual-bug.md)
+- **2026-09-19** — Backend depth pass: a live performance-metrics rollup (`GET /metrics/performance`, admin-only), RAG/web-search evaluation harnesses (citation correctness/coverage/fabrication, retrieval quality), and new grounded trend/variance/outlier statistics in the insight engine (`agent/insight.py`, fully tested but not yet wired into the live insight prompt — see [`docs/DEEP_FEATURE_PERFORMANCE_ASSESSMENT.md`](docs/DEEP_FEATURE_PERFORMANCE_ASSESSMENT.md) for the roadmap this was scoped from)
+- **2026-09-19** — Functional UI audit of Settings/search/New Chat/image attachments against the *live* app (not just source reading): three of the four reported problem areas were already fixed by the prior day's UI cleanup and were re-verified working end-to-end; one real bug found and fixed (closing Settings didn't return keyboard focus to the account-menu button) — see [`docs/functional-ui-audit.md`](docs/functional-ui-audit.md)
 
 <a id="example-usage"></a>
 
@@ -115,7 +115,7 @@ dashboard; it was removed once the dashboard reached full feature parity
   only) — an explicit allowlist, not a keyword blocklist that a syntax
   variant could slip past.
 - **A self-correcting retry loop, not a free-form agent.** The pipeline is
-  an explicit 11-node LangGraph state machine (see the diagram below); a
+  an explicit 12-node LangGraph state machine (see the diagram below); a
   review/validation/execution failure routes back to regeneration with the
   error appended to context, capped at an adaptively-widened retry budget —
   inspectable and boundable, not implicit ReAct-style reasoning.
@@ -177,7 +177,7 @@ dashboard; it was removed once the dashboard reached full feature parity
   mode is the one enabled).
 
 <details>
-<summary>Full agent graph (11 nodes)</summary>
+<summary>Full agent graph (12 nodes)</summary>
 
 ```mermaid
 flowchart TD
@@ -188,7 +188,8 @@ flowchart TD
     CF -->|ambiguous| STOP2(["Needs clarification"])
     CF --> RS["retrieve_schema<br/>ChromaDB top-k + FK-adjacency<br/>bridge expansion, auto-routed database"]
     RS --> RGE["retrieve_golden_examples<br/>human-approved past (question, SQL) pairs"]
-    RGE --> PQ["plan_query<br/>LLM plan, only for complex questions"]
+    RGE --> RBC["retrieve_business_context<br/>glossary/metric/relationship chunks, fails open"]
+    RBC --> PQ["plan_query<br/>LLM plan, only for complex questions"]
     PQ --> GS["generate_sql<br/>Ollama, via LangGraph"]
     GS -->|off-topic / LLM error / rate limit| STOP3(["Rejected / Failed / Rate limited"])
     GS --> RV["review_sql<br/>plan-conformance check, only if planned"]
@@ -352,6 +353,41 @@ PowerShell equivalents are in `tasks.ps1` (`.\tasks.ps1 run`,
 `Makefile`. CI (`.github/workflows/ci.yml`) runs the same lint + test steps
 on GitHub Actions.
 
+**Frontend tests** (`frontend/`, vitest + React Testing Library — added
+alongside the UI overhaul below, previously no test runner existed):
+
+```bash
+cd frontend
+npm run test        # vitest run -- one-shot
+npm run test:watch  # vitest -- watch mode
+npm run lint         # oxlint
+npm run build        # tsc -b && vite build (also the typecheck)
+```
+
+### Frontend UI
+
+The React dashboard has a persistent left sidebar (conversation history +
+search, replacing an earlier combined history/settings drawer — see
+[`docs/ui-design-system.md`](docs/ui-design-system.md) and
+[`docs/chat-history-ui.md`](docs/chat-history-ui.md)), collapsible on
+desktop to a narrow icon rail via the header's sidebar toggle (the
+collapsed/expanded preference persists across sessions, `localStorage`
+only, never chat content), a single consolidated account menu (avatar,
+top-right — display name/email, Settings, Theme, Sign out; previously
+duplicated as two independent copies of Settings and Sign out, see
+[`docs/ui-production-audit.md`](docs/ui-production-audit.md) and
+[`docs/navigation-and-actions.md`](docs/navigation-and-actions.md) for the
+one-owner-per-action rule that replaced it), a Stop button that genuinely
+cancels an in-flight question (`AbortController`, no fake token stream),
+and an optional image attachment + local editor (crop/draw/annotate/
+undo-redo) in the composer. **The image editor is local-only — no backend
+endpoint exists yet to send an attached image to, and the editor's own
+"AI-guided editing" section says so explicitly rather than pretending to
+call a model.** See
+[`docs/image-editing-architecture.md`](docs/image-editing-architecture.md)
+for exactly what's implemented, what's stubbed, and the backend contract
+a real AI-editing integration would need.
+
 ### Running with Docker
 
 ```bash
@@ -389,6 +425,21 @@ connectivity and reverse-proxy placement.
 | Understand universal server-side chat history | [`docs/chat-history-architecture.md`](docs/chat-history-architecture.md), [`docs/chat-history-search.md`](docs/chat-history-search.md) |
 | Understand the display-name/password-strength requirements | [`docs/authentication-and-password-policy.md`](docs/authentication-and-password-policy.md) |
 | See what the chat-history feature replaced and why | [`docs/chat-history-authentication-audit.md`](docs/chat-history-authentication-audit.md) |
+| Understand the frontend's design tokens (colors, spacing, motion, theming) | [`docs/ui-design-system.md`](docs/ui-design-system.md) |
+| Understand the sidebar/history/search UI (not the backend behind it) | [`docs/chat-history-ui.md`](docs/chat-history-ui.md) |
+| See which UI action lives where (Settings, Theme, Logout, sidebar collapse, ...) and why | [`docs/navigation-and-actions.md`](docs/navigation-and-actions.md) |
+| See the duplicated controls a later UI pass found and removed (two settings dialogs, two logout buttons, no sidebar collapse) | [`docs/ui-production-audit.md`](docs/ui-production-audit.md) |
+| Understand image attachments/editing — what's real vs. stubbed, and the backend contract a real AI-guided editor would need | [`docs/image-editing-architecture.md`](docs/image-editing-architecture.md) |
+| See the full frontend audit this UI pass started from | [`docs/frontend-ui-audit.md`](docs/frontend-ui-audit.md) |
+| See the live, browser-verified root-cause investigation of reported Settings/search/New-Chat/image-attachment issues | [`docs/functional-ui-audit.md`](docs/functional-ui-audit.md) |
+| Understand exactly how the Settings modal's overlay/focus/keyboard behavior works | [`docs/settings-modal.md`](docs/settings-modal.md) |
+| Understand the New Chat lazy-persistence flow and its duplicate-creation safeguards | [`docs/new-chat-flow.md`](docs/new-chat-flow.md) |
+| See the current image-attachment request path step-by-step, and exactly what backend work would be needed to make it real | [`docs/image-attachment-flow.md`](docs/image-attachment-flow.md) |
+| See a point-in-time production-UI checklist and what it found | [`docs/production-ui-checklist.md`](docs/production-ui-checklist.md) |
+| Understand the root cause of the dark-mode Settings-modal transparency bug and its fix | [`docs/settings-modal-visual-bug.md`](docs/settings-modal-visual-bug.md) |
+| Understand the generic Tool/MCP abstraction (`agent/tools/`) — what it wraps, why the orchestrator doesn't call it yet | [`docs/TOOLS.md`](docs/TOOLS.md) |
+| See the full platform-transformation discovery/assessment/roadmap this and other recent passes were scoped from | [`docs/PLATFORM_TRANSFORMATION_ASSESSMENT.md`](docs/PLATFORM_TRANSFORMATION_ASSESSMENT.md), [`docs/DEEP_FEATURE_PERFORMANCE_ASSESSMENT.md`](docs/DEEP_FEATURE_PERFORMANCE_ASSESSMENT.md) |
+| See the live performance-metrics rollup (`GET /metrics/performance`) | [`docs/API.md`](docs/API.md) |
 | Check production readiness before deploying | [`docs/PRODUCTION_CHECKLIST.md`](docs/PRODUCTION_CHECKLIST.md), [`docs/PRODUCTION_READINESS_REPORT.md`](docs/PRODUCTION_READINESS_REPORT.md) |
 | Governance, compliance, responsible-AI, risk tracking | [`docs/GOVERNANCE.md`](docs/GOVERNANCE.md), [`docs/COMPLIANCE.md`](docs/COMPLIANCE.md), [`docs/RESPONSIBLE_AI.md`](docs/RESPONSIBLE_AI.md), [`docs/RISK_REGISTER.md`](docs/RISK_REGISTER.md) |
 | Contribute a change or an eval case | [`CONTRIBUTING.md`](CONTRIBUTING.md) |
@@ -498,6 +549,16 @@ any of this security work and remains a separate, equally real gap.
   browser's own speech recognition, so they need a Chromium-based browser
   and, in that browser, are not fully local (see `CLAUDE.md`'s "Voice
   mode" section).
+- **Image attachments in the chat composer are frontend-only.** You can
+  attach, crop, draw on, and annotate an image entirely in the browser, but
+  it is never sent to the assistant — no backend endpoint accepts a chat
+  image attachment yet, and the composer says so explicitly. The
+  "AI-guided editing" panel in the image editor (prompt field, preset
+  buttons) is real UI but always returns a clear "not configured" message
+  rather than faking a result — see
+  [`docs/image-editing-architecture.md`](docs/image-editing-architecture.md)
+  for what's implemented versus the backend contract a real version would
+  need.
 - **Media search (`ENABLE_MEDIA_SEARCH`, off by default) adds a real,
   meaningfully larger dependency footprint** — `torch` (via
   `sentence-transformers`, for local CLIP embeddings) and `opencv-python`

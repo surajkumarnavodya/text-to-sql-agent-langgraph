@@ -13,12 +13,18 @@ handles persistence); it's pure decision logic plus the audit-log call.
 from __future__ import annotations
 
 import logging
+from typing import Literal
 
 from config.moderation_blocklist import find_matches, load_blocklist
 from config.settings import Settings, get_settings
 from moderation.provider import analyze_chunk
-from moderation.taxonomy import decision_for
-from moderation.types import CategoryResult, ChunkModerationResult, ModerationChunk, ModerationDecision
+from moderation.taxonomy import Category
+from moderation.types import (
+    CategoryResult,
+    ChunkModerationResult,
+    ModerationChunk,
+    ModerationDecision,
+)
 from security.audit_log import log_security_event
 
 logger = logging.getLogger(__name__)
@@ -53,7 +59,9 @@ def _moderate_one_chunk(
     placeholder_results: list[CategoryResult] = []
     if chunk.content_type == "image":
         placeholder_results.append(
-            CategoryResult(category="synthetic_media", triggered=False, severity=None, source="not_checked")
+            CategoryResult(
+                category="synthetic_media", triggered=False, severity=None, source="not_checked"
+            )
         )
 
     return ChunkModerationResult(
@@ -94,8 +102,8 @@ def moderate_chunks(
 
     chunk_results = [_moderate_one_chunk(chunk, settings, blocklist) for chunk in chunks]
 
-    hard_reject_categories: list[str] = []
-    soft_flag_categories: list[str] = []
+    hard_reject_categories: list[Category] = []
+    soft_flag_categories: list[Category] = []
     triggering_chunk_index: int | None = None
     for result in chunk_results:
         if result.hard_rejected_categories and triggering_chunk_index is None:
@@ -103,7 +111,7 @@ def moderate_chunks(
         hard_reject_categories.extend(result.hard_rejected_categories)
         soft_flag_categories.extend(result.soft_flagged_categories)
 
-    status = "rejected" if hard_reject_categories else "passed"
+    status: Literal["passed", "rejected"] = "rejected" if hard_reject_categories else "passed"
     decision = ModerationDecision(
         status=status,
         triggering_categories=tuple(dict.fromkeys(hard_reject_categories)),

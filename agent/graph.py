@@ -116,6 +116,7 @@ to use the agent.
 from __future__ import annotations
 
 import logging
+import time
 from functools import lru_cache
 
 from langgraph.graph import END, StateGraph
@@ -144,6 +145,7 @@ from agent.nodes import (
 )
 from agent.state import AgentState, ConversationExchange
 from config.settings import get_settings
+from observability.metrics import get_default_metrics
 
 logger = logging.getLogger(__name__)
 
@@ -370,7 +372,9 @@ def run_agent(
     # above the base Settings.max_retries by agent.complexity's adaptive
     # bonus) so a future config change can't reintroduce this.
     recursion_limit = 20 + effective_max_retries * 10
+    run_start = time.perf_counter()
     final_state = compiled_graph.invoke(initial_state, config={"recursion_limit": recursion_limit})
+    total_duration_ms = (time.perf_counter() - run_start) * 1000
     logger.info(
         "Agent run finished: status=%s retries=%d followup_classification=%s has_insight=%s "
         "rejection_reason=%s",
@@ -380,4 +384,17 @@ def run_agent(
         final_state.get("insight") is not None,
         final_state.get("rejection_reason"),
     )
+    # Purely additive observability -- feeds the already-computed
+    # stage_timings into the live rollup GET /metrics/performance reads.
+    # Never allowed to fail the request it's instrumenting: a metrics-
+    # recording bug must degrade to "this one run's data is missing from
+    # the rollup," never to "the user's question failed," matching this
+    # codebase's standing fail-open posture for every other accuracy/
+    # observability aid (see observability/metrics.py's own docstring).
+    try:
+        get_default_metrics().record_agent_run(
+            final_state.get("stage_timings", []), total_duration_ms, final_state.get("status")
+        )
+    except Exception:
+        logger.warning("Failed to record performance metrics for this run", exc_info=True)
     return final_state

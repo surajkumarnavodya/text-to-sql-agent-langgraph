@@ -1,11 +1,34 @@
 import { Loader2, Mic, Send, Square, Volume2 } from 'lucide-react'
-import { useEffect, useRef, useState, type ChangeEvent, type KeyboardEvent } from 'react'
+import {
+  lazy,
+  Suspense,
+  useEffect,
+  useRef,
+  useState,
+  type ChangeEvent,
+  type ClipboardEvent,
+  type DragEvent,
+  type KeyboardEvent,
+} from 'react'
 import { useTranslation } from 'react-i18next'
+import { AttachmentChip } from '@/components/image/AttachmentChip'
+import { ImageUploader } from '@/components/image/ImageUploader'
+import { ImageViewer } from '@/components/image/ImageViewer'
 import { Button } from '@/components/ui/button'
 import { useHealth } from '@/hooks/queries'
+import { useImageAttachments } from '@/hooks/useImageAttachments'
 import { useVoiceConversation } from '@/hooks/useVoiceConversation'
 import { useSettingsStore } from '@/store/settingsStore'
 import { useChatStore } from '@/store/chatStore'
+
+// Konva + react-konva are a genuinely large dependency (see
+// docs/frontend-ui-audit.md's bundle-size note) that only the image editor
+// needs -- lazy-loaded so opening the app, or attaching/viewing an image
+// without editing it, never pays that cost. Only actually clicking "Edit"
+// (setEditingImageId, below) triggers this import.
+const ImageEditor = lazy(() =>
+  import('@/components/image/ImageEditor').then((module) => ({ default: module.ImageEditor })),
+)
 
 const MAX_WORDS = 250
 // Caps how tall the box can grow before it scrolls internally instead --
@@ -50,12 +73,34 @@ export function ChatInput() {
 
   const pendingQuestion = useChatStore((state) => state.pendingQuestion)
   const askQuestion = useChatStore((state) => state.askQuestion)
+  const cancelPendingQuestion = useChatStore((state) => state.cancelPendingQuestion)
   const disabled = pendingQuestion !== null
 
   const voice = useVoiceConversation((text) => {
     setValue(text)
     setFromVoice(true)
   })
+
+  const attachments = useImageAttachments()
+  const [editingImageId, setEditingImageId] = useState<string | null>(null)
+  const [viewingImageId, setViewingImageId] = useState<string | null>(null)
+  const [isDraggingOver, setIsDraggingOver] = useState(false)
+  const editingImage = attachments.images.find((img) => img.id === editingImageId) ?? null
+  const viewingImage = attachments.images.find((img) => img.id === viewingImageId) ?? null
+
+  const handleDrop = (event: DragEvent<HTMLDivElement>) => {
+    event.preventDefault()
+    setIsDraggingOver(false)
+    if (event.dataTransfer.files.length > 0) void attachments.addFiles(event.dataTransfer.files)
+  }
+
+  const handlePaste = (event: ClipboardEvent<HTMLDivElement>) => {
+    const files = Array.from(event.clipboardData.items)
+      .filter((item) => item.kind === 'file' && item.type.startsWith('image/'))
+      .map((item) => item.getAsFile())
+      .filter((file): file is File => file !== null)
+    if (files.length > 0) void attachments.addFiles(files)
+  }
 
   // Once a finished transcript lands in `value` (voice.phase back to
   // 'idle' after having been 'transcribing'), resize + focus the textarea
@@ -120,7 +165,34 @@ export function ChatInput() {
   const voiceLocked = isListening || isTranscribing || isSpeaking
 
   return (
-    <div className="flex flex-col gap-1 rounded-2xl border border-[var(--border)] bg-[var(--card)] p-3 shadow-sm transition-shadow focus-within:border-[var(--accent)] focus-within:shadow-md">
+    <div
+      onDragOver={(event) => {
+        event.preventDefault()
+        setIsDraggingOver(true)
+      }}
+      onDragLeave={() => setIsDraggingOver(false)}
+      onDrop={handleDrop}
+      onPaste={handlePaste}
+      className={`flex flex-col gap-1 rounded-2xl border p-3 shadow-sm transition-shadow focus-within:border-[var(--accent)] focus-within:shadow-md ${
+        isDraggingOver ? 'border-[var(--accent)] bg-[var(--accent-soft)]' : 'border-[var(--border)] bg-[var(--card)]'
+      }`}
+    >
+      {attachments.images.length > 0 && (
+        <div className="flex flex-col gap-1.5 border-b border-[var(--border)] pb-2">
+          <div className="flex flex-wrap gap-2">
+            {attachments.images.map((image) => (
+              <AttachmentChip
+                key={image.id}
+                image={image}
+                onEdit={() => setEditingImageId(image.id)}
+                onRemove={() => attachments.removeImage(image.id)}
+                onView={() => setViewingImageId(image.id)}
+              />
+            ))}
+          </div>
+          <p className="text-[11px] text-[var(--muted-foreground)]">{t('image.localOnlyNotice')}</p>
+        </div>
+      )}
       <div className="flex items-end gap-2">
         <textarea
           ref={textareaRef}
@@ -130,11 +202,13 @@ export function ChatInput() {
           placeholder={
             isListening && !voice.isSupported ? t('voice.unsupportedCaption') : t('chat.placeholder')
           }
+          aria-label={t('chat.placeholder')}
           disabled={disabled || voiceLocked}
           readOnly={isListening || isTranscribing}
           rows={1}
           className="min-h-10 max-h-60 flex-1 resize-none overflow-y-auto bg-transparent px-1 py-1.5 text-sm leading-normal focus-visible:outline-none"
         />
+        <ImageUploader onFilesSelected={(files) => void attachments.addFiles(files)} disabled={disabled} />
         {showVoiceButton && (
           <Button
             variant="secondary"
@@ -158,14 +232,20 @@ export function ChatInput() {
           </Button>
         )}
         <Button
-          variant="primary"
+          variant={disabled ? 'secondary' : 'primary'}
           size="icon"
-          onClick={() => void submit()}
-          disabled={disabled || voiceLocked || !value.trim()}
-          aria-label={t('chat.placeholder')}
+          onClick={() => (disabled ? cancelPendingQuestion() : void submit())}
+          // Stop is always available the instant a question is pending --
+          // there is no real token stream to interrupt (see
+          // docs/frontend-ui-audit.md), but the single outstanding /ask
+          // request can genuinely be aborted (AbortController, chatStore
+          // .cancelPendingQuestion), so this is a real cancel, not a fake one.
+          disabled={!disabled && (voiceLocked || !value.trim())}
+          aria-label={disabled ? t('common.stop') : t('chat.send')}
+          title={disabled ? t('common.stop') : t('chat.send')}
           className="rounded-xl"
         >
-          {disabled ? <Loader2 className="h-4 w-4 animate-spin" /> : <Send className="h-4 w-4" />}
+          {disabled ? <Square className="h-4 w-4" /> : <Send className="h-4 w-4" />}
         </Button>
       </div>
       <div className="flex items-center justify-between">
@@ -186,6 +266,31 @@ export function ChatInput() {
           {wordCount} / {MAX_WORDS} {t('chat.words')}
         </span>
       </div>
+
+      {editingImage && (
+        // Suspense fallback is intentionally invisible (null): the editor
+        // dialog itself isn't mounted/visible until the lazy chunk
+        // resolves, so there's nothing on screen to show a spinner over
+        // yet -- the "Edit" button's own disabled/pressed state is the
+        // only loading affordance for the brief chunk-fetch window.
+        <Suspense fallback={null}>
+          <ImageEditor
+            open={editingImageId !== null}
+            onOpenChange={(open) => !open && setEditingImageId(null)}
+            imageSrc={editingImage.editedDataUrl ?? editingImage.originalUrl}
+            fileName={editingImage.file.name}
+            onSave={(dataUrl) => attachments.setEditedImage(editingImage.id, dataUrl)}
+          />
+        </Suspense>
+      )}
+      {viewingImage && (
+        <ImageViewer
+          open={viewingImageId !== null}
+          onOpenChange={(open) => !open && setViewingImageId(null)}
+          imageSrc={viewingImage.editedDataUrl ?? viewingImage.originalUrl}
+          altText={viewingImage.file.name}
+        />
+      )}
     </div>
   )
 }

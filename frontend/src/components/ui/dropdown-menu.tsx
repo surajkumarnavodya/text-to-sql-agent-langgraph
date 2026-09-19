@@ -32,3 +32,21 @@ export function DropdownMenuItem({ className, ...props }: DropdownMenuPrimitive.
     />
   )
 }
+
+export function DropdownMenuSeparator({ className, ...props }: DropdownMenuPrimitive.DropdownMenuSeparatorProps) {
+  return (
+    <DropdownMenuPrimitive.Separator
+      className={cn('my-1 h-px bg-[var(--border)]', className)}
+      {...props}
+    />
+  )
+}
+
+export function DropdownMenuLabel({ className, ...props }: DropdownMenuPrimitive.DropdownMenuLabelProps) {
+  return (
+    <DropdownMenuPrimitive.Label
+      className={cn('px-2 py-1.5 text-xs font-medium text-[var(--muted-foreground)]', className)}
+      {...props}
+    />
+  )
+}

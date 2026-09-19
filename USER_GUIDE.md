@@ -74,7 +74,7 @@ either way:
 17. [Voice input and spoken answers](#17-voice-input-and-spoken-answers)
 18. [Generating images and video](#18-generating-images-and-video)
 19. [Searching your media library](#19-searching-your-media-library)
-20. [Session history](#20-session-history)
+20. [Conversation history](#20-conversation-history)
 21. [Understanding error and status messages](#21-understanding-error-and-status-messages)
 22. [Security — what this app does and doesn't protect against](#22-security--what-this-app-does-and-doesnt-protect-against)
 23. [Troubleshooting](#23-troubleshooting)
@@ -108,31 +108,35 @@ Or, if it's running via Docker (see
 `http://localhost:8000` in a browser — everything described below is
 identical either way; only how the app is *started* differs.
 
-Open `http://localhost:8000` in your browser. The header shows the
-product name and a gear icon (opens the chat history panel from the
-right). Before you've asked anything, the main panel shows a heading
-("Ask your data anything"), a short explanation, and a few example
-questions you can click to try immediately.
+Open `http://localhost:8000` in your browser. A persistent left-hand
+sidebar lists your past conversations (search box and "New chat" button
+at the top); the header above the main chat area shows the product name,
+a sidebar-collapse toggle, and — top right — your account menu (an
+avatar), which opens **Settings** (appearance, database connection
+status, discovered tables, and toggles like "Generate AI insight" and
+"Voice mode" — see §4/§12) as well as Theme and Sign out. Before you've
+asked anything, the main panel shows a heading ("Ask your data
+anything"), a short explanation, and a few example questions you can
+click to try immediately.
 
-**If the database can't be reached**, the app stops at a single screen —
-*"⚠️ Database Connection Required"* — showing the connection error and a
-suggestion to check `.env` or run `python scripts/test_db_connection.py`
-for a detailed diagnostic. Nothing else loads until this is fixed; there's
-no way to "use the app anyway" with a broken connection. If more than one
-database is configured (§3), the app only stops this way if *every*
-database fails — one down connection among several doesn't block the
-others.
+**If the database can't be reached**, the chat UI still loads — there is
+no full-screen blocking error. Open **Settings** (§2) to see the specific
+connection error per database, or run `python
+scripts/test_db_connection.py` for a detailed diagnostic. Asking a
+question against a database that can't be reached fails with an error at
+that point rather than earlier.
 
 ## 2. Connecting and configuring a database
 
 There's no in-app login or connection form — the database is configured
 once, in `.env`, before starting the app (see
-[`docs/CONFIGURATION.md`](docs/CONFIGURATION.md)). Once running, the
-sidebar's **"🔌 Database Connection"** panel shows what's currently
-connected: database type, database name, a partially-masked username
-(e.g. `j***n`), and schema (if restricted to one). A **"🔌 Test
-Connection"** button re-checks the connection at any time and reports
-success (with the database version) or the specific error.
+[`docs/CONFIGURATION.md`](docs/CONFIGURATION.md)). Once running, open
+**Settings** (account menu, top right → "Settings") — its **"Connection
+status"** section shows what's currently connected: database type,
+database name, a partially-masked username (e.g. `j***n`), and schema (if
+restricted to one). A **"Test Connection"** button re-checks the
+connection at any time and reports success (with the database version) or
+the specific error.
 
 If the connected account happens to have write access (INSERT/UPDATE/
 DELETE), a warning banner appears here too. This app never issues writes
@@ -144,27 +148,24 @@ itself, but that warning is worth acting on — see
 *(Only relevant if your administrator configured more than one database —
 skip to §4 otherwise.)*
 
-If your `.env` lists more than one database connection, the sidebar
-heading changes to **"🔌 Database Connections"** (plural), with one card
-per database — each showing its own status icon (✅ reachable / ❌ not
-reachable), type, name, user, and schema, so you can tell at a glance
-which ones are reachable.
+If your `.env` lists more than one database connection, Settings'
+**"Connection status"** section (§2) shows one card per database — each
+with its own status (reachable/not reachable), type, name, user, and
+schema, so you can tell at a glance which ones are reachable.
 
 **There is no manual "pick a database" dropdown.** You just ask your
 question in plain English, and the app automatically figures out which
 configured database it's actually about — by comparing your question
 against each database's own table structure and picking the best match,
-before generating any SQL. You'll see which one it picked in two places:
+before generating any SQL. You can see which one it picked in the
+answer's collapsed **"Query information"** panel (a **"Database"** field)
+— technical metadata that stays out of the way unless you expand it.
 
-- A caption right under your result: **"🧭 Routed to database: *name*"**.
-- The sidebar's **"🧭 Last question routed to: *name*"** caption, updated
-  after every question.
-
-The **"🔄 Refresh Schema"** button (§4) refreshes *every* configured
+The **"Refresh Schema"** button (§4) refreshes *every* configured
 database in one click — the success message reports the total table count
-across all of them. The **"📋 Discovered tables"** panel groups tables by
-database name, so you can confirm the app sees the right tables in the
-right place.
+across all of them. The **"Discovered tables"** section (grouped by
+database when more than one is configured) lets you confirm the app sees
+the right tables in the right place.
 
 **If a question gets routed to the wrong database**, it's almost always
 because the question is genuinely ambiguous between two databases that
@@ -177,15 +178,15 @@ phrase.
 
 Before the app can answer questions, it needs to know your database's
 shape. This happens automatically once per app run, and is also available
-on demand via the sidebar's **"🔄 Refresh Schema"** button — use it after
+on demand via Settings' **"Refresh Schema"** button (§2) — use it after
 you've added, renamed, or removed tables/columns in the database. It
 re-reads the schema and rebuilds the internal search index; a success
 message shows how many tables were found. This is safe to click any time —
 if nothing actually changed, it's a fast no-op.
 
-The sidebar's **"📋 Discovered tables"** panel (collapsed by default) lists
-every table the app currently knows about, with each column's name and
-type — useful for confirming the app can see what you expect it to.
+Settings' **"Discovered tables"** section (collapsed by default) lists
+every table the app currently knows about — useful for confirming the app
+can see what you expect it to.
 
 ## 5. Asking a natural-language question
 
@@ -213,8 +214,8 @@ structure.
 
 ## 7. Reviewing the generated SQL
 
-After processing, the SQL query the AI generated appears under **"🛠️
-Generated SQL"** in an editable text box, with the note: *"Edit if needed
+After processing, the SQL query the AI generated appears under
+**"Generated SQL"** in an editable text box, with the note: *"Edit if needed
 — it will be re-validated and re-run when you click Confirm and Run."*
 **Nothing has been run against your database yet at this point** — this
 is a proposal for you to review, not a completed action.
@@ -240,7 +241,7 @@ section for this protection's honest limits.
 
 Before a query actually runs, the app estimates roughly how much work it
 will involve (without running it). If a query looks like it will scan a
-lot of data, you'll see a caption: *"⏳ This query scans a large amount of
+lot of data, you'll see a caption: *"This query scans a large amount of
 data and may take a moment to run."* — informational, the query still
 runs. If a query looks extremely expensive, it isn't run at all; the AI
 is asked to try a narrower approach instead (this shows up as a step in
@@ -248,7 +249,7 @@ the retry timeline — see below — rather than a message to you directly).
 
 ## 10. Confirming execution
 
-Click **"▶ Confirm and Run"** to actually execute the SQL currently shown
+Click **"Confirm and Run"** to actually execute the SQL currently shown
 in the box (including any edits you made). This is the one moment
 anything runs against your real database for something you'll actually
 see. If the SQL fails the safety check at this point (e.g. you edited it
@@ -258,7 +259,7 @@ failed: ..."*.
 
 ## 11. Viewing results
 
-A successful run shows a results table headed **"📊 Results (N rows)"**.
+A successful run shows a results table headed **"Results (N rows)"**.
 By default, purely technical columns (internal ID/key columns) are hidden
 and column names are expanded into readable labels (e.g. `CustName`
 becomes "Customer Name") — check **"Show technical columns"** to see the
@@ -276,12 +277,12 @@ to the top 30 values for readability). If the result shape doesn't fit
 either, the checkbox is disabled with the note *"No suitable chart for
 this result shape"* — the app never forces a misleading chart.
 
-If enabled (sidebar toggle, on by default: **"💡 Generate AI insight"**),
-a short plain-English sentence about the result appears above the table,
-labeled **"AI insight."** This sentence is checked against the actual
-result numbers before being shown — if it doesn't hold up, it's silently
-skipped rather than shown as an unverified guess. Turn the sidebar toggle
-off if you'd rather not see this at all.
+If enabled (Settings toggle, on by default: **"Generate AI insight"** —
+see §2/§4), a short plain-English sentence about the result appears above
+the table, labeled **"AI insight."** This sentence is checked against the
+actual result numbers before being shown — if it doesn't hold up, it's
+silently skipped rather than shown as an unverified guess. Turn the
+Settings toggle off if you'd rather not see this at all.
 
 ## 13. Editing SQL yourself
 
@@ -358,16 +359,15 @@ described earlier in this guide (SQL safety, retry behavior, Confirm and
 Run) still applies unchanged whenever your question turns out to be a
 database question.
 
-**Uploading documents and policies.** A separate **"📚 Knowledge Sources"**
-page (in the sidebar navigation, alongside the main chat page) has two
-tabs:
+**Uploading documents and policies.** A separate **"Knowledge Sources"**
+page (a header nav tab, alongside "Chat" and "Media Search") has two tabs:
 
-- **"📄 Documents"** — general reference material. Upload one or more PDF
+- **"Documents"** — general reference material. Upload one or more PDF
   files; each shows a progress bar, then a success/failure summary (how
   many chunks were indexed, or the specific error). A document becomes
-  askable as soon as its status turns **✅ ready** in the table below — no
+  askable as soon as its status turns **ready** in the table below — no
   app restart needed.
-- **"🔒 Policies"** — company/HR policy documents, with one extra field: a
+- **"Policies"** — company/HR policy documents, with one extra field: a
   **sensitivity category** (`None`, `Compensation & pay`,
   `Disciplinary / HR case content`, `Legal / litigation`). Pick a category
   only for content that's genuinely restricted — see "Sensitive policies"
@@ -375,15 +375,15 @@ tabs:
   content (leave policy, dress code, general process docs).
 
 Each ingested file's row shows its status, upload date, chunk count, and
-sensitivity category, with a **🗑️ delete** button to remove it (and
+sensitivity category, with a **delete** button to remove it (and
 everything it contributed) at any time.
 
 **Asking a multi-source question.** Just ask normally — no need to say
 which source you mean. A purely database question behaves exactly as
 described everywhere else in this guide. A question about your documents,
-policies, or the wider web gets answered directly, with a
-**"🔗 Sources used: 📄 Documents"** (or `🔒 Policy`, `🌐 Web (external,
-live)`) caption showing which source(s) actually contributed, and the
+policies, or the wider web gets answered directly, with an
+**"Answered using:"** caption and a badge per source that actually
+contributed (`Database`, `Documents`, `Policy`, `Web`, ...), and the
 specific file(s)/URL(s) it drew from underneath. A web-search answer
 always opens with *"According to a live web search:"* and lists the
 source links — so it's never confused with your own data. A question that
@@ -392,11 +392,14 @@ what's in the database") gets a combined answer with each source's
 contribution shown under its own labeled heading.
 
 **Sensitive policies.** A policy document tagged with a sensitivity
-category is **never summarized into an answer, for anyone** — this app
-has no per-user login, so it can't check who's allowed to see restricted
-content, and refuses rather than guess. Asking about a restricted policy
-returns a fixed message pointing you to HR/the policy owner directly, not
-a partial or hedged answer.
+category is **never summarized into an answer, for anyone**, regardless
+of role — a fixed, hard-blocked gate with no override. If your
+administrator has also enabled this app's own accounts (sign-in, top
+right), a second, independent check can additionally restrict a specific
+document to named roles (e.g. "HR only") — see
+[`docs/AUTHORIZATION.md`](docs/AUTHORIZATION.md). Asking about a
+restricted policy returns a fixed message pointing you to HR/the policy
+owner directly, not a partial or hedged answer.
 
 **If a multi-source question comes back wrong or incomplete**, it's
 usually because the question was really two unrelated asks mashed into
@@ -408,24 +411,31 @@ one sentence — try asking each part separately first.
 don't see a microphone button next to the chat box.)*
 
 Click the microphone icon instead of typing, and speak your question. As
-you talk, word-by-word captions appear so you can see it being recognized
-in real time. The moment you stop talking, your question is submitted
-automatically — there's no separate "review the transcript, then send"
-step — and once the answer comes back, it's read aloud automatically, in
-addition to appearing as normal text/results. After that one exchange, the
-app resets to the ordinary typing box; click the microphone again to ask
-another question by voice. This is a **press-to-talk, one question, one
-spoken answer** pattern, not a continuously-listening assistant.
+you talk, word-by-word captions appear in the composer so you can see it
+being recognized in real time — the box visibly "types" what it hears.
+The moment you stop talking (or you tap the button again, now showing
+**Stop**, to end recording manually), the recognized text is dropped
+straight into the composer for you to review and edit, exactly as if
+you'd typed it — **nothing is submitted automatically.** Press **Send**
+(or Enter) when you're ready, the same as any typed question. Once the
+answer comes back, it's read aloud automatically, in addition to
+appearing as normal text/results. This is a **record-once, review, then
+send** pattern, not a continuously-listening or auto-submitting assistant.
 
-A voice-submitted question goes through the exact same safety checks,
+A voice-originated question goes through the exact same safety checks,
 retry behavior, and "Confirm and Run" gate as a typed one — nothing about
-how it's answered changes because it arrived by voice.
+how it's answered changes because it arrived by voice. You can also edit
+the recognized text before sending, or clear it and type something else
+entirely.
 
 If your browser doesn't support live captions, you won't see the
-word-by-word preview, and a **"Done speaking"** button appears instead of
-automatic silence detection — everything else works the same. You can
-always replay a spoken answer afterward from the small audio control shown
-under that turn, without it being read aloud a second time automatically.
+word-by-word preview — the composer shows a static *"Recording... speak
+now, then tap stop"* placeholder instead, and tapping the same button
+(now showing **Stop**) ends recording, since there's no automatic
+silence detection to fall back on. Everything else works the same. You
+can always replay a spoken answer afterward from the small audio control
+shown under that turn, without it being read aloud a second time
+automatically.
 
 Transcription and the spoken voice are both produced entirely on your own
 machine — no cloud speech service, no data leaving it for either
@@ -435,9 +445,9 @@ recognition, which in a Chromium-based browser sends your audio to that
 browser vendor's own cloud service purely to draw the caption on screen.
 Your actual submitted question always comes from the local transcription,
 never from that caption. If you'd rather not see the microphone button at
-all, look for a "Voice mode" toggle in the settings panel (gear icon) — it
-hides the control for you without needing your administrator to change
-anything server-side.
+all, look for a **"Voice mode"** toggle in **Settings** (§2/§4) — it hides
+the control for you without needing your administrator to change anything
+server-side.
 
 ## 18. Generating images and video
 
@@ -486,7 +496,7 @@ required. Two ways to use it:
   asking it to generate brand-new media (§18); if in doubt, say "find" or
   "do we have," not "create" or "make." A matching answer shows a short
   written summary plus a thumbnail grid of what was found.
-- **A dedicated "🖼️ Media Search" page**, in the navigation bar alongside
+- **A dedicated "Media Search" page**, in the navigation bar alongside
   Chat and Knowledge Sources — type a description, optionally narrow it to
   images only or videos only, and click **Search**. This works
   independently of the chat, for quickly browsing the library without
@@ -508,22 +518,37 @@ re-indexed. Everything about this feature runs on the same machine as the
 rest of the app — your media is never uploaded to a third party to make it
 searchable.
 
-## 20. Session history
+## 20. Conversation history
 
-The sidebar's **"📜 History"** panel lists every question you've asked
-this session (most recent first), each with a status badge (succeeded,
-failed, needs clarification, rejected, rate limited, or retried) and a
-timestamp. Two actions per entry:
+The persistent left sidebar lists your **conversations** (most recent
+first), not individual questions — each conversation is the full back-
+and-forth from one "New chat" onward. Click **"New chat"** to start a
+fresh one (nothing is saved until you actually send a first message — see
+[`docs/new-chat-flow.md`](docs/new-chat-flow.md)), click any conversation
+to reload it, and use the search box at the top of the sidebar to find a
+past conversation by title or by anything asked or answered inside it
+(search runs against the server, not just what's currently loaded in your
+browser). Each conversation's "⋯" menu offers **Rename** and **Delete**
+(a soft delete — see below).
 
-- **"👁 View"** — instantly restores exactly what you saw for that
-  question (including its actual confirmed result, if you ran one) — no
-  new processing.
-- **"🔄 Re-run"** — asks the question again from scratch, as a fresh
-  request (counts against the same rate limit as a brand-new question).
+**Whether history survives a page refresh or a different device depends
+on whether you're signed in with a local account** (an optional,
+administrator-enabled feature — see
+[`docs/AUTHENTICATION.md`](docs/AUTHENTICATION.md)):
 
-**"🗑️ Clear history"** removes everything. History is **session-only** —
-it disappears when you refresh the page or restart the app; nothing here
-is saved permanently.
+- **Signed in with a local account**: every conversation and message is
+  stored permanently on the server — it follows you across browser tabs,
+  devices, and restarts, and only disappears if you explicitly delete it.
+  See [`docs/chat-history-architecture.md`](docs/chat-history-architecture.md).
+- **Not signed in** (the default for a single-user/local setup with no
+  accounts configured): history lives only in the browser tab's memory,
+  exactly like the rest of this guide's Part 1 describes elsewhere —
+  it disappears on refresh or restart, and there is nothing to search on
+  the server.
+
+There is no per-question "re-run" action — reloading a conversation shows
+you what you asked and were told; to ask it again, just type it into the
+composer as a new message.
 
 ## 21. Understanding error and status messages
 
@@ -578,7 +603,7 @@ technical reference. The most common day-to-day issues:
   `.env` database settings; run `python scripts/test_db_connection.py`
   for specifics.
 - **"Chroma index is empty" or questions never find the right tables** —
-  click **"🔄 Refresh Schema"** in the sidebar, or run `python
+  click **"Refresh Schema"** in Settings (§2/§4), or run `python
   scripts/build_embeddings.py` from a terminal.
 - **Every question is very slow** — expected with a local AI model on
   modest hardware; this trades speed for running entirely offline. See
@@ -601,7 +626,7 @@ technical reference. The most common day-to-day issues:
   answered as if it were a database question** — media generation is off
   by default; ask your administrator whether `ENABLE_MEDIA_GENERATION` is
   set, and try rephrasing with an explicit "generate"/"create" verb.
-- **The "🖼️ Media Search" page says the feature is disabled, or a search
+- **The "Media Search" page says the feature is disabled, or a search
   never finds a file you know is in the library** — media search is off by
   default and needs a configured library folder; if it's supposed to be
   on, ask your administrator to confirm `ENABLE_MEDIA_SEARCH` and that the

@@ -199,6 +199,16 @@ below, and `docs/MULTI_SOURCE_GUIDE.md` for how to configure each source.
   never replaces it — see "Multi-source orchestration" below), `graph.py`
   (`run_orchestrated`, the single entry point `api/main.py` calls in place
   of `agent.graph.run_agent` directly).
+- `agent/tools/` — a generic, MCP-shaped tool abstraction (`types.py`'s
+  `Tool`/`ToolCategory`/`RetryPolicy`/`ToolResult`, `registry.py`'s
+  `ToolRegistry`, `definitions.py`'s `build_default_registry()`) wrapping
+  the same six real functions `agent/orchestrator/nodes.py` already calls
+  (`agent.graph.run_agent`, `rag.graph.run_rag` × 2 collections,
+  `search.web_search.web_search`, `media.search.search_media`,
+  `agent.orchestrator.nodes.execute_generation`) — see "Tool/MCP
+  abstraction" below. **Additive, not a replacement**: the orchestrator
+  graph's own hardcoded nodes are unmodified and still the only thing
+  `run_orchestrated` actually calls in production today.
 - `rag/` — document/policy agentic RAG, one implementation shared by both
   the "documents" and "policies" collections (parameterized by collection
   name, not two near-duplicate modules): `store.py` (SQL Server native
@@ -234,16 +244,26 @@ below, and `docs/MULTI_SOURCE_GUIDE.md` for how to configure each source.
   (`commitQueryHistory`); switching conversations swaps which one
   `queryHistory` points at. This is in-memory/session-only, same as the
   Streamlit app's own history was — a page reload clears it, by design, not
-  as a regression. `src/components/layout/AppShell.tsx` is the full-
-  viewport shell: a compact header (product mark, nav, theme toggle, and a
-  single gear icon) and a right-side `HistoryDrawer.tsx` that the gear
-  toggles open/closed — hidden by default, no other control opens or
-  closes it. `HistorySettingsSection.tsx` (nested inside the drawer) holds
-  everything that used to live in the Streamlit sidebar and isn't chat
-  history itself: appearance (theme/accent/font/language, `src/lib/
-  theme.ts`), per-database connection status, a manual re-test, a manual
-  schema refresh, a schema browser grouped by database, and the "Generate
-  AI insight" toggle. `src/components/chat/TurnCard.tsx` renders one
+  as a regression (server-backed history for a locally-authenticated user
+  is a separate, additional layer — see "Universal server-side chat
+  history" below; `chatStore` is what mirrors that server state into the
+  UI, not a replacement for it). `src/components/layout/AppShell.tsx` is
+  the full-viewport shell: a persistent left conversation-history rail
+  (`Sidebar.tsx`, `lg:`+ viewports) + main workspace, with a compact header
+  (product mark, nav, theme toggle, gear icon) above the workspace only.
+  Below `lg:`, the header's hamburger (`MobileNav.tsx`) opens the same
+  `Sidebar` in a slide-in drawer instead — one history-list implementation,
+  not two kept in sync. **2026 UI pass** (see "Frontend UI redesign"
+  below): this replaced an earlier single combined right-side
+  `HistoryDrawer.tsx` (history + settings behind one gear icon, now
+  deleted) — settings are now `SettingsDialog.tsx`, reachable from the
+  header gear and the Sidebar's own footer, wrapping the same
+  `HistorySettingsSection.tsx` content unmodified. `HistorySettingsSection.tsx`
+  holds everything that isn't chat history itself: appearance
+  (theme/accent/font/language, `src/lib/theme.ts`), per-database connection
+  status, a manual re-test, a manual schema refresh, a schema browser
+  grouped by database, and the "Generate AI insight" toggle.
+  `src/components/chat/TurnCard.tsx` renders one
   question+answer turn — schema context and the generated SQL are both
   collapsible (`src/components/ui/expander.tsx`), and technical metadata
   (which database a question was routed to) sits inside a collapsed
@@ -389,10 +409,14 @@ below, and `docs/MULTI_SOURCE_GUIDE.md` for how to configure each source.
 ## Key design decisions
 
 ### Self-correcting retry loop (LangGraph)
-The full graph (`agent/graph.py`) is eleven nodes, not four:
+The full graph (`agent/graph.py`) is twelve nodes, not four:
 `sanitize_input → classify_followup → retrieve_schema →
-retrieve_golden_examples → plan_query → generate_sql → review_sql →
-validate_sql → estimate_cost → execute_sql → generate_insight`. On a review, validation, cost-estimate, or execution
+retrieve_golden_examples → retrieve_business_context → plan_query →
+generate_sql → review_sql → validate_sql → estimate_cost → execute_sql →
+generate_insight` (a 2026-09-18 doc-drift fix — `retrieve_business_context`
+was already live, documented under its own heading further below, but
+missing from this particular summary list; see
+`docs/DEEP_FEATURE_PERFORMANCE_ASSESSMENT.md` §2). On a review, validation, cost-estimate, or execution
 failure, a conditional edge routes back to `generate_sql` (or, for a
 "missing reference" execution error, back to `retrieve_schema`) with the
 error message appended to the state's history, so the LLM sees what went
@@ -575,6 +599,61 @@ silently ignored): the eval benchmark's per-case `database:` label (see the
 table could in principle also apply to a same-named table in another. Both
 are real, narrow limitations worth knowing about if you're extending this
 further, not oversights to silently work around.
+
+### Tool/MCP abstraction (`agent/tools/`)
+A generic, governed way to describe and invoke this application's six real
+capabilities (SQL, document RAG, policy RAG, web search, media search,
+media generation) by name, added as the first step of a broader "Enterprise
+AI Intelligence Platform" roadmap (see
+`docs/PLATFORM_TRANSFORMATION_ASSESSMENT.md`). **Deliberately additive, not
+a rewrite**: `agent/orchestrator/nodes.py`'s five hardcoded nodes are
+completely unmodified, and `run_orchestrated` still calls them directly in
+production exactly as before this package existed — there was no clear,
+low-risk way to swap a heavily security-reviewed, already-tested graph's
+node bodies for a generic dispatch layer without real regression risk, so
+that integration was deliberately deferred rather than forced into this
+increment (see "Do not blindly follow this sequence" reasoning in the
+assessment doc).
+
+Each of the six `Tool`s in `agent/tools/definitions.py` (`sql_query`,
+`document_search`, `policy_search`, `web_search`, `media_search`,
+`media_generation`) wraps the *exact same* function
+`agent/orchestrator/nodes.py` already calls (`agent.graph.run_agent`,
+`rag.graph.run_rag`, `search.web_search.web_search`,
+`media.search.search_media`, `agent.orchestrator.nodes.execute_generation`)
+— no reimplementation, confirmed by tests that monkeypatch each real
+function and assert the tool called through to it with the right
+arguments (`tests/test_tools_definitions.py`). `agent/tools/registry.py`'s
+`ToolRegistry.execute` governs every call uniformly: a permission check
+(`agent.authz.has_role_permission`, the same check `router_node` already
+does for its own sources — fail-closed, raises `ToolPermissionError`, never
+silently denies), a hard per-attempt timeout (thread-based, mirroring
+`db.execution._execute_with_timeout`'s own daemon-thread-join pattern —
+the only cross-platform way to bound an arbitrary call's wall-clock time),
+a configurable retry policy (`max_attempts=1` by default — most wrapped
+functions already have their own internal retry loop, so an outer retry
+would just multiply latency), and one structured `security.audit_log`
+event per outcome (`tool_permission_denied`/`tool_executed`/
+`tool_execution_failed`). `ToolCategory.READ`/`WRITE` distinguishes the
+five read-only sources from `media_generation` (the only one that spends
+real, metered money) — the category alone grants no extra authorization;
+`media_generation`'s own human-approval gate (`Settings
+.require_generation_approval`, see "Media generation" above) still lives
+entirely in `generation_node`/`execute_generation`, upstream of this
+tool.
+
+**Who consumes this today**: nothing in production yet — this is
+foundation for the next roadmap step (a research-planner upgrade that
+needs to choose and invoke a tool dynamically by name, rather than
+following a fixed LangGraph edge, plus a future external MCP client). It
+is fully tested (`tests/test_tools_registry.py`,
+`tests/test_tools_definitions.py`) and functionally complete on its own —
+not scaffolding that does nothing — but has no caller wired into the live
+request path in this increment. Known, disclosed limitation: per-tool
+timeouts (`agent/tools/definitions.py`'s `_SQL_TOOL_TIMEOUT_SECONDS` etc.)
+are hand-picked constants, not yet wired to `config.settings.Settings`,
+to keep this increment's surface area small — a legitimate follow-up, not
+an oversight.
 
 ### Multi-source orchestration (router + subgraphs)
 `ENABLE_MULTI_SOURCE_ROUTER` (default `false`) puts a router in front of
@@ -1455,6 +1534,116 @@ answer text + SQL (if any), not the full `AskResponse` (charts,
 citations, the schema DDL shown at generation time) — see
 `docs/chat-history-architecture.md`'s own "Known limitations" section.
 
+### Frontend UI redesign (2026 UI pass)
+A ground-up-in-appearance, additive-in-substance redesign of `frontend/`
+into a left-sidebar/main-workspace AI-workspace layout — no backend logic,
+API contract, auth flow, SQL validation, or chat-persistence behavior
+changed as part of this pass; every change is presentation/interaction
+layer only, verified by the pre-existing backend test suite being
+untouched and the frontend's own `GET`/`POST` call sites being unchanged.
+Four docs carry the full detail so this section stays a pointer, not a
+duplicate:
+
+- [`docs/frontend-ui-audit.md`](docs/frontend-ui-audit.md) — the Phase 1
+  audit this pass started from: component hierarchy, design
+  inconsistencies, and gaps as they stood before any change.
+- [`docs/ui-design-system.md`](docs/ui-design-system.md) — the token set
+  added to `frontend/src/index.css` (message-role surfaces, code/SQL
+  surfaces, a focus-ring token, named z-index tiers, named transition
+  durations) and the new shared `components/ui/` primitives (`dialog.tsx`,
+  `drawer.tsx`, `toast.tsx`, `copy-button.tsx`), all additive to the
+  existing Tailwind v4 + CSS-custom-property system — no new styling
+  framework.
+- [`docs/chat-history-ui.md`](docs/chat-history-ui.md) — the sidebar/
+  settings split: `HistoryDrawer.tsx` (one combined right-side drawer) was
+  deleted in favor of `Sidebar.tsx` (persistent left rail, `lg:`+),
+  `MobileNav.tsx` (hamburger + drawer below `lg:`, rendering the same
+  `Sidebar`), and `SettingsDialog.tsx` (the unmodified
+  `HistorySettingsSection.tsx` content, now its own surface). Search/list/
+  rename/delete logic was extracted into `hooks/useChatSearch.ts` and
+  independently-tested presentational components
+  (`ConversationSearch`/`ConversationList`/`ConversationListItem`/
+  `ConversationSearchResults`) — the server-backed history/search behavior
+  itself (`GET /conversations`, `GET /chat/search`, etc.) is unchanged.
+- [`docs/image-editing-architecture.md`](docs/image-editing-architecture.md)
+  — a genuinely new capability, **frontend-only and explicitly labeled as
+  such in the UI**: `ChatInput.tsx` now accepts image attachments (file
+  picker, drag-drop, clipboard paste — `hooks/useImageAttachments.ts`,
+  `lib/imageValidation.ts`) with a full local editor
+  (`components/image/ImageEditor.tsx`, Konva/react-konva — crop, rotate,
+  flip, draw, shapes, text, mask layer, undo/redo). **No backend endpoint
+  accepts a chat image attachment or an AI-guided edit instruction** —
+  confirmed against `api/schemas.py`'s `AskRequest` (no file field) and
+  every `UploadFile` route in `api/` (only PDF documents and voice audio).
+  The editor's "AI-guided editing" section is real, visible UI (per the
+  original request's instruction not to hide the affordance) but its
+  adapter (`lib/imageEditAdapter.ts`'s `AiGuidedEditAdapter`) is a
+  deliberate, permanent stub that always rejects with a clear "not
+  configured" message — never a fabricated result. The composer shows an
+  explicit "Local only — image attachments aren't sent to the assistant
+  yet" notice whenever one is attached, so this limitation is visible in
+  the product, not just in this file. The backend contract a real
+  implementation would need (`POST /media/edit`, mirroring `media_gen`'s
+  existing human-approval/cost-ceiling/SSRF-hardened-storage pattern) is
+  documented but **not built** — a substantial backend feature in its own
+  right, correctly out of scope for a frontend UI pass. The editor is
+  lazy-loaded (`React.lazy`, its own ~343KB/106KB-gzip chunk) so attaching
+  or viewing an image — or using the app without ever touching images —
+  never pays Konva's bundle cost.
+
+**Follow-up pass — duplicated controls + sidebar collapse (still 2026-09-18):**
+the redesign above introduced its own new duplication, found and fixed in
+a immediately-following pass: `SettingsDialog` was mounted **twice**
+(once in `AppShell.tsx`'s header, once in `Sidebar.tsx`'s footer), each
+with its own independent open/closed state and its own gear button, and
+Sign Out was similarly copy-pasted in both places. Fixed by introducing
+`layout/UserMenu.tsx` — one consolidated account menu (avatar → display
+name/email, Settings, Theme, Sign out), rendered exactly once, in the
+header — and deleting `Sidebar.tsx`'s entire footer (it now owns exactly
+one concern, history navigation). Also added real desktop sidebar
+collapse (`layout/SidebarToggle.tsx`, one instance, header-only;
+`settingsStore.sidebarCollapsed`, persisted, the single source of truth —
+deliberately separate from `MobileNav`'s own ephemeral drawer-open state,
+which is a different concern and was never unified with it). See
+[`docs/ui-production-audit.md`](docs/ui-production-audit.md) for exactly
+what was found duplicated and how it was verified (by reading handlers,
+not just visual similarity), and
+[`docs/navigation-and-actions.md`](docs/navigation-and-actions.md) for the
+resulting one-action-one-owner table, including the one deliberate,
+documented exception (`ThemeToggle` appears both as a `UserMenu` shortcut
+and inside the full Settings dialog — same component/store, not a second
+implementation). Verified visually, not just via component tests: a real
+headless-Chromium pass (dev server + Playwright, auth mocked via request
+interception) at desktop/tablet/mobile widths and in dark mode, zero
+console errors.
+
+**Second follow-up pass — Settings modal background bled through in dark
+mode (2026-09-19):** a later report showed the Settings panel/backdrop
+letting background chat content show through, but only in dark mode. Root
+cause: `ui/dialog.tsx`'s panel used `bg-[var(--card)]`, and `--card`'s
+dark-mode value (`index.css`) is `#15132485` — an 8-digit hex with an
+embedded ~52%-opacity alpha channel, a deliberate "glass" treatment for
+other surfaces (message bubbles) that the modal panel wrongly inherited;
+the overlay was also only `bg-black/40` (40% opaque) in both themes. Light
+mode's `--card: #ffffff` has no alpha component, which is exactly why the
+first follow-up pass's own dark-mode screenshot check above didn't catch
+this — that pass verified layout/duplication, not per-theme opacity.
+Fixed with two new tokens, deliberately independent of `--card`:
+`--modal-backdrop` (`#05050a`, opaque in both themes) and `--modal-surface`
+(`#ffffff` light / `#151324` dark — `--card`'s dark hue with the alpha
+stripped), consumed by `ui/dialog.tsx` (panel + overlay) and `ui/drawer.tsx`
+(overlay only — its own panel, `--sidebar`, had no alpha channel in either
+theme already). `AppShell.tsx`'s background wrapper also now gets the
+native `inert` attribute while a modal is open, additive to the opaque
+backdrop — `inert` removes the background from the accessibility tree/tab
+order, the backdrop handles visual occlusion. Both `ImageViewer`/
+`ImageEditor` (`components/image/`) build on the same shared `Dialog` and
+inherited the fix with no changes of their own. Verified live (Playwright,
+computed `background-color`/`opacity` sampled, not just screenshotted) at
+desktop/tablet/mobile widths in both themes — see
+[`docs/settings-modal-visual-bug.md`](docs/settings-modal-visual-bug.md)
+for the full root-cause writeup and test matrix.
+
 ### SQL is untrusted output, always
 The LLM's SQL is never trusted at face value. `agent/sql_validator.py`
 parses it with `sqlglot` (in the dialect matching `DB_TYPE`) and rejects
@@ -1672,6 +1861,83 @@ since the cached function body simply wouldn't re-run.
 - Process-lifetime singletons (DB engine, Ollama client, compiled LangGraph
   graph) — see "Process-lifetime singletons" above.
 
+### Observability — live performance rollup (`observability/`)
+`agent.nodes._timed_node` has, since before this section existed, logged a
+`[timing] stage=... attempt=... duration_ms=...` line for every LangGraph
+node call and appended a `StageTiming` entry to `AgentState["stage_timings"]`
+(consumed only two ways before this: read live off a log line by a human,
+or aggregated *offline* from a captured `eval/results/run_*.json` file, as
+`docs/PERFORMANCE_BASELINE.md`'s manual latency-waterfall analysis did).
+**2026-09-18:** `observability/metrics.py`'s `PerformanceMetrics` (one
+process-wide singleton, `get_default_metrics()`, same `functools.cache`
+pattern as every other singleton in this section) closes that gap —
+`agent.graph.run_agent` now feeds every completed run's `stage_timings` +
+total duration + final status into it after `compiled_graph.invoke()`
+returns, wrapped in a `try`/`except` so a metrics-recording bug can never
+fail the request it's instrumenting (the same fail-open posture this
+codebase already applies to every other accuracy/observability aid).
+`GET /metrics/performance` (admin-only, `Permission.ADMIN_CONFIG` — the
+same gate `POST /schema/refresh` already uses) reads back a live snapshot:
+per-stage count/mean/p50/p95/max/total (mirroring
+`docs/PERFORMANCE_BASELINE.md`'s own table shape) plus an overall
+request-duration distribution and a status-outcome tally. **Deliberately
+single-process, in-memory, resets on restart** — a multi-worker deployment
+would have one independent rollup per worker, the identical limitation
+`agent/rate_limit.py`'s own sliding-window limiters already disclose for
+the same reason (no shared store like Redis exists in this architecture);
+real cross-process metrics would need Prometheus/OpenTelemetry, a
+genuinely separate piece of infrastructure, not attempted here. This is
+the first concrete step of a broader assessment — see
+`docs/DEEP_FEATURE_PERFORMANCE_ASSESSMENT.md` for the full discovery/
+target-architecture/roadmap this was scoped from, and
+`docs/PERFORMANCE_BASELINE.md`/`docs/PERFORMANCE_RESULTS.md` for why no
+further backend "optimization" is justified today without a model/
+hardware/prompt-size tradeoff (LLM inference is 93.8–98% of wall-clock
+time; this rollup makes that fact continuously verifiable against live
+traffic instead of a single point-in-time benchmark run).
+
+### AI Data Analyst depth — trend/variance/outlier detection (`agent/insight.py`)
+**2026-09-19:** `ResultSummary` (the small, aggregate-only summary
+`generate_insight_from_llm` is given — see "Grounded insights, not
+free-form narration" — never raw rows) gained three new deterministic
+fields, computed the identical "Python does the arithmetic, the LLM only
+narrates already-computed truths" way `top_label`/`top_share_percent`
+already worked: `ColumnStat.stddev`/`coefficient_of_variation` (population
+standard deviation and a scale-independent spread measure, `None` when
+degenerate — a single row, or a zero mean), `ResultSummary.trend`
+(first-vs-last-period change percent + direction, using the SQL's own row
+order rather than re-deriving a chronology — see `TrendStat`'s own
+docstring for why), and `ResultSummary.outliers` (per-label totals more
+than `OUTLIER_STDDEV_THRESHOLD`, default 2.0, population-standard-
+deviations from the mean, requiring at least 3 distinct labels since two
+points are always symmetric around their own mean). All three flow
+through `allowed_values()`/`allowed_percents()` alongside the pre-existing
+fields, so the existing grounding gate (`is_insight_grounded`) would
+already validate a claim mentioning any of them correctly.
+
+**Fully tested (`tests/test_insight.py`, 16 new cases), but — like
+`agent/tools/` before it (see "Tool/MCP abstraction" above) — not yet
+wired into `agent.llm_client._build_insight_prompt`, so nothing in the
+live `generate_insight_node` path actually surfaces a trend/variance/
+outlier claim yet.** Deliberately deferred rather than folded into this
+same change: `_build_insight_prompt`'s exact wording is what
+`docs/EVALUATION_CURRENT.md`'s live-LLM benchmark numbers were measured
+against, and this session had no way to re-run that 57-case live-Ollama
+benchmark to confirm a prompt change doesn't shift generation behavior
+before merging it — changing a security/accuracy-reviewed, eval-tracked
+prompt without being able to re-verify against the eval harness would
+violate this project's own "never compromise correctness," "do not
+optimize/change behavior blindly" standard (see
+`docs/PERFORMANCE_RESULTS.md` for the precedent of explicitly declining a
+change for the identical reason). The new fields are additive-only
+(everything existing on `ResultSummary` is unchanged), so a future pass
+can wire them into the prompt (or straight into the API response for the
+frontend to render as a trend badge/outlier highlight without an LLM
+sentence at all) once it can validate the change properly. See
+`docs/DEEP_FEATURE_PERFORMANCE_ASSESSMENT.md`'s P1 roadmap for where this
+sits relative to the rest of the AI Data Analyst work (chart-type
+coverage, segmentation, forecasting).
+
 ## How to run
 
 See `README.md` for full setup. Short version:
@@ -1724,19 +1990,43 @@ new finding. Only `gitleaks` and the Trivy container scan remain
 why (tooling/timing, not an unreviewed exception) — see
 `docs/security/CVE_TRIAGE.md`.
 
-**Known, pre-existing CI-hygiene gaps, found but not fixed (out of scope
-for the pass that found them — flagged here so a future session doesn't
-have to rediscover them):** `mypy .` (the exact CI invocation, run from
-the repo root) currently fails immediately with a module-resolution error
-(`scripts/build_user_guide_pdf.py: error: Source file found twice under
-different module names`) on a clean checkout, before producing any
-per-file type-error list — reproduced via `git stash`, confirmed unrelated
-to any session's own changes. Separately, `ruff check .`/`black --check .`
-across the *whole* repo currently report ~9-10 pre-existing findings, none
-in files any recent session touched (also confirmed via `git stash`) —
-`moderation/types.py`, `moderation/gate.py`, `moderation/provider.py`,
-`media_gen/download.py`, `scripts/build_media_index.py`, and a handful of
-test files.
+**Known, pre-existing CI-hygiene gaps (partially closed 2026-09-19 — this
+note tracks what remains, not what's already fixed):** `mypy .`'s
+module-resolution crash (`scripts/build_user_guide_pdf.py: error: Source
+file found twice under different module names`, caused by
+`scripts/build_setup_guide_pdf.py`'s `from scripts.build_user_guide_pdf
+import build` combined with `scripts/` having no `__init__.py`) is
+**fixed** — `scripts/__init__.py` (empty) now exists, so `scripts.X` and
+the bare filename always resolve to the same module. `mypy .` now
+actually runs to completion for the first time, which is itself a real
+finding: it surfaces **117 pre-existing type errors across 30 files** that
+were always there, just hidden behind the crash. Of those, 12 were fixed
+in the same pass (all with zero behavior change, verified against the
+full test suite): the 6 in this pass's own two new test files
+(`tests/test_observability_metrics.py`, `tests/test_web_search.py`), a
+stale `keyframe: object` field in `media/ingest.py`'s `_SegmentPrep`
+(there was never an actual import cycle — `media/ingest.py` already
+imports directly from `media.keyframes` for `extract_keyframes`; now
+properly typed as `KeyframeSegment`), `moderation/gate.py`'s
+`hard_reject_categories`/`soft_flag_categories`/`status` locals (typed as
+plain `list[str]`/`str` instead of the `Category`/`Literal["passed",
+"rejected"]` types `ModerationDecision` actually declares), and
+`scripts/build_media_index.py`'s `exc` variable name colliding with mypy's
+exception-variable-deletion tracking from earlier `except ... as exc:`
+blocks in the same function (a mypy false-positive, not a real runtime
+bug — renamed to `error`, zero behavior change). **The remaining ~105
+errors are still open, all in test files this pass didn't touch** (mostly
+`Argument ... has incompatible type "None"; expected "Settings"` from
+tests passing `None` where a test helper's own signature could reasonably
+accept `Settings | None`, plus a scattering of `var-annotated`/
+`union-attr`/`typeddict-item` findings) — a real, bounded, separate
+mypy-hygiene pass, out of scope here. Separately, `ruff check .`/
+`black --check .` across the *whole* repo currently report **6 ruff / 8
+black** pre-existing findings (down from ~9-10 each before this pass fixed
+`moderation/gate.py`'s and `scripts/build_media_index.py`'s own drift as a
+side effect of editing them above) — `moderation/types.py`,
+`moderation/provider.py`, `media_gen/download.py`, and a handful of test
+files remain, none touched by this pass.
 
 ## Common commands
 
@@ -1808,19 +2098,19 @@ test files.
 Named explicitly rather than silently left for a future session to
 rediscover:
 
-- **`rag/` and `search/` have no dedicated `pytest` unit test files yet.**
-  `tests/test_orchestrator.py` mocks their entry points
-  (`rag.llm.call_ollama`, `rag.graph.run_rag`, `search.web_search.web_search`)
-  to test the orchestrator's own wiring, but `rag/store.py`,
-  `rag/ingestion.py`, `rag/retriever.py`, `rag/graph.py`'s internal nodes,
-  and `search/web_search.py` itself were verified by running them against
-  this project's real SQL Server/Tavily/Ollama instances during
-  development (documented end-to-end: ingestion, retrieval, grading,
-  sensitivity blocking, the insufficient-information fallback, and a real
-  multi-source fan-out all confirmed working), not by a mocked regression
-  suite. Adding one (chunking logic, the `VECTOR` cast SQL construction,
-  Tavily response parsing — all pure-logic-testable with mocks) is a real,
-  worthwhile follow-up before this code is trusted long-term.
+- **`search/` still has no dedicated `pytest` unit test file.**
+  (Previously this note also named `rag/` — that half is now stale:
+  `tests/test_rag_graph.py`, `tests/test_rag_ingestion.py`, and
+  `tests/test_rag_pdf_download.py` were added in a later session and
+  directly test `rag.graph`/`rag.store`, closing that part of the gap.)
+  `tests/test_orchestrator.py` still only mocks `search.web_search
+  .web_search` at the boundary to test the orchestrator's own wiring —
+  `search/web_search.py` itself (the Tavily request construction, response
+  parsing, `SUPPORTED_SEARCH_PROVIDERS` dispatch) was verified by running
+  it against this project's real Tavily instance during development, not
+  by a mocked regression suite. Adding one (request construction, response
+  parsing — pure-logic-testable with mocks) is a real, worthwhile follow-up
+  before this code is trusted long-term.
 - **Per-source query decomposition doesn't exist** — see "Multi-source
   orchestration"'s "Known limitation" note above.
 - **`DB_<NAME>_SCHEMA` is one schema per connection, not "all schemas."**

@@ -57,8 +57,8 @@ export async function request<T>(path: string, init?: RequestInit): Promise<T> {
   return (await response.json()) as T
 }
 
-export function askQuestion(payload: AskRequest): Promise<AskResponse> {
-  return request<AskResponse>('/ask', { method: 'POST', body: JSON.stringify(payload) })
+export function askQuestion(payload: AskRequest, signal?: AbortSignal): Promise<AskResponse> {
+  return request<AskResponse>('/ask', { method: 'POST', body: JSON.stringify(payload), signal })
 }
 
 export function executeSql(payload: ExecuteRequest): Promise<ExecuteResponse> {

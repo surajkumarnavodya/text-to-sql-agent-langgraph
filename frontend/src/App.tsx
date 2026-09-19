@@ -4,6 +4,7 @@ import { Route, Routes } from 'react-router-dom'
 import { AuthGate } from '@/components/auth/AuthGate'
 import { AppShell } from '@/components/layout/AppShell'
 import { PwaUpdateBanner } from '@/components/layout/PwaUpdateBanner'
+import { ToastProvider } from '@/components/ui/toast'
 import { watchSystemTheme, applyThemeMode } from '@/lib/theme'
 import { AuthCallback } from '@/pages/AuthCallback'
 import { Chat } from '@/pages/Chat'
@@ -33,7 +34,7 @@ export function App() {
   }, [themeMode])
 
   return (
-    <>
+    <ToastProvider>
       <PwaUpdateBanner />
       <Routes>
         {/* Reachable without being signed in -- this is where the identity
@@ -52,6 +53,6 @@ export function App() {
           <Route path="/media-search" element={<MediaSearch />} />
         </Route>
       </Routes>
-    </>
+    </ToastProvider>
   )
 }

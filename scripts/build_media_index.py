@@ -46,18 +46,21 @@ from typing import Literal
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from moderation.exceptions import ModerationNotConfiguredError  # noqa: E402
+from moderation.store import ensure_schema, get_moderation_engine  # noqa: E402
+
 from config.settings import Settings, configure_logging, get_settings  # noqa: E402
 from media.exceptions import MediaFileTooLargeError, UnsupportedMediaTypeError  # noqa: E402
 from media.ingest import IngestResult, ingest_file  # noqa: E402
-from moderation.exceptions import ModerationNotConfiguredError  # noqa: E402
-from moderation.store import ensure_schema, get_moderation_engine  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
 Outcome = Literal["indexed", "skipped", "rejected", "failed"]
 
 
-def _process_one(path: Path, settings: Settings, force: bool) -> tuple[Outcome, IngestResult | None, Exception | None]:
+def _process_one(
+    path: Path, settings: Settings, force: bool
+) -> tuple[Outcome, IngestResult | None, Exception | None]:
     """Ingests one file and classifies the outcome -- run inside a worker
     thread (`main`'s `ThreadPoolExecutor`), so this must not mutate any
     shared state; the caller aggregates counts from the returned tuple."""
@@ -100,7 +103,10 @@ def main() -> None:
         logger.info("MEDIA_LIBRARY_PATH (%s) does not exist -- creating it.", media_path)
         try:
             media_path.mkdir(parents=True, exist_ok=True)
-            logger.info("Created media library directory at %s. Add media files (images/videos) and re-run this script.", media_path)
+            logger.info(
+                "Created media library directory at %s. Add media files (images/videos) and re-run this script.",
+                media_path,
+            )
             return
         except OSError as exc:
             logger.error("Failed to create MEDIA_LIBRARY_PATH (%s): %s", media_path, exc)
@@ -126,14 +132,23 @@ def main() -> None:
     started_at = time.perf_counter()
 
     with ThreadPoolExecutor(max_workers=settings.media_ingest_workers) as pool:
-        future_to_path = {pool.submit(_process_one, path, settings, args.force): path for path in files}
+        future_to_path = {
+            pool.submit(_process_one, path, settings, args.force): path for path in files
+        }
         for future in as_completed(future_to_path):
             path = future_to_path[future]
-            outcome, result, exc = future.result()
+            # Named "error", not "exc" -- mypy's exception-variable-deletion
+            # tracking (Python implicitly `del`s the name bound by `except
+            # X as exc:` at the end of that block) otherwise flags this
+            # ordinary tuple-unpacking assignment as if it were reusing a
+            # deleted `except`-bound name, even though this is a distinct,
+            # unrelated local variable. No behavior change, just a rename
+            # to stop tripping that check.
+            outcome, result, error = future.result()
 
             if outcome == "skipped":
-                if exc is not None:
-                    logger.debug("[%s] skipped: %s", path, exc)
+                if error is not None:
+                    logger.debug("[%s] skipped: %s", path, error)
                 else:
                     logger.info("[%s] unchanged, skipped", path)
                 skipped += 1
@@ -141,7 +156,7 @@ def main() -> None:
                 logger.warning("[%s] rejected by content moderation", path)
                 rejected += 1
             elif outcome == "failed":
-                logger.warning("[%s] ingestion failed: %s", path, exc, exc_info=exc)
+                logger.warning("[%s] ingestion failed: %s", path, error, exc_info=error)
                 failed += 1
             else:  # "indexed"
                 assert result is not None
@@ -151,7 +166,11 @@ def main() -> None:
                     "[%s] indexed as %s%s",
                     path,
                     result.media_type,
-                    f" ({result.segments_indexed} segment(s))" if result.media_type == "video" else "",
+                    (
+                        f" ({result.segments_indexed} segment(s))"
+                        if result.media_type == "video"
+                        else ""
+                    ),
                 )
 
     total_seconds = time.perf_counter() - started_at

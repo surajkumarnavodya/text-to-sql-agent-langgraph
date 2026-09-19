@@ -47,6 +47,51 @@
   --warning: #d97706;
   --danger: #dc2626;
 
+  /* Focus ring -- a distinct semantic token (currently mirrors --accent)
+     so a future theme can tune keyboard-focus visibility independently of
+     the interactive-accent color without touching every consumer. */
+  --focus-ring: var(--accent);
+
+  /* Message-role surfaces -- pulled out of ad hoc per-component classes so
+     TurnCard/ChatMessage read intent ("this is the user's turn") from one
+     shared token pair instead of a bespoke bg/border combination each. */
+  --user-message-bg: var(--accent-soft);
+  --user-message-foreground: var(--foreground);
+  --assistant-message-bg: var(--card);
+  --assistant-message-foreground: var(--foreground);
+
+  /* Code / SQL surfaces -- distinct from --muted/--card so a future syntax
+     highlighter (markdown code fences) and the SQL result area can share
+     one consistent "this is data/code, not prose" surface. */
+  --code-block-bg: var(--muted);
+  --code-block-foreground: var(--foreground);
+  --sql-result-bg: var(--card);
+
+  /* Modal-specific surfaces -- deliberately NOT --card. --card carries a
+     translucent "glass" alpha channel in dark mode (see the dark override
+     below) intended for surfaces meant to sit atop other content, like
+     message bubbles. A modal that's meant to fully occlude the page behind
+     it needs a guaranteed fully-opaque panel/backdrop regardless of theme,
+     so it gets its own tokens instead of inheriting --card's transparency. */
+  --modal-backdrop: #05050a;
+  --modal-surface: #ffffff;
+  --modal-surface-foreground: var(--foreground);
+
+  /* Z-index layers -- named stacking tiers instead of ad hoc numbers, so a
+     new overlay (toast, dialog) can pick the right tier without guessing
+     what else is already stacked. Ordered low -> high. */
+  --z-dropdown: 30;
+  --z-drawer: 40;
+  --z-modal: 50;
+  --z-toast: 60;
+
+  /* Transition durations -- named speeds instead of a bare "0.15s"
+     repeated per component; reduced-motion still overrides all of these
+     to ~0 via the @media block below. */
+  --duration-fast: 100ms;
+  --duration-base: 150ms;
+  --duration-slow: 250ms;
+
   --radius: 0.75rem;
   --shadow-color: 220 3% 15%;
 
@@ -72,6 +117,12 @@
   --input: #17152a;
   --header: #100e1f;
 
+  /* Same hue as --card's dark value, alpha channel removed -- --card's
+     transparency here is deliberate ("glass" surfaces like message
+     bubbles), but a modal panel meant to fully occlude the page must never
+     let the backdrop/page show through it. */
+  --modal-surface: #151324;
+
   --shadow-color: 260 60% 3%;
 }
 
@@ -93,6 +144,17 @@
   --color-success: var(--success);
   --color-warning: var(--warning);
   --color-danger: var(--danger);
+  --color-focus-ring: var(--focus-ring);
+  --color-user-message-bg: var(--user-message-bg);
+  --color-user-message-foreground: var(--user-message-foreground);
+  --color-assistant-message-bg: var(--assistant-message-bg);
+  --color-assistant-message-foreground: var(--assistant-message-foreground);
+  --color-code-block-bg: var(--code-block-bg);
+  --color-code-block-foreground: var(--code-block-foreground);
+  --color-sql-result-bg: var(--sql-result-bg);
+  --color-modal-backdrop: var(--modal-backdrop);
+  --color-modal-surface: var(--modal-surface);
+  --color-modal-surface-foreground: var(--modal-surface-foreground);
   --radius-lg: var(--radius);
   --radius-md: calc(var(--radius) - 0.25rem);
   --radius-sm: calc(var(--radius) - 0.375rem);

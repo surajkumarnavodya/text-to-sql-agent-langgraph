@@ -12,13 +12,14 @@ import { useChatStore } from '@/store/chatStore'
 import { useSettingsStore } from '@/store/settingsStore'
 import { SectionBody, SectionHeader } from './SectionHeader'
 
-/** Everything that used to live in the always-visible left sidebar and
- * isn't "chat history" -- appearance, connection/schema status, and the
- * AI-insight toggle. Folded into a collapsed-by-default block at the
- * bottom of the history drawer so none of that functionality is lost, but
- * none of it competes with chat history for primary screen space (see
- * CLAUDE.md-adjacent redesign notes: the drawer's one job is history, this
- * is secondary and stays out of the way by default). */
+/** Application settings content -- appearance, connection/schema status,
+ * and the AI-insight toggle. Rendered inside `SettingsDialog`, whose single
+ * mounted instance lives in `AppShell.tsx` and opens only via the header's
+ * `UserMenu` "Settings" item -- previously reachable from two independent
+ * gear buttons (the header and the Sidebar footer), each mounting its own
+ * separate `SettingsDialog` with its own open/closed state; consolidated
+ * to one location, one instance (see docs/navigation-and-actions.md and
+ * docs/ui-production-audit.md). */
 export function HistorySettingsSection() {
   const { t } = useTranslation()
   const health = useHealth()
@@ -41,7 +42,7 @@ export function HistorySettingsSection() {
   }
 
   return (
-    <div className="flex flex-col gap-3 border-t border-[var(--border)] p-3">
+    <div className="flex flex-col gap-3 p-4">
       {canInstall && (
         <Button variant="secondary" size="sm" onClick={() => void promptInstall()}>
           <Download className="h-3.5 w-3.5" />

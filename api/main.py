@@ -78,10 +78,13 @@ from api.schemas import (
     MediaGenerationResultOut,
     MediaSearchHitOut,
     MediaSearchResultOut,
+    PerformanceMetricsResponse,
+    RequestMetricOut,
     SchemaRefreshResponse,
     SchemaRefreshResult,
     SchemaTableOut,
     SourceAnswerOut,
+    StageMetricOut,
     TableOut,
     TablesResponse,
 )
@@ -98,6 +101,7 @@ from db.execution import execute_readonly_sql
 from db.schema_introspection import introspect_schema
 from embeddings.golden_examples import save_golden_example
 from embeddings.schema_indexer import get_chroma_client, get_collection, refresh_all_schema_indexes
+from observability.metrics import get_default_metrics
 from security.audit_log import (
     get_correlation_id,
     log_security_event,
@@ -993,6 +997,34 @@ def schema_refresh(
             SchemaRefreshResult(database=db_name, table_count=len(tables))
             for db_name, tables in results.items()
         ]
+    )
+
+
+@app.get("/metrics/performance", response_model=PerformanceMetricsResponse)
+def metrics_performance(
+    _identity: AuthIdentity = Depends(require_permission(Permission.ADMIN_CONFIG)),
+) -> PerformanceMetricsResponse:
+    """A live rollup of per-LangGraph-stage timing across recent `/ask`
+    requests (`observability.metrics`) -- turns the `[timing] stage=...`
+    log lines `agent.nodes._timed_node` has always emitted into a
+    queryable snapshot, without adding any new per-request instrumentation.
+    Admin-only: while nothing returned here is question/answer content
+    (only stage names and aggregate durations), it is still an internal
+    operational view, gated the same way `/schema/refresh` already is.
+
+    Single-process, in-memory, resets on restart -- see
+    `observability/metrics.py`'s own docstring for why, and
+    `docs/DEEP_FEATURE_PERFORMANCE_ASSESSMENT.md` for the broader
+    observability assessment this endpoint is the first concrete step of.
+    """
+    snapshot = get_default_metrics().snapshot()
+    return PerformanceMetricsResponse(
+        started_at=snapshot["started_at"],
+        window_requests=snapshot["window_requests"],
+        max_window_requests=snapshot["max_window_requests"],
+        requests=RequestMetricOut(**snapshot["requests"]),
+        stages=[StageMetricOut(**stage) for stage in snapshot["stages"]],
+        status_counts=snapshot["status_counts"],
     )
 
 

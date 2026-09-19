@@ -1,6 +1,7 @@
 import { Database } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
 import { ChatInput } from '@/components/chat/ChatInput'
+import { ChatLiveRegion } from '@/components/chat/ChatLiveRegion'
 import { PendingTurn } from '@/components/chat/PendingTurn'
 import { SuggestedPrompts } from '@/components/chat/SuggestedPrompts'
 import { TurnCard } from '@/components/chat/TurnCard'
@@ -30,6 +31,10 @@ export function Chat() {
     // conversation, and each turn keeps its own editable SQL/confirmed
     // result independently (see TurnCard).
     <div className="flex h-full min-h-0 flex-col">
+      <ChatLiveRegion
+        pendingQuestion={pendingQuestion}
+        latestEntryId={queryHistory.at(-1)?.entryId ?? null}
+      />
       <div className="min-h-0 flex-1 overflow-y-auto">
         <div className="mx-auto max-w-4xl px-4 py-6">
           {queryHistory.length === 0 && !pendingQuestion && (

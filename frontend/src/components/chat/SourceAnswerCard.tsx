@@ -22,8 +22,17 @@ function isUrl(value: string): boolean {
  * download as the button row below instead, since there's no external URL
  * to open. A citation with neither (an older upload, ingested before
  * ENABLE_PDF_DOWNLOAD existed) stays plain text -- there's genuinely
- * nothing to link to. */
+ * nothing to link to.
+ *
+ * Page number is shown when the backend sent one (`Citation.page_number`,
+ * real data that existed but wasn't previously surfaced here) -- a
+ * per-message date/excerpt is NOT shown, because `Citation` genuinely has
+ * no such fields today (confirmed against `api/schemas.py`/
+ * `agent/orchestrator/nodes.py`'s actual citation construction); adding
+ * either would mean fabricating data, not surfacing it. See
+ * docs/frontend-ui-audit.md for this as a named, backend-dependent gap. */
 function SourceLink({ citation }: { citation: Citation }) {
+  const pageSuffix = citation.page_number != null ? ` (p. ${citation.page_number})` : ''
   if (isUrl(citation.filename)) {
     return (
       <a
@@ -44,10 +53,16 @@ function SourceLink({ citation }: { citation: Citation }) {
         className="text-[var(--accent)] underline underline-offset-2 hover:opacity-80"
       >
         {citation.filename}
+        {pageSuffix}
       </button>
     )
   }
-  return <span>{citation.filename}</span>
+  return (
+    <span>
+      {citation.filename}
+      {pageSuffix}
+    </span>
+  )
 }
 
 export function SourceAnswerCard({ sourceKey, result }: { sourceKey: string; result: SourceAnswer }) {

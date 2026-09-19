@@ -85,6 +85,13 @@ interface ChatState {
   confirmGeneration: (entryId: string) => Promise<void>
   rerunEntry: (entryId: string) => Promise<void>
   giveGoldenFeedback: (entryId: string, thumbsUp: boolean) => Promise<void>
+  /** Aborts the in-flight `/ask` request started by the current
+   * `pendingQuestion`, if any -- a no-op if nothing is pending, or if it
+   * already settled. There is no real token-by-token stream to interrupt
+   * (see docs/frontend-ui-audit.md's "no streaming" finding); this cancels
+   * the single outstanding HTTP request via AbortController, which is what
+   * "Stop" can honestly mean here. */
+  cancelPendingQuestion: () => void
 
   startNewChat: () => void
   /** Async: for a server-backed conversation whose messages haven't been
@@ -193,6 +200,13 @@ function isServerHistoryActive(): boolean {
   return useLocalAuthStore.getState().status === 'authenticated'
 }
 
+/** The AbortController for whichever `/ask` call is currently in flight --
+ * plain module-level plumbing, not reactive Zustand state, since no
+ * component needs to re-render when *this specific object's identity*
+ * changes; components only care about `pendingQuestion` (already
+ * reactive) and call `cancelPendingQuestion()` to act on this. */
+let currentAbortController: AbortController | null = null
+
 export const useChatStore = create<ChatState>((set, get) => ({
   queryHistory: [],
   pendingQuestion: null,
@@ -236,19 +250,37 @@ export const useChatStore = create<ChatState>((set, get) => ({
       ? activeConversationId
       : undefined
 
+    const controller = new AbortController()
+    currentAbortController = controller
+
     let finalState: AskResponse
     try {
       finalState =
         cached ??
-        (await apiAskQuestion({
-          question,
-          conversation_history: buildConversationHistory(queryHistory),
-          enable_insight: enableInsight,
-          conversation_id: knownServerConversationId,
-        }))
+        (await apiAskQuestion(
+          {
+            question,
+            conversation_history: buildConversationHistory(queryHistory),
+            enable_insight: enableInsight,
+            conversation_id: knownServerConversationId,
+          },
+          controller.signal,
+        ))
     } catch (error) {
-      const message = error instanceof ApiError ? error.message : 'The agent could not be reached.'
+      const message =
+        error instanceof DOMException && error.name === 'AbortError'
+          ? 'Cancelled.'
+          : error instanceof ApiError
+            ? error.message
+            : 'The agent could not be reached.'
       finalState = emptyAskResponse(message)
+    } finally {
+      // Only clear the module-level slot if it's still pointing at *this*
+      // call's controller -- a second askQuestion() could already have
+      // started (and installed its own controller) while this one was
+      // still in flight, and clearing unconditionally here would let a
+      // later Stop click silently do nothing.
+      if (currentAbortController === controller) currentAbortController = null
     }
 
     const answerDurationMs = performance.now() - startedAt
@@ -373,6 +405,8 @@ export const useChatStore = create<ChatState>((set, get) => ({
       database: entry.finalState.database ?? 'default',
     })
   },
+
+  cancelPendingQuestion: () => currentAbortController?.abort(),
 
   startNewChat: () => set(freshConversationState()),
 

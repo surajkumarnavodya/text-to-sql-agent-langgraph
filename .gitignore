@@ -39,6 +39,10 @@ media_library/
 *.sqlite3
 *.db
 
+# --- Local runtime logs (e.g. redirected uvicorn stdout/stderr during
+# manual dev-session testing) -- never build artifacts or app source ---
+*.log
+
 # --- Test / lint / type-check caches ---
 .pytest_cache/
 .ruff_cache/

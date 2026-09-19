@@ -52,7 +52,7 @@ from config.settings import Settings
 from media import embedding, store
 from media.captioning import generate_caption
 from media.exceptions import MediaFileTooLargeError, UnsupportedMediaTypeError
-from media.keyframes import extract_keyframes
+from media.keyframes import KeyframeSegment, extract_keyframes
 from media.ocr import extract_text
 from media.transcription import transcribe_video, transcript_for_range
 from security.malware_scanner import scan_upload
@@ -263,7 +263,12 @@ class _SegmentPrep:
     redoing any ASR/OCR/captioning work, so moderation adds one extra pass
     over already-extracted data, not a second expensive extraction pass."""
 
-    keyframe: object  # media.keyframes.KeyframeSegment -- avoids a hard import cycle here
+    # No actual import cycle -- this module already imports directly from
+    # media.keyframes for extract_keyframes above; a stale comment
+    # previously claimed one and typed this as `object`, which let
+    # attribute access on `keyframe` (thumbnail_path, segment_start/_end,
+    # below) go unchecked by mypy.
+    keyframe: KeyframeSegment
     display_text: str
     combined_text: str
 

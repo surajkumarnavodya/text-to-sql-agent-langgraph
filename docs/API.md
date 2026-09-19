@@ -241,6 +241,12 @@ equivalent) also exist (`api/main.py`, `api/documents.py`, `api/media.py`)
 — not yet given their own subsection here; see each module's own
 docstrings for the authoritative contract in the meantime.
 
+`GET /metrics/performance` (`Permission.ADMIN_CONFIG`, same gate as
+`POST /schema/refresh`) returns a live rollup of per-LangGraph-stage
+timing across recent `/ask` requests — `observability.metrics`, see
+`CLAUDE.md`'s "Observability — live performance rollup" section for the
+full design and its single-process/resets-on-restart limits.
+
 **Local-account auth** (`api/identity_auth.py`, only reachable when
 `LOCAL_AUTH_ENABLED=true` — 404s otherwise, not 503, see that router's own
 docstring): `POST /auth/register`, `POST /auth/login`, `POST /auth/refresh`,

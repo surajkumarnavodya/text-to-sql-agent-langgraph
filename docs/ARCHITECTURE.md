@@ -17,7 +17,7 @@ The agent is a small, explicit `StateGraph` (`agent/graph.py`), not a
 free-form ReAct-style agent. That's a deliberate choice: every possible
 transition is a named edge in a fixed graph, so the retry/error-feedback
 path is something you can read off the graph definition, not something
-that emerges from a model's own planning. The graph has **eleven nodes**,
+that emerges from a model's own planning. The graph has **twelve nodes**,
 not just the four covering the "happy path" of retrieval → generation →
 validation → execution — the full picture, straight from
 `agent/graph.py::build_graph()`:
@@ -30,7 +30,8 @@ flowchart TD
     CF -->|ambiguous| ENDCLAR(["END — needs_clarification"])
     CF --> RS["retrieve_schema<br/>ChromaDB top-k + FK-adjacency bridge"]
     RS --> RGE["retrieve_golden_examples<br/>human-approved past (question, SQL) pairs"]
-    RGE --> PQ["plan_query<br/>LLM plan, only for complex questions"]
+    RGE --> RBC["retrieve_business_context<br/>glossary/metric/relationship chunks, fails open"]
+    RBC --> PQ["plan_query<br/>LLM plan, only for complex questions"]
     PQ --> GS["generate_sql<br/>Ollama via agent/llm_client.py"]
     GS -->|off-topic sentinel| ENDREJ2(["END — rejected"])
     GS -->|LLM/Ollama error| ENDFAIL1(["END — failed"])
@@ -80,7 +81,7 @@ lets `generate_sql` see the full trail of prior failures on a retry, and
 what lets the UI render a complete "Attempt 1: ..., Attempt 2: ..." timeline
 instead of just the latest attempt.
 
-### The eleven nodes
+### The twelve nodes
 
 **`sanitize_input_node`** — the graph's true entry point, before anything
 else (including follow-up classification) touches the question. Runs
@@ -126,6 +127,21 @@ subsequent `generate_sql` attempt's prompt as reference-only few-shot
 material. Fails open exactly like `plan_query_node` right below: a disabled
 flag, an empty/unreachable store, or a lookup error all resolve to "no
 examples," never a reason a question can't be answered.
+
+**`retrieve_business_context_node`** — semantic retrieval over a second,
+business-context ChromaDB collection (`retrieval/`, see
+[`docs/vector-retrieval-design.md`](vector-retrieval-design.md)): table/
+column/relationship descriptions, glossary terms, metric definitions,
+curated SQL examples, and documentation chunks — additive to (never a
+replacement for) the live schema-DDL retrieval `retrieve_schema_node`
+already did. Results are stored in `state["retrieved_context"]` and
+injected into every `generate_sql` attempt's prompt as a clearly labeled
+"verify against the live schema, treat retrieved SQL as a pattern only"
+section. Fails open on any vector-store/embedding failure or a disabled
+`ENABLE_BUSINESS_CONTEXT_RETRIEVAL` flag — an empty collection, a lookup
+error, and the feature being off all resolve to "no extra context" plus a
+logged, state-visible warning (`state["retrieval_warnings"]`), never a
+reason a question can't be answered.
 
 **`plan_query_node`** — the agentic query-decomposition step. Reads
 `state["complexity_signals"]` (computed once, up front, by `run_agent()` —

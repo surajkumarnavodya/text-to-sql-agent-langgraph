@@ -206,6 +206,26 @@ class TestVerticalPrivilegeEscalation:
 
         assert response.status_code == 200
 
+    def test_analyst_cannot_view_performance_metrics(self, client, _keypair):
+        """ADMIN_CONFIG (like SCHEMA_REFRESH) is admin-only -- even the
+        next-highest role, "analyst", must not reach it."""
+        private_key, _ = _keypair
+        token = _token(private_key, subject="u1", roles=("analyst",))
+
+        response = client.get("/metrics/performance", headers=_auth(token))
+
+        assert response.status_code == 403
+
+    def test_admin_can_view_performance_metrics(self, client, _keypair):
+        private_key, _ = _keypair
+        token = _token(private_key, subject="admin1", roles=("admin",))
+
+        response = client.get("/metrics/performance", headers=_auth(token))
+
+        assert response.status_code == 200
+        body = response.json()
+        assert "stages" in body and "requests" in body and "status_counts" in body
+
 
 class TestHorizontalPrivilegeEscalation:
     """Identity alone (a distinct `sub`) must never grant a permission a
