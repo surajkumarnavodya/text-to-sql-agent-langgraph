@@ -274,6 +274,21 @@ _SOURCE_PERMISSIONS: dict[str, Permission] = {
     "media_search": Permission.MEDIA_SEARCH,
 }
 
+# Plain-language label for each permission-gated source, used only to build
+# `permission_denied_notice` below -- a real, user-reported bug (see
+# CLAUDE.md) was that a denied source was dropped silently and the caller
+# saw an unrelated generic failure from whatever it fell back to (e.g. a SQL
+# "off-topic" rejection for a media-generation request), with no indication
+# their account role was the actual reason. `_SOURCE_PERMISSIONS` itself
+# isn't reused for this text since its dict values are `Permission` enum
+# members, not prose.
+_SOURCE_DENIAL_LABELS: dict[str, str] = {
+    "policy": "restricted policy documents",
+    "generation": "media generation",
+    "web": "live web search",
+    "media_search": "the media library",
+}
+
 
 def router_node(state: OrchestratorState) -> dict[str, Any]:
     """Decides which source(s) this question should be routed to.
@@ -355,6 +370,7 @@ def router_node(state: OrchestratorState) -> dict[str, Any]:
         if s in _SOURCE_PERMISSIONS
         and not has_role_permission(caller_roles, _SOURCE_PERMISSIONS[s])
     ]
+    permission_denied_notice: str | None = None
     if denied_sources:
         log_security_event(
             "orchestrator_source_denied",
@@ -368,6 +384,14 @@ def router_node(state: OrchestratorState) -> dict[str, Any]:
         )
         sources = [s for s in sources if s not in denied_sources] or ["sql"]
         reasoning += f" (caller lacks permission for {denied_sources} -- dropped)"
+        friendly = [_SOURCE_DENIAL_LABELS.get(s, s) for s in denied_sources]
+        plural = "s" if len(friendly) > 1 else ""
+        permission_denied_notice = (
+            f"This request needed {', '.join(friendly)}, which your account role "
+            f"doesn't have permission{plural} for -- it was answered from a different "
+            "source instead, which may not match what you asked for. Contact an "
+            "administrator if you need access."
+        )
 
     route_decision: RouteDecision = {
         "sources": sources,
@@ -395,7 +419,7 @@ def router_node(state: OrchestratorState) -> dict[str, Any]:
             sources=sources,
             short_circuited=short_circuited,
         )
-    return {"route_decision": route_decision}
+    return {"route_decision": route_decision, "permission_denied_notice": permission_denied_notice}
 
 
 _DESTINATION_NODE_NAMES: dict[str, str] = {

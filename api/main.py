@@ -625,6 +625,7 @@ def _ask_response_from_state(
         followup_resolved_against=_followup_resolved_against_out(
             state.get("followup_resolved_against")
         ),
+        permission_denied_notice=state.get("permission_denied_notice"),
     )
 
 

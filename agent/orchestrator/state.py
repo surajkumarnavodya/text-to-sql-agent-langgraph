@@ -113,6 +113,17 @@ class OrchestratorState(AgentState, total=False):
     # Set by router_node -- see RouteDecision above.
     route_decision: RouteDecision | None
 
+    # Set by router_node whenever the LLM's own source selection included a
+    # source the caller's role(s) don't have permission for (see
+    # agent.orchestrator.nodes._SOURCE_PERMISSIONS) -- a short, human-
+    # readable explanation that request was answered from a different,
+    # possibly-mismatched source because of a role restriction, not a
+    # genuine failure of the source it actually used. None when nothing was
+    # denied. Surfaced as-is in AskResponse.permission_denied_notice so the
+    # frontend can show an honest reason instead of (or alongside) whatever
+    # generic failure the fallback source produced.
+    permission_denied_notice: str | None
+
     # Which source(s) actually contributed to the final answer, accumulated
     # via the same operator.add reducer pattern AgentState's error_history/
     # attempt_history already use, so a multi-source run collects

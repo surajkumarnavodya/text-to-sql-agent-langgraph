@@ -273,6 +273,16 @@ class AskResponse(BaseModel):
     schema_tables: list[SchemaTableOut] = Field(default_factory=list)
     followup_classification: Literal["standalone", "followup", "ambiguous"] | None = None
     followup_resolved_against: ConversationExchangeOut | None = None
+    permission_denied_notice: str | None = Field(
+        default=None,
+        description=(
+            "Set when the multi-source router picked a source the caller's account "
+            "role doesn't have permission for (e.g. media generation requires "
+            "analyst/admin) -- that source was dropped and the question was answered "
+            "from whatever remained instead, which may not match what was asked. "
+            "None when nothing was denied."
+        ),
+    )
 
 
 class ExecuteRequest(BaseModel):

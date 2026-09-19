@@ -36,6 +36,7 @@ function makeFinalState(overrides: Partial<AskResponse> = {}): AskResponse {
     schema_tables: [],
     followup_classification: null,
     followup_resolved_against: null,
+    permission_denied_notice: null,
     ...overrides,
   }
 }

@@ -133,6 +133,7 @@ export function serverMessagesToQueryHistory(rows: ServerMessage[]): QueryHistor
       schema_tables: [],
       followup_classification: null,
       followup_resolved_against: null,
+      permission_denied_notice: null,
     }
     entries.push({
       entryId: userRow.id,

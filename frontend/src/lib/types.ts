@@ -126,6 +126,11 @@ export interface AskResponse {
   schema_tables: SchemaTable[]
   followup_classification: 'standalone' | 'followup' | 'ambiguous' | null
   followup_resolved_against: ConversationExchange | null
+  // Set when the multi-source router dropped a picked source because the
+  // caller's account role lacks permission for it (e.g. media generation
+  // needs analyst/admin) -- the question was answered from whatever
+  // remained instead, which may not match what was actually asked.
+  permission_denied_notice: string | null
 }
 
 export interface ExecuteRequest {

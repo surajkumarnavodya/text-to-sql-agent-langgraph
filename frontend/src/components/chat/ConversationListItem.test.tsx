@@ -37,6 +37,7 @@ function makeConversation(overrides: Partial<ConversationSummary> = {}): Convers
     schema_tables: [],
     followup_classification: null,
     followup_resolved_against: null,
+    permission_denied_notice: null,
   }
   return {
     id: 'c1',

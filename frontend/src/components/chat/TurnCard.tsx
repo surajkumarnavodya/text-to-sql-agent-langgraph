@@ -98,11 +98,20 @@ export function TurnCard({ entry, isMultiDb }: { entry: QueryHistoryEntry; isMul
             Needs clarification: {state.clarification_message}
           </p>
         )}
+        {state.permission_denied_notice && (
+          <p className="text-sm text-[var(--warning)]">{state.permission_denied_notice}</p>
+        )}
         {entry.agentStatus === 'failed' && (
           <div className="flex flex-col gap-2">
             <p className="text-sm text-[var(--danger)]">
-              Agent could not produce a working query:{' '}
-              {state.failure_explanation ?? state.error_history.at(-1) ?? 'Unknown error.'}
+              {isSqlResult(state.sources_used) ? (
+                <>
+                  Agent could not produce a working query:{' '}
+                  {state.failure_explanation ?? state.error_history.at(-1) ?? 'Unknown error.'}
+                </>
+              ) : (
+                (state.failure_explanation ?? state.error_history.at(-1) ?? 'The request failed.')
+              )}
             </p>
             {state.sql && (
               <pre className="whitespace-pre-wrap break-words rounded bg-[var(--muted)] p-2 font-mono text-xs">

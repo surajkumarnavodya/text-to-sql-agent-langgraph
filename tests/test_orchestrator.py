@@ -495,6 +495,38 @@ class TestRouterNodeAuthorization:
 
         assert result["route_decision"]["sources"] == ["sql", "policy", "web"]
 
+    def test_denial_sets_a_human_readable_notice(self, monkeypatch):
+        """A denied source must leave a trace the caller actually sees --
+        AskResponse.permission_denied_notice -- not just a server log line,
+        since the fallback source's own answer (e.g. a SQL off-topic
+        rejection) gives no hint the real cause was a role restriction."""
+        settings = self._settings_with_policy_and_web()
+        monkeypatch.setattr(orchestrator_nodes, "get_settings", lambda: settings)
+        monkeypatch.setattr(
+            orchestrator_nodes,
+            "classify_sources",
+            lambda q, avail, s: (["policy", "web"], "relevant"),
+        )
+
+        result = router_node({"question": "compare policy with sales", "caller_roles": ("viewer",)})
+
+        assert result["permission_denied_notice"] is not None
+        assert "restricted policy documents" in result["permission_denied_notice"]
+        assert "live web search" in result["permission_denied_notice"]
+
+    def test_no_denial_leaves_notice_none(self, monkeypatch):
+        settings = self._settings_with_policy_and_web()
+        monkeypatch.setattr(orchestrator_nodes, "get_settings", lambda: settings)
+        monkeypatch.setattr(
+            orchestrator_nodes,
+            "classify_sources",
+            lambda q, avail, s: (["sql", "policy"], "relevant"),
+        )
+
+        result = router_node({"question": "compare policy with sales", "caller_roles": ("admin",)})
+
+        assert result["permission_denied_notice"] is None
+
 
 class TestRouteAfterRouter:
     def test_routes_sql_only_decision_to_sql_subgraph(self):
