@@ -205,7 +205,7 @@ jobs:
         # against this image, so its findings (a real base-image OS-package
         # backlog is likely, same as any base image) haven't been triaged
         # yet. Remove `continue-on-error` once that backlog is triaged.
-        uses: aquasecurity/trivy-action@0.24.0
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           image-ref: text-to-sql-dashboard:ci
           format: table
