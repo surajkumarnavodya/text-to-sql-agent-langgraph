@@ -168,7 +168,7 @@ python-dotenv==1.2.2
 pyyaml==6.0.3   # config/table_descriptions.py -- was only a transitive dep before
 
 # --- Dev / test / lint (not required to run the app) ---
-pytest==8.3.4
+pytest==9.0.3
 black==24.10.0
 ruff==0.8.4
 mypy==1.13.0
