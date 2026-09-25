@@ -115,7 +115,7 @@ class OrchestratorState(AgentState, total=False):
 
     # Set by router_node whenever the LLM's own source selection included a
     # source the caller's role(s) don't have permission for (see
-    # agent.orchestrator.nodes._SOURCE_PERMISSIONS) -- a short, human-
+    # agent.orchestrator.nodes.SOURCE_PERMISSIONS) -- a short, human-
     # readable explanation that request was answered from a different,
     # possibly-mismatched source because of a role restriction, not a
     # genuine failure of the source it actually used. None when nothing was

@@ -41,12 +41,13 @@ threshold decision.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import re
 import threading
 from dataclasses import dataclass
-from typing import Literal
+from typing import Any, Literal
 
 # 2026 Phase 3 security review: `defusedxml`, not stdlib `xml.etree`
 # (bandit B405/B314) -- the parsed XML here is MSSQL's own SHOWPLAN_XML
@@ -285,31 +286,76 @@ _STRATEGIES = {
 }
 
 
+class _ConnectionTrackingEngine:
+    """Thin `.connect()`-only proxy for an `Engine`, recording whichever
+    live `Connection` a strategy function opens into `holder` -- lets
+    `_run_with_timeout` force-abort a stuck plan compile past its deadline
+    without changing any of the four strategy functions above, each of
+    which already does nothing with `engine` except
+    `with engine.connect() as connection:` as its very first line.
+    """
+
+    def __init__(self, engine: Engine, holder: dict[str, Any]) -> None:
+        self._engine = engine
+        self._holder = holder
+
+    def connect(self, *args: Any, **kwargs: Any) -> Any:
+        connection = self._engine.connect(*args, **kwargs)
+        self._holder["connection"] = connection
+        return connection
+
+
 def _run_with_timeout(strategy, engine: Engine, sql: str, timeout_seconds: float):
     """Runs `strategy(engine, sql)` on a worker thread, raising `TimeoutError` past the deadline.
 
     A plan-only compile is normally fast (milliseconds), so this is a pure
-    safety net for a pathological edge case, not the primary defense --
-    unlike `db.execution._execute_with_timeout`, an abandoned worker thread
-    here is simply left to finish and clean up its own connection on its
-    own schedule (daemon thread; never blocks process exit). That's an
-    acceptable simplification for a rare-timeout, estimation-only path
-    where correctness doesn't depend on the abandoned call's outcome.
+    safety net for a pathological edge case, not the primary defense.
+
+    **2026-09-25 fix, found by the "Resource exhaustion/agent loop"
+    security-benchmark category** (see
+    `docs/security/PROMPT_INJECTION_BENCHMARK_GAP_REPORT.md`): this used to
+    simply abandon the worker thread on timeout, on the stated theory that
+    "a plan-only compile is normally fast" made a stuck one rare enough not
+    to matter. A pathological recursive CTE (exactly this category's
+    purpose) can make MSSQL's own SHOWPLAN_XML compile itself take a very
+    long time or hang -- and an abandoned thread never released its pooled
+    connection, so repeated retries against the same pathological query
+    class could leak enough connections to exhaust the pool
+    (`Settings.db_pool_size`/`db_max_overflow`), stalling every *other*
+    real query in the process behind it. Now mirrors
+    `db.execution._execute_with_timeout`'s own abort-via-close mechanic
+    exactly (via `_ConnectionTrackingEngine`, so none of the four
+    dialect-specific strategy functions needed to change): past the
+    deadline, force-close whatever connection the strategy opened from the
+    *calling* thread, wait once more for the worker to actually unwind,
+    then raise regardless of whether the abort provably worked -- the
+    calling thread is unblocked in bounded time either way, exactly like
+    the query-execution path already guarantees.
     """
     result: dict[str, object] = {}
     error: dict[str, BaseException] = {}
+    connection_holder: dict[str, Any] = {}
+    tracking_engine = _ConnectionTrackingEngine(engine, connection_holder)
 
     def _run() -> None:
         try:
-            result["value"] = strategy(engine, sql)
+            result["value"] = strategy(tracking_engine, sql)
         except BaseException as exc:  # noqa: BLE001 - re-raised on the caller's thread below
             error["error"] = exc
+        finally:
+            connection_holder.pop("connection", None)
 
     worker = threading.Thread(target=_run, daemon=True)
     worker.start()
     worker.join(timeout_seconds)
 
     if worker.is_alive():
+        connection = connection_holder.get("connection")
+        if connection is not None:
+            # Best-effort abort; must not mask the TimeoutError raised below.
+            with contextlib.suppress(Exception):
+                connection.close()
+        worker.join(timeout_seconds)
         raise TimeoutError(f"Cost estimation exceeded {timeout_seconds}s")
     if "error" in error:
         raise error["error"]

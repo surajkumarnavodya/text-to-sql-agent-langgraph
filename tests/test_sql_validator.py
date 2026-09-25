@@ -118,6 +118,59 @@ class TestValidateSqlRejectsUnsafeInput:
         assert result.violation_type not in SAFETY_VIOLATION_TYPES
 
 
+class TestValidateSqlRejectsUnsafeQueryOptions:
+    """2026-09-25: found via the "Resource exhaustion/agent loop" security
+    benchmark category. `OPTION (MAXRECURSION n)` parses as an ordinary
+    `exp.QueryOption` on an otherwise perfectly normal `exp.Select` -- none
+    of the checks above it (statement-type allowlist, embedded-write walk,
+    dangerous-function denylist, system-catalog check, nested-aggregate
+    check) would have caught it, yet `MAXRECURSION 0` disables MSSQL's own
+    default 100-level recursive-CTE safety limit entirely. A prompt like
+    "use recursive queries without a limit" reliably gets a local model to
+    add exactly this hint to a self-referencing CTE with no natural
+    termination -- see docs/security/PROMPT_INJECTION_BENCHMARK_GAP_REPORT.md
+    for the live incident this was found from (a stuck benchmark run, not a
+    theoretical concern)."""
+
+    def test_rejects_maxrecursion_zero_unlimited(self):
+        sql = (
+            "WITH r AS (SELECT 1 AS n UNION ALL SELECT n + 1 FROM r) "
+            "SELECT * FROM r OPTION (MAXRECURSION 0)"
+        )
+        result = validate_sql(sql, dialect="tsql")
+        assert not result.is_valid
+        assert result.violation_type == "unsafe_query_option"
+        assert result.violation_type in SAFETY_VIOLATION_TYPES
+
+    def test_rejects_maxrecursion_with_a_nonzero_value_too(self):
+        """Rejected outright regardless of value -- this app never has a
+        legitimate reason to override the engine's own default at all, so
+        this isn't a capped allowlist, it's a flat denial."""
+        sql = (
+            "WITH r AS (SELECT 1 AS n UNION ALL SELECT n + 1 FROM r) "
+            "SELECT * FROM r OPTION (MAXRECURSION 5000)"
+        )
+        result = validate_sql(sql, dialect="tsql")
+        assert not result.is_valid
+        assert result.violation_type == "unsafe_query_option"
+
+    def test_ordinary_recursive_cte_without_the_hint_is_still_allowed(self):
+        """The fix targets the specific unsafe hint, not recursive CTEs in
+        general -- a legitimate bounded hierarchy query (e.g. an org chart)
+        using MSSQL's own sane default must keep working."""
+        sql = (
+            "WITH r AS (SELECT EmployeeID, ManagerID FROM Employee WHERE ManagerID IS NULL "
+            "UNION ALL SELECT e.EmployeeID, e.ManagerID FROM Employee e JOIN r ON e.ManagerID = r.EmployeeID) "
+            "SELECT * FROM r"
+        )
+        result = validate_sql(sql, dialect="tsql")
+        assert result.is_valid
+
+    def test_ordinary_select_with_no_options_is_unaffected(self):
+        result = validate_sql("SELECT * FROM Employee", dialect="tsql")
+        assert result.is_valid
+
+
 class TestValidateSqlRejectsNestedAggregates:
     """Every supported engine rejects one aggregate nested inside another's
     arguments at execution time -- catching it statically here (before a DB

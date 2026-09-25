@@ -123,6 +123,36 @@ class TestAsk:
         assert body["attempt_history"][0]["outcome"] == "succeeded"
         assert "X-Correlation-ID" in response.headers
 
+    def test_configured_secret_in_llm_response_text_is_redacted(self, monkeypatch, client):
+        """Defense-in-depth regression: if a real configured secret ever
+        ended up in LLM-generated response text (insight/failure_explanation/
+        error_history/...), it must never reach the caller verbatim -- see
+        `api.main._redact_text`/`security.redaction.redact_configured_secrets`.
+        `_BASE_SETTINGS.db_password` is `SecretStr("secret")` (see this
+        file's fixtures), so the literal word "secret" here stands in for a
+        real leaked value.
+        """
+        final_state: AgentState = {
+            "status": "succeeded",
+            "sql": "SELECT COUNT(*) FROM t",
+            "result_columns": ["cnt"],
+            "result_rows": [(5,)],
+            "row_count": 1,
+            "retry_count": 0,
+            "attempt_history": [],
+            "insight": "There are 5 rows. (debug: db password is secret)",
+            "error_history": ["connection failed: password=secret;host=db"],
+        }
+        monkeypatch.setattr("api.main.run_orchestrated", lambda *a, **k: final_state)
+
+        response = client.post("/ask", json={"question": "How many rows are there?"})
+
+        assert response.status_code == 200
+        body = response.json()
+        assert "secret" not in body["insight"]
+        assert "***REDACTED***" in body["insight"]
+        assert "secret" not in body["error_history"][0]
+
     def test_conversation_history_is_forwarded_to_run_agent(self, monkeypatch, client):
         captured = {}
 

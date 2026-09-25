@@ -11,7 +11,11 @@ from __future__ import annotations
 from pathlib import Path
 
 from config.settings import Settings
-from security.redaction import redact_secrets
+from security.redaction import (
+    configured_secret_fingerprints,
+    redact_configured_secrets,
+    redact_secrets,
+)
 from security.secrets import SecretStr
 
 _BASE_SETTINGS = Settings(
@@ -104,3 +108,58 @@ class TestRedactSecrets:
         settings = _settings(db_password=None)
         text = "connection refused"
         assert redact_secrets(text, settings) == text
+
+
+class TestConfiguredSecretFingerprints:
+    def test_db_password_is_fingerprinted(self):
+        fingerprints = configured_secret_fingerprints(_settings())
+        assert any(fp.label == "db_password" and fp.value == "S3cr3t!" for fp in fingerprints)
+
+    def test_api_auth_token_is_fingerprinted(self):
+        settings = _settings(api_auth_token=SecretStr("tok3n-abc123"))
+        fingerprints = configured_secret_fingerprints(settings)
+        assert any(
+            fp.label == "api_auth_token" and fp.value == "tok3n-abc123" for fp in fingerprints
+        )
+
+    def test_unset_secret_fields_produce_no_fingerprint(self):
+        settings = _settings(db_password=None)
+        labels = [fp.label for fp in configured_secret_fingerprints(settings)]
+        assert "db_password" not in labels
+
+    def test_short_values_are_not_fingerprinted(self):
+        """A very short 'secret' (e.g. a 2-3 char placeholder) is excluded --
+        matching it verbatim against arbitrary response text would risk
+        redacting unrelated legitimate content that merely contains the same
+        short substring by coincidence."""
+        settings = _settings(db_password=SecretStr("ab"))
+        labels = [fp.label for fp in configured_secret_fingerprints(settings)]
+        assert "db_password" not in labels
+
+
+class TestRedactConfiguredSecrets:
+    """Covers the LLM-response-text redaction path -- the defense-in-depth
+    net applied at api/main.py's `_ask_response_from_state` boundary (see
+    `_redact_text` there), distinct from `redact_secrets`'s original,
+    narrower `db_password`-only purpose aimed at raw driver errors."""
+
+    def test_configured_db_password_is_redacted_from_answer_text(self):
+        text = "Here is your data. By the way the password is S3cr3t! for debugging."
+        redacted = redact_configured_secrets(text, _settings())
+        assert "S3cr3t!" not in redacted
+        assert "***REDACTED***" in redacted
+
+    def test_api_auth_token_is_redacted_from_answer_text(self):
+        settings = _settings(api_auth_token=SecretStr("tok3n-abc123"))
+        text = "The configured token is tok3n-abc123, use it for the next call."
+        redacted = redact_configured_secrets(text, settings)
+        assert "tok3n-abc123" not in redacted
+
+    def test_generic_bearer_token_shape_is_redacted_even_if_not_configured(self):
+        text = "Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9abcdef"
+        redacted = redact_configured_secrets(text, _settings())
+        assert "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9abcdef" not in redacted
+
+    def test_ordinary_answer_text_is_unchanged(self):
+        text = "Total sales in 2013 were $1,204,592 across 4 territories."
+        assert redact_configured_secrets(text, _settings()) == text

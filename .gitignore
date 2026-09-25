@@ -43,6 +43,16 @@ media_library/
 # manual dev-session testing) -- never build artifacts or app source ---
 *.log
 
+# --- Security-benchmark run output (eval/security_benchmark/, scripts/
+# run_security_benchmark.py) -- a *_full.json result can contain real
+# leaked content (a secret value's context, a system-prompt fragment) on a
+# failing case; even the compact form reveals which live adversarial
+# prompts currently succeed. Deliberately stricter than eval/results/
+# eval/baselines/ (the accuracy benchmark's own equivalents, which this
+# repo does commit) -- see docs/security/PROMPT_INJECTION_BENCHMARK_GAP_REPORT.md. ---
+eval/security_results/
+eval/security_baselines/
+
 # --- Test / lint / type-check caches ---
 .pytest_cache/
 .ruff_cache/

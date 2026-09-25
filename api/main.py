@@ -109,7 +109,7 @@ from security.audit_log import (
     set_correlation_id,
 )
 from security.oidc import AuthIdentity
-from security.redaction import redact_secrets
+from security.redaction import redact_configured_secrets, redact_secrets
 
 configure_logging()
 logger = logging.getLogger(__name__)
@@ -503,13 +503,24 @@ def _rows_to_json(rows: list[Any] | None) -> list[list[Any]] | None:
     return jsonable_encoder([list(row) for row in rows])
 
 
-def _source_answer_out(result: Mapping[str, Any] | None) -> SourceAnswerOut | None:
+def _redact_text(text: str | None, settings: Any) -> str | None:
+    """Applies `security.redaction.redact_configured_secrets` to one
+    caller-visible text field -- a last-line defense-in-depth net in case a
+    real secret value ever reached LLM context and got parroted back (no
+    secret is ever intentionally included in a prompt; see that function's
+    own docstring). A `None` input passes through unchanged."""
+    if text is None:
+        return None
+    return redact_configured_secrets(text, settings)
+
+
+def _source_answer_out(result: Mapping[str, Any] | None, settings: Any) -> SourceAnswerOut | None:
     """Converts one `agent.orchestrator.state.SourceAnswer` dict (document_result/
     policy_result/web_result) to its API shape -- None passes through as None."""
     if result is None:
         return None
     return SourceAnswerOut(
-        answer=result.get("answer", ""),
+        answer=_redact_text(result.get("answer", ""), settings) or "",
         citations=[
             CitationOut(
                 filename=citation["filename"],
@@ -525,14 +536,14 @@ def _source_answer_out(result: Mapping[str, Any] | None) -> SourceAnswerOut | No
 
 
 def _media_generation_result_out(
-    result: Mapping[str, Any] | None,
+    result: Mapping[str, Any] | None, settings: Any
 ) -> MediaGenerationResultOut | None:
     """Converts one `agent.orchestrator.state.MediaGenerationResult` dict
     (generation_result) to its API shape -- None passes through as None."""
     if result is None:
         return None
     return MediaGenerationResultOut(
-        answer=result.get("answer", ""),
+        answer=_redact_text(result.get("answer", ""), settings) or "",
         status=result.get("status", "succeeded"),
         media_id=result.get("media_id"),
         media_type=result.get("media_type"),
@@ -541,20 +552,20 @@ def _media_generation_result_out(
 
 
 def _media_search_result_out(
-    result: Mapping[str, Any] | None,
+    result: Mapping[str, Any] | None, settings: Any
 ) -> MediaSearchResultOut | None:
     """Converts one `agent.orchestrator.state.MediaSearchResult` dict
     (media_search_result) to its API shape -- None passes through as None."""
     if result is None:
         return None
     return MediaSearchResultOut(
-        answer=result.get("answer", ""),
+        answer=_redact_text(result.get("answer", ""), settings) or "",
         status=result.get("status", "succeeded"),
         hits=[
             MediaSearchHitOut(
                 media_id=hit["media_id"],
                 media_type=hit["media_type"],
-                caption=hit["caption"],
+                caption=_redact_text(hit["caption"], settings) or "",
                 timestamp_start=hit.get("timestamp_start"),
                 timestamp_end=hit.get("timestamp_end"),
             )
@@ -585,6 +596,9 @@ def _ask_response_from_state(
     # ...) aren't part of AgentState's declared shape. Same convention
     # the React dashboard's own `isSqlResult` check uses for the identical reason.
     result_rows = state.get("result_rows")
+    settings = get_settings()
+    error_history = state.get("error_history", [])
+    query_plan = state.get("query_plan")
     return AskResponse(
         session_id=session_id,
         conversation_id=conversation_id,
@@ -596,23 +610,27 @@ def _ask_response_from_state(
         row_count=state.get("row_count"),
         retry_count=state.get("retry_count", 0),
         attempt_history=_attempt_records_out(state),
-        insight=state.get("insight"),
+        insight=_redact_text(state.get("insight"), settings),
         cost_notice=state.get("cost_notice"),
-        low_confidence_notice=state.get("low_confidence_notice"),
+        low_confidence_notice=_redact_text(state.get("low_confidence_notice"), settings),
         rejection_reason=state.get("rejection_reason"),
-        rejection_message=state.get("rejection_message"),
-        rate_limit_message=state.get("rate_limit_message"),
-        clarification_message=state.get("clarification_message"),
-        failure_explanation=state.get("failure_explanation"),
-        error_history=state.get("error_history", []),
+        rejection_message=_redact_text(state.get("rejection_message"), settings),
+        rate_limit_message=_redact_text(state.get("rate_limit_message"), settings),
+        clarification_message=_redact_text(state.get("clarification_message"), settings),
+        failure_explanation=_redact_text(state.get("failure_explanation"), settings),
+        error_history=[redact_configured_secrets(e, settings) for e in error_history],
         sources_used=state.get("sources_used", []),
-        synthesized_answer=state.get("synthesized_answer"),
-        document_result=_source_answer_out(state.get("document_result")),
-        policy_result=_source_answer_out(state.get("policy_result")),
-        web_result=_source_answer_out(state.get("web_result")),
-        generation_result=_media_generation_result_out(state.get("generation_result")),
-        media_search_result=_media_search_result_out(state.get("media_search_result")),
-        query_plan=state.get("query_plan"),
+        synthesized_answer=_redact_text(state.get("synthesized_answer"), settings),
+        document_result=_source_answer_out(state.get("document_result"), settings),
+        policy_result=_source_answer_out(state.get("policy_result"), settings),
+        web_result=_source_answer_out(state.get("web_result"), settings),
+        generation_result=_media_generation_result_out(state.get("generation_result"), settings),
+        media_search_result=_media_search_result_out(state.get("media_search_result"), settings),
+        query_plan=(
+            [redact_configured_secrets(step, settings) for step in query_plan]
+            if query_plan is not None
+            else None
+        ),
         schema_tables=[
             SchemaTableOut(
                 table_name=table["table_name"],
@@ -625,7 +643,7 @@ def _ask_response_from_state(
         followup_resolved_against=_followup_resolved_against_out(
             state.get("followup_resolved_against")
         ),
-        permission_denied_notice=state.get("permission_denied_notice"),
+        permission_denied_notice=_redact_text(state.get("permission_denied_notice"), settings),
     )
 
 

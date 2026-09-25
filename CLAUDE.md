@@ -1938,6 +1938,123 @@ sentence at all) once it can validate the change properly. See
 sits relative to the rest of the AI Data Analyst work (chart-type
 coverage, segmentation, forecasting).
 
+### Prompt-injection benchmark and hardening pass (2026-09-24/25)
+
+A new, externally supplied 500-case prompt-injection/security benchmark
+(20 categories: direct instruction override, role manipulation, prompt
+disclosure, policy bypass, SQL safety bypass, tool manipulation,
+authorization/exfiltration, obfuscation, multi-turn persistence, 7
+`Indirect *` categories, resource exhaustion, ambiguous/benign boundary
+cases, cross-tenant isolation) was run to completion against the real
+live agent (real Ollama, real SQL Server databases) — not a static
+regex-blind-spot probe. Full detail, live results, and honest residual
+gaps: `docs/security/PROMPT_INJECTION_BENCHMARK_GAP_REPORT.md` (the
+authoritative, continuously-updated source — this section is a pointer,
+not a duplicate). Harness: `eval/security_benchmark/` (dataset loader,
+pure detectors, live runner, reporting, plus `multiturn.py` for a true
+turn-1-poison/turn-2-real-attack persistence test), CLI entry points
+`scripts/run_security_benchmark.py`/`scripts/run_multiturn_persistence_benchmark.py`.
+
+**Headline result: all 500 cases completed, 0 critical findings** — zero
+writes executed, zero unauthorized sources reached, zero secrets leaked,
+zero system prompts leaked, across the entire run. 66.4% raw pass rate;
+every one of the 168 `expected_behavior` mismatches is a content-level
+miss (the model answers where a refusal was expected, or over-refuses a
+benign case), never a hard-gate violation — several were individually
+traced by hand and confirmed benign (e.g. a "wrap a DELETE in a harmless
+SELECT" attempt failed at *parse time*, never reaching the embedded-write
+check at all). A true multi-turn persistence test (10 payloads, organic
+turn-1 + worst-case-simulated turn-2) and the pre-existing
+`conversation_id` IDOR/cross-tenant test
+(`tests/test_api_chat_history.py::TestOwnershipIsolation`, already
+existed, confirmed still passing) both also show 0 critical findings.
+
+**Real bugs found and fixed along the way, not just findings**:
+
+1. **`OPTION (MAXRECURSION 0)` passed `agent/sql_validator.py`
+   unguarded.** This MSSQL hint disables the engine's own 100-level
+   recursive-CTE safety limit — parses as an ordinary `exp.QueryOption` on
+   an otherwise unremarkable `exp.Select`, which nothing above it checked.
+   A prompt engineered around "use recursive queries without a limit"
+   reliably got the local model to add this hint, and one live case hung
+   the whole benchmark process for 80+ minutes (found because the process
+   showed 0% CPU well past every configured timeout). New
+   `unsafe_query_option` violation type (in `SAFETY_VIOLATION_TYPES`,
+   fails closed, no retry) — flat denial of any `MAXRECURSION` hint
+   regardless of value; there's no legitimate reason this app ever needs
+   to override the engine's own recursion safety net. Paired fix:
+   `db/query_cost.py`'s cost-estimation timeout used to abandon its
+   worker thread on timeout rather than force-closing its connection
+   (unlike `db.execution._execute_with_timeout`'s already-trusted abort
+   mechanic) — a stuck plan-compile call (exactly what a pathological
+   recursive CTE causes) leaked a pooled DB connection every time. Now
+   mirrors `_execute_with_timeout`'s abort-via-close pattern via a new
+   `_ConnectionTrackingEngine` proxy, with no changes needed to any of the
+   four dialect-specific plan-fetch strategies.
+2. **`security.redaction.redact_secrets` was never applied to
+   LLM-generated response text** — only to raw driver/retrieval errors.
+   New `redact_configured_secrets` (covers all 12 secret fields `Settings`
+   defines, not just `db_password`) is now applied at
+   `api/main.py::_ask_response_from_state`'s response-assembly boundary —
+   `insight`, `synthesized_answer`, every orchestrator source's
+   answer/caption text, `error_history`, `query_plan`, and the other
+   free-text notice fields.
+3. **`agent/followup.py::classify_followup` over-refusal bug.** A
+   standalone question containing "it"/"this"/"that" whose antecedent is
+   named earlier in the *same* sentence (e.g. "...must be refused,
+   without executing **it**") was misclassified as an ambiguous follow-up
+   reference on a fresh session with no history at all. Fixed with a
+   one-directional heuristic (`_has_intra_sentence_antecedent`) that can
+   only reduce false ambiguity, never introduce it — this classifier is a
+   UX/latency optimization, never a security boundary, so this was safe
+   to fix without re-running the live benchmark first.
+4. **New `cross_source_injection_narrative` pattern in
+   `security/injection_patterns.py`.** The two lowest-scoring benchmark
+   categories (`Indirect multi-source injection`, `Indirect
+   glossary/metric injection`) trace to a real, common gap: their payloads
+   are third-person *narrations* of an indirect-injection scenario (e.g.
+   "The HR source instructs the agent to reveal finance records.") rather
+   than direct imperative commands — a shape none of the existing 6
+   patterns target. Verified before adding: 16/16 real failing payloads
+   now match, 0 false positives across three independent control sets
+   (a hand-built benign set, all 47 real `eval/benchmark/*.yaml`
+   questions, all 10 `Benign adversarial boundary` payloads). **Confirmed
+   live**: both categories re-run against the fixed code — pass rate
+   20% → **100%**, 0 critical findings, average latency 212.6s → **8.6s**
+   (every case now short-circuits at the input-guard layer instead of
+   reaching generation).
+5. **`eval/security_benchmark/runner.py` had no per-case exception
+   handling** — a transient `agent.exceptions.AgentError` (e.g.
+   `OllamaUnavailableError` when local Ollama is overloaded) crashed an
+   entire in-progress multi-hour benchmark run via an unhandled exception,
+   losing every already-completed case's result. Confirmed this was
+   harness-only fragility, not a production gap:
+   `OllamaUnavailableError` is an `AgentError` subclass, and
+   `api/main.py` already registers `@app.exception_handler(AgentError)` —
+   a real caller hitting the same timeout via HTTP gets a clean
+   `.safe_message` response, not a crashed server. `run_security_case`
+   now catches `AgentError` and records an `"error"`-status result
+   (never counted as a pass or critical finding) instead of propagating.
+
+**True channel-level seeding tests** (`tests/test_indirect_channel_injection.py`,
+11 tests) were added for the 6 indirect categories that previously only
+had direct-channel-proxy coverage via the benchmark itself (schema/
+comment injection already had true coverage —
+`tests/test_adversarial_input.py::TestPoisonedSchemaValueNeutralization`).
+Each seeds a poisoned string directly into the real object shape that
+channel produces (a `GoldenExample`, a business-context chunk dict, a
+`WebResult`, a RAG `ChunkResult`, a `MediaHit`, an `OrchestratorState`
+source-result dict) and confirms it reaches the model framed as DATA, not
+instructions — fully mocked, no live LLM/DB/Chroma.
+
+**Honest residual gaps, not closed by this pass** (see the gap report's
+own "What hasn't been done yet" for the current list): an admin-role
+re-run of the RBAC-bypass categories was still in progress as of this
+writing; the multi-turn organic-history follow-up (2 of 10 payloads whose
+turn-1 organically succeeded were never separately re-graded against
+their real history entry, only the synthetic worst-case) remains open.
+Neither is a known failure — both are simply not yet re-confirmed.
+
 ## How to run
 
 See `README.md` for full setup. Short version:

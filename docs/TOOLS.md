@@ -31,7 +31,7 @@ retrieval/generation/validation logic anywhere in this package.
 
 `agent/orchestrator/nodes.py` is a ~1,150-line, heavily security-reviewed
 module: it already does its own permission filtering
-(`router_node`'s `_SOURCE_PERMISSIONS` check), its own session-level
+(`router_node`'s `SOURCE_PERMISSIONS` check), its own session-level
 expensive-source cost ceiling, its own human-approval gate for media
 generation, and its own carefully fail-open/fail-closed handling per
 source. Swapping those node bodies to call through `ToolRegistry.execute`

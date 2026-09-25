@@ -121,7 +121,7 @@ class ToolRegistry:
             caller_roles: The invoking identity's roles
                 (`security.oidc.AuthIdentity.roles`) -- checked against
                 `tool.permission` exactly the way `agent.orchestrator.nodes
-                .router_node` already checks `_SOURCE_PERMISSIONS`,
+                .router_node` already checks `SOURCE_PERMISSIONS`,
                 fail-closed on an empty/unrecognized role set.
             actor: An optional human-readable identifier for the caller,
                 for the audit log only -- never used for authorization.

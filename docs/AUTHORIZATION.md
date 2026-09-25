@@ -51,7 +51,7 @@ A role name `ROLE_PERMISSIONS` doesn't recognize (a typo, or a claim from an ide
 
 ### Closing AGT-01/R-008: authorization inside the orchestrator, not just at the API boundary
 
-The most architecturally significant piece: `router_node` (`agent/orchestrator/nodes.py`) filters the LLM's own source selection through `_SOURCE_PERMISSIONS` **after** classification but **before** `route_after_router` ever fans out to a subgraph node. A denied source is dropped from that turn's route (falling back to `sql` alone, never an empty/unrunnable route) and logged (`orchestrator_source_denied`) — the LLM may still *request* a source, but it never gets to decide alone whether the request is *permitted*. This is the same principle the SQL pipeline's own validator already embodies ("never trust the LLM's output as authorization"), extended to the multi-source router's routing decision itself.
+The most architecturally significant piece: `router_node` (`agent/orchestrator/nodes.py`) filters the LLM's own source selection through `SOURCE_PERMISSIONS` **after** classification but **before** `route_after_router` ever fans out to a subgraph node. A denied source is dropped from that turn's route (falling back to `sql` alone, never an empty/unrunnable route) and logged (`orchestrator_source_denied`) — the LLM may still *request* a source, but it never gets to decide alone whether the request is *permitted*. This is the same principle the SQL pipeline's own validator already embodies ("never trust the LLM's output as authorization"), extended to the multi-source router's routing decision itself.
 
 ### Auditability
 

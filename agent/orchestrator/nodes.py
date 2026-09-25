@@ -267,7 +267,12 @@ _EXPENSIVE_SOURCES = ("generation", "web")
 # queries the general (non-sensitivity-restricted) RAG collection, already
 # covered by `Permission.DOCUMENTS_READ`, which every default role grants
 # (see `agent/authz.py`).
-_SOURCE_PERMISSIONS: dict[str, Permission] = {
+#
+# Exported (no leading underscore) specifically so
+# `eval/security_benchmark/detectors.py::detect_unauthorized_privileged_source`
+# can import this dict directly instead of maintaining its own duplicate
+# copy that could silently drift out of sync with the real gate.
+SOURCE_PERMISSIONS: dict[str, Permission] = {
     "policy": Permission.POLICY_RAG_QUERY,
     "generation": Permission.MEDIA_GENERATE,
     "web": Permission.WEB_SEARCH,
@@ -279,7 +284,7 @@ _SOURCE_PERMISSIONS: dict[str, Permission] = {
 # CLAUDE.md) was that a denied source was dropped silently and the caller
 # saw an unrelated generic failure from whatever it fell back to (e.g. a SQL
 # "off-topic" rejection for a media-generation request), with no indication
-# their account role was the actual reason. `_SOURCE_PERMISSIONS` itself
+# their account role was the actual reason. `SOURCE_PERMISSIONS` itself
 # isn't reused for this text since its dict values are `Permission` enum
 # members, not prose.
 _SOURCE_DENIAL_LABELS: dict[str, str] = {
@@ -357,7 +362,7 @@ def router_node(state: OrchestratorState) -> dict[str, Any]:
             sources = [s for s in sources if s not in _EXPENSIVE_SOURCES] or ["sql"]
             reasoning += f" (session expensive-source limit reached -- dropped {expensive_picked})"
 
-    # Authorization -- see _SOURCE_PERMISSIONS' own docstring. Deliberately
+    # Authorization -- see SOURCE_PERMISSIONS' own docstring. Deliberately
     # placed after the LLM classification (and after the cost-ceiling drop
     # above) but strictly before route_after_router ever reads
     # route_decision to build the actual fan-out list, so a denied source
@@ -367,8 +372,7 @@ def router_node(state: OrchestratorState) -> dict[str, Any]:
     denied_sources = [
         s
         for s in sources
-        if s in _SOURCE_PERMISSIONS
-        and not has_role_permission(caller_roles, _SOURCE_PERMISSIONS[s])
+        if s in SOURCE_PERMISSIONS and not has_role_permission(caller_roles, SOURCE_PERMISSIONS[s])
     ]
     permission_denied_notice: str | None = None
     if denied_sources:
@@ -379,7 +383,7 @@ def router_node(state: OrchestratorState) -> dict[str, Any]:
             "for; it was dropped from this turn's routing before that source's "
             "subgraph ever ran.",
             denied_sources=denied_sources,
-            required_permissions=[_SOURCE_PERMISSIONS[s].value for s in denied_sources],
+            required_permissions=[SOURCE_PERMISSIONS[s].value for s in denied_sources],
             caller_roles=list(caller_roles),
         )
         sources = [s for s in sources if s not in denied_sources] or ["sql"]

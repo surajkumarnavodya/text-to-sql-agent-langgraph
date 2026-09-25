@@ -228,7 +228,7 @@ flag, never a per-request/per-user decision).
 **Update (2026 Phase 2, restated here since this entry had gone stale):**
 this is fixed. `agent/authz.py`'s RBAC layer is now wired directly into
 `router_node` — the LLM's chosen source(s) are filtered through a
-per-caller permission check (`_SOURCE_PERMISSIONS`) *before* any subgraph
+per-caller permission check (`SOURCE_PERMISSIONS`) *before* any subgraph
 runs; a source the caller's role doesn't permit is dropped, never silently
 allowed. Confirmed via direct code reading (`agent/orchestrator/nodes.py`),
 not a doc claim — this is the fix `docs/AUTHORIZATION.md` describes and

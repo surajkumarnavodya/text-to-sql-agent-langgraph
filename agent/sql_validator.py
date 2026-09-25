@@ -265,6 +265,7 @@ ViolationType = Literal[
     "dangerous_function",
     "system_catalog_access",
     "nested_aggregate",
+    "unsafe_query_option",
 ]
 
 SAFETY_VIOLATION_TYPES: frozenset[str] = frozenset(
@@ -275,8 +276,39 @@ SAFETY_VIOLATION_TYPES: frozenset[str] = frozenset(
         "embedded_write",
         "dangerous_function",
         "system_catalog_access",
+        "unsafe_query_option",
     }
 )
+
+# 2026-09-25: found via the "Resource exhaustion/agent loop" security
+# benchmark category, whose entire purpose is to probe for exactly this
+# shape of gap -- see docs/security/PROMPT_INJECTION_BENCHMARK_GAP_REPORT.md.
+# A query-level session hint the model has no legitimate reason to ever
+# set on this app's behalf: `OPTION (MAXRECURSION n)` overrides MSSQL's own
+# default 100-level recursive-CTE safety limit (0 means *unlimited*). A
+# prompt like "use recursive queries without a limit" reliably gets a local
+# model to add this hint to an otherwise syntactically ordinary SELECT --
+# sqlglot parses it as a ordinary `exp.QueryOption` on the `Select` node
+# (still `exp.Select`-rooted, no disallowed nested type, no dangerous
+# function, no system-catalog reference), so nothing above this check
+# would have caught it. Rejected outright regardless of the requested
+# value -- there is no legitimate business question this app answers that
+# needs to override the engine's own recursion safety net, so this isn't a
+# capped-allowlist the way `_DANGEROUS_FUNCTION_NAMES` is, it's a flat
+# denial. Query-hint syntax is itself MSSQL-specific
+# (`OPTION (...)`/`QueryOption`), but the check below matches by node type,
+# not by dialect, so it applies uniformly regardless of which dialect
+# `validate_sql` was called with.
+_UNSAFE_QUERY_OPTION_NAMES: frozenset[str] = frozenset({"maxrecursion"})
+
+
+def _find_unsafe_query_option(statement: exp.Expression) -> exp.Expression | None:
+    for option in statement.find_all(exp.QueryOption):
+        name_node = option.this
+        name = (getattr(name_node, "this", None) or "").lower()
+        if name in _UNSAFE_QUERY_OPTION_NAMES:
+            return option
+    return None
 
 
 class ValidationResult(BaseModel):
@@ -534,6 +566,18 @@ def validate_sql(sql: str, dialect: str | None = DEFAULT_DIALECT) -> ValidationR
                 "of nesting aggregate calls."
             ),
             violation_type="nested_aggregate",
+        )
+
+    unsafe_option = _find_unsafe_query_option(statement)
+    if unsafe_option is not None:
+        return ValidationResult(
+            is_valid=False,
+            error=(
+                f"'{unsafe_option.sql(dialect=dialect)}' is not allowed -- this app "
+                "never overrides the database engine's own safety limits (e.g. a "
+                "recursion cap), regardless of what the query is trying to compute."
+            ),
+            violation_type="unsafe_query_option",
         )
 
     return ValidationResult(

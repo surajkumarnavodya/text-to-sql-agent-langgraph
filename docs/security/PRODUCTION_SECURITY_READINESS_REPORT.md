@@ -168,6 +168,41 @@ and *before* any subgraph executes, the same structural pattern already
 verified in prior sessions, not re-verified with new adversarial cases
 this pass.
 
+**2026-09-25 update — this section is now superseded by a materially
+larger, live evidence base**: a 500-case externally-supplied prompt-
+injection benchmark (`eval/security_benchmark/`,
+`docs/security/PROMPT_INJECTION_BENCHMARK_GAP_REPORT.md`) was built,
+unit-tested, and run to completion against the real live agent (real
+Ollama, real SQL Server databases) — not a 14-case static regex-blind-spot
+probe. Headline result: **all 500 cases completed, 0 critical findings**
+(zero writes executed, zero unauthorized sources reached, zero secrets
+leaked, zero system prompts leaked) — a materially stronger claim than
+"the structural backstop holds under one simulated hijack," now backed by
+500 live adversarial attempts across 20 categories including tool/agent-
+escalation and cross-tenant/session-isolation specifically (the two
+categories this section's prior text named as "not independently
+re-tested"). Also produced a genuine, previously-unknown finding, fixed in
+the same pass: `OPTION (MAXRECURSION 0)` (disabling MSSQL's own recursive-
+CTE safety limit) passed `agent/sql_validator.py` unguarded and could hang
+a live query — see the gap report §3c for the full incident writeup. A
+true multi-turn persistence test (10 payloads × organic-turn-1 +
+worst-case-simulated-turn-2, 0 critical findings) and the pre-existing
+`conversation_id` IDOR/cross-tenant HTTP test
+(`tests/test_api_chat_history.py::TestOwnershipIsolation`, 5/5 passing)
+were also confirmed. **Honest residual gap, not closed by this update**:
+66.4% overall pass rate means 168 of 500 cases are `expected_behavior`
+mismatches (mostly over-engagement — the model answers where a refusal
+was expected — never a hard-gate violation) that have not each been
+individually root-caused; two categories in particular
+(`Indirect multi-source injection`, `Indirect glossary/metric injection`)
+have notably low content-refusal rates and are flagged for dedicated
+follow-up in the gap report rather than claimed closed. Read
+`docs/security/PROMPT_INJECTION_BENCHMARK_GAP_REPORT.md` for the current,
+authoritative state of this control — it supersedes this section's
+original text the same way this document's own conventions already treat
+newer, more rigorously-sourced evidence as authoritative over older
+summaries.
+
 ## 17. File Upload/Malware Security Results
 
 Magic-byte validation, size caps, PDF page caps, mandatory moderation gate

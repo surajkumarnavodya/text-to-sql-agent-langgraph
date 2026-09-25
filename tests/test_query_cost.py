@@ -251,3 +251,92 @@ class TestMaxMysqlScanRows:
 
     def test_returns_none_when_no_row_fields_present(self):
         assert _max_mysql_scan_rows({"query_block": {"select_id": 1}}) is None
+
+
+class TestRunWithTimeoutAbortsStuckConnection:
+    """Regression coverage for a real finding from the "Resource
+    exhaustion/agent loop" security-benchmark category (see
+    docs/security/PROMPT_INJECTION_BENCHMARK_GAP_REPORT.md): a pathological
+    query (e.g. an unbounded recursive CTE) can make a strategy's plan
+    compile itself hang. `_run_with_timeout` used to simply abandon that
+    worker thread on timeout, silently leaking whatever pooled connection
+    it had opened -- confirmed here by asserting the tracked connection's
+    `.close()` is actually called once the deadline passes, mirroring
+    `db.execution._execute_with_timeout`'s already-trusted abort mechanic.
+    """
+
+    def test_timeout_force_closes_the_connection_the_strategy_opened(self):
+        import threading
+        import time
+
+        from db.query_cost import _run_with_timeout
+
+        close_calls: list[bool] = []
+        connection_opened = threading.Event()
+
+        class _FakeConnection:
+            def close(self):
+                close_calls.append(True)
+
+        class _FakeEngine:
+            def connect(self):
+                connection_opened.set()
+                return _FakeConnection()
+
+        def _hangs_forever(engine, sql):
+            engine.connect()  # tracked by _ConnectionTrackingEngine
+            time.sleep(5)  # never finishes within the test's short timeout
+            return None
+
+        start = time.perf_counter()
+        try:
+            _run_with_timeout(_hangs_forever, _FakeEngine(), "SELECT 1", timeout_seconds=0.05)
+            raise AssertionError("expected TimeoutError")
+        except TimeoutError:
+            pass
+        elapsed = time.perf_counter() - start
+
+        assert connection_opened.is_set()
+        assert close_calls == [True]
+        # Bounded: at most ~2x the timeout (the second worker.join wait),
+        # never anywhere near the strategy's own 5-second sleep.
+        assert elapsed < 2.0
+
+    def test_no_connection_opened_means_nothing_to_close(self):
+        """A strategy that hangs before ever calling engine.connect() (an
+        unrealistic edge case, but the code must not crash on it) --
+        confirms the None-connection branch is safe."""
+        import time
+
+        from db.query_cost import _run_with_timeout
+
+        def _hangs_without_connecting(engine, sql):
+            time.sleep(5)
+            return None
+
+        try:
+            _run_with_timeout(
+                _hangs_without_connecting, _UNUSED_ENGINE, "SELECT 1", timeout_seconds=0.05
+            )
+            raise AssertionError("expected TimeoutError")
+        except TimeoutError:
+            pass
+
+    def test_fast_strategy_returns_normally_without_any_abort(self):
+        from db.query_cost import _run_with_timeout
+
+        class _FakeConnection:
+            def close(self):
+                raise AssertionError(
+                    "close() must not be called when the strategy finishes in time"
+                )
+
+        class _FakeEngine:
+            def connect(self):
+                return _FakeConnection()
+
+        def _fast(engine, sql):
+            engine.connect()
+            return "ok"
+
+        assert _run_with_timeout(_fast, _FakeEngine(), "SELECT 1", timeout_seconds=5) == "ok"
