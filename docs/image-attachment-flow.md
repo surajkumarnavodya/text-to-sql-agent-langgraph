@@ -1,5 +1,24 @@
 # Image Attachment Flow — Current State vs. Required for Real Support
 
+> **⚠️ Superseded — kept for historical record only.** Every "❌ Does not
+> happen" / "N/A" row in the table below described a real gap at the time
+> this document was written, but a subsequent feature pass (`attachments/`,
+> `POST /attachments/upload`, `POST /ask`'s `attachment_ids`) built the
+> entire missing pipeline this document says doesn't exist: attachments
+> now do reach the backend as real bytes, are validated/malware-scanned/
+> stored/processed, and reach a configured vision model or OCR via a
+> dedicated LangGraph subgraph (`attachments/graph.py`). A later pass also
+> added explicit `POST /attachments/{id}/extract-text|resize|remove-text`
+> actions. **Do not use this document as the current state of the image
+> attachment pipeline** — see `CLAUDE.md`'s "Chat attachments" and
+> "Explicit image actions" sections, `docs/API.md`'s "Attachments" section,
+> and `SECURITY.md`'s "Chat attachments — security controls" section
+> instead. The one thing this document says is still accurate: the image
+> **editor**'s own "AI-guided editing" panel (a natural-language-prompted
+> generative edit, distinct from the real "Resize"/"Remove text" actions
+> above) remains a deliberate, permanent stub — see
+> `docs/image-editing-architecture.md`.
+
 Companion to `docs/functional-ui-audit.md` §4 (the full investigation) and
 `docs/image-editing-architecture.md` (the editor itself). This document is
 the step-by-step flow this task's Phase 7 asked for, with each step marked

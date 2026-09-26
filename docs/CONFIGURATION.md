@@ -78,14 +78,16 @@ zero extra LLM calls regardless of `ENABLE_QUERY_PLANNING`.
 
 ## Rate limiting
 
-Basic in-memory safeguards, appropriate for local/single-user use — not a
-distributed multi-tenant rate limiter. See `SECURITY.md`,
+Real, in-process safeguards — not yet distributed across replicas (see
+`docs/SCALE_OUT_PROMPT.md`'s Phase 3). See `SECURITY.md`,
 `docs/RISK_REGISTER.md`'s R-001.
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `QUESTION_RATE_LIMIT_PER_MINUTE` | `10` | Max question submissions/minute, per client IP (`api/main.py`). |
+| `QUESTION_RATE_LIMIT_PER_MINUTE` | `10` | Max question submissions/minute, per caller — an authenticated subject when local/OIDC auth is on, else client IP (`api/main.py`'s `_rate_limit_key`). |
 | `LLM_CALL_RATE_LIMIT_PER_MINUTE` | `20` | Max LLM *generation* calls/minute, process-wide — stricter, since retries can multiply calls. |
+| `MAX_CONCURRENT_ASK_REQUESTS` | `50` | Max `POST /ask` executions running at once, process-wide — an *in-flight* concurrency cap (distinct from the per-minute limit above), also what sizes the bounded ask-worker thread pool. A caller past this gets an immediate 429, not a queued wait. |
+| `MAX_CONCURRENT_ASK_REQUESTS_PER_CALLER` | `2` | Max `POST /ask` executions one caller may have in flight at once (same caller key as `QUESTION_RATE_LIMIT_PER_MINUTE`) — a fairness bound, not a throughput control. |
 
 ## Query cost estimation
 
@@ -243,6 +245,84 @@ moderation gate" section for the design rationale.
 | `MODERATION_STORE_POOL_RECYCLE_SECONDS` | `1800` | Discard/replace a pooled connection after this long, regardless of use — set below your SQL Server/network's idle-connection timeout. |
 | `MEDIA_INGEST_WORKERS` | `4` | Concurrent worker threads `scripts/build_media_index.py` uses (this project's first bounded thread pool — previously a sequential loop). |
 | `MEDIA_IMAGE_TILE_THRESHOLD_PX` | `2048` | An ingested image larger than this (either dimension) is tiled before moderation, so a classifier's own downsampling can't hide a small region of concern. |
+
+## Chat attachments (images, PDF, DOCX, XLSX, PPTX, TXT, MD, CSV, JSON)
+
+On by default — no cost, no outbound network call. `POST /attachments/upload`
+validates, malware-scans (see below), stores, and eagerly processes each
+file (`attachments/pipeline.py`); `POST /ask`'s `attachment_ids` gives the
+model actual access via a dedicated LangGraph subgraph
+(`attachments/graph.py`). Works even with `ENABLE_MULTI_SOURCE_ROUTER=false`
+— attaching a file is a per-request opt-in, not a standing routing
+decision. See `CLAUDE.md`'s "Chat attachments" and "Explicit image
+actions" sections for the full design.
+
+**Image understanding needs a vision-capable model.** Set
+`MEDIA_VISION_MODEL` (above, in the Media search section) to a
+vision-capable Ollama model — check with `ollama list` and look for
+`"vision"` in that model's own capabilities, since not every locally
+pulled model can see images (e.g. this project's own default
+`OLLAMA_MODEL=llama3.1:8b` cannot). Without it, an attached image still
+uploads and stores normally, but a question about its visual content
+degrades to on-screen-text OCR only (needs the system Tesseract binary —
+see `CLAUDE.md`'s Windows-specific notes) and returns a specific
+"image understanding is not configured" message rather than a generic
+failure — never a false claim that the image was analyzed.
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `ENABLE_CHAT_ATTACHMENTS` | `true` | Whether the composer's attachment upload/`POST /ask` attachment path is offered at all. |
+| `MAX_ATTACHMENT_IMAGE_BYTES` | `10485760` (10MB) | Per-image upload size cap. |
+| `MAX_ATTACHMENT_DOCUMENT_BYTES` | `26214400` (25MB) | Per-document (PDF/DOCX/XLSX/PPTX/TXT/MD/CSV/JSON) upload size cap. |
+| `MAX_ATTACHMENTS_PER_MESSAGE` | `5` | Max files one `/ask` call may attach at once. |
+| `MAX_TOTAL_ATTACHMENT_BYTES` | `52428800` (50MB) | Combined size cap across every attachment on one message. |
+| `MAX_ATTACHMENT_TEXT_CHARS` | `80000` | Ceiling on combined extracted-text characters injected into one generation prompt, across all attachments. |
+| `MAX_ATTACHMENT_DOCUMENT_PAGES` | `200` | Max pages read from one attached PDF. |
+| `MAX_ATTACHMENT_SPREADSHEET_ROWS` | `500` | Max rows read per sheet from one attached XLSX/CSV. |
+| `MAX_ATTACHMENT_IMAGE_DIMENSION_PX` | `1568` | An attached image wider/taller than this is downscaled before being sent to the vision model (never affects the stored original). |
+| `ATTACHMENT_STORAGE_DIR` | `./data/attachments` | Where attachment bytes are stored, one file per generated `attachment_id` (never the caller's filename). Gitignored, like every other runtime-data directory. |
+| `ATTACHMENT_RETENTION_HOURS` | `24` | How long a stored attachment is kept before opportunistic cleanup considers it eligible for deletion (this project has no background scheduler — cleanup runs on each new upload, not on a timer). |
+| `MAX_ATTACHMENT_RESIZE_DIMENSION_PX` | `4096` | Upper bound on a requested `POST /attachments/{id}/resize` target width/height, and the working size OCR/text-removal downscale an oversized source image to first. |
+| `ATTACHMENT_OCR_TIMEOUT_SECONDS` | `20.0` | Per-call timeout for a Tesseract OCR pass (`POST /attachments/{id}/extract-text`, and the auto-detect step of `remove-text`). |
+| `MAX_TEXT_REMOVAL_REGIONS` | `20` | Max text regions one `POST /attachments/{id}/remove-text` call will mask and inpaint at once. |
+| `MAX_ATTACHMENT_ZIP_UNCOMPRESSED_BYTES` | `209715200` (200MB) | Decompression-bomb guard for DOCX/XLSX/PPTX (all plain ZIP archives) — rejected if the archive's own central-directory metadata reports more than this total uncompressed size, checked before any parser decompresses a single entry. |
+| `MAX_ATTACHMENT_ZIP_ENTRIES` | `2000` | Companion entry-count cap for the same ZIP-container guard. |
+| `ATTACHMENT_PROCESSING_TIMEOUT_SECONDS` | `30.0` | Hard wall-clock bound on one attachment's processor call — a pathological file can't hang a request thread past this. |
+
+**Explicit image actions** — `POST /attachments/{id}/extract-text` (real
+Tesseract OCR, distinct from vision-model description), `POST
+/attachments/{id}/resize` (deterministic Pillow work, no model call),
+`GET /attachments/{id}/detect-text-regions` + `POST
+/attachments/{id}/remove-text` (classical OpenCV inpainting — explicitly
+**not** generative AI, and never a solid rectangle) all reuse the settings
+above; see `docs/API.md`'s "Attachments" section for the request/response
+shapes and `GET /attachments/capabilities` for a live, per-deployment
+capability report.
+
+## Malware scanning
+
+Binary-signature scan of an upload's raw bytes (`security/malware_scanner.py`),
+before any parser (`pypdf`/`pymupdf`/Pillow/`python-docx`/`openpyxl`/
+`python-pptx`) ever touches them — shared by chat attachments
+(`attachments/pipeline.py`), document/policy RAG PDF uploads
+(`rag/ingestion.py`), and media-library ingestion (`media/ingest.py`).
+
+Off by default (no scanning capability existed in this codebase before it
+was added — defaulting it "on" would break every existing deployment with
+no ClamAV daemon reachable), but **fail-closed once configured**: an
+infected result and a scanner error/timeout/unreachable daemon are both
+treated as a rejection, never silently treated as clean. A production
+deployment (`ENVIRONMENT=production`) with chat attachments, document RAG,
+policy RAG, or media search enabled **must** set this to `clamav` —
+`Settings` refuses to start otherwise (see
+`config/settings.py::_require_malware_scanning_in_production`).
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `MALWARE_SCAN_PROVIDER` | `disabled` | `disabled` \| `clamav` (`security/malware_scanner.py::SUPPORTED_MALWARE_SCAN_PROVIDERS`). |
+| `CLAMAV_HOST` | `localhost` | Hostname/IP of the `clamd` daemon. Only read when `MALWARE_SCAN_PROVIDER=clamav`. |
+| `CLAMAV_PORT` | `3310` | TCP port `clamd` listens on (ClamAV's own documented default). |
+| `MALWARE_SCAN_TIMEOUT_SECONDS` | `15.0` | Socket timeout for one `clamd` `INSTREAM` scan call. |
 
 ## Validation behavior worth knowing
 

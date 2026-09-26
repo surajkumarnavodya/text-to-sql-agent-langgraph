@@ -623,6 +623,98 @@ silently skipping the check.
   certain viewers — this app still has no per-user authorization system to
   enforce that, for media any more than for the database.
 
+## Chat attachments — security controls
+
+Images, PDFs, DOCX, XLSX, PPTX, TXT, MD, CSV, and JSON files attached
+directly to a chat question (`attachments/`, `POST /attachments/upload`,
+`POST /ask`'s `attachment_ids`) go through the same class of untrusted-input
+handling as every other content source in this codebase, plus a few
+controls specific to what a file upload can carry that plain text cannot.
+
+- **Validated before anything else runs.** Extension allowlist plus
+  server-side magic-byte signature checking (`attachments/validation.py`)
+  — never the browser-reported MIME type or a preview alone. Empty,
+  corrupt, oversized, or signature-mismatched files are rejected with a
+  structured error before storage. Filenames are sanitized for display;
+  the actual on-disk path is built entirely from a generated
+  `attachment_id`, never from the caller's filename — there is nothing to
+  escape with `../` or a null byte if the filename never touches the path.
+- **Malware-scanned before any parser touches the bytes**
+  (`security/malware_scanner.py::scan_upload`, called from
+  `attachments/pipeline.py` — see "Content moderation gate" above for the
+  same ordering principle applied to a different check). Off by default;
+  fail-closed once configured (`MALWARE_SCAN_PROVIDER=clamav`) — an
+  infected result and a scanner error/timeout are both treated as a
+  rejection, never silently treated as clean. **A production deployment
+  with any file-upload-accepting feature enabled now refuses to start with
+  scanning off** (`config/settings.py::_require_malware_scanning_in_production`)
+  — this closes a real gap where "off by default" could otherwise reach
+  production unnoticed.
+- **ZIP-container documents (DOCX/XLSX/PPTX) are checked for a
+  decompression bomb before being parsed** (`attachments/zip_safety.py`) —
+  the archive's own central-directory metadata (entry count, total
+  uncompressed size) is read without decompressing anything, and an
+  archive exceeding `MAX_ATTACHMENT_ZIP_ENTRIES`/
+  `MAX_ATTACHMENT_ZIP_UNCOMPRESSED_BYTES` is rejected before
+  `python-docx`/`openpyxl`/`python-pptx` ever decompresses a single entry.
+  Also rejects an internal entry with an absolute or path-traversal-shaped
+  name, as a signal the archive wasn't produced by an ordinary Office
+  application.
+- **PDFs are preflighted for active content before extraction**
+  (`attachments/pdf_safety.py`) — a document-catalog-level check rejects
+  embedded JavaScript, an embedded-files name tree, an automatic open
+  action, or document-level additional actions. Deliberately catalog-level
+  only (not a full page/annotation walk) — a disclosed, named scope
+  boundary, not a silent gap; see that module's own docstring. Existing
+  page-count and password-protection rejection (`attachments/processors/pdf_processor.py`)
+  are unchanged.
+- **Bounded processing time.** Every attachment processor call runs on a
+  bounded background thread pool with a hard timeout
+  (`ATTACHMENT_PROCESSING_TIMEOUT_SECONDS`, `attachments/pipeline.py`) — a
+  pathological file (deeply nested PDF object graph, adversarial
+  spreadsheet) can't tie up a request thread indefinitely. Same
+  "the calling thread stops waiting; Python can't force-kill another
+  thread" caveat this codebase's `/ask` concurrency bound already
+  discloses — the abandoned call still runs to completion inside the
+  pool, but a fixed pool size means it occupies one of a bounded number of
+  slots, not an unbounded extra OS thread.
+- **Extracted attachment text is scanned for injection-style phrasing**
+  (`attachments/pipeline.py::_scan_for_injection_patterns`, the same
+  `security/injection_patterns.py` set `agent/input_guard.py` and the
+  retrieved-schema RAG-poisoning scan already use). Detection-only, exactly
+  like this codebase's other uses of the same pattern set — a match is
+  logged as a `possible_attachment_injection` security event but never
+  blocks processing; what actually bounds the consequence is structural:
+  `attachments/graph.py`'s system prompts frame every attachment's content
+  as untrusted data, never instructions, the same posture `rag/graph.py`
+  and `web_search_node` already have for their own untrusted content.
+- **Attachment-only questions never reach SQL.** A question that reads as
+  an OCR/vision/resize/text-removal/document-summary request, with no
+  database keyword anywhere in it, is routed away from schema
+  retrieval/SQL generation by a deterministic, zero-LLM-call check
+  (`agent/orchestrator/nodes.py::_looks_like_attachment_only_question`) —
+  not left to an LLM classifier's discretion, which had no built-in reason
+  not to also pick "sql" just because a database happens to always be
+  configured. A question that genuinely names a database keyword alongside
+  an attachment still reaches the classifier and the normal SQL path,
+  unaffected.
+- **Ownership-scoped throughout.** Every attachment carries the
+  authenticated caller's subject; lookup, processing, the explicit image
+  actions above, and deletion all resolve a wrong-owner id to the same
+  `404` as one that never existed — never confirming another user's
+  attachment even exists (`attachments/store.py::AttachmentStore`).
+- **"Remove text" is real pixel editing, never a solid-color rectangle or
+  a CSS overlay claiming to be one** — classical OpenCV inpainting
+  (`attachments/inpaint.py`, Telea's algorithm), explicitly labeled as
+  such (not generative AI) in every response's `warnings` field, so a
+  caller can't mistake a blurred, artifact-prone reconstruction on a
+  complex background for a higher-fidelity generative result it never
+  claimed to be.
+
+See `CLAUDE.md`'s "Chat attachments" and "Explicit image actions" sections
+for the full design and `docs/API.md`'s "Attachments" section for the
+request/response contracts.
+
 ## Resource exhaustion / abuse protections
 
 Two independent, deliberately simple protections guard against both
@@ -636,9 +728,16 @@ enforced" above; none of this replaces those).
   counter, no external store, resets on every app restart. Two separate
   limits, at different scope and strictness:
   - **Question submissions** (default 10/minute, `QUESTION_RATE_LIMIT_PER_MINUTE`):
-    per client IP, checked in `api/main.py` before `run_orchestrated()` is
+    per caller, checked in `api/main.py` before `run_orchestrated()` is
     ever called — including for the dashboard's "Re-run" action, which
-    costs exactly as much as retyping the question.
+    costs exactly as much as retyping the question. 2026 scale-out
+    hardening pass: keyed by authenticated subject when local/OIDC auth is
+    on (`security.oidc.real_caller_subject`, via `api/main.py`'s
+    `_rate_limit_key`), not raw client IP — IP alone is meaningless behind
+    a load balancer or carrier NAT, where many real callers would
+    otherwise share one bucket. Falls back to client IP only for the
+    `none`/`static_token` auth modes, where every caller is genuinely
+    indistinguishable anyway.
   - **LLM generation calls** (default 20/minute, stricter,
     `LLM_CALL_RATE_LIMIT_PER_MINUTE`): process-wide, checked inside
     `generate_sql_node` before *every* attempt, including retries within
@@ -649,9 +748,22 @@ enforced" above; none of this replaces those).
     `MAX_RETRIES` — `agent/complexity.py` widens this by up to
     `COMPLEX_QUERY_MAX_RETRY_BONUS` for a question judged non-trivial; see
     `docs/ARCHITECTURE.md`'s "Agentic query planning and plan-conformance
-    review"). Process-wide (not per-session) is a deliberate simplification
+    review"). Process-wide (not per-caller) is a deliberate simplification
     appropriate for one local user; see "What is explicitly not
     guaranteed" above.
+- **In-flight concurrency limiting** (`agent/rate_limit.ConcurrencyLimiter`,
+  2026 scale-out hardening pass) — complementary to the per-minute limit
+  above, not a replacement: a caller under the per-minute cap can still
+  have several slow `/ask` requests running *simultaneously*, each
+  holding a thread-pool slot, a DB connection, and an in-flight LLM call.
+  `MAX_CONCURRENT_ASK_REQUESTS` (default 50, process-wide) and
+  `MAX_CONCURRENT_ASK_REQUESTS_PER_CALLER` (default 2, same caller key as
+  the question-submission limit above) are checked before any LLM/DB work
+  starts — a caller past either gets an immediate 429 with `Retry-After`,
+  never a queued wait. This also replaced an unbounded
+  `threading.Thread`-per-request pattern in `api/main.py` with a bounded
+  thread pool sized to `MAX_CONCURRENT_ASK_REQUESTS`, so a burst of slow
+  requests can no longer spawn an unbounded number of real OS threads.
 
     **Known gap, not currently covered by this limiter:** `plan_query_node`
     (up to one call per question, or a few more on a `missing_reference`

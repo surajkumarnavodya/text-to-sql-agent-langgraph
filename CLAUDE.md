@@ -231,6 +231,25 @@ below, and `docs/MULTI_SOURCE_GUIDE.md` for how to configure each source.
   function dict (`SUPPORTED_SEARCH_PROVIDERS`), shaped exactly like
   `db.connection.SUPPORTED_DB_TYPES` — swapping `WEB_SEARCH_PROVIDER` is a
   `.env` change, not a code change. Only `tavily` is implemented today.
+- `attachments/` — chat file attachments (images, PDF, DOCX, XLSX, PPTX,
+  TXT, MD, CSV, JSON) given directly to the model as context for the
+  question that attached them — see "Chat attachments" below for the full
+  design. `models.py` (`Attachment`/`ProcessedAttachment`/`AttachmentError`),
+  `validation.py`, `storage.py` (sanitized on-disk storage, id-only paths),
+  `store.py` (the bounded, in-memory, owner-scoped `AttachmentStore`),
+  `image_processing.py`/`vision.py` (normalize → data URL; local Ollama
+  vision description with an OCR fallback), `processors/` (one
+  `FileProcessor` per file kind + a registry), `context_builder.py`
+  (delimited, truncation-safe prompt context), `pipeline.py` (the
+  validate → scan → store → process orchestration `api/attachments.py`
+  and `graph.py` both call, plus `register_derived_image` for a resize/
+  remove-text output), `state.py`/`graph.py` (the attachment-QA LangGraph
+  subgraph, wired into `agent/orchestrator/` as a new `"attachments"`
+  source). `ocr_extract.py`/`image_ops.py`/`inpaint.py`/`capabilities.py`
+  are the explicit image-action modules (OCR-with-regions, deterministic
+  resize, classical-inpainting text removal, and the live capability
+  registry, respectively) — see "Explicit image actions" below for the
+  full design.
 - `frontend/` — the React + Vite + TypeScript + Tailwind dashboard, the
   only UI this project ships (see the "History note" near the top of this
   file for the Streamlit app it replaced). `src/pages/Chat.tsx` is the main
@@ -1566,30 +1585,28 @@ duplicate:
   `ConversationSearchResults`) — the server-backed history/search behavior
   itself (`GET /conversations`, `GET /chat/search`, etc.) is unchanged.
 - [`docs/image-editing-architecture.md`](docs/image-editing-architecture.md)
-  — a genuinely new capability, **frontend-only and explicitly labeled as
-  such in the UI**: `ChatInput.tsx` now accepts image attachments (file
-  picker, drag-drop, clipboard paste — `hooks/useImageAttachments.ts`,
-  `lib/imageValidation.ts`) with a full local editor
+  — a genuinely new capability, **originally frontend-only and explicitly
+  labeled as such in the UI**: `ChatInput.tsx` accepts image attachments
+  (file picker, drag-drop, clipboard paste) with a full local editor
   (`components/image/ImageEditor.tsx`, Konva/react-konva — crop, rotate,
-  flip, draw, shapes, text, mask layer, undo/redo). **No backend endpoint
-  accepts a chat image attachment or an AI-guided edit instruction** —
-  confirmed against `api/schemas.py`'s `AskRequest` (no file field) and
-  every `UploadFile` route in `api/` (only PDF documents and voice audio).
-  The editor's "AI-guided editing" section is real, visible UI (per the
-  original request's instruction not to hide the affordance) but its
-  adapter (`lib/imageEditAdapter.ts`'s `AiGuidedEditAdapter`) is a
+  flip, draw, shapes, text, mask layer, undo/redo). At the time this was
+  built, no backend endpoint accepted a chat attachment at all — see the
+  "Chat attachments" section below for the pass that closed that specific
+  gap; **AI-guided editing specifically is still unchanged and still not
+  built**: the editor's "AI-guided editing" section is real, visible UI
+  (per the original request's instruction not to hide the affordance) but
+  its adapter (`lib/imageEditAdapter.ts`'s `AiGuidedEditAdapter`) remains a
   deliberate, permanent stub that always rejects with a clear "not
-  configured" message — never a fabricated result. The composer shows an
-  explicit "Local only — image attachments aren't sent to the assistant
-  yet" notice whenever one is attached, so this limitation is visible in
-  the product, not just in this file. The backend contract a real
-  implementation would need (`POST /media/edit`, mirroring `media_gen`'s
-  existing human-approval/cost-ceiling/SSRF-hardened-storage pattern) is
-  documented but **not built** — a substantial backend feature in its own
-  right, correctly out of scope for a frontend UI pass. The editor is
-  lazy-loaded (`React.lazy`, its own ~343KB/106KB-gzip chunk) so attaching
-  or viewing an image — or using the app without ever touching images —
-  never pays Konva's bundle cost.
+  configured" message — never a fabricated result. The backend contract a
+  real implementation would need (`POST /media/edit`, mirroring
+  `media_gen`'s existing human-approval/cost-ceiling/SSRF-hardened-storage
+  pattern) is documented but **not built** — a substantial backend feature
+  in its own right, correctly out of scope both for the original frontend
+  UI pass and for the later "Chat attachments" pass (which only reuses the
+  editor's *manual* crop/rotate/draw output, never routes through this
+  adapter). The editor is lazy-loaded (`React.lazy`, its own
+  ~343KB/106KB-gzip chunk) so attaching or viewing an image — or using the
+  app without ever touching images — never pays Konva's bundle cost.
 
 **Follow-up pass — duplicated controls + sidebar collapse (still 2026-09-18):**
 the redesign above introduced its own new duplication, found and fixed in
@@ -1896,6 +1913,138 @@ hardware/prompt-size tradeoff (LLM inference is 93.8–98% of wall-clock
 time; this rollup makes that fact continuously verifiable against live
 traffic instead of a single point-in-time benchmark run).
 
+### Optional, opt-in SQL result charting (`frontend/src/lib/chartEngine.ts`)
+A confirmed SQL result never auto-renders a chart — an unobtrusive
+"Visualize" button (disabled, with a reason, when nothing in the result is
+chartable) is the only way one appears, and removing it drops back to just
+the answer + table, never the other way around. This replaced an earlier,
+always-on Plotly-figure-from-the-backend design entirely (`plotly` is no
+longer a dependency) in favor of a fully client-side engine, for the same
+reason `embeddings.retriever.select_database` and this file's other
+"never trust the suggestion" precedents exist: **the backend's own
+`chart_recommendation` (`agent/result_charting.py`'s `classify_columns`/
+`recommend_chart`, still computed and returned on every `/execute` call as
+`column_types`/`chart_recommendation`/`truncated`) is only ever a seed for
+the *initial* axis/type choice — every chart type's actual enabled/disabled
+state is recomputed from the real returned columns/rows on the frontend,
+every time**, which is also what lets the user switch chart types (or
+send a follow-up like "show this as a pie chart") without a server round
+trip or re-running SQL at all.
+
+`frontend/src/lib/chartEngine.ts` is the one place chart logic lives:
+`inferColumnRoles` (numeric/date/text, preferring the backend's
+`column_types` hint but falling back to client-side inference so a result
+reloaded from chat history — which has `column_types` too, see "Universal
+server-side chat history" — still works), `getChartTypeOptions` (every one
+of 11 types — kpi/bar/bar-horizontal/bar-stacked/line/area/pie/doughnut/
+scatter/mixed/table — with a real validity rule and an always-populated
+reason, shown as the disabled button's `title` and, for the current
+selection, as visible text), `recommendChart`, `prepareChart` (sort/top-N/
+date-grouping transforms, all disclosed via `notices`), and the Chart.js
+dataset/options builders. **"mixed" (bar+line) never adds a second y-axis**
+— per the loaded data-viz skill's own non-negotiable ("two measures of
+different scale → two charts, never a dual axis"), it's only offered when
+the two measures are within a 10x magnitude ratio of each other
+(`MIXED_SCALE_RATIO_LIMIT`), sharing one axis.
+
+`ChartSection.tsx` (`frontend/src/components/sql/`) owns the whole flow:
+closed (Visualize button) → editing (`ChartPicker` + `ChartCustomizePanel`
++ a live preview, "Generate chart"/"Reset to recommended"/"Cancel") →
+generated (`ResultChart.tsx`'s Chart.js render + "Customize"/"Remove
+chart"). `TurnCard.tsx` lazy-loads this whole subtree (`React.lazy`,
+mirroring `ImageEditor`'s own precedent) so Chart.js — the largest single
+remaining dependency chunk — is never downloaded for a turn nobody
+visualizes. State (`QueryHistoryEntry.chartOptions`, plus
+`confirmedColumnTypes`/`confirmedChartRecommendation`/`confirmedTruncated`)
+is session-only, the same lifetime as `confirmedColumns`/`confirmedRows`
+themselves — this app doesn't persist full SQL results server-side (see
+"Universal server-side chat history"'s own "Known limitation" on reloaded
+turns), so a chart config isn't persisted past a reload either; reset to
+`null` on every fresh "Confirm and Run" (a new result may have a different
+shape than whatever chart was built for the old one).
+
+The categorical palette (`--chart-cat-1..6` in `index.css`, light and dark)
+was generated and validated against this app's own real light/dark card
+surfaces via the data-viz skill's `validate_palette.js` (lightness band,
+chroma floor, CVD/normal-vision separation, contrast) — used in the fixed
+order the skill mandates, never cycled/regenerated per chart.
+
+**Lightweight NL follow-up chart-type switching**
+(`frontend/src/lib/chartFollowup.ts`, `chatStore.tryApplyChartTypeFollowup`):
+a message like "show this as a pie chart", "switch to line", or "bar chart
+instead" is detected by a small, deliberately non-LLM set of regexes (a
+switch-shaped phrase — "switch/change/convert/turn ... to/into", a
+"show/display/... this/it/that/the chart/the data/the result ... as/to/
+into", "make this a ...", or a trailing "instead" — combined with a
+recognized chart-type keyword; either signal alone is not enough, which is
+what keeps an ordinary question like "show sales as a percentage of total"
+or "what's the pie shop revenue" from misfiring). If detected,
+`ChatInput.tsx`'s `submit()` never calls `/ask` at all — it re-validates
+the requested type against the most recent chartable turn's *actual*
+result via the same `getChartTypeOptions` every other chart path uses, and
+either applies it directly (`setChartOptions`, a toast confirms it) or
+shows why it can't (a toast with the same disabled-reason text the picker
+itself would show), rather than sending nonsense to the SQL agent as if it
+were a real question. Deliberately scoped as "lightweight, not full NLU"
+per its own request — a phrasing outside this pattern set (or a chart-type
+word embedded in an otherwise-unrelated sentence with no switch-shaped
+phrasing around it) simply falls through to a normal question, which is
+the safe, disclosed failure mode.
+
+**Verified**: `frontend/src/lib/chartEngine.test.ts` (35 cases — column
+role inference, every chart type's enabled/disabled+reason logic, the
+recommendation engine including "never trust the backend hint blindly",
+and `prepareChart`'s sort/top-N/date-grouping transforms),
+`frontend/src/lib/chartFollowup.test.ts` (21 cases — the NL detector, both
+positive matches and the ordinary-question non-matches it must not
+misfire on), `frontend/src/store/chatStore.chartFollowup.test.ts` (7 cases
+— the full detect-then-validate-then-apply path against a real seeded
+`queryHistory`, including "no chart yet," "type invalid for this result,"
+targeting the *most recent* chartable turn when several exist, and that a
+switch never touches `confirmedRows`/`confirmedSql`, i.e. never re-runs
+SQL), `frontend/src/components/sql/ChartSection.test.tsx` (11 cases — the
+opt-in-only default, the picker's live preview, enabling/disabling with a
+reason, switching types, commit-only-after-"Generate chart", cancel,
+Customize/Remove-chart, the truncation notice, keyboard operability), and
+`frontend/src/components/sql/ResultChart.test.tsx` (5 cases — bar/line/
+pie/scatter mount without throwing, plus the accessible-name assertion).
+`agent/result_charting.py`'s `classify_columns`/`recommend_chart` are
+covered by `tests/test_result_charting.py` (13 cases) and
+`tests/test_api_execute.py`'s updated `/execute` response-shape
+assertions. Full suites green at the time this was built: 1757 backend
+(pytest) + 165 frontend (vitest) tests, `tsc --noEmit` clean, `ruff`/
+`black --check`/`mypy` clean on every touched backend file, `oxlint` clean
+(pre-existing, unrelated warnings only), and `npm run build` succeeds.
+
+**A genuine jsdom/Chart.js incompatibility, found and fixed as
+infrastructure, not app-code**: jsdom's `HTMLCanvasElement.getContext('2d')`
+is unimplemented (returns `undefined`), which Chart.js treats not as "no-op
+the draw calls" but as a fully-failed construction — the resulting
+half-built chart instance then crashes deep in its own internal
+attach/detach resize-bind logic the moment anything calls `.update()` on
+it (e.g. a chart-type switch in a test). Fixed with two additive stubs in
+`frontend/src/test/setup.ts` (a `ResizeObserver` stub, and a minimal fake
+2D context via `Proxy` so every canvas method no-ops instead of the real
+context acquisition failing) — the same category as that file's
+pre-existing `Blob.prototype.arrayBuffer`/`matchMedia` polyfills for
+missing jsdom capabilities, not a behavior mock of this app's own code, and
+deliberately still short of pulling in the full `canvas` npm package (no
+pixel output is asserted on in any test here).
+
+**Known limitations, named rather than silently left**: (1) the NL
+follow-up detector is intentionally a small pattern set, not full
+intent/slot NLU — a real production deployment wanting broader phrasing
+coverage would need a different approach (e.g. a cheap classifier call),
+which was explicitly out of scope here; (2) a chart's `title`/axis labels
+are user-entered free text rendered by Chart.js's own canvas text
+renderer (not `innerHTML`), so there's no injection surface, but no
+explicit sanitization/length cap exists beyond `Settings.max_question_length`
+not applying here at all (chart titles are local UI state, never sent to
+the backend); (3) as noted above, a chart config doesn't survive a page
+reload or a reloaded-from-server past conversation turn, by the same
+disclosed design as the rest of this app's session-only confirmed-result
+state.
+
 ### AI Data Analyst depth — trend/variance/outlier detection (`agent/insight.py`)
 **2026-09-19:** `ResultSummary` (the small, aggregate-only summary
 `generate_insight_from_llm` is given — see "Grounded insights, not
@@ -2054,6 +2203,502 @@ writing; the multi-turn organic-history follow-up (2 of 10 payloads whose
 turn-1 organically succeeded were never separately re-graded against
 their real history entry, only the synthetic worst-case) remains open.
 Neither is a known failure — both are simply not yet re-confirmed.
+
+### Chat attachments (images, PDF, DOCX, XLSX, PPTX, TXT, MD, CSV, JSON) (`attachments/`)
+
+Closes a real, previously-disclosed gap (see the "Frontend UI redesign"
+section above): attaching a file to a chat question used to only ever
+hold it in the browser tab's memory for local preview/editing, with no
+backend endpoint that accepted it at all and no way for the model to see
+its content. `attachments/` is a new top-level package implementing the
+full validate → store → process → answer pipeline, wired in as a new
+`"attachments"` orchestrator source alongside `sql`/`documents`/`policy`/
+`web`/`generation`/`media_search`.
+
+**Storage model, and why it's deliberately NOT `rag/ingestion.py`'s
+pipeline.** A chat attachment is ephemeral, per-conversation, per-caller
+content given directly to the model as context for the question that
+attached it — not a permanent, shared knowledge base entry retrieved many
+times later the way an uploaded Knowledge Sources PDF is. So this reuses
+`rag.ingestion.extract_pdf_pages` for the one genuinely shared piece (PDF
+text extraction) but does **not** run attachments through
+`rag/ingestion.py::ingest_pdf`'s moderation gate, vector embedding, or SQL
+Server `VECTOR` storage — `attachments/store.py`'s `AttachmentStore` is a
+bounded, in-memory, process-lifetime registry (FIFO eviction past 200
+entries, same accepted tradeoff as `media_gen.cache.MediaCache`), keyed by
+a server-generated `attachment_id`, never persisted to a database. Bytes
+live under `Settings.attachment_storage_dir` (default `./data/attachments`,
+gitignored), one file per `attachment_id` — the actual on-disk path is
+built entirely from that id plus the validated extension, never from the
+caller's filename at all, which is a stronger path-traversal defense than
+sanitizing the filename would be (there's nothing to escape with `../`
+if the filename never touches the path in the first place;
+`attachments.storage.sanitize_filename` still produces a display-safe
+name for `Attachment.safe_filename`, belt-and-suspenders).
+
+**Processing happens once, eagerly, at upload time** (`POST
+/attachments/upload` → `attachments.pipeline.validate_and_store_upload`),
+not lazily when a question later references the attachment — this is what
+makes a follow-up question ("what's the total in that spreadsheet I
+uploaded earlier?") free: the store already holds the fully-processed
+record, so referencing the same `attachment_id` again is a cache hit, not
+a re-parse. Re-uploading byte-identical content (by SHA-256, scoped per
+caller) reuses the existing record outright rather than reprocessing it,
+including a previously-*failed* outcome (retrying would just fail
+identically). Malware scanning (`security.malware_scanner.scan_upload`,
+off by default — see that module's own docstring) runs on the raw bytes
+before any parser touches them, mirroring `rag/ingestion.py`'s identical
+ordering rationale.
+
+**Access control**: every `Attachment` carries an `owner_subject` (the
+authenticated caller's `security.oidc.AuthIdentity.subject`, OIDC mode
+only — same scoping `AgentState.caller_subject` already uses elsewhere,
+see that field's own docstring for why "none"/"static_token" modes have no
+real per-caller identity to scope to). `AttachmentStore.get`/`resolve_many`/
+`delete` all silently treat a wrong-owner id exactly like a
+never-existed one — never confirming another caller's attachment even
+exists, the same account-enumeration-avoidance shape
+`identity.exceptions.InvalidCredentialsError` already uses for login.
+
+**One processor class per file kind** (`attachments/processors/`:
+`image_processor.py`, `pdf_processor.py`, `docx_processor.py`,
+`xlsx_processor.py`, `pptx_processor.py`, `json_processor.py`,
+`csv_processor.py`, `text_processor.py` for TXT/Markdown), a `FileProcessor`
+Protocol + `registry.get_processor_for` picking the right one by
+`media_type` — deliberately not one large dispatch function. A scanned PDF
+page (little/no extractable text) falls back to OCR via the existing
+`media.ocr.extract_text` (Tesseract), the same rasterize-via-`pymupdf`
+pattern `rag/ingestion.py::_ocr_suspect_pages` already established for the
+Knowledge Sources pipeline (a small, deliberate duplication rather than
+importing that module's private helper — see `pdf_processor.py`'s own
+docstring for why these stay two separate pipelines). CSV/XLSX processors
+use the standard library `csv` module / `openpyxl` directly, never pandas
+— this codebase already has a documented pandas/Python-3.14 datetime
+segfault footgun (see "Python 3.14 gotchas" above), and a chat
+attachment's spreadsheet is exactly the kind of arbitrary, unvalidated
+schema where a stray date-looking column could trigger it.
+
+**Images**: decoded/verified/resized/re-encoded by `attachments/
+image_processing.py` (Pillow) — downscaled to
+`Settings.max_attachment_image_dimension_px` (default 1568px long edge,
+preserving aspect ratio) and re-encoded to PNG/JPEG through a fresh
+buffer, which is what strips EXIF/ICC/XMP metadata, before being base64
+data-URL-encoded. Describing *what's in* an image reuses this project's
+existing local Ollama vision-model call
+(`attachments/vision.py::describe_images`, the exact same
+`client.chat(..., images=[...])` shape `media/captioning.py` already uses
+and has confirmed working) — fully local, no API key, no outbound network
+call, consistent with every other model choice in this codebase. If
+`Settings.media_vision_model` is blank (the default), an attached image is
+**never silently discarded**: `attachments/graph.py`'s
+`build_multimodal_message_node` falls back to OCR'ing the image's
+on-screen text instead (reusing `media/ocr.py` again) and records
+`vision_unavailable=True` on the result so the UI can show an honest
+degraded-mode notice rather than implying full visual understanding
+happened.
+
+**The attachment-QA LangGraph subgraph** (`attachments/graph.py`,
+`run_attachment_qa`) is the spec-shaped 7-node flow: `validate_attachments`
+(resolves ids → owned, stored attachments; a missing/inaccessible id
+becomes a structured `AttachmentError`, never a crash) → `process_attachments`
+(the cheap lookup+convert described above) → `build_attachment_context`
+(`attachments/context_builder.py` — delimited, per-attachment-budget-capped,
+de-duplicated by content hash, explicit truncation notice, never claims an
+attachment contains information if it failed to process) →
+`build_multimodal_message` (collects image data URLs, or the OCR fallback
+above) → `call_model` (the vision call if images are present, else a plain
+Ollama text call grounded strictly in the attachment context — framed as
+untrusted data, never instructions, the same posture `rag/graph.py`'s own
+`generate_node` already has for RAG-retrieved content; an Ollama outage is
+caught locally here, never left to crash the whole orchestrated run) →
+`validate_response` (records `used_attachment_ids`, fails closed with a
+clear message if nothing usable came back). Compiled once per process
+(`functools.lru_cache`, same pattern as `agent.graph.build_graph`).
+
+**Orchestrator wiring is the one genuinely new architectural wrinkle**:
+`"attachments"` is added to `agent/orchestrator/nodes.py`'s source list,
+but unlike every other source there, its *availability* depends on the
+current request (did the caller attach anything?), not standing config —
+`get_available_sources` takes a new `has_attachments` parameter for this.
+More importantly, `router_node` **forces** `"attachments"` into the final
+route whenever available, regardless of what the LLM classifier picks —
+the user explicitly attached a file to this exact question, so silently
+dropping it (e.g. the classifier judging the question "sounds like SQL")
+would violate this feature's own "never silently discard an attachment"
+requirement; the classifier's only real job when attachments are present
+is deciding whether some *other* source is *also* needed (e.g. "compare
+this file with the database" genuinely needs both). And
+`agent.orchestrator.graph.run_orchestrated` gained a new parameter,
+`attachment_ids`, that **breaks its own pre-existing "flag off → call
+`run_agent` directly" short-circuit**: attaching a file must work
+regardless of `Settings.enable_multi_source_router`, since attaching a
+file is a per-request opt-in the caller makes explicitly, not a standing
+multi-source-routing decision — the short-circuit condition is now `not
+enable_multi_source_router and not has_attachments`, preserving the
+byte-for-byte-unchanged guarantee for every caller that never attaches
+anything.
+
+**API surface**: `POST /attachments/upload` (multipart, one or more
+files — each validated/processed independently, so one bad file in a
+batch never fails the others; per-file errors come back structured,
+`AttachmentErrorCode` values like `UNSUPPORTED_FILE_TYPE`/`FILE_TOO_LARGE`/
+`MALWARE_DETECTED`/`ATTACHMENT_NOT_FOUND`, never a bare exception string)
+and `DELETE /attachments/{id}` (`api/attachments.py`, gated by
+`Permission.ASK` — attaching/removing a file is the same underlying
+capability as asking a question, not a new permission). `AskRequest`
+gained `attachment_ids: list[str]`; `AskResponse` gained
+`attachment_result` (mirrors `agent.orchestrator.state.AttachmentResult`:
+`answer`, `status`, `used_attachment_ids`, `vision_unavailable`).
+`Settings.enable_chat_attachments` (default `true` — no cost, no
+network call beyond the already-local vision model) is the flag; a
+`max_attachment_*` family of settings bounds image/document size, total
+per-message size, attachment count, extracted-text length, PDF page
+count, and spreadsheet row count (see `.env.example`'s "Chat attachments"
+section for the full list).
+
+**Frontend**: `useChatAttachments.ts` replaced the old, purely-local
+`useImageAttachments.ts` (deleted, along with `AttachmentChip.tsx` —
+fully superseded, not kept as a parallel implementation) — it now handles
+both images and documents uniformly, uploading each file to `POST
+/attachments/upload` immediately on selection (one request per file, so
+one chip's status never blocks or gets confused with another's) and
+tracking per-chip `uploading`/`ready`/`error` status with an inline error
+message, never just a spinner that silently resolves to nothing. The
+"Local only" notice is gone because it's no longer true. `ChatAttachmentChip.tsx`
+renders a thumbnail preview for an image (unchanged from before) or a
+generic file icon for a document (there's no meaningful visual preview for
+a PDF/DOCX/XLSX/PPTX/TXT/CSV/JSON attachment). Editing an already-uploaded
+image in `ImageEditor.tsx` re-uploads the edited bytes as a fresh
+attachment (new `attachment_id`) and deletes the stale one server-side in
+the background — without this, the model would keep seeing the original,
+pre-edit image no matter what the user changed. Send is disabled while any
+attachment is still uploading. Attachments are deliberately **not**
+cleared from the composer after sending — matching this feature's
+"conversation follow-up" requirement (asking a second question about the
+same file without re-uploading it) with no extra UI needed, since the chip
+just stays there until the user removes it.
+
+**Known, disclosed limitations, not silently left**: `Settings
+.databases`/eval-benchmark-style per-item routing has no equivalent
+here — an attachment is global to the caller, not scoped to a particular
+configured database. PPTX speaker notes are not extracted (only slide
+title + body text). A legacy `.doc`/`.xls`/`.ppt` (pre-OOXML binary
+Office format) is rejected at validation time with a message naming the
+modern extension it needs instead, since none of `python-docx`/
+`openpyxl`/`python-pptx` can parse the legacy binary formats. There is no
+scheduled/background purge of expired attachment files — `attachments
+.storage.purge_expired_attachments` runs opportunistically on each new
+upload (same disclosed limitation `media_gen.cache.MediaCache`'s own
+FIFO-only eviction already has: this app has no background job
+scheduler).
+
+### Explicit image actions: extract text, resize, remove text (2026-09-26)
+
+Closes a real gap in the "Chat attachments" feature above: an attached
+image could only ever be described by the vision model (or, before that,
+OCR'd only as an internal fallback when no vision model was configured) —
+there was no way to ask for exactly one of these four distinct
+capabilities on purpose. `CLAUDE.md`'s own four-capability split (image
+understanding / OCR / deterministic manipulation / generative-adjacent
+editing) is now real, separately-implemented code, not just a design
+principle:
+
+- **(A) Image understanding** — unchanged, `attachments/vision.py` via
+  `POST /ask` with `attachment_ids` (the existing "what does this image
+  show?" conversational path).
+- **(B) OCR / text extraction** (`attachments/ocr_extract.py`,
+  `POST /attachments/{id}/extract-text`) — a real Tesseract pass
+  (`pytesseract.image_to_data`), returning `raw_text`/`cleaned_text` (both
+  exact recognized text, never an LLM paraphrase) plus per-word bounding
+  boxes/confidence. A result's `raw_text`, if non-empty, is persisted onto
+  the attachment's own `extracted_text` so a follow-up question in the same
+  conversation can see it via the normal attachment-context path
+  (`attachments.graph.build_attachment_context_node`'s image-exclusion rule
+  now has one exception: an image carrying real OCR'd text).
+- **(C) Deterministic manipulation — resize** (`attachments/image_ops.py`,
+  `POST /attachments/{id}/resize`) — pure Pillow work, no model call: width/
+  height with `contain`/`cover`/`stretch` fit modes, EXIF-orientation
+  correction before computing dimensions, output-format conversion, and a
+  small named-preset list (`RESIZE_PRESETS`, also returned by the
+  capabilities route for the frontend's own preset buttons).
+- **(D) Image editing — remove text** (`attachments/inpaint.py`,
+  `GET /attachments/{id}/detect-text-regions` +
+  `POST /attachments/{id}/remove-text`) — real pixel editing via OpenCV's
+  classical `cv2.inpaint` (Telea's fast-marching algorithm), explicitly
+  **not** a generative AI model and **not** a solid-color rectangle; every
+  response carries an honest limitation warning saying so. Region selection
+  is either OCR-proposed (Tesseract's per-word boxes merged into per-line
+  regions, `detect_text_line_regions`, capped at
+  `Settings.max_text_removal_regions`, largest-area-first) and
+  caller-confirmed, or manually drawn — both paths produce the same
+  `InpaintRegion` rectangles. If OCR is unavailable (missing Tesseract
+  binary) or finds nothing, `detect-text-regions` returns an empty list
+  rather than an error — the frontend's `RemoveTextDialog.tsx` falls open
+  to a manual click-and-drag selection on the image preview in that case,
+  never a dead end.
+
+**Both (C) and (D) always produce a brand-new attachment** (`attachments
+.pipeline.register_derived_image`), never mutate the source in place — the
+original stays available exactly per this feature's own "keep the original
+unless explicitly deleted" rule. The frontend's "Attach resized image"/
+"Attach edited image" buttons (`useChatAttachments.ts`'s
+`addProcessedResult`) add that new, already-server-processed attachment
+directly to the composer without a second upload round-trip, then remove
+the source chip — the composer ends up holding the edited result, not
+both versions.
+
+**A capability registry, not an assumption** — `attachments/capabilities.py`
+(`GET /attachments/capabilities`) reports live `vision_input`/`ocr`/
+`image_resize`/`image_text_removal` flags (plus size limits and resize
+presets) computed from current `Settings`, never hardcoded. The
+composer's per-image "more actions" menu (`ChatAttachmentChip.tsx`) only
+offers an action when the registry says it's actually available — per
+this feature's own "never display a capability as working unless it is"
+requirement. One honest nuance: `ocr`/`image_text_removal` report whether
+`pytesseract` (the Python package) is importable, not whether the
+Tesseract *system binary* is installed — probing the real binary on every
+capability check would cost a subprocess call; a missing binary instead
+degrades one OCR/remove-text request to an empty result with a warning; it
+does not flip the capability flag. Verified in this development
+environment specifically: the Tesseract binary is **not** installed here
+(`pytesseract.get_tesseract_version()` raises `TesseractNotFoundError`) —
+every OCR-dependent test in `tests/test_attachments_ocr_extract.py`/
+`tests/test_attachments_inpaint.py` is honest about that split (real
+fail-open behavior verified against this actual environment; the
+line-merging/coordinate-scaling logic itself verified against a hand-built
+mocked Tesseract response, never claimed as "real OCR accuracy verified").
+Resize and text removal's actual pixel editing (`cv2.inpaint`) need no
+external binary and are fully, genuinely verified in this environment —
+including an explicit test asserting the edited region's pixels are
+*not* a flat, uniform fill, the concrete way this codebase distinguishes
+real inpainting from a rectangle pasted over the text.
+
+### Attachment security hardening: routing fix, zip/PDF safety, injection detection (2026-09-27)
+
+Two independent pieces of follow-up work, both closing gaps found by
+directly inspecting the attachment pipeline against a real security-review
+brief rather than assuming prior coverage was complete.
+
+**Routing bug: "extract image text" (and other real-world phrasing) could
+still reach SQL generation.** `agent/orchestrator/nodes.py::get_available_sources`
+always includes `"sql"` (a database is always configured), so attaching
+any file made 2+ sources available, which unconditionally triggered the
+LLM classifier (`classify_sources`) — with no built-in reason not to also
+pick `"sql"` just because a database happens to be configured. Fixed with
+`_looks_like_attachment_only_question`, a deterministic, zero-LLM-call
+pre-check: when attachments are present and the question matches an
+unambiguous OCR/image-understanding/resize/text-removal/document phrasing
+**and** contains no database keyword (database, sql, table, records, rows,
+columns, query, report, revenue, count, filter), `router_node` skips
+`classify_sources` entirely and routes to `["attachments"]` alone — never
+`"sql"`. A single database keyword anywhere in the question defers to the
+classifier instead, so a genuinely mixed question ("use this file to query
+the database") is unaffected. `RouteDecision` gained a `requires_database`
+field for debug transparency. Defense-in-depth: `classify_sources`'s
+prompt also gained `_ATTACHMENT_VS_SQL_GUIDANCE`, explicit few-shot
+examples of what NOT to also pick, for the phrasings the deterministic
+check doesn't confidently catch. The existing frontend gating
+(`TurnCard.tsx`'s `isSqlResult = sourcesUsed.includes('sql')`) needed no
+changes — it already correctly hides SQL UI once `sources_used` stops
+containing `"sql"` for these questions.
+
+**Also root-caused, same session: "no vision model configured" for a
+genuinely attached image.** `MEDIA_VISION_MODEL` was simply unset, and
+Tesseract (the OCR fallback) isn't installed on the reference dev machine
+either, so both paths failed, producing one generic, unhelpful message.
+Fixed by (1) actually configuring a real, already-pulled vision-capable
+Ollama model (verified live: a real `qwen3.8:27b` call correctly read text
+from a synthetic test image before being set) and (2) replacing the single
+generic failure message with `attachments.state.ModelCallOutcome`
+(`no_content`/`vision_ok`/`vision_empty`/`text_llm_ok`/`text_llm_empty`/
+`text_llm_unavailable`), combined with the pre-existing `vision_unavailable`
+flag in `attachments/graph.py::_describe_failure`, so "vision was never
+configured" (`vision_unavailable=True`), "a configured vision model
+answered empty" (`vision_empty`), and "the text-only model was unreachable"
+(`text_llm_unavailable`) each produce a genuinely different, actionable
+message instead of one indistinguishable string. `GET /health` also gained live vision
+diagnostics (`vision_enabled`/`vision_model`/`vision_model_available`/
+`ocr_enabled`) — `vision_model_available` is a real lookup against
+Ollama's own pulled-model list (`api/main.py::_pulled_ollama_model_names`,
+tolerant of both the real `ollama.Client().list()` `ListResponse` shape
+and a plain dict, since this project's own existing `/health` tests mock
+the latter), reusing the same `.list()` call the base Ollama-reachability
+check already makes.
+
+**A structured security-brief audit found five further, concrete gaps**
+(verified by reading the actual code, not assumed) — see `SECURITY.md`'s
+"Chat attachments — security controls" section for the user-facing
+summary; the technical detail:
+
+- **No decompression-bomb guard for DOCX/XLSX/PPTX.** All three are plain
+  ZIP archives; none of `python-docx`/`openpyxl`/`python-pptx` bound total
+  decompressed size or entry count before parsing. Closed by
+  `attachments/zip_safety.py::check_zip_safety` — reads only the archive's
+  own central-directory metadata (`ZipInfo.file_size`, no actual
+  decompression) and rejects before the real parser ever touches an entry,
+  wired into all three processors ahead of their existing corrupt-file
+  handling. Also rejects an absolute or `..`-traversal-shaped internal
+  path, as a signal the archive wasn't produced by an ordinary Office
+  application (this app never extracts an entry to disk, so there's no
+  real zip-slip write target today — a defense-in-depth signal, not the
+  primary concern).
+- **No PDF dangerous-content preflight.** `attachments/processors/pdf_processor.py`
+  checked page count and password-protection only.
+  `attachments/pdf_safety.py::check_pdf_safety` adds a **catalog-level**
+  check (the document's root `/Root` dict plus its `/Names` name tree) for
+  embedded JavaScript, an embedded-files name tree, an automatic open
+  action, or document-level additional actions — deliberately not a full
+  page/annotation walk (a disclosed scope boundary named in that module's
+  own docstring, not a silent gap): the catalog-level checks catch the
+  three most common, well-documented "PDF malware" vectors cheaply (a
+  handful of dict lookups, no page-count-scaling cost). Test fixtures are
+  real PDFs built with `pypdf`'s own `add_js`/`add_attachment` writer
+  helpers — genuinely exercising the same catalog structure a malicious
+  PDF would use, never a checked-in malware sample.
+- **No parser timeout.** A pathological file could tie up a request
+  thread indefinitely. `attachments/pipeline.py::process_attachment` now
+  runs every processor call on a small (`max_workers=4`), process-wide
+  bounded thread pool with a hard timeout
+  (`Settings.attachment_processing_timeout_seconds`) — the same "the
+  calling thread stops waiting; Python can't force-kill another thread"
+  caveat `api/main.py::_run_orchestrated_with_timeout` already discloses
+  for `/ask`, applied to attachment processing.
+- **No prompt-injection detection on attachment text.**
+  `security/injection_patterns.py::INJECTION_PATTERNS` was wired into the
+  typed question (`agent/input_guard.py`), the retrieved-schema
+  RAG-poisoning scan (`agent/nodes.py`), and the *persistent* Knowledge
+  Sources PDF pipeline (`rag/ingestion.py`) — but never into chat
+  attachments, regardless of file type. Closed by
+  `attachments/pipeline.py::_scan_for_injection_patterns`, run on every
+  successfully-processed attachment's extracted text, mirroring
+  `rag/ingestion.py`'s own "detection-only, log a `possible_*_injection`
+  security event, never block" policy exactly — the structural
+  untrusted-data framing already in `attachments/graph.py`'s system
+  prompts is what actually bounds the consequence, same as everywhere else
+  this pattern set is used.
+- **Malware scanning could be off in production with no warning.**
+  `MALWARE_SCAN_PROVIDER` defaults to `"disabled"` (a deliberate default —
+  no scanning capability existed before that module was built, so
+  defaulting it "on" would break every existing deployment with no ClamAV
+  daemon reachable), but nothing previously stopped `ENVIRONMENT=production`
+  from starting that way. Closed by a new `Settings` `model_validator`,
+  `_require_malware_scanning_in_production` — mirrors
+  `_require_identity_in_production`'s exact "fail closed at startup, not
+  silently at request time" shape: production with chat attachments,
+  document RAG, policy RAG, or media search enabled and scanning off
+  refuses to start.
+
+**Also found and fixed as a side effect of this audit, not the main
+subject**: `data/attachments/` (the real on-disk attachment storage
+directory) was never gitignored, unlike every other runtime-data directory
+this project has (`media_library/`, `embeddings/.chroma/`,
+`voice/models/`) — closed alongside this pass. `MALWARE_SCAN_PROVIDER`/
+`CLAMAV_HOST`/`CLAMAV_PORT`/`MALWARE_SCAN_TIMEOUT_SECONDS` and the three
+newest attachment settings above were also missing from `.env.example`
+entirely (present in `config/settings.py` with real defaults, just never
+surfaced in the template) — backfilled in the same pass.
+
+**Verified**: 1926 backend tests (58 new: `tests/test_attachments_zip_safety.py`,
+`tests/test_attachments_pdf_safety.py`, extended
+`tests/test_attachments_processors.py`/`_pipeline.py`/`_graph.py`/
+`test_orchestrator.py`/`test_settings_validation.py`/
+`test_startup_write_privilege_enforcement.py`/`test_api_health.py`) and
+208 frontend tests (10 new: `frontend/src/lib/csv.test.ts`, covering the
+already-implemented but previously untested OWASP CSV-injection escaping
+in `frontend/src/lib/csv.ts`) all pass; `tsc --noEmit` clean, `oxlint` exits
+0 (a small number of pre-existing-pattern `react(set-state-in-effect)`
+warnings now also appear in three new dialog components —
+`ResizeImageDialog.tsx`/`RemoveTextDialog.tsx`/`OcrResultDialog.tsx` — none
+block the build). **Not clean, and not newly broken by this pass**: a
+repo-wide `ruff check .`/`black --check .`/`mypy .` re-run during the
+following documentation pass (2026-09-27) found the pre-existing gaps this
+file already discloses elsewhere have grown, not shrunk, over several
+sessions — 7 ruff findings (up from 6), 12 files `black` would reformat (up
+from 8), and 209 `mypy` errors (up from ~117 total/~105 open, mostly new
+`var-annotated`/`arg-type` findings in test files added by later sessions,
+e.g. `eval/security_benchmark/`, `tests/test_api_identity_auth.py`). None
+of the newly-counted findings are in any file this attachment-hardening
+pass touched (verified by cross-referencing file paths) — see this file's
+own "Known, pre-existing CI-hygiene gaps" note under "How to run tests /
+lint" for the fuller history of this drift. Every new attachment-hardening
+test fixture is synthetic/programmatically generated (real `pypdf`/
+`zipfile` writer output) — no malicious samples committed, per this
+codebase's own established convention for adversarial-scenario regression
+tests.
+
+**Not independently verified in this pass**: no live ClamAV daemon was
+available, so the "scanner unreachable"/"scanner error" fail-closed path
+is unit-tested against a mocked socket only (the existing
+`security/malware_scanner.py` test suite), not a real daemon — the same
+disclosed gap this project's earlier security engagements already named.
+The PDF preflight's page/annotation-level action detection remains
+unimplemented (catalog-level only, as designed and disclosed above).
+
+### Scale-out program: Phase 0 harness + a same-session hardening pass (2026-09-26)
+
+`docs/SCALE_OUT_PROMPT.md` is an 11-phase program (committed verbatim,
+per its own instruction) taking this app from single-instance toward
+horizontally scalable — see `docs/ARCHITECTURE.md`'s own "Scale-out
+program" section for the full per-change writeup and
+`docs/SCALE_BASELINE.md` for measured numbers. Short version, since this
+touched several existing modules this file already documents elsewhere:
+
+- **`eval/load/`** (new): a Phase 0 load-test harness — a mock Ollama
+  server (`mock_ollama_server.py`, wire-protocol-compatible, zero
+  application code changed to use it), a throwaway Postgres +
+  `docker-compose.loadtest.yml`, seeded local-auth users
+  (`seed_users.py`), and k6 scenarios (`k6/`). `make load-test` drives it
+  end to end. Actually *running* this (not just writing it) found and
+  fixed a real, previously-invisible bug: `db/connection.py::get_engine`
+  passed a *password-masked* `sqlalchemy.engine.URL` string (`str(url)`
+  masks the password as `"***"` by design) straight into `create_engine`
+  — every discrete-field (`DB_HOST`/`DB_USER`/`DB_PASSWORD`, not
+  `DB_CONNECTION_STRING`) connection with a real password has been
+  silently unable to authenticate since this code was written, caught by
+  nothing because this project's test suite is fully mocked and had never
+  made a real password-authenticated connection. Fixed with
+  `url.render_as_string(hide_password=False)`; regression test in
+  `tests/test_connection.py::TestGetEngine`.
+- **Bounded `/ask` concurrency + real admission control** (`api/main.py`,
+  `agent/rate_limit.py`). The unbounded `threading.Thread`-per-request
+  pattern `_run_orchestrated_with_timeout` used is now a
+  `ThreadPoolExecutor` (`_get_ask_executor`) sized to
+  `Settings.max_concurrent_ask_requests` (default 50, global) — a caller
+  past that cap, or past their own `max_concurrent_ask_requests_per_caller`
+  cap (default 2, via the new `agent.rate_limit.ConcurrencyLimiter`/
+  `BoundedConcurrencyLimiterCache`), gets an immediate 429 with
+  `Retry-After`, before any LLM/DB work starts. A concurrency slot is
+  released only when the underlying graph execution *actually* finishes —
+  not when the outer request timeout gives up waiting on it — so an
+  abandoned-but-still-running call still correctly occupies its slot
+  (real backpressure under sustained overload: fewer free slots, more
+  429s, never an invisible unbounded thread pile-up). Still not true
+  cross-thread cancellation of an in-flight LLM/DB call — that needs the
+  full async rewrite `docs/SCALE_OUT_PROMPT.md` scopes as its own Phase 1.
+- **Rate/concurrency limits — and attachment ownership — keyed by real
+  identity, not raw client IP** (`security.oidc.real_caller_subject`,
+  used by `api/main.py`'s `_rate_limit_key` and `api/attachments.py`'s
+  `_owner_subject`). Two gaps closed by the same fix: IP-keying means
+  nothing behind a load balancer or carrier NAT, and — a genuine
+  cross-user data-isolation bug, found while fixing the first gap — both
+  call sites previously checked `identity.mode == "oidc"` specifically,
+  treating `mode="local"` (this app's own real, per-user JWT accounts,
+  `identity/`) exactly like the two modes with no real per-caller identity
+  at all. Every distinct local-auth user's attachments and rate/concurrency
+  budget were silently pooled into one shared "no owner" bucket. See
+  `AuthIdentity`'s own (now-corrected) docstring in `security/oidc.py`.
+
+**What's now suitable for multi-instance deployment vs. what still isn't**
+— see `docs/SCALE_BASELINE.md`'s own "Honest capacity statement" for the
+full, no-numbers-without-a-real-test-run answer. Short version: one
+instance now degrades to slow/429 rather than an unbounded thread pile-up
+under load, and per-caller isolation is real for the auth mode this app's
+multi-user story actually uses — but rate limiting, the Chroma schema
+index, and the compiled-graph/Ollama-client singletons are all still
+process-local (Phase 3/5's job), and there is still no true
+cross-thread cancellation, streaming, or distributed coordination (Phases
+1-4). Nothing here changes `/ask`/`/execute`'s request/response shape or
+any existing security control's behavior.
 
 ## How to run
 

@@ -38,21 +38,41 @@ described below.
 
 ### `GET /health`
 
-Real, non-cached reachability check of every external dependency: database
-(`db.connection.test_connection`), Ollama (a cheap `list()` call — no
-generation), and the Chroma schema index (collection reachable and
-non-empty). Returns HTTP `200` with `{"status": "ok", ...}` when everything
-is reachable, `503` with `{"status": "degraded", ...}` otherwise, so
-container/orchestrator health-check tooling that checks the status code
-works correctly. Never requires auth (a health check consumed by
-infrastructure tooling, not a data-exposing endpoint).
+Real, non-cached reachability check of every external dependency: every
+configured database (`db.connection.test_connection`) plus its schema
+index, and Ollama (a cheap `list()` call — no generation). Returns HTTP
+`200` with `{"status": "ok", ...}` when everything is reachable, `503` with
+`{"status": "degraded", ...}` otherwise, so container/orchestrator
+health-check tooling that checks the status code works correctly. Never
+requires auth (a health check consumed by infrastructure tooling, not a
+data-exposing endpoint).
+
+Also reports live chat-image-vision diagnostics
+(`vision_enabled`/`vision_model`/`vision_model_available`/`ocr_enabled`) —
+`vision_model_available` is a real, live lookup against Ollama's own
+pulled-model list (reusing the same `list()` call above, not a second
+round-trip), so a configured-but-never-pulled model name is caught here
+rather than only discovered the first time a user attaches an image.
 
 ```json
 {
   "status": "ok",
-  "database": {"ok": true, "detail": "Connection successful."},
+  "databases": [
+    {
+      "name": "default",
+      "connection": {"ok": true, "detail": "Connection successful."},
+      "schema_index": {"ok": true, "detail": "31 table(s) indexed."}
+    }
+  ],
   "ollama": {"ok": true, "detail": "Reachable at http://localhost:11434."},
-  "schema_index": {"ok": true, "detail": "31 table(s) indexed."}
+  "voice_enabled": true,
+  "media_search_enabled": false,
+  "local_auth_enabled": false,
+  "vision_enabled": true,
+  "vision_provider": "ollama",
+  "vision_model": "llava",
+  "vision_model_available": true,
+  "ocr_enabled": true
 }
 ```
 
@@ -124,6 +144,86 @@ per-session limiter) returns `429` with a `Retry-After` header when
 tripped. The stricter, process-wide LLM-*call* limiter
 (`Settings.llm_call_rate_limit_per_minute`) applies automatically inside
 the agent graph itself, same as it does for the UI.
+
+`attachment_ids` (optional) references file(s) already uploaded via
+`POST /attachments/upload` below — see "Attachments" for the full upload
+flow. Attaching a file is never a reason SQL gets generated: an
+attachment-only question ("extract text from this image," "summarize this
+PDF") is deterministically routed away from schema retrieval/SQL
+generation entirely (`agent/orchestrator/nodes.py::_looks_like_attachment_only_question`),
+regardless of how many databases are configured. A question that
+genuinely names a database keyword alongside an attachment ("use this
+file to query the database") still reaches the normal SQL path, with the
+attachment folded in as grounding context, never as privileged
+instructions — the existing read-only SQL validator and schema
+authorization are unchanged either way.
+
+### Attachments
+
+`POST /attachments/upload` (`api/attachments.py`) — multipart upload.
+Validates (extension + magic-byte signature, size limits), malware-scans
+(if `MALWARE_SCAN_PROVIDER` is configured), stores under a generated id,
+and eagerly processes each file independently — one bad file in a batch
+never fails the others. Requires `Permission.ASK` (the same permission
+asking a question needs).
+
+```json
+// Response
+{
+  "attachments": [
+    {"attachment_id": "att_...", "filename": "invoice.png", "media_type": "image/png", "size_bytes": 48213, "processing_status": "succeeded", "processing_error": null}
+  ],
+  "errors": []
+}
+```
+
+`attachment_id` is what gets passed as `POST /ask`'s `attachment_ids`.
+`DELETE /attachments/{id}` removes it (ownership-scoped — a wrong or
+another caller's id resolves to a `404`, never confirming it exists).
+
+`GET /attachments/capabilities` — live, per-deployment capability report
+(no request body). Reflects actual configuration, not a static claim:
+
+```json
+{
+  "enabled": true,
+  "vision_input": true,
+  "vision_model": "llava",
+  "ocr": true,
+  "image_resize": true,
+  "image_text_removal": true,
+  "image_text_removal_method": "opencv_telea_inpaint",
+  "native_pdf_input": false,
+  "max_image_bytes": 10485760,
+  "max_document_bytes": 26214400,
+  "max_attachments_per_message": 5,
+  "max_total_attachment_bytes": 52428800,
+  "max_resize_dimension_px": 4096,
+  "max_text_removal_regions": 20,
+  "supported_image_extensions": [".gif", ".jpeg", ".jpg", ".png", ".webp"],
+  "supported_document_extensions": [".csv", ".docx", ".json", ".md", ".pdf", ".pptx", ".txt", ".xlsx"],
+  "resize_presets": [{"name": "medium_800", "width": 800, "height": 800}]
+}
+```
+
+`ocr`/`image_text_removal` reflect whether the `pytesseract` *package* is
+importable, not whether the system Tesseract *binary* is installed — a
+missing binary degrades one OCR/remove-text request to an honest warning
+at call time, it doesn't flip this flag.
+
+**Explicit image actions** (image attachments only — each returns `404`
+for a document attachment or an id the caller doesn't own):
+
+| Route | What it does |
+|---|---|
+| `POST /attachments/{id}/extract-text` | Real Tesseract OCR — returns `raw_text`/`cleaned_text` (both exact recognized text, never a model paraphrase) plus per-word bounding boxes/confidence. Distinct from asking a natural-language vision question via `/ask`. |
+| `POST /attachments/{id}/resize` | Deterministic Pillow resize — `{"width": 800, "height": null, "fit": "contain", "output_format": null}`. No model call. Always returns a brand-new attachment (the original is never mutated). |
+| `GET /attachments/{id}/detect-text-regions` | OCR-proposed text-line regions, for the "Remove text" workflow's confirm/adjust step. Returns `[]` (not an error) if OCR is unavailable or finds nothing — the caller falls back to manual region selection. |
+| `POST /attachments/{id}/remove-text` | Real pixel editing via classical OpenCV inpainting (Telea's algorithm) — `{"regions": [{"left": 10, "top": 10, "width": 80, "height": 20}]}`, either OCR-proposed (caller-confirmed) or manually drawn. **Not** generative AI and never a solid-color rectangle; the response's `warnings` field says so explicitly. Always returns a brand-new attachment. |
+
+The last two share the `ImageEditResultResponse` shape
+(`attachment_id`, `source_attachment_id`, `operation`, `image_data_url`,
+`media_type`, `width`, `height`, `size_bytes`, `warnings`).
 
 ### `GET /schema/tables`
 

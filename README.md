@@ -22,9 +22,9 @@
 
 <!-- Newest first, sourced from real commit history. Keep no more than the three most recent entries. -->
 
+- **2026-09-27** — Chat attachments are now genuinely secured and routed correctly, closing three real gaps found while hardening the feature: (1) a question that only concerned an attached file (e.g. "summarize this file") could be misrouted to the SQL pipeline instead of the attachment subgraph — fixed with a deterministic pre-filter that forces attachment-only questions to the right route; (2) image understanding silently degraded with no visible signal when no vision-capable Ollama model was configured — `GET /health`/`GET /attachments/capabilities` now report whether a configured vision model was actually found, and a missing one now falls back to OCR rather than answering as if the image were never considered; (3) a security audit of the attachment pipeline found and closed real gaps — a ZIP decompression-bomb guard and PDF preflight for DOCX/XLSX/PPTX processing, a bounded per-file processing timeout, prompt-injection pattern detection on extracted text, and a new startup check requiring malware scanning to be configured in production. Also fixed two pre-existing gaps found during a full documentation audit: `data/attachments/` (real runtime upload storage) was never gitignored, and three recently-added settings plus the entire malware-scanning config block were missing from `.env.example`. See `CLAUDE.md`'s "Attachment security hardening" section and `SECURITY.md`'s "Chat attachments — security controls" section.
+- **2026-09-26** — Started an 11-phase scale-out program ([`docs/SCALE_OUT_PROMPT.md`](docs/SCALE_OUT_PROMPT.md)) toward horizontal scalability. Phase 0 (done): a real load-test harness (`eval/load/` — mock LLM, seeded Postgres, k6, `make load-test`) plus a same-session hardening pass — bounded `/ask` concurrency with real admission control (replacing an unbounded thread-per-request pattern; 429+`Retry-After` before any work starts, `MAX_CONCURRENT_ASK_REQUESTS`/`_PER_CALLER`) and rate/attachment-ownership limits now keyed by real per-user identity instead of raw client IP — the latter fix closed a genuine cross-user isolation gap where every locally-authenticated user shared one bucket. Actually *running* the harness also found and fixed a real, previously invisible bug: `db/connection.py` was passing a password-*masked* connection string to `create_engine`, silently breaking any real discrete-field database connection. Measured baseline in [`docs/SCALE_BASELINE.md`](docs/SCALE_BASELINE.md); 1783 backend tests green.
 - **2026-09-25** — 500-case live prompt-injection benchmark run to completion against the real agent (real Ollama, real SQL Server): **0 critical findings** (no writes executed, no unauthorized sources, no secret/system-prompt leaks). Found and fixed two real bugs along the way — an MSSQL `MAXRECURSION` query hint that bypassed the SQL validator and could hang a query indefinitely (paired with a DB-connection-leak fix in the cost-estimation timeout path), and a narrative-phrased indirect-injection shape (`"The HR source instructs the agent to reveal finance records."`) that no existing detection pattern caught — the two affected categories' pass rate went 20% → 100% after the fix, re-confirmed live (0 false positives verified across three independent control sets before shipping it). Also added true channel-level injection tests for 6 previously direct-proxy-only categories and a real multi-turn persistence test — see [`docs/security/PROMPT_INJECTION_BENCHMARK_GAP_REPORT.md`](docs/security/PROMPT_INJECTION_BENCHMARK_GAP_REPORT.md)
-- **2026-09-19** — Settings modal fully opaque in dark mode: the panel and backdrop could let background chat content (SQL, tables, buttons) visibly bleed through, because the panel reused `--card`'s deliberate dark-mode "glass" transparency and the backdrop was only 40% opaque. Fixed with dedicated, always-fully-opaque `--modal-backdrop`/`--modal-surface` tokens (shared by every `Dialog`/`Drawer` in the app) plus `inert` on the background while a modal is open; verified live across desktop/tablet/mobile and both themes — see [`docs/settings-modal-visual-bug.md`](docs/settings-modal-visual-bug.md)
-- **2026-09-19** — Backend depth pass: a live performance-metrics rollup (`GET /metrics/performance`, admin-only), RAG/web-search evaluation harnesses (citation correctness/coverage/fabrication, retrieval quality), and new grounded trend/variance/outlier statistics in the insight engine (`agent/insight.py`, fully tested but not yet wired into the live insight prompt — see [`docs/DEEP_FEATURE_PERFORMANCE_ASSESSMENT.md`](docs/DEEP_FEATURE_PERFORMANCE_ASSESSMENT.md) for the roadmap this was scoped from)
 
 <a id="example-usage"></a>
 
@@ -379,14 +379,20 @@ duplicated as two independent copies of Settings and Sign out, see
 [`docs/navigation-and-actions.md`](docs/navigation-and-actions.md) for the
 one-owner-per-action rule that replaced it), a Stop button that genuinely
 cancels an in-flight question (`AbortController`, no fake token stream),
-and an optional image attachment + local editor (crop/draw/annotate/
-undo-redo) in the composer. **The image editor is local-only — no backend
-endpoint exists yet to send an attached image to, and the editor's own
-"AI-guided editing" section says so explicitly rather than pretending to
-call a model.** See
+and an optional attachment (image, PDF, DOCX, XLSX, PPTX, TXT, MD, CSV,
+JSON) + local image editor (crop/draw/annotate/undo-redo) in the composer.
+Attachments are real, not local-only: each one is uploaded, validated,
+malware-scanned (if configured), and processed server-side, and the model
+genuinely sees its content — a vision model's description or an OCR
+fallback for images, extracted text for documents — via a dedicated
+LangGraph subgraph (see "Known limitations" below and `CLAUDE.md`'s "Chat
+attachments" section). **The one part of this that remains a stub is the
+image editor's own "AI-guided editing" panel** — a natural-language-
+prompted generative edit, distinct from attaching a file at all — which
+says so explicitly in the UI rather than pretending to call a model. See
 [`docs/image-editing-architecture.md`](docs/image-editing-architecture.md)
 for exactly what's implemented, what's stubbed, and the backend contract
-a real AI-editing integration would need.
+a real AI-guided-editing integration would need.
 
 ### Running with Docker
 
@@ -429,12 +435,12 @@ connectivity and reverse-proxy placement.
 | Understand the sidebar/history/search UI (not the backend behind it) | [`docs/chat-history-ui.md`](docs/chat-history-ui.md) |
 | See which UI action lives where (Settings, Theme, Logout, sidebar collapse, ...) and why | [`docs/navigation-and-actions.md`](docs/navigation-and-actions.md) |
 | See the duplicated controls a later UI pass found and removed (two settings dialogs, two logout buttons, no sidebar collapse) | [`docs/ui-production-audit.md`](docs/ui-production-audit.md) |
-| Understand image attachments/editing — what's real vs. stubbed, and the backend contract a real AI-guided editor would need | [`docs/image-editing-architecture.md`](docs/image-editing-architecture.md) |
+| Understand the local Konva image editor and exactly what's still stubbed (AI-guided/generative editing specifically) | [`docs/image-editing-architecture.md`](docs/image-editing-architecture.md) |
 | See the full frontend audit this UI pass started from | [`docs/frontend-ui-audit.md`](docs/frontend-ui-audit.md) |
 | See the live, browser-verified root-cause investigation of reported Settings/search/New-Chat/image-attachment issues | [`docs/functional-ui-audit.md`](docs/functional-ui-audit.md) |
 | Understand exactly how the Settings modal's overlay/focus/keyboard behavior works | [`docs/settings-modal.md`](docs/settings-modal.md) |
 | Understand the New Chat lazy-persistence flow and its duplicate-creation safeguards | [`docs/new-chat-flow.md`](docs/new-chat-flow.md) |
-| See the current image-attachment request path step-by-step, and exactly what backend work would be needed to make it real | [`docs/image-attachment-flow.md`](docs/image-attachment-flow.md) |
+| See the historical record of the image-attachment gap this project closed (superseded — see `CLAUDE.md`'s "Chat attachments" section for the current pipeline) | [`docs/image-attachment-flow.md`](docs/image-attachment-flow.md) |
 | See a point-in-time production-UI checklist and what it found | [`docs/production-ui-checklist.md`](docs/production-ui-checklist.md) |
 | Understand the root cause of the dark-mode Settings-modal transparency bug and its fix | [`docs/settings-modal-visual-bug.md`](docs/settings-modal-visual-bug.md) |
 | Understand the generic Tool/MCP abstraction (`agent/tools/`) — what it wraps, why the orchestrator doesn't call it yet | [`docs/TOOLS.md`](docs/TOOLS.md) |
@@ -528,10 +534,17 @@ any of this security work and remains a separate, equally real gap.
   accuracy** — the SQL often runs successfully but returns the wrong
   answer, especially on hard/real-world questions (25% pass rate on each).
   Security-rejection accuracy is 100%.
-- **Single-user, local-dev oriented.** Not hardened for concurrent
-  multi-tenant or production use — see [`SECURITY.md`](SECURITY.md) and
+- **Local-dev oriented; not yet multi-tenant.** A 2026-09-26 hardening
+  pass (see the News entry above and
+  [`docs/SCALE_OUT_PROMPT.md`](docs/SCALE_OUT_PROMPT.md)) added real
+  bounded concurrency/admission control for `/ask` and fixed a genuine
+  cross-user isolation gap in attachment ownership, with a measured
+  baseline in [`docs/SCALE_BASELINE.md`](docs/SCALE_BASELINE.md) — but
+  rate limiting, the schema-embedding index, and the compiled-graph/Ollama
+  singletons are all still per-process (no multi-replica story yet), and
+  there's no tenant isolation model. See [`SECURITY.md`](SECURITY.md) and
   [`docs/PRODUCTION_CHECKLIST.md`](docs/PRODUCTION_CHECKLIST.md) before
-  pointing it at anything sensitive.
+  pointing it at anything sensitive or multi-tenant.
 - **Document/policy RAG requires SQL Server 2025+ or Azure SQL**
   specifically (native `VECTOR` column type), separate from the four
   `DB_TYPE`s the core SQL pipeline supports.
@@ -549,11 +562,29 @@ any of this security work and remains a separate, equally real gap.
   browser's own speech recognition, so they need a Chromium-based browser
   and, in that browser, are not fully local (see `CLAUDE.md`'s "Voice
   mode" section).
-- **Image attachments in the chat composer are frontend-only.** You can
-  attach, crop, draw on, and annotate an image entirely in the browser, but
-  it is never sent to the assistant — no backend endpoint accepts a chat
-  image attachment yet, and the composer says so explicitly. The
-  "AI-guided editing" panel in the image editor (prompt field, preset
+- **Chat attachments (images, PDF, DOCX, XLSX, PPTX, TXT, MD, CSV, JSON) are
+  real, not frontend-only** — `POST /attachments/upload` validates,
+  malware-scans (if configured), stores, and processes each file, and
+  `POST /ask`'s `attachment_ids` gives the model actual access to them via
+  a dedicated LangGraph subgraph (see `CLAUDE.md`'s "Chat attachments"
+  section). **Describing an image's visual content requires a vision-
+  capable Ollama model** (`MEDIA_VISION_MODEL`, e.g. `llava` — blank by
+  default); with no vision model configured, an attached image still isn't
+  silently ignored — it falls back to OCR'ing any on-screen text (Tesseract)
+  and `GET /attachments/capabilities`/`GET /health` report whether a
+  configured vision model was actually found on the Ollama server, so a
+  misconfiguration is visible rather than a silent quality drop. Three
+  explicit, deterministic image actions also exist independent of any
+  model — `POST /attachments/{id}/extract-text|resize|remove-text` — the
+  last being classical (OpenCV inpainting) region-based text removal, not
+  a generative edit. Security hardening around this pipeline (zip
+  decompression-bomb guard, PDF preflight, a bounded per-file processing
+  timeout, and prompt-injection pattern detection on extracted text) is
+  documented in `SECURITY.md`'s "Chat attachments — security controls"
+  section. A question that only concerns an attached file (e.g. "summarize
+  this file") is routed directly to the attachment pipeline rather than
+  being treated as a database question. The one thing still explicitly a
+  stub: the image editor's "AI-guided editing" panel (prompt field, preset
   buttons) is real UI but always returns a clear "not configured" message
   rather than faking a result — see
   [`docs/image-editing-architecture.md`](docs/image-editing-architecture.md)

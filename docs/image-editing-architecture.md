@@ -1,9 +1,27 @@
 # Image Editing Architecture
 
-**Status: implemented and tested (local editing) / not connected to a
-backend (AI-guided editing).** Read this before assuming "AI-guided
-editing" in the composer actually calls a model — it does not, by design,
-and says so in the UI.
+> **⚠️ Partially superseded — read the note below before relying on this
+> document.** This document's core claim when written was "attachments are
+> never actually sent anywhere" (see "Known limitations" below). That is no
+> longer true: a subsequent feature pass built a real backend attachment
+> pipeline (`attachments/`) — an attached image now genuinely reaches a
+> configured vision model or OCR, and explicit `POST
+> /attachments/{id}/extract-text|resize|remove-text` actions exist for
+> real, deterministic image operations. See `CLAUDE.md`'s "Chat
+> attachments"/"Explicit image actions" sections and `docs/API.md`'s
+> "Attachments" section for the current, accurate state. **What remains
+> genuinely accurate below**: the local Konva-based editor's own feature
+> set (crop/rotate/draw/annotate), its library-choice rationale, and —
+> specifically — the **"AI-guided editing" panel** (a natural-language-
+> prompted *generative* edit, distinct from the real "Resize"/"Remove
+> text" actions above): it is still a deliberate, permanent stub exactly
+> as described here, unaffected by the later attachment-pipeline work.
+
+**Status: implemented and tested (local editing, plus a real backend for
+OCR/vision/resize/text-removal — see the note above) / still not connected
+to a backend (AI-guided editing specifically).** Read this before assuming
+"AI-guided editing" in the composer actually calls a model — it does not,
+by design, and says so in the UI.
 
 ## What exists today
 
@@ -30,14 +48,26 @@ and says so in the UI.
   unchanged in size with or without this feature; the editor is its own
   chunk.
 
-## What does NOT exist: AI-guided editing
+## What does NOT exist: AI-guided (generative, prompt-driven) editing
 
-**No backend endpoint accepts an image for AI-guided editing.** Confirmed
-by inspection: `api/schemas.py`'s `AskRequest` has no file/image field of
-any kind, and the only `UploadFile` routes anywhere in `api/` are PDF
-documents (`api/documents.py`) and voice audio (`api/voice.py`).
-`media_gen`'s existing image *generation* takes a text prompt and produces
-a brand-new image — it does not accept an uploaded image plus an edit
+**Update, later pass:** the claim immediately below ("no backend endpoint
+accepts an image") is no longer accurate in general — `api/attachments.py`
+now has real `UploadFile` routes (`POST /attachments/upload`, plus
+`POST /attachments/{id}/resize|remove-text`), and `AskRequest` does now
+carry `attachment_ids`. What remains true, specifically, is narrower: no
+endpoint accepts an image **plus a free-text natural-language edit
+instruction** and returns a generatively-edited result — `POST
+/attachments/{id}/remove-text` is real pixel editing, but it takes explicit
+region coordinates, not a prompt, and uses classical (non-generative)
+inpainting. See `CLAUDE.md`'s "Chat attachments"/"Explicit image actions"
+sections for what's real today; the rest of this section (the
+`AiGuidedEditAdapter` stub, its own honest in-UI error message) remains
+accurate for that specific, narrower capability.
+
+**No backend endpoint accepts an image plus a natural-language edit
+instruction for AI-guided (generative) editing.** `media_gen`'s existing
+image *generation* takes a text prompt and produces a brand-new image — it
+does not accept an uploaded image plus an edit
 instruction.
 
 The editor's "AI-guided editing" section (preset buttons like "Remove the
@@ -127,12 +157,17 @@ load.
 
 ## Known limitations (disclosed, not hidden)
 
-- **Attachments are never actually sent anywhere.** `AskRequest` has no
-  image field, so an attached/edited image is visual-only, local to the
-  browser tab — the composer shows an explicit
-  "Local only — image attachments aren't sent to the assistant yet"
-  notice whenever one is attached. This is the single most important
-  thing to understand about this feature's current state.
+- **Superseded — see the note at the top of this document.** This bullet
+  originally read "Attachments are never actually sent anywhere." That is
+  no longer true: `AskRequest.attachment_ids` exists, `api/attachments.py`
+  has real upload/resize/remove-text routes, and an attached image
+  genuinely reaches a configured vision model or OCR via
+  `attachments/graph.py`. The composer's "Local only" notice described
+  here has been replaced accordingly — see `CLAUDE.md`'s "Chat
+  attachments" section and `docs/API.md`'s "Attachments" section for the
+  current behavior. What remains true is narrower: the *editor's*
+  "AI-guided editing" panel specifically (a natural-language-prompted
+  generative edit) is still not wired to a backend — see above.
 - **Crop's pixel-exactness has not been manually verified in a real
   browser** in this session (no browser automation tool was available)
   — the coordinate math (`Stage.toDataURL({x, y, width, height})`, scaled
@@ -159,15 +194,20 @@ load.
 
 ## Security
 
-- **Client-side validation is a UX convenience, not a security
-  boundary.** There is no backend endpoint to receive an uploaded image
-  yet, so there is nothing to layer server-side re-validation onto today.
-  When a real upload endpoint is built, it **must** independently
-  re-validate everything checked client-side (magic bytes, size,
-  dimensions) — exactly the pattern `api/documents.py` already
-  establishes for PDF uploads — never trust the client-side check alone.
+- **Superseded — see the note at the top of this document.** This section
+  originally described a client-side-only feature with no backend to
+  secure. That's no longer the case: attaching a file now does reach
+  `api/attachments.py`, which independently re-validates everything
+  (magic bytes, size, dimensions), runs malware scanning (when
+  configured) and injection-pattern detection, and stores the file
+  server-side. See `SECURITY.md`'s "Chat attachments — security controls"
+  section for the current, accurate list of controls.
 - **No API keys are exposed in the frontend.** `AiGuidedEditAdapter`
-  contains no credentials — it cannot, since it never reaches a real
-  provider.
-- **Images never leave the browser tab.** No image data is uploaded,
-  stored, or transmitted anywhere by this feature as currently built.
+  (the *generative* AI-guided editing stub, not the real attachment
+  upload path above) contains no credentials — it cannot, since it never
+  reaches a real provider.
+- **The local Konva editor's own output never leaves the browser tab
+  except via the same attachment-upload path** any other attached image
+  uses — saving an edit re-uploads the edited bytes as a fresh attachment
+  (see `CLAUDE.md`'s "Frontend" paragraph under "Chat attachments"), it
+  does not open a separate, unaudited channel.
