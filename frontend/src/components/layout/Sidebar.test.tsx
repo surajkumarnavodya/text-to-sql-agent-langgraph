@@ -54,6 +54,7 @@ function makeFinalState(): AskResponse {
     web_result: null,
     generation_result: null,
     media_search_result: null,
+    attachment_result: null,
     query_plan: null,
     schema_tables: [],
     followup_classification: null,

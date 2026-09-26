@@ -47,6 +47,30 @@
   --warning: #d97706;
   --danger: #dc2626;
 
+  /* Chart categorical palette -- for multi-series charts (pie/doughnut,
+     stacked bar, multi-line, scatter groups) where distinct-identity color
+     is the point. Deliberately NOT derived from --accent (unlike
+     --accent-soft above): --accent is a single, user-chosen hue, but a
+     categorical palette needs several hues validated together as a set
+     (fixed order, never cycled/regenerated -- see below), which a
+     single-hue user preference can't provide. Validated with the
+     data-viz skill's validate_palette.js against this app's own light
+     surface (--background #f8fafc): lightness band, chroma floor, CVD
+     (colorblind) adjacent-pair separation, and normal-vision separation
+     all PASS; contrast vs. surface WARNs for 3 of the 6 slots, which is
+     why every consumer of these tokens must pair color with a visible
+     label/legend, never color alone (chart.js legends + tooltips already
+     do this). Order is the safety mechanism, not cosmetic -- assign slot
+     1 to the first series, slot 2 to the second, etc.; never reorder or
+     cycle back to slot 1 for a 7th series (fold extra series into "Other"
+     instead). */
+  --chart-cat-1: #2a78d6; /* blue */
+  --chart-cat-2: #eb6834; /* orange */
+  --chart-cat-3: #1baf7a; /* aqua */
+  --chart-cat-4: #eda100; /* yellow */
+  --chart-cat-5: #e87ba4; /* magenta */
+  --chart-cat-6: #008300; /* green */
+
   /* Focus ring -- a distinct semantic token (currently mirrors --accent)
      so a future theme can tune keyboard-focus visibility independently of
      the interactive-accent color without touching every consumer. */
@@ -124,6 +148,16 @@
   --modal-surface: #151324;
 
   --shadow-color: 260 60% 3%;
+
+  /* Same 6 hues, stepped for the dark surface (--background #0b0a14) --
+     not a separate palette; re-validated against that surface (all 6
+     clear 3:1 contrast in dark mode, unlike light mode's 3 WARNs). */
+  --chart-cat-1: #3987e5;
+  --chart-cat-2: #d95926;
+  --chart-cat-3: #199e70;
+  --chart-cat-4: #c98500;
+  --chart-cat-5: #d55181;
+  --chart-cat-6: #008300;
 }
 
 @theme inline {

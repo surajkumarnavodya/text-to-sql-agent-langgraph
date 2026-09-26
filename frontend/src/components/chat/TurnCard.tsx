@@ -14,16 +14,24 @@ import { ChatMessage } from './ChatMessage'
 import { CopyAnswerButton } from './CopyAnswerButton'
 import { DownloadAnswerButton } from './DownloadAnswerButton'
 import { QueryPlanPanel } from './QueryPlanPanel'
+import { ResponseFeedbackWidget } from './ResponseFeedbackWidget'
 import { RetryTimeline } from './RetryTimeline'
 import { SchemaContextPanel } from './SchemaContextPanel'
+import { SentAttachmentsPreview } from './SentAttachmentsPreview'
 import { SourcesUsedPanel } from './SourcesUsedPanel'
 import { TimingBadge } from './TimingBadge'
 
 // Chart.js is the largest remaining chunk in this app -- lazy-loaded so a
-// turn that never shows a chart never pays for it, matching
-// agent/result_charting.py's own "no chart is a valid, common outcome"
-// philosophy.
-const ResultChart = lazy(() => import('@/components/sql/ResultChart').then((m) => ({ default: m.ResultChart })))
+// turn never pays for it unless the user actually clicks "Visualize"
+// (ChartSection.tsx itself imports ResultChart.tsx, so this one lazy
+// boundary covers the whole opt-in chart flow: the picker, the customize
+// panel, and the chart.js renderer). Chart generation is optional by
+// design (see ChartSection.tsx's own docstring) -- this lazy boundary is
+// what makes "optional" also mean "not even downloaded" for the common
+// case of a turn nobody ever visualizes.
+const ChartSection = lazy(() =>
+  import('@/components/sql/ChartSection').then((m) => ({ default: m.ChartSection })),
+)
 
 function isSqlResult(sourcesUsed: string[]): boolean {
   return sourcesUsed.length === 0 || sourcesUsed.includes('sql')
@@ -42,6 +50,7 @@ export function TurnCard({ entry, isMultiDb }: { entry: QueryHistoryEntry; isMul
   const setEditableSql = useChatStore((state) => state.setEditableSql)
   const confirmAndRun = useChatStore((state) => state.confirmAndRun)
   const confirmingEntryId = useChatStore((state) => state.confirmingEntryId)
+  const setChartOptions = useChatStore((state) => state.setChartOptions)
 
   const state = entry.finalState
   const showSqlPanel = isSqlResult(state.sources_used) && !BLOCKED_STATUSES.has(entry.agentStatus)
@@ -50,6 +59,7 @@ export function TurnCard({ entry, isMultiDb }: { entry: QueryHistoryEntry; isMul
 
   return (
     <div id={`turn-${entry.entryId}`} className="flex scroll-mt-4 flex-col gap-3">
+      <SentAttachmentsPreview attachments={entry.sentAttachments} />
       <div className="flex justify-end">
         <ChatMessage message={{ role: 'user', content: entry.question }} />
       </div>
@@ -61,6 +71,7 @@ export function TurnCard({ entry, isMultiDb }: { entry: QueryHistoryEntry; isMul
             <>
               <CopyAnswerButton answer={answerMarkdown} />
               <DownloadAnswerButton question={entry.question} answer={answerMarkdown} />
+              <ResponseFeedbackWidget entryId={entry.entryId} />
             </>
           )}
           {entry.spokenAudioUrl && (
@@ -187,13 +198,19 @@ export function TurnCard({ entry, isMultiDb }: { entry: QueryHistoryEntry; isMul
                   </div>
                 )}
                 <ResultsTable columns={entry.confirmedColumns} rows={entry.confirmedRows} />
-                {entry.confirmedChart && (
-                  <Suspense
-                    fallback={<p className="text-xs text-[var(--muted-foreground)]">{t('common.loading')}</p>}
-                  >
-                    <ResultChart figure={entry.confirmedChart} />
-                  </Suspense>
-                )}
+                <Suspense
+                  fallback={<p className="text-xs text-[var(--muted-foreground)]">{t('common.loading')}</p>}
+                >
+                  <ChartSection
+                    columns={entry.confirmedColumns}
+                    rows={entry.confirmedRows}
+                    columnTypes={entry.confirmedColumnTypes ?? {}}
+                    chartRecommendation={entry.confirmedChartRecommendation}
+                    truncated={entry.confirmedTruncated}
+                    chartOptions={entry.chartOptions}
+                    onChartOptionsChange={(options) => setChartOptions(entry.entryId, options)}
+                  />
+                </Suspense>
               </div>
             )}
           </>

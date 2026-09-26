@@ -1,12 +1,31 @@
 import type {
   AgentStatus,
   AskResponse,
+  ChartRecommendation,
   Citation,
   ConversationExchange,
   MediaGenerationResult,
-  PlotlyFigure,
   ServerMessage,
 } from './types'
+import type { ChartOptions } from './chartEngine'
+
+/** A read-only snapshot of one file attached to a sent question, taken at
+ * submit time (`ChatInput.tsx`'s `submit()`) so the question's own chat
+ * bubble can show what was actually attached to it. Deliberately
+ * independent of the composer's own live `ChatAttachment.previewUrl` --
+ * the composer's pending chips (and their `previewUrl`s) are cleared once
+ * the backend has accepted the request (see `ChatInput.tsx`'s `submit()`),
+ * so without this separate snapshot a sent turn would have no record of
+ * its attachment left anywhere at all. `previewUrl` here is a fresh,
+ * separate object/data URL, created before that clear happens, so it stays
+ * valid for the life of this already-sent turn regardless of what happens
+ * to the composer afterward. */
+export interface SentAttachmentPreview {
+  filename: string
+  kind: 'image' | 'document'
+  /** Null for a document -- no visual preview to show. */
+  previewUrl: string | null
+}
 
 /** One full chat turn -- question + everything about its answer. Holds its
  * own editable-SQL/confirmed-result state (rather than a single global
@@ -33,8 +52,26 @@ export interface QueryHistoryEntry {
   confirmedRows: unknown[][] | null
   confirmedError: string | null
   confirmedSql: string | null
-  confirmedChart: PlotlyFigure | null
+  /** Per-column inferred type ('numeric' | 'date' | 'text'), from
+   * ExecuteResponse.column_types -- feeds frontend/src/lib/chartEngine.ts's
+   * chart-type validity checks without re-guessing types client-side. */
+  confirmedColumnTypes: Record<string, string> | null
+  /** A starting-point suggestion only -- see ChartRecommendation's own
+   * docstring for why chartEngine.ts never trusts this outright. */
+  confirmedChartRecommendation: ChartRecommendation | null
+  /** Whether confirmedRows hit Settings.max_result_rows -- shown as a
+   * visible notice both in the results table area and (if a chart exists)
+   * alongside the chart, per this feature's own "never chart a subset as
+   * though it's the full data" requirement. */
+  confirmedTruncated: boolean
   confirmedDurationMs: number | null
+  /** The user's own chart selection for this confirmed result, or `null`
+   * if no chart has been generated (the default -- see ChartSection.tsx).
+   * Session-only, same lifetime as confirmedColumns/confirmedRows
+   * themselves (neither survives a reload today -- see CLAUDE.md's chat-
+   * history "Known limitations"), so there is nothing server-side this
+   * could stay out of sync with. */
+  chartOptions: ChartOptions | null
   /** True only when this question came from a voice turn
    * (`useVoiceConversation`'s transcript, landed in the composer and then
    * submitted like any typed question) -- the sole signal
@@ -46,6 +83,10 @@ export interface QueryHistoryEntry {
    * synthesis completes for a voice-originated turn. `TurnCard` plays it
    * and must revoke it on unmount/replacement. */
   spokenAudioUrl: string | null
+  /** Files attached to this specific question, as sent -- see
+   * `SentAttachmentPreview`'s own docstring. Empty for the overwhelming
+   * majority of turns (no attachment). */
+  sentAttachments: SentAttachmentPreview[]
 }
 
 /** One conversation as shown in the history drawer.
@@ -129,6 +170,7 @@ export function serverMessagesToQueryHistory(rows: ServerMessage[]): QueryHistor
       web_result: null,
       generation_result: null,
       media_search_result: null,
+      attachment_result: null,
       query_plan: null,
       schema_tables: [],
       followup_classification: null,
@@ -151,10 +193,19 @@ export function serverMessagesToQueryHistory(rows: ServerMessage[]): QueryHistor
       confirmedRows: null,
       confirmedError: null,
       confirmedSql: null,
-      confirmedChart: null,
+      confirmedColumnTypes: null,
+      confirmedChartRecommendation: null,
+      confirmedTruncated: false,
       confirmedDurationMs: null,
+      chartOptions: null,
       originatedFromVoice: false,
       spokenAudioUrl: null,
+      // A reloaded past turn isn't a byte-for-byte reconstruction of a live
+      // one -- charts/citations/schema DDL aren't restored either (see
+      // docs/chat-history-architecture.md's own "Known limitations").
+      // Nothing server-side stores which files a past question was sent
+      // with, so this stays empty rather than guessing.
+      sentAttachments: [],
     })
     index += assistantRow ? 2 : 1
   }
@@ -232,6 +283,7 @@ export function newHistoryEntry(
   finalState: AskResponse,
   answerDurationMs: number,
   originatedFromVoice = false,
+  sentAttachments: SentAttachmentPreview[] = [],
 ): QueryHistoryEntry {
   return {
     entryId: crypto.randomUUID(),
@@ -249,10 +301,14 @@ export function newHistoryEntry(
     confirmedRows: null,
     confirmedError: null,
     confirmedSql: null,
-    confirmedChart: null,
+    confirmedColumnTypes: null,
+    confirmedChartRecommendation: null,
+    confirmedTruncated: false,
     confirmedDurationMs: null,
+    chartOptions: null,
     originatedFromVoice,
     spokenAudioUrl: null,
+    sentAttachments,
   }
 }
 
@@ -267,7 +323,9 @@ export function withConfirmedResult(
   columns: string[],
   rows: unknown[][],
   confirmedSql: string,
-  chart: PlotlyFigure | null,
+  columnTypes: Record<string, string>,
+  chartRecommendation: ChartRecommendation | null,
+  truncated: boolean,
   durationMs: number,
 ): QueryHistoryEntry {
   return {
@@ -275,10 +333,27 @@ export function withConfirmedResult(
     confirmedColumns: columns,
     confirmedRows: rows,
     confirmedSql,
-    confirmedChart: chart,
+    confirmedColumnTypes: columnTypes,
+    confirmedChartRecommendation: chartRecommendation,
+    confirmedTruncated: truncated,
     confirmedDurationMs: durationMs,
     confirmedError: null,
+    // A fresh confirmed result may have a different shape than whatever
+    // chart the user built for a prior run of this same turn's SQL box --
+    // never carry a stale chart config over onto new columns/rows it was
+    // never validated against.
+    chartOptions: null,
   }
+}
+
+/** Sets or clears (pass `null`) this turn's user-generated chart -- the
+ * one piece of chart state that changes independently of a SQL
+ * confirm/execute cycle (generate/customize/remove, see ChartSection.tsx). */
+export function withChartOptions(
+  entry: QueryHistoryEntry,
+  chartOptions: ChartOptions | null,
+): QueryHistoryEntry {
+  return { ...entry, chartOptions }
 }
 
 /** Replaces this turn's `generation_result` after `POST /generate/confirm`
@@ -303,8 +378,11 @@ export function withConfirmedError(entry: QueryHistoryEntry, error: string): Que
     confirmedColumns: null,
     confirmedRows: null,
     confirmedSql: null,
-    confirmedChart: null,
+    confirmedColumnTypes: null,
+    confirmedChartRecommendation: null,
+    confirmedTruncated: false,
     confirmedDurationMs: null,
+    chartOptions: null,
   }
 }
 

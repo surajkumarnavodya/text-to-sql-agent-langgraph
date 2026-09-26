@@ -150,3 +150,36 @@ export async function refreshCurrentLocalUser(): Promise<LocalUser> {
   useLocalAuthStore.setState({ user })
   return user
 }
+
+/** Registered with `lib/api.ts` via `setUnauthorizedHandler` (see
+ * `AuthGate.tsx`'s mount effect) -- `request()` calls this on any 401
+ * (except `/auth/*` itself) and retries the original call once if a fresh
+ * token comes back. A real gap found via live use, not a hypothetical:
+ * `access_token_expire_minutes` defaults to 15 minutes
+ * (`config/settings.py`), and nothing previously noticed when this
+ * in-memory `accessToken` went stale mid-session -- every subsequent call
+ * failed with a bare "Missing or invalid Authorization header." until the
+ * user manually reloaded the page, which was the only thing that re-ran
+ * `initialize()`'s own refresh-via-cookie check.
+ *
+ * Returns `null` (never throws) whenever there's truly no live session to
+ * recover -- local auth unconfigured, or the `HttpOnly` refresh-token
+ * cookie itself is gone/expired -- and, in that case, flips `status` to
+ * `"unauthenticated"` so `AuthGate` shows the sign-in screen instead of
+ * leaving the user staring at a wall of failed requests. */
+export async function handleUnauthorized(): Promise<string | null> {
+  if (useLocalAuthStore.getState().status === 'unconfigured') return null
+  try {
+    const token = await refreshAccessToken()
+    useLocalAuthStore.setState({
+      status: 'authenticated',
+      user: token.user,
+      accessToken: token.access_token,
+      error: null,
+    })
+    return token.access_token
+  } catch {
+    useLocalAuthStore.setState({ status: 'unauthenticated', user: null, accessToken: null })
+    return null
+  }
+}

@@ -5,9 +5,11 @@ import {
   confirmGeneration as apiConfirmGeneration,
   executeSql,
   submitGoldenExampleFeedback,
+  submitMessageFeedback,
   synthesizeSpeechUrl,
 } from '@/lib/api'
 import {
+  buildAnswerMarkdown,
   buildConversationHistory,
   buildSpokenAnswerText,
   deriveConversationTitle,
@@ -15,13 +17,23 @@ import {
   nlCacheKey,
   replaceEntry,
   serverMessagesToQueryHistory,
+  withChartOptions,
   withConfirmedError,
   withConfirmedResult,
   withGenerationResult,
   withSpokenAudio,
   type ConversationSummary,
   type QueryHistoryEntry,
+  type SentAttachmentPreview,
 } from '@/lib/history'
+import {
+  CHART_TYPE_LABELS,
+  defaultSeriesForType,
+  getChartTypeOptions,
+  inferColumnRoles,
+  type ChartOptions,
+} from '@/lib/chartEngine'
+import { detectChartTypeSwitchRequest } from '@/lib/chartFollowup'
 import {
   deleteConversationOnServer,
   getConversation as apiGetConversation,
@@ -43,12 +55,25 @@ export interface PendingQuestion {
   startedAt: number
 }
 
+/** Result of `tryApplyChartTypeFollowup` -- see that action's own doc for
+ * what each outcome means to the caller (`ChatInput.tsx`). */
+export type ChartFollowupOutcome =
+  | { handled: false }
+  | { handled: true; applied: true; message: string }
+  | { handled: true; applied: false; message: string }
+
 interface ChatState {
   queryHistory: QueryHistoryEntry[]
   pendingQuestion: PendingQuestion | null
   confirmingEntryId: string | null
   confirmingGenerationEntryId: string | null
   goldenFeedbackGiven: Set<string>
+  /** Last like/dislike rating submitted per entry (see
+   * ResponseFeedbackWidget.tsx) -- a Map, not a Set, since (unlike
+   * goldenFeedbackGiven above) a rating can be changed after the fact, and
+   * the UI needs to know *which* one is currently selected to highlight
+   * it. */
+  messageFeedbackGiven: Map<string, 'positive' | 'negative'>
   enableInsight: boolean
   nlQuestionCache: Map<string, AskResponse>
 
@@ -72,6 +97,24 @@ interface ChatState {
 
   setEnableInsight: (value: boolean) => void
   setEditableSql: (entryId: string, sql: string) => void
+  /** Sets (generate/customize) or clears (remove, pass `null`) one turn's
+   * user-built chart -- see ChartSection.tsx. Purely local/session state,
+   * like confirmedColumns/confirmedRows themselves. */
+  setChartOptions: (entryId: string, chartOptions: ChartOptions | null) => void
+  /** Detects a lightweight NL follow-up asking to switch the *most recent*
+   * chartable turn's chart type ("show this as a pie chart", "switch to
+   * line", "bar chart instead") and, if the requested type is genuinely
+   * valid for that turn's actual result (re-checked via
+   * `getChartTypeOptions`, never assumed), applies it directly via
+   * `setChartOptions` -- no `/ask` call, no SQL re-run. `{ handled: false }`
+   * means `text` didn't read as a chart-followup at all, so the caller
+   * should fall through to a normal `askQuestion`. `{ handled: true,
+   * applied: false, message }` means it *did* read as one but couldn't be
+   * applied (no chartable turn yet, or the type doesn't fit this result's
+   * shape) -- the caller should show `message` and stop, since sending
+   * that text on to the SQL agent as if it were a real question would be
+   * meaningless. */
+  tryApplyChartTypeFollowup: (text: string) => ChartFollowupOutcome
   /** Returns the finished entry (including `spokenAudioUrl`, if speech
    * synthesis for a voice-originated turn succeeded) so a caller that
    * needs to react to the *result* -- `useVoiceConversation`'s hands-free
@@ -79,12 +122,29 @@ interface ChatState {
    * to `queryHistory` and diffing for the new entry itself. */
   askQuestion: (
     question: string,
-    options?: { originatedFromVoice?: boolean },
+    options?: {
+      originatedFromVoice?: boolean
+      attachmentIds?: string[]
+      /** Snapshot of the attached files, for the sent question's own chat
+       * bubble -- see `SentAttachmentPreview`'s own docstring. */
+      sentAttachments?: SentAttachmentPreview[]
+    },
   ) => Promise<QueryHistoryEntry>
   confirmAndRun: (entryId: string) => Promise<void>
   confirmGeneration: (entryId: string) => Promise<void>
   rerunEntry: (entryId: string) => Promise<void>
   giveGoldenFeedback: (entryId: string, thumbsUp: boolean) => Promise<void>
+  /** General like/dislike + optional comment on any answer (SQL,
+   * document/policy RAG, web search, media) -- see
+   * ResponseFeedbackWidget.tsx. Independent of giveGoldenFeedback above,
+   * which only ever saves a confirmed SQL result as a few-shot example; a
+   * positive rating here on a turn that also has a confirmedSql still
+   * triggers that same save, additively. */
+  giveMessageFeedback: (
+    entryId: string,
+    rating: 'positive' | 'negative',
+    comment: string | null,
+  ) => Promise<void>
   /** Aborts the in-flight `/ask` request started by the current
    * `pendingQuestion`, if any -- a no-op if nothing is pending, or if it
    * already settled. There is no real token-by-token stream to interrupt
@@ -183,6 +243,7 @@ function emptyAskResponse(message: string): AskResponse {
     web_result: null,
     generation_result: null,
     media_search_result: null,
+    attachment_result: null,
     query_plan: null,
     schema_tables: [],
     followup_classification: null,
@@ -214,6 +275,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
   confirmingEntryId: null,
   confirmingGenerationEntryId: null,
   goldenFeedbackGiven: new Set(),
+  messageFeedbackGiven: new Map(),
   enableInsight: true,
   nlQuestionCache: new Map(),
   activeConversationId: crypto.randomUUID(),
@@ -232,14 +294,71 @@ export const useChatStore = create<ChatState>((set, get) => ({
       ),
     ),
 
+  setChartOptions: (entryId, chartOptions) =>
+    set((state) =>
+      commitQueryHistory(
+        state,
+        state.queryHistory.map((entry) =>
+          entry.entryId === entryId ? withChartOptions(entry, chartOptions) : entry,
+        ),
+      ),
+    ),
+
+  tryApplyChartTypeFollowup: (text) => {
+    const requestedType = detectChartTypeSwitchRequest(text)
+    if (!requestedType) return { handled: false }
+
+    const target = [...get().queryHistory]
+      .reverse()
+      .find((entry) => entry.confirmedColumns && entry.confirmedRows && entry.confirmedRows.length > 0)
+    if (!target || !target.confirmedColumns || !target.confirmedRows) {
+      return { handled: true, applied: false, message: 'No chart yet -- run a query first.' }
+    }
+
+    const columnInfos = inferColumnRoles(
+      target.confirmedColumns,
+      target.confirmedRows,
+      target.confirmedColumnTypes ?? {},
+    )
+    const match = getChartTypeOptions(columnInfos, target.confirmedRows).find((o) => o.type === requestedType)
+    if (!match?.enabled) {
+      return {
+        handled: true,
+        applied: false,
+        message: match?.reason ?? `${CHART_TYPE_LABELS[requestedType]} isn't valid for this result.`,
+      }
+    }
+
+    const base = target.chartOptions
+    const nextOptions: ChartOptions = {
+      chartType: requestedType,
+      series: defaultSeriesForType(requestedType, columnInfos),
+      sortOrder: base?.sortOrder ?? 'none',
+      topN: base?.topN ?? (target.confirmedRows.length > 20 ? 20 : null),
+      dateGrouping: base?.dateGrouping ?? 'none',
+      numberFormat: base?.numberFormat ?? 'plain',
+      title: base?.title ?? '',
+      showLegend: base?.showLegend ?? true,
+      stacked: base?.stacked ?? false,
+    }
+    get().setChartOptions(target.entryId, nextOptions)
+    return { handled: true, applied: true, message: `Switched the chart to ${CHART_TYPE_LABELS[requestedType]}.` }
+  },
+
   askQuestion: async (question, options) => {
     const { queryHistory, enableInsight, nlQuestionCache, activeConversationId, conversations } = get()
     const startedAt = performance.now()
     set({ pendingQuestion: { question, startedAt } })
 
+    const attachmentIds = options?.attachmentIds ?? []
     const priorQuestions = queryHistory.map((entry) => entry.question)
     const cacheKey = nlCacheKey(question, priorQuestions, enableInsight)
-    const cached = nlQuestionCache.get(cacheKey)
+    // A cached answer was computed without whatever attachment(s) this call
+    // carries -- reusing it would silently ignore the attachment, so the
+    // cache is skipped entirely whenever one is present rather than trying
+    // to fold attachment_ids into the cache key for a case that's cheap to
+    // just always re-ask.
+    const cached = attachmentIds.length === 0 ? nlQuestionCache.get(cacheKey) : undefined
     // Only pass conversation_id once the server has actually confirmed this
     // id exists (i.e. we've already gotten it back from a prior /ask call,
     // or it came from hydrateHistoryFromServer) -- a brand-new, purely
@@ -264,6 +383,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
             conversation_history: buildConversationHistory(queryHistory),
             enable_insight: enableInsight,
             conversation_id: knownServerConversationId,
+            attachment_ids: attachmentIds,
           },
           controller.signal,
         ))
@@ -290,6 +410,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
       finalState,
       answerDurationMs,
       options?.originatedFromVoice ?? false,
+      options?.sentAttachments ?? [],
     )
 
     // If the server assigned/confirmed a real conversation id (a
@@ -315,7 +436,14 @@ export const useChatStore = create<ChatState>((set, get) => ({
       }
     })
     set((state) => ({
-      nlQuestionCache: cached ? state.nlQuestionCache : new Map(state.nlQuestionCache).set(cacheKey, finalState),
+      // Never caches an attachment-informed answer under the bare question
+      // text -- see the attachmentIds/cached comment above for why a later
+      // identical-looking text-only (or differently-attached) question must
+      // not silently reuse it.
+      nlQuestionCache:
+        cached || attachmentIds.length > 0
+          ? state.nlQuestionCache
+          : new Map(state.nlQuestionCache).set(cacheKey, finalState),
     }))
 
     // Spoken answer synthesis: only ever for a voice-originated turn that
@@ -353,7 +481,9 @@ export const useChatStore = create<ChatState>((set, get) => ({
               response.result_columns ?? [],
               response.result_rows ?? [],
               response.normalized_sql ?? entry.editableSql,
-              response.chart,
+              response.column_types,
+              response.chart_recommendation,
+              response.truncated,
               durationMs,
             )
           : withConfirmedError(entry, response.error ?? 'Execution failed.')
@@ -405,6 +535,38 @@ export const useChatStore = create<ChatState>((set, get) => ({
       sql: entry.confirmedSql,
       database: entry.finalState.database ?? 'default',
     })
+  },
+
+  giveMessageFeedback: async (entryId, rating, comment) => {
+    const entry = get().queryHistory.find((item) => item.entryId === entryId)
+    if (!entry) return
+    set((state) => ({
+      messageFeedbackGiven: new Map(state.messageFeedbackGiven).set(entryId, rating),
+    }))
+    const answerState = entry.finalState
+    await submitMessageFeedback({
+      question: entry.question,
+      answer: buildAnswerMarkdown(entry),
+      rating,
+      sql: entry.confirmedSql ?? entry.sql,
+      database: answerState.database ?? null,
+      sources_used: answerState.sources_used,
+      comment,
+      conversation_id: answerState.conversation_id ?? get().activeConversationId,
+    })
+    // A positive rating on a confirmed SQL result also feeds the few-shot
+    // golden dataset -- the exact same side effect giveGoldenFeedback's own
+    // thumbs-up path has, kept additive rather than merged into one
+    // function so each store stays independently testable (see
+    // feedback/store.py's and embeddings/golden_examples.py's own
+    // docstrings for why they're two stores, not one).
+    if (rating === 'positive' && entry.confirmedSql) {
+      await submitGoldenExampleFeedback({
+        question: entry.question,
+        sql: entry.confirmedSql,
+        database: answerState.database ?? 'default',
+      })
+    }
   },
 
   cancelPendingQuestion: () => currentAbortController?.abort(),
@@ -538,5 +700,6 @@ export const useChatStore = create<ChatState>((set, get) => ({
       historyError: null,
       nlQuestionCache: new Map(),
       goldenFeedbackGiven: new Set(),
+      messageFeedbackGiven: new Map(),
     }),
 }))

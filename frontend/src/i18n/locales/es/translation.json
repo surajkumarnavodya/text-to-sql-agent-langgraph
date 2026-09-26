@@ -134,7 +134,17 @@
   "feedback": {
     "question": "¿Fue correcto este SQL?",
     "savedToast": "Guardado — las preguntas similares futuras usarán esto como ejemplo de referencia.",
-    "thanksToast": "Gracias por tu comentario."
+    "thanksToast": "Gracias por tu comentario.",
+    "ratePositive": "Buena respuesta",
+    "rateNegative": "Mala respuesta",
+    "positiveTitle": "Dar feedback positivo",
+    "negativeTitle": "Dar feedback negativo",
+    "detailsLabel": "Proporciona más detalles: (opcional)",
+    "detailsPlaceholder": "¿Qué fue útil o qué se podría mejorar?",
+    "privacyNotice": "Esto guarda tu pregunta, esta respuesta y tu comentario para que el equipo pueda revisarlo y mejorar futuras respuestas. No se envía nada a terceros.",
+    "cancel": "Cancelar",
+    "submit": "Enviar",
+    "submittedToast": "Gracias — tu comentario fue registrado."
   },
   "knowledge": {
     "title": "Fuentes de conocimiento",

@@ -80,6 +80,148 @@ export interface MediaSearchResult {
   hits: MediaSearchHit[]
 }
 
+/** Mirrors agent.orchestrator.state.AttachmentResult -- the "attachments"
+ * source's contribution when the question had file(s) attached. */
+export interface AttachmentResult {
+  answer: string
+  status: string
+  used_attachment_ids: string[]
+  vision_unavailable: boolean
+}
+
+/** Mirrors api.schemas.AttachmentOut -- one uploaded file's metadata/status. */
+export interface AttachmentOut {
+  attachment_id: string
+  filename: string
+  media_type: string
+  size_bytes: number
+  processing_status: string
+  processing_error: string | null
+}
+
+export interface AttachmentErrorOut {
+  code: string
+  attachment_id: string | null
+  filename: string
+  message: string
+}
+
+/** Mirrors api.schemas.ImageResizePresetOut. */
+export interface ImageResizePresetOut {
+  name: string
+  width: number
+  height: number
+}
+
+/** Mirrors api.schemas.AttachmentCapabilitiesResponse (`GET
+ * /attachments/capabilities`) -- what this deployment can actually do with
+ * an attachment right now. The composer's image-action menu reads this to
+ * enable/disable each action honestly instead of assuming vision/OCR/
+ * editing are always available. */
+export interface AttachmentCapabilities {
+  enabled: boolean
+  vision_input: boolean
+  vision_model: string | null
+  ocr: boolean
+  image_resize: boolean
+  image_text_removal: boolean
+  image_text_removal_method: string | null
+  native_pdf_input: boolean
+  max_image_bytes: number
+  max_document_bytes: number
+  max_attachments_per_message: number
+  max_total_attachment_bytes: number
+  max_resize_dimension_px: number
+  max_text_removal_regions: number
+  supported_image_extensions: string[]
+  supported_document_extensions: string[]
+  resize_presets: ImageResizePresetOut[]
+}
+
+/** Mirrors api.schemas.TextRegionOut -- one recognized word from `POST
+ * /attachments/{id}/extract-text`. */
+export interface TextRegionOut {
+  text: string
+  left: number
+  top: number
+  width: number
+  height: number
+  confidence: number
+  low_confidence: boolean
+}
+
+/** Mirrors api.schemas.OcrExtractResponse. `raw_text`/`cleaned_text` are
+ * both exact OCR output -- never an LLM paraphrase, see that route's own
+ * docstring. */
+export interface OcrExtractResponse {
+  attachment_id: string
+  operation: string
+  raw_text: string
+  cleaned_text: string
+  regions: TextRegionOut[]
+  warnings: string[]
+}
+
+/** Mirrors api.schemas.TextLineRegionOut -- one OCR-proposed text line for
+ * the "Remove text" workflow's confirm/adjust step. */
+export interface TextLineRegionOut {
+  region_id: number
+  text: string
+  left: number
+  top: number
+  width: number
+  height: number
+  confidence: number
+}
+
+export interface DetectTextRegionsResponse {
+  attachment_id: string
+  regions: TextLineRegionOut[]
+}
+
+/** One rectangle, in source-image pixel coordinates -- sent to `POST
+ * /attachments/{id}/remove-text` (mirrors api.schemas.ImageRegionIn). */
+export interface ImageRegionIn {
+  left: number
+  top: number
+  width: number
+  height: number
+}
+
+/** Mirrors api.schemas.ImageEditResultResponse -- the shared shape both
+ * resize and remove-text return: a brand-new, separately downloadable
+ * attachment, never the original mutated in place. */
+export interface ImageEditResultResponse {
+  attachment_id: string
+  source_attachment_id: string
+  operation: string
+  image_data_url: string
+  media_type: string
+  width: number
+  height: number
+  original_width: number | null
+  original_height: number | null
+  size_bytes: number
+  warnings: string[]
+}
+
+export type ImageResizeFit = 'contain' | 'cover' | 'stretch'
+export type ImageResizeOutputFormat = 'png' | 'jpeg' | 'webp'
+
+/** Mirrors api.schemas.ImageResizeRequest. */
+export interface ImageResizeRequest {
+  width?: number | null
+  height?: number | null
+  fit?: ImageResizeFit
+  output_format?: ImageResizeOutputFormat | null
+  quality?: number
+}
+
+export interface AttachmentUploadResponse {
+  attachments: AttachmentOut[]
+  errors: AttachmentErrorOut[]
+}
+
 export interface AskRequest {
   question: string
   conversation_history?: ConversationExchange[]
@@ -89,6 +231,9 @@ export interface AskRequest {
   // meaningful for a locally-authenticated caller (see
   // api/chat_persistence.py). Omit on the first turn of a new conversation.
   conversation_id?: string | null
+  // Ids of files attached to this question, from a prior
+  // POST /attachments/upload response -- see useChatAttachments.ts.
+  attachment_ids?: string[]
 }
 
 export interface AskResponse {
@@ -122,6 +267,7 @@ export interface AskResponse {
   web_result: SourceAnswer | null
   generation_result: MediaGenerationResult | null
   media_search_result: MediaSearchResult | null
+  attachment_result: AttachmentResult | null
   query_plan: string[] | null
   schema_tables: SchemaTable[]
   followup_classification: 'standalone' | 'followup' | 'ambiguous' | null
@@ -138,9 +284,17 @@ export interface ExecuteRequest {
   database?: string | null
 }
 
-export interface PlotlyFigure {
-  data: Record<string, unknown>[]
-  layout: Record<string, unknown>
+/** Mirrors api.schemas.ChartRecommendationOut -- a suggested starting chart
+ * type + reason from agent.result_charting.recommend_chart. Only ever used
+ * by frontend/src/lib/chartEngine.ts as a *seed* for the initial axis
+ * selection; every chart type's actual validity is always independently
+ * recomputed from the real result_columns/result_rows (see that module's
+ * own docstring for why this suggestion is never trusted outright). */
+export interface ChartRecommendation {
+  chart_type: string
+  reason: string
+  x_column: string | null
+  y_column: string | null
 }
 
 export interface ExecuteResponse {
@@ -151,7 +305,9 @@ export interface ExecuteResponse {
   result_rows: unknown[][] | null
   row_count: number | null
   duration_ms: number | null
-  chart: PlotlyFigure | null
+  column_types: Record<string, string>
+  chart_recommendation: ChartRecommendation | null
+  truncated: boolean
   error: string | null
 }
 
@@ -159,6 +315,21 @@ export interface GoldenExampleFeedbackRequest {
   question: string
   sql: string
   database: string
+}
+
+/** Backs POST /feedback/message -- a like/dislike + optional comment on
+ * ANY answer (SQL, document/policy RAG, web search, media), unlike
+ * GoldenExampleFeedbackRequest above which only ever covers a confirmed,
+ * executed SQL result. See ResponseFeedbackWidget.tsx. */
+export interface MessageFeedbackRequest {
+  question: string
+  answer: string
+  rating: 'positive' | 'negative'
+  sql?: string | null
+  database?: string | null
+  sources_used?: string[]
+  comment?: string | null
+  conversation_id?: string | null
 }
 
 export interface SchemaRefreshResult {
@@ -188,6 +359,15 @@ export interface HealthResponse {
   voice_enabled: boolean
   media_search_enabled: boolean
   local_auth_enabled: boolean
+  // Startup/operator diagnostic for chat-image vision support --
+  // vision_model_available is null whenever vision_enabled is false
+  // (nothing to check); when true, it's a real, live lookup against
+  // Ollama's own pulled-model list, not just "a name is configured."
+  vision_enabled: boolean
+  vision_provider: 'ollama' | null
+  vision_model: string | null
+  vision_model_available: boolean | null
+  ocr_enabled: boolean
 }
 
 export interface ColumnOut {

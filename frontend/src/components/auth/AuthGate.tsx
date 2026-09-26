@@ -4,11 +4,12 @@ import { useTranslation } from 'react-i18next'
 import { Button } from '@/components/ui/button'
 import { ProfileCompletionBanner } from '@/components/auth/ProfileCompletionBanner'
 import { isOidcConfigured } from '@/lib/auth'
+import { setUnauthorizedHandler } from '@/lib/api'
 import { Register } from '@/pages/auth/Register'
 import { SignIn } from '@/pages/auth/SignIn'
 import { useAuthStore } from '@/store/authStore'
 import { useChatStore } from '@/store/chatStore'
-import { useLocalAuthStore } from '@/store/localAuthStore'
+import { handleUnauthorized, useLocalAuthStore } from '@/store/localAuthStore'
 
 function Spinner() {
   return (
@@ -62,6 +63,12 @@ export function AuthGate({ children }: { children: React.ReactNode }) {
   const signIn = useAuthStore((state) => state.signIn)
 
   useEffect(() => {
+    // Registered here (not at localAuthStore.ts's module top level) so
+    // lib/api.ts never has to import the store back -- that module is
+    // already imported *by* the store (via identityApi.ts), and a mount
+    // effect runs safely after every module has finished loading, unlike
+    // a top-level call racing module-initialization order.
+    setUnauthorizedHandler(handleUnauthorized)
     void localInitialize()
     void oidcInitialize()
     // Runs once on mount -- both initialize() references are stable

@@ -12,6 +12,7 @@ import { VitePWA } from 'vite-plugin-pwa'
 // react-router routes never accidentally get proxied to the backend.
 const BACKEND_ROUTES = [
   '/ask',
+  '/attachments',
   '/execute',
   '/documents',
   '/schema',

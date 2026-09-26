@@ -1,114 +1,243 @@
 import {
+  ArcElement,
+  BarController,
   BarElement,
   CategoryScale,
   Chart as ChartJS,
   Filler,
   Legend,
   LinearScale,
+  LineController,
   LineElement,
+  PieController,
   PointElement,
+  ScatterController,
   Title,
   Tooltip,
+  type ChartData,
+  type ChartOptions as ChartJsOptions,
 } from 'chart.js'
 import { useMemo } from 'react'
-import { Bar, Line } from 'react-chartjs-2'
-import { useTranslation } from 'react-i18next'
-import { adaptPlotlyFigure } from '@/lib/chartAdapter'
-import type { PlotlyFigure } from '@/lib/types'
+import { Chart } from 'react-chartjs-2'
+import { formatNumber, type ChartTypeId, type NumberFormat, type PreparedChart } from '@/lib/chartEngine'
 import { useSettingsStore } from '@/store/settingsStore'
 
-ChartJS.register(CategoryScale, LinearScale, BarElement, LineElement, PointElement, Title, Tooltip, Legend, Filler)
+ChartJS.register(
+  BarController,
+  LineController,
+  PieController,
+  ScatterController,
+  CategoryScale,
+  LinearScale,
+  BarElement,
+  LineElement,
+  PointElement,
+  ArcElement,
+  Title,
+  Tooltip,
+  Legend,
+  Filler,
+)
 
 function cssVar(name: string): string {
   return getComputedStyle(document.documentElement).getPropertyValue(name).trim()
 }
 
-/** Renders the backend's chart decision (see agent/result_charting.py) with
- * Chart.js -- tooltips, a themed gradient fill on line charts, rounded bar
- * corners, and full light/dark/accent-aware theming (colors are re-read
- * from the live CSS variables whenever the theme/accent settings change,
- * since a <canvas> can't reference `var(--x)` directly the way DOM
- * elements can). */
-export function ResultChart({ figure }: { figure: PlotlyFigure }) {
-  const { t } = useTranslation()
+/** Renders one prepared chart configuration (see `frontend/src/lib
+ * /chartEngine.ts`) with Chart.js, via `react-chartjs-2`'s generic `Chart`
+ * component so one component can switch between every supported chart
+ * type (bar/horizontal-bar/stacked-bar/line/area/pie/doughnut/scatter/
+ * mixed) rather than needing a separate component per type. Colors/theming
+ * are re-read from the live CSS variables whenever the theme/accent
+ * settings change, since a `<canvas>` can't reference `var(--x)` directly
+ * the way DOM elements can (same pattern this component already used
+ * before this feature). */
+export function ResultChart({
+  prepared,
+  chartType,
+  title,
+  showLegend,
+  numberFormat,
+  stacked,
+}: {
+  prepared: PreparedChart
+  chartType: ChartTypeId
+  title: string
+  showLegend: boolean
+  numberFormat: NumberFormat
+  stacked: boolean
+}) {
   // Subscribed only to force a re-render (and therefore a re-read of the
-  // computed CSS variables below) when either setting changes -- the
-  // values themselves aren't used directly.
+  // computed CSS variables below) when either setting changes.
   useSettingsStore((state) => state.themeMode)
   useSettingsStore((state) => state.accent)
 
-  const adapted = useMemo(() => adaptPlotlyFigure(figure), [figure])
-
   const colors = useMemo(
     () => ({
-      accent: cssVar('--accent') || '#4f46e5',
-      accentSoft: cssVar('--accent-soft') || '#eef2ff',
       foreground: cssVar('--foreground') || '#0f172a',
       mutedForeground: cssVar('--muted-foreground') || '#64748b',
       border: cssVar('--border') || '#e2e8f0',
+      accentSoft: cssVar('--accent-soft') || '#eef2ff',
     }),
     // eslint-disable-next-line react-hooks/exhaustive-deps -- intentionally re-runs on theme/accent change via the subscriptions above
-    [figure],
+    [prepared],
   )
 
-  if (!adapted) return null
+  const isHorizontal = chartType === 'bar-horizontal'
+  const isArea = chartType === 'area'
+  const isPieLike = prepared.chartJsType === 'pie' || prepared.chartJsType === 'doughnut'
 
-  const commonScales = {
-    x: {
-      title: { display: Boolean(adapted.xTitle), text: adapted.xTitle, color: colors.mutedForeground },
-      ticks: { color: colors.mutedForeground },
-      grid: { color: colors.border },
-    },
-    y: {
-      title: { display: Boolean(adapted.yTitle), text: adapted.yTitle, color: colors.mutedForeground },
-      ticks: { color: colors.mutedForeground },
-      grid: { color: colors.border },
-      beginAtZero: true,
-    },
-  }
+  const data: ChartData = useMemo(() => {
+    if (isPieLike) {
+      const sliceColors = prepared.labels.map((_, i) => {
+        const paletteIndex = (i % 6) + 1
+        return cssVar(`--chart-cat-${paletteIndex}`) || prepared.datasets[0].color
+      })
+      return {
+        labels: prepared.labels,
+        datasets: [
+          {
+            label: prepared.datasets[0].label,
+            data: prepared.datasets[0].data as number[],
+            backgroundColor: sliceColors,
+            borderColor: cssVar('--card') || '#ffffff',
+            borderWidth: 2,
+          },
+        ],
+      }
+    }
 
-  const options = {
-    responsive: true,
-    maintainAspectRatio: false,
-    animation: { duration: 500, easing: 'easeOutQuart' as const },
-    plugins: {
-      legend: { display: false },
-      tooltip: {
-        backgroundColor: colors.foreground,
-        titleColor: colors.accentSoft,
-        bodyColor: '#ffffff',
-        padding: 10,
-        cornerRadius: 8,
-        displayColors: false,
+    if (prepared.chartJsType === 'scatter') {
+      return {
+        datasets: prepared.datasets.map((ds) => ({
+          label: ds.label,
+          data: ds.data as { x: number; y: number }[],
+          backgroundColor: ds.color,
+          borderColor: ds.color,
+          pointRadius: 5,
+        })),
+      }
+    }
+
+    return {
+      labels: prepared.labels,
+      datasets: prepared.datasets.map((ds) => {
+        const type = ds.datasetType ?? (prepared.chartJsType === 'line' ? 'line' : 'bar')
+        return {
+          type,
+          label: ds.label,
+          data: ds.data as number[],
+          backgroundColor: type === 'bar' ? ds.color : colors.accentSoft,
+          borderColor: ds.color,
+          borderWidth: type === 'line' ? 2.5 : 0,
+          borderRadius: type === 'bar' ? 6 : 0,
+          pointRadius: type === 'line' ? 3 : 0,
+          pointBackgroundColor: ds.color,
+          fill: type === 'line' && isArea,
+          tension: 0.35,
+        }
+      }),
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [prepared, isPieLike, isArea, colors])
+
+  const options: ChartJsOptions = useMemo(() => {
+    const tooltipFormat = (value: unknown) =>
+      typeof value === 'number' ? formatNumber(value, numberFormat) : String(value)
+
+    const base: ChartJsOptions = {
+      responsive: true,
+      maintainAspectRatio: false,
+      animation: { duration: 400, easing: 'easeOutQuart' },
+      plugins: {
+        title: title ? { display: true, text: title, color: colors.foreground } : { display: false },
+        legend: {
+          display: showLegend && (isPieLike || prepared.datasets.length > 1),
+          labels: { color: colors.mutedForeground },
+        },
+        tooltip: {
+          backgroundColor: colors.foreground,
+          padding: 10,
+          cornerRadius: 8,
+          callbacks: {
+            label: (context) => {
+              const raw = context.raw
+              if (raw && typeof raw === 'object' && 'y' in raw) {
+                return `${context.dataset.label}: ${tooltipFormat((raw as { y: number }).y)}`
+              }
+              return `${context.dataset.label}: ${tooltipFormat(context.parsed?.y ?? context.parsed)}`
+            },
+          },
+        },
       },
-    },
-    scales: commonScales,
-  }
+    }
 
-  const data = {
-    labels: adapted.labels,
-    datasets: [
-      {
-        label: adapted.yTitle || 'Value',
-        data: adapted.values,
-        backgroundColor: adapted.kind === 'bar' ? colors.accent : colors.accentSoft,
-        borderColor: colors.accent,
-        borderWidth: adapted.kind === 'line' ? 2.5 : 0,
-        borderRadius: adapted.kind === 'bar' ? 6 : 0,
-        pointRadius: adapted.kind === 'line' ? 3 : 0,
-        pointBackgroundColor: colors.accent,
-        fill: adapted.kind === 'line',
-        tension: 0.35,
+    if (isPieLike) return base
+
+    if (prepared.chartJsType === 'scatter') {
+      return {
+        ...base,
+        scales: {
+          x: {
+            type: 'linear',
+            title: { display: Boolean(prepared.xTitle), text: prepared.xTitle, color: colors.mutedForeground },
+            ticks: { color: colors.mutedForeground },
+            grid: { color: colors.border },
+          },
+          y: {
+            title: { display: Boolean(prepared.yTitle), text: prepared.yTitle, color: colors.mutedForeground },
+            ticks: { color: colors.mutedForeground },
+            grid: { color: colors.border },
+          },
+        },
+      }
+    }
+
+    return {
+      ...base,
+      indexAxis: isHorizontal ? 'y' : 'x',
+      scales: {
+        x: {
+          stacked: stacked || chartType === 'bar-stacked',
+          title: {
+            display: Boolean(!isHorizontal ? prepared.xTitle : prepared.yTitle),
+            text: !isHorizontal ? prepared.xTitle : prepared.yTitle,
+            color: colors.mutedForeground,
+          },
+          ticks: {
+            color: colors.mutedForeground,
+            callback: isHorizontal ? (value) => tooltipFormat(value) : undefined,
+          },
+          grid: { color: colors.border },
+        },
+        y: {
+          stacked: stacked || chartType === 'bar-stacked',
+          beginAtZero: true,
+          title: {
+            display: Boolean(!isHorizontal ? prepared.yTitle : prepared.xTitle),
+            text: !isHorizontal ? prepared.yTitle : prepared.xTitle,
+            color: colors.mutedForeground,
+          },
+          ticks: {
+            color: colors.mutedForeground,
+            callback: !isHorizontal ? (value) => tooltipFormat(value) : undefined,
+          },
+          grid: { color: colors.border },
+        },
       },
-    ],
-  }
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [prepared, isHorizontal, isPieLike, stacked, chartType, title, showLegend, colors, numberFormat])
 
+  // `react-chartjs-2`'s own `<canvas>` already carries `role="img"` by
+  // default -- a wrapping div with its own `role="img"` would give the
+  // chart two competing accessible-image nodes for the same content, which
+  // is what `getByRole('img')` (rightly) treats as ambiguous. The
+  // accessible name is set directly on the canvas itself instead (spread
+  // into `canvasProps` by `react-chartjs-2`, landing on the one real node).
   return (
-    <div className="flex flex-col gap-2">
-      <h3 className="text-sm font-semibold">📈 {t('results.chart')}</h3>
-      <div className="rounded-md border border-[var(--border)] p-3" style={{ height: 320 }}>
-        {adapted.kind === 'bar' ? <Bar data={data} options={options} /> : <Line data={data} options={options} />}
-      </div>
+    <div style={{ height: 340 }}>
+      <Chart type={prepared.chartJsType} data={data} options={options} aria-label={title || `${chartType} chart`} />
     </div>
   )
 }

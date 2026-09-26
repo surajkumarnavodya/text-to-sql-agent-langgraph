@@ -1,9 +1,17 @@
-import { ImagePlus } from 'lucide-react'
+import { Paperclip } from 'lucide-react'
 import { useRef, type ChangeEvent } from 'react'
 import { useTranslation } from 'react-i18next'
 import { Button } from '@/components/ui/button'
 
-/** The file-picker half of image attachment -- a plain icon button + a
+/** Every extension attachments/validation.py's EXTENSION_TO_MEDIA_TYPE
+ * allowlist accepts -- kept in sync with that server-side allowlist since
+ * this is a UX convenience filter only (the real validation is server-side,
+ * same "not a security boundary" posture frontend/src/lib/imageValidation.ts
+ * already documents for images specifically). */
+const ACCEPTED_EXTENSIONS =
+  '.png,.jpg,.jpeg,.webp,.gif,.pdf,.txt,.md,.markdown,.json,.csv,.docx,.xlsx,.pptx'
+
+/** The file-picker half of chat attachments -- a plain icon button + a
  * hidden `<input type="file">`. Drag-and-drop and clipboard paste are
  * wired directly onto ChatInput's own container instead of duplicated
  * here (they need to work anywhere in the composer, not just on this one
@@ -32,7 +40,7 @@ export function ImageUploader({
       <input
         ref={inputRef}
         type="file"
-        accept="image/png,image/jpeg,image/webp,image/gif"
+        accept={ACCEPTED_EXTENSIONS}
         multiple
         onChange={handleChange}
         className="hidden"
@@ -44,11 +52,11 @@ export function ImageUploader({
         size="icon"
         onClick={() => inputRef.current?.click()}
         disabled={disabled}
-        aria-label={t('image.attach')}
-        title={t('image.attach')}
+        aria-label={t('attachments.attach')}
+        title={t('attachments.attach')}
         className="rounded-xl"
       >
-        <ImagePlus className="h-4 w-4" />
+        <Paperclip className="h-4 w-4" />
       </Button>
     </>
   )

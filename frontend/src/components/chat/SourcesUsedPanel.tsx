@@ -2,6 +2,7 @@ import { useTranslation } from 'react-i18next'
 import { Badge } from '@/components/ui/badge'
 import { Markdown } from '@/components/ui/markdown'
 import type { AskResponse } from '@/lib/types'
+import { AttachmentResultCard } from './AttachmentResultCard'
 import { MediaResultCard } from './MediaResultCard'
 import { MediaSearchResultCard } from './MediaSearchResultCard'
 import { SourceAnswerCard } from './SourceAnswerCard'
@@ -13,6 +14,7 @@ const SOURCE_CHIP_LABELS: Record<string, string> = {
   web: 'Web',
   generation: 'Generated Media',
   media_search: 'Media Library',
+  attachments: 'Attached Files',
 }
 
 /** Shows which source(s) contributed, and either the synthesized combined
@@ -52,6 +54,7 @@ export function SourcesUsedPanel({ state, entryId }: { state: AskResponse; entry
           {state.document_result && <SourceAnswerCard sourceKey="document_result" result={state.document_result} />}
           {state.policy_result && <SourceAnswerCard sourceKey="policy_result" result={state.policy_result} />}
           {state.web_result && <SourceAnswerCard sourceKey="web_result" result={state.web_result} />}
+          {state.attachment_result && <AttachmentResultCard result={state.attachment_result} />}
         </>
       )}
       {state.generation_result && <MediaResultCard result={state.generation_result} entryId={entryId} />}

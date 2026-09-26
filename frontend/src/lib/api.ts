@@ -2,15 +2,23 @@ import { getBearerToken } from '@/store/authStore'
 import type {
   AskRequest,
   AskResponse,
+  AttachmentCapabilities,
+  AttachmentUploadResponse,
   Collection,
+  DetectTextRegionsResponse,
   DocumentListResponse,
   DocumentUploadResponse,
   ExecuteRequest,
   ExecuteResponse,
   GoldenExampleFeedbackRequest,
   HealthResponse,
+  ImageEditResultResponse,
+  ImageRegionIn,
+  ImageResizeRequest,
   MediaGenerationResult,
   MediaSearchResult,
+  MessageFeedbackRequest,
+  OcrExtractResponse,
   SchemaRefreshResponse,
   SensitivityCategory,
   TablesResponse,
@@ -27,19 +35,76 @@ export class ApiError extends Error {
   }
 }
 
+/** Registered by `AuthGate.tsx` (`localAuthStore.handleUnauthorized`) once
+ * on app mount -- kept as a setter rather than a direct import so this
+ * module never has to import the store (which already imports this
+ * module, via `identityApi.ts`'s own `request()` reuse). A real gap found
+ * via live use: `access_token_expire_minutes` defaults to 15 minutes
+ * (`config/settings.py`), and before this existed nothing in the frontend
+ * noticed when that access token went stale mid-session -- every call
+ * failed with a bare "Missing or invalid Authorization header." until the
+ * user manually reloaded the page (the only thing that re-ran
+ * `localAuthStore.initialize()`'s own refresh-via-cookie check). Returning
+ * `null` (no live session to recover) is a normal, expected outcome, not
+ * an error -- `request()` just lets the original 401 propagate then. */
+type UnauthorizedHandler = () => Promise<string | null>
+let unauthorizedHandler: UnauthorizedHandler | undefined
+export function setUnauthorizedHandler(handler: UnauthorizedHandler): void {
+  unauthorizedHandler = handler
+}
+
+// Shared across every concurrent 401 so a burst of simultaneous requests
+// (easily hit in practice -- this app fires several independent calls on
+// load) triggers exactly one `/auth/refresh` call, not one per request.
+let refreshInFlight: Promise<string | null> | null = null
+
 /** Exported so `frontend/src/lib/identityApi.ts` can reuse the exact same
  * fetch/error-handling/auth-header logic for `/auth/*` calls, rather than
  * duplicating it -- every other function in this file is just a thin
- * wrapper around this one. */
-export async function request<T>(path: string, init?: RequestInit): Promise<T> {
+ * wrapper around this one.
+ *
+ * `overrideToken` is internal-only (the retry-after-refresh path sets it) --
+ * every real call site omits it. Passed explicitly rather than relying on
+ * the retry's own `getBearerToken()` call to pick up whatever
+ * `unauthorizedHandler` just wrote to its store: that's true in production
+ * (`localAuthStore.handleUnauthorized` does update the store before
+ * returning), but making the retry depend on that ordering as an implicit
+ * side effect, rather than just using the token already in hand, is a
+ * needless, fragile coupling between two separate modules. */
+export async function request<T>(
+  path: string,
+  init?: RequestInit,
+  overrideToken?: string,
+): Promise<T> {
+  const isRetryAfterRefresh = overrideToken !== undefined
   const headers = new Headers(init?.headers)
-  const token = getBearerToken()
+  const token = overrideToken ?? getBearerToken()
   if (token) headers.set('Authorization', `Bearer ${token}`)
   if (init?.body && !(init.body instanceof FormData) && !headers.has('Content-Type')) {
     headers.set('Content-Type', 'application/json')
   }
 
   const response = await fetch(path, { ...init, headers })
+
+  // `/auth/*` itself is deliberately exempt -- `/auth/refresh` failing its
+  // own 401 must never re-trigger another refresh attempt (infinite
+  // recursion), and a `/auth/login` 401 is a real "wrong password," not a
+  // stale-token condition a silent refresh could ever fix.
+  if (
+    response.status === 401 &&
+    !isRetryAfterRefresh &&
+    !path.startsWith('/auth/') &&
+    unauthorizedHandler
+  ) {
+    refreshInFlight ??= unauthorizedHandler().finally(() => {
+      refreshInFlight = null
+    })
+    const refreshedToken = await refreshInFlight
+    if (refreshedToken) {
+      return request<T>(path, init, refreshedToken)
+    }
+  }
+
   if (!response.ok) {
     let detail = `Request failed with status ${response.status}.`
     try {
@@ -83,6 +148,13 @@ export function submitGoldenExampleFeedback(
   return request('/feedback/golden-example', { method: 'POST', body: JSON.stringify(payload) })
 }
 
+/** General like/dislike + optional comment on any answer -- see
+ * ResponseFeedbackWidget.tsx. Independent of submitGoldenExampleFeedback
+ * above, which only ever fires for a confirmed SQL result. */
+export function submitMessageFeedback(payload: MessageFeedbackRequest): Promise<{ saved: boolean }> {
+  return request('/feedback/message', { method: 'POST', body: JSON.stringify(payload) })
+}
+
 export function refreshSchema(): Promise<SchemaRefreshResponse> {
   return request<SchemaRefreshResponse>('/schema/refresh', { method: 'POST' })
 }
@@ -115,6 +187,71 @@ export function uploadDocument(
 
 export function deleteDocument(documentId: string): Promise<void> {
   return request<void>(`/documents/${documentId}`, { method: 'DELETE' })
+}
+
+/** Uploads one or more chat attachments -- validates, malware-scans,
+ * stores, and eagerly processes each file server-side, returning per-file
+ * status/errors (see useChatAttachments.ts, api/attachments.py). A file's
+ * `attachment_id` in the response is what gets passed as
+ * `AskRequest.attachment_ids`. */
+export function uploadAttachments(files: File[]): Promise<AttachmentUploadResponse> {
+  const form = new FormData()
+  for (const file of files) form.append('files', file)
+  return request<AttachmentUploadResponse>('/attachments/upload', { method: 'POST', body: form })
+}
+
+export function deleteAttachment(attachmentId: string): Promise<void> {
+  return request<void>(`/attachments/${attachmentId}`, { method: 'DELETE' })
+}
+
+/** What this deployment can actually do with an attachment right now
+ * (`GET /attachments/capabilities`) -- vision/OCR/resize/text-removal
+ * availability, size limits, resize presets. See AttachmentCapabilities's
+ * own docstring for why the composer's image-action menu must read this
+ * rather than assuming every action is always available. */
+export function getAttachmentCapabilities(): Promise<AttachmentCapabilities> {
+  return request<AttachmentCapabilities>('/attachments/capabilities')
+}
+
+/** "Extract text" -- runs real OCR (Tesseract) server-side and returns
+ * exactly what it recognized, never a vision-model paraphrase. Distinct
+ * from asking a natural-language question about an image via `/ask`. */
+export function extractAttachmentText(attachmentId: string): Promise<OcrExtractResponse> {
+  return request<OcrExtractResponse>(`/attachments/${attachmentId}/extract-text`, { method: 'POST' })
+}
+
+/** Proposes OCR-detected text-line regions for the "Remove text" workflow's
+ * confirm/adjust step -- no pixels are edited by this call. */
+export function detectAttachmentTextRegions(attachmentId: string): Promise<DetectTextRegionsResponse> {
+  return request<DetectTextRegionsResponse>(`/attachments/${attachmentId}/detect-text-regions`)
+}
+
+/** "Remove text" -- real pixel editing via classical (OpenCV) inpainting,
+ * never a solid rectangle or a CSS overlay. `regions` is either
+ * OCR-proposed (caller-confirmed) or manually drawn, in source-image pixel
+ * coordinates. Always returns a brand-new attachment; the original is
+ * untouched. */
+export function removeAttachmentText(
+  attachmentId: string,
+  regions: ImageRegionIn[],
+): Promise<ImageEditResultResponse> {
+  return request<ImageEditResultResponse>(`/attachments/${attachmentId}/remove-text`, {
+    method: 'POST',
+    body: JSON.stringify({ regions }),
+  })
+}
+
+/** "Resize" -- deterministic Pillow work, no model call. Always returns a
+ * brand-new attachment; if its `attachment_id` is then attached to a
+ * follow-up question, the *resized* bytes are what reach the model. */
+export function resizeAttachmentImage(
+  attachmentId: string,
+  body: ImageResizeRequest,
+): Promise<ImageEditResultResponse> {
+  return request<ImageEditResultResponse>(`/attachments/${attachmentId}/resize`, {
+    method: 'POST',
+    body: JSON.stringify(body),
+  })
 }
 
 export async function downloadDocument(documentId: string, filename: string): Promise<void> {

@@ -37,6 +37,67 @@ if (typeof Blob !== 'undefined' && !Blob.prototype.arrayBuffer) {
   }
 }
 
+// ResizeObserver is used internally by Chart.js (`chart.js`'s DomPlatform
+// binds one to track canvas-container attach/detach and size changes) --
+// jsdom doesn't implement it, so any test that re-renders an already-mounted
+// chart (a type/option change, not just the initial mount) would otherwise
+// throw deep inside Chart.js's own resize-binding code. Real browsers have
+// always had this, so ResultChart.tsx is written against the real API; this
+// is a minimal stub, not a behavior mock -- it only needs to exist.
+if (typeof window.ResizeObserver === 'undefined') {
+  window.ResizeObserver = class ResizeObserverStub {
+    observe() {}
+    unobserve() {}
+    disconnect() {}
+  }
+}
+
+// jsdom's `HTMLCanvasElement.getContext('2d')` is unimplemented (confirmed:
+// logs "Not implemented" and returns `undefined`). Chart.js treats a falsy
+// context not as "no-op the draw calls" but as a fully-failed construction
+// (`this.canvas`/`this._responsiveListeners` stay `undefined` forever, and
+// `_initialize()`/`bindEvents()` are skipped entirely -- see chart.js's own
+// `Chart` constructor) -- a half-built instance that then crashes deep
+// inside its own attach/detach resize-bind logic
+// (`Cannot read properties of null (reading 'ownerDocument')`) the moment
+// anything calls `.update()` on it, e.g. a chart-type/option change. A
+// minimal fake 2D context (every method no-ops; unknown members are stubbed
+// on first access) lets Chart.js's real construction/lifecycle path run
+// instead of aborting early into that broken state -- this is a jsdom
+// capability gap being polyfilled, the same category as the ResizeObserver
+// stub above and the deliberate choice (documented in
+// ResultChart.test.tsx) not to pull in the full `canvas` npm package just
+// for pixel output nobody asserts on here.
+if (typeof HTMLCanvasElement !== 'undefined') {
+  const fakeContext2d = (canvas: HTMLCanvasElement) =>
+    new Proxy(
+      { canvas } as unknown as CanvasRenderingContext2D,
+      {
+        get(target, prop) {
+          if (prop in target) return (target as unknown as Record<string | symbol, unknown>)[prop]
+          if (prop === 'measureText') return () => ({ width: 0 })
+          if (prop === 'createLinearGradient' || prop === 'createRadialGradient') {
+            return () => ({ addColorStop: () => {} })
+          }
+          if (prop === 'getImageData') return () => ({ data: [] })
+          if (prop === 'isPointInPath' || prop === 'isPointInStroke') return () => false
+          return () => {}
+        },
+        set(target, prop, value) {
+          ;(target as unknown as Record<string | symbol, unknown>)[prop] = value
+          return true
+        },
+      },
+    )
+
+  HTMLCanvasElement.prototype.getContext = function fakeGetContext(
+    this: HTMLCanvasElement,
+    contextId: string,
+  ) {
+    return contextId === '2d' ? fakeContext2d(this) : null
+  } as typeof HTMLCanvasElement.prototype.getContext
+}
+
 // matchMedia is used by useTheme/usePwaInstall-style hooks that check
 // `prefers-color-scheme`/`prefers-reduced-motion` -- jsdom doesn't implement
 // it, so components that call it would otherwise throw in every test.

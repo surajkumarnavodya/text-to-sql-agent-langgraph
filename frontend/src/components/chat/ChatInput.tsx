@@ -11,13 +11,18 @@ import {
   type KeyboardEvent,
 } from 'react'
 import { useTranslation } from 'react-i18next'
-import { AttachmentChip } from '@/components/image/AttachmentChip'
+import { ChatAttachmentChip } from '@/components/chat/ChatAttachmentChip'
 import { ImageUploader } from '@/components/image/ImageUploader'
 import { ImageViewer } from '@/components/image/ImageViewer'
+import { OcrResultDialog } from '@/components/image/OcrResultDialog'
+import { RemoveTextDialog } from '@/components/image/RemoveTextDialog'
+import { ResizeImageDialog } from '@/components/image/ResizeImageDialog'
 import { Button } from '@/components/ui/button'
-import { useHealth } from '@/hooks/queries'
-import { useImageAttachments } from '@/hooks/useImageAttachments'
+import { useToast } from '@/components/ui/toast'
+import { useChatAttachments } from '@/hooks/useChatAttachments'
+import { useAttachmentCapabilities, useHealth } from '@/hooks/queries'
 import { useVoiceConversation } from '@/hooks/useVoiceConversation'
+import type { SentAttachmentPreview } from '@/lib/history'
 import { useSettingsStore } from '@/store/settingsStore'
 import { useChatStore } from '@/store/chatStore'
 
@@ -73,20 +78,43 @@ export function ChatInput() {
 
   const pendingQuestion = useChatStore((state) => state.pendingQuestion)
   const askQuestion = useChatStore((state) => state.askQuestion)
+  const tryApplyChartTypeFollowup = useChatStore((state) => state.tryApplyChartTypeFollowup)
   const cancelPendingQuestion = useChatStore((state) => state.cancelPendingQuestion)
   const disabled = pendingQuestion !== null
+  const { toast } = useToast()
 
   const voice = useVoiceConversation((text) => {
     setValue(text)
     setFromVoice(true)
   })
 
-  const attachments = useImageAttachments()
+  const attachments = useChatAttachments()
+  const capabilities = useAttachmentCapabilities()
   const [editingImageId, setEditingImageId] = useState<string | null>(null)
   const [viewingImageId, setViewingImageId] = useState<string | null>(null)
+  const [ocrImageId, setOcrImageId] = useState<string | null>(null)
+  const [resizeImageId, setResizeImageId] = useState<string | null>(null)
+  const [removeTextImageId, setRemoveTextImageId] = useState<string | null>(null)
   const [isDraggingOver, setIsDraggingOver] = useState(false)
-  const editingImage = attachments.images.find((img) => img.id === editingImageId) ?? null
-  const viewingImage = attachments.images.find((img) => img.id === viewingImageId) ?? null
+  const editingImage = attachments.attachments.find((item) => item.id === editingImageId) ?? null
+  const viewingImage = attachments.attachments.find((item) => item.id === viewingImageId) ?? null
+  const ocrImage = attachments.attachments.find((item) => item.id === ocrImageId) ?? null
+  const resizeImage = attachments.attachments.find((item) => item.id === resizeImageId) ?? null
+  const removeTextImage = attachments.attachments.find((item) => item.id === removeTextImageId) ?? null
+
+  // "Attach resized/edited image" replaces the source chip with the new,
+  // server-derived one -- the user asked to edit *this* image, so the
+  // composer should hold the edited result afterward, not both versions
+  // (see useChatAttachments.ts's addProcessedResult docstring for why this
+  // never re-uploads anything).
+  const replaceWithProcessedResult = (
+    sourceId: string,
+    result: Parameters<typeof attachments.addProcessedResult>[0],
+    filename: string,
+  ) => {
+    attachments.removeAttachment(sourceId)
+    void attachments.addProcessedResult(result, filename)
+  }
 
   const handleDrop = (event: DragEvent<HTMLDivElement>) => {
     event.preventDefault()
@@ -115,7 +143,29 @@ export function ChatInput() {
 
   const submit = async () => {
     const trimmed = value.trim()
-    if (!trimmed || disabled) return
+    // Blocked while any attachment is still uploading/processing -- sending
+    // early would either omit it entirely or race the server still writing
+    // its record, neither of which should silently happen.
+    if (!trimmed || disabled || attachments.isUploading) return
+
+    // A "show this as a pie chart"/"switch to line" style follow-up is
+    // answered instantly, client-side, against the most recent chartable
+    // turn -- never sent to the agent as if it were a real question (see
+    // chatStore.tryApplyChartTypeFollowup's own docstring for why: the SQL
+    // agent has no way to act on it, and re-running SQL for a pure
+    // visualization change would be wasted work the user never asked for).
+    const chartFollowup = tryApplyChartTypeFollowup(trimmed)
+    if (chartFollowup.handled) {
+      setValue('')
+      setFromVoice(false)
+      if (textareaRef.current) textareaRef.current.style.height = 'auto'
+      toast({
+        title: chartFollowup.message,
+        variant: chartFollowup.applied ? 'success' : 'info',
+      })
+      return
+    }
+
     const voiceOriginated = fromVoice
     setValue('')
     setFromVoice(false)
@@ -126,7 +176,47 @@ export function ChatInput() {
     // fire one.
     if (textareaRef.current) textareaRef.current.style.height = 'auto'
 
-    const entry = await askQuestion(trimmed, { originatedFromVoice: voiceOriginated })
+    // An immutable snapshot of what's attached right now, taken before the
+    // request is built -- both for this question's own chat bubble (below)
+    // and as the ids actually sent (`attachments.readyAttachmentIds` reads
+    // live state, so it must be captured alongside this, not re-read after
+    // the composer is cleared further down). A fresh `URL.createObjectURL`
+    // (never the composer's own `previewUrl`) keeps this thumbnail alive
+    // even after the composer's own chip is cleared/removed, which revokes
+    // `previewUrl` itself.
+    const submissionAttachmentIds = attachments.readyAttachmentIds
+    const sentAttachments: SentAttachmentPreview[] = attachments.attachments
+      .filter((item) => item.status === 'ready' && item.attachmentId)
+      .map((item) => ({
+        filename: item.file.name,
+        kind: item.kind,
+        previewUrl:
+          item.kind !== 'image'
+            ? null
+            : (item.editedDataUrl ?? URL.createObjectURL(item.file)),
+      }))
+
+    const entry = await askQuestion(trimmed, {
+      originatedFromVoice: voiceOriginated,
+      attachmentIds: submissionAttachmentIds,
+      sentAttachments,
+    })
+
+    // Clear the composer's pending attachment chips once the backend has
+    // actually accepted and answered the request -- a non-empty
+    // `session_id` is the signal for that (see AskResponse.session_id's own
+    // docstring: askQuestion only ever returns an empty one when the call
+    // never reached the backend at all -- aborted/cancelled, or genuinely
+    // unreachable -- in which case the attachments are left in place so the
+    // user can retry without re-selecting files). This clears regardless of
+    // whether the agent's own answer succeeded or failed, since "the model
+    // couldn't answer" still means the attachment was received and
+    // processed -- the sent bubble above already carries its own read-only
+    // reference, so nothing is lost by clearing the now-stale pending chips.
+    if (entry.finalState.session_id) {
+      attachments.clearAll()
+    }
+
     if (voiceOriginated && entry.spokenAudioUrl) {
       await voice.playAnswer(entry.spokenAudioUrl)
     }
@@ -177,20 +267,32 @@ export function ChatInput() {
         isDraggingOver ? 'border-[var(--accent)] bg-[var(--accent-soft)]' : 'border-[var(--border)] bg-[var(--card)]'
       }`}
     >
-      {attachments.images.length > 0 && (
+      {attachments.attachments.length > 0 && (
         <div className="flex flex-col gap-1.5 border-b border-[var(--border)] pb-2">
           <div className="flex flex-wrap gap-2">
-            {attachments.images.map((image) => (
-              <AttachmentChip
-                key={image.id}
-                image={image}
-                onEdit={() => setEditingImageId(image.id)}
-                onRemove={() => attachments.removeImage(image.id)}
-                onView={() => setViewingImageId(image.id)}
+            {attachments.attachments.map((item) => (
+              <ChatAttachmentChip
+                key={item.id}
+                attachment={item}
+                onEdit={item.kind === 'image' ? () => setEditingImageId(item.id) : undefined}
+                onRemove={() => attachments.removeAttachment(item.id)}
+                onView={item.kind === 'image' ? () => setViewingImageId(item.id) : undefined}
+                onExtractText={
+                  item.kind === 'image' && capabilities.data?.ocr ? () => setOcrImageId(item.id) : undefined
+                }
+                onResize={
+                  item.kind === 'image' && capabilities.data?.image_resize
+                    ? () => setResizeImageId(item.id)
+                    : undefined
+                }
+                onRemoveText={
+                  item.kind === 'image' && capabilities.data?.image_text_removal
+                    ? () => setRemoveTextImageId(item.id)
+                    : undefined
+                }
               />
             ))}
           </div>
-          <p className="text-[11px] text-[var(--muted-foreground)]">{t('image.localOnlyNotice')}</p>
         </div>
       )}
       <div className="flex items-end gap-2">
@@ -240,7 +342,7 @@ export function ChatInput() {
           // docs/frontend-ui-audit.md), but the single outstanding /ask
           // request can genuinely be aborted (AbortController, chatStore
           // .cancelPendingQuestion), so this is a real cancel, not a fake one.
-          disabled={!disabled && (voiceLocked || !value.trim())}
+          disabled={!disabled && (voiceLocked || !value.trim() || attachments.isUploading)}
           aria-label={disabled ? t('common.stop') : t('chat.send')}
           title={disabled ? t('common.stop') : t('chat.send')}
           className="rounded-xl"
@@ -277,7 +379,7 @@ export function ChatInput() {
           <ImageEditor
             open={editingImageId !== null}
             onOpenChange={(open) => !open && setEditingImageId(null)}
-            imageSrc={editingImage.editedDataUrl ?? editingImage.originalUrl}
+            imageSrc={editingImage.editedDataUrl ?? editingImage.previewUrl ?? ''}
             fileName={editingImage.file.name}
             onSave={(dataUrl) => attachments.setEditedImage(editingImage.id, dataUrl)}
           />
@@ -287,8 +389,41 @@ export function ChatInput() {
         <ImageViewer
           open={viewingImageId !== null}
           onOpenChange={(open) => !open && setViewingImageId(null)}
-          imageSrc={viewingImage.editedDataUrl ?? viewingImage.originalUrl}
+          imageSrc={viewingImage.editedDataUrl ?? viewingImage.previewUrl ?? ''}
           altText={viewingImage.file.name}
+        />
+      )}
+      {ocrImage?.attachmentId && (
+        <OcrResultDialog
+          open={ocrImageId !== null}
+          onOpenChange={(open) => !open && setOcrImageId(null)}
+          attachmentId={ocrImage.attachmentId}
+          filename={ocrImage.file.name}
+        />
+      )}
+      {resizeImage?.attachmentId && (
+        <ResizeImageDialog
+          open={resizeImageId !== null}
+          onOpenChange={(open) => !open && setResizeImageId(null)}
+          attachmentId={resizeImage.attachmentId}
+          filename={resizeImage.file.name}
+          previewUrl={resizeImage.editedDataUrl ?? resizeImage.previewUrl}
+          presets={capabilities.data?.resize_presets ?? []}
+          maxDimension={capabilities.data?.max_resize_dimension_px ?? 4096}
+          onResized={(result) => resizeImageId && replaceWithProcessedResult(resizeImageId, result, resizeImage.file.name)}
+        />
+      )}
+      {removeTextImage?.attachmentId && (
+        <RemoveTextDialog
+          open={removeTextImageId !== null}
+          onOpenChange={(open) => !open && setRemoveTextImageId(null)}
+          attachmentId={removeTextImage.attachmentId}
+          filename={removeTextImage.file.name}
+          previewUrl={removeTextImage.editedDataUrl ?? removeTextImage.previewUrl}
+          maxRegions={capabilities.data?.max_text_removal_regions ?? 20}
+          onEdited={(result) =>
+            removeTextImageId && replaceWithProcessedResult(removeTextImageId, result, removeTextImage.file.name)
+          }
         />
       )}
     </div>

@@ -1,9 +1,29 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { deleteDocument, getHealth, getSchemaTables, listDocuments, refreshSchema, uploadDocument } from '@/lib/api'
+import {
+  deleteDocument,
+  getAttachmentCapabilities,
+  getHealth,
+  getSchemaTables,
+  listDocuments,
+  refreshSchema,
+  uploadDocument,
+} from '@/lib/api'
 import type { Collection, SensitivityCategory } from '@/lib/types'
 
 export function useHealth() {
   return useQuery({ queryKey: ['health'], queryFn: getHealth, staleTime: 30_000 })
+}
+
+/** What this deployment can actually do with an attachment right now
+ * (vision/OCR/resize/text-removal) -- see AttachmentCapabilities's own
+ * docstring. Cached the same 30s as useHealth above, since it changes only
+ * with server config, never per-request. */
+export function useAttachmentCapabilities() {
+  return useQuery({
+    queryKey: ['attachment-capabilities'],
+    queryFn: getAttachmentCapabilities,
+    staleTime: 30_000,
+  })
 }
 
 export function useSchemaTables() {
