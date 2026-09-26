@@ -50,9 +50,12 @@ defusedxml==0.7.1
 pymupdf==1.28.2
 
 # Result formatting/charting (agent/result_charting.py, db/column_formatting.py) --
-# consumed by the /execute API endpoint, whose chart JSON the React
-# dashboard renders via chart.js (frontend/src/lib/chartAdapter.ts).
-plotly==5.24.1
+# only pandas dtype inference is needed (classify_columns/recommend_chart
+# just emit column-type metadata + a suggested starting chart type; actual
+# chart rendering moved fully client-side, frontend/src/lib/chartEngine.ts,
+# so the user can switch chart types without a server round trip). plotly
+# was removed from this list -- it was only ever used here to build a
+# server-rendered Plotly figure JSON, which this pass replaced.
 # pandas==2.2.3 predates Python 3.14 and segfaults (access violation deep in
 # pandas.core.arrays.datetimes._construct_from_dt64_naive) building a
 # DataFrame from any row data containing a raw datetime.datetime value --
@@ -158,6 +161,16 @@ pytesseract==0.3.13
 # the vulnerable formats are in that allowlist -- but the bump is a same-API,
 # low-risk hygiene fix (full test suite reran clean after it).
 pillow==12.3.0
+
+# --- Chat attachment document processing (attachments/processors/) -- see
+# .env.example's ENABLE_CHAT_ATTACHMENTS section. PDF text extraction reuses
+# pypdf (already pinned above); OCR for scanned pages reuses pytesseract
+# (already pinned above, via media/ocr.py). openpyxl was already present
+# transitively (a pandas Excel-engine dependency); pinned explicitly now
+# that attachments/processors/xlsx_processor.py imports it directly.
+python-docx==1.2.0
+openpyxl==3.1.5
+python-pptx==1.0.2
 
 # Config
 # Bumped 1.0.1 -> 1.2.2 (2026 Phase 1 dependency pass) for CVE-2026-28684

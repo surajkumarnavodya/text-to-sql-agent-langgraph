@@ -13,10 +13,18 @@
             |    default, Settings.enable_media_generation; image
             |    generation confirmed working end-to-end against a
             |    real IMA account, see media_gen/client.py)
-            +-> media_search  -+
-                (media.search.search_media -- off by default,
-                 Settings.enable_media_search; local CLIP embeddings
-                 over an untagged image/video library, see media/)
+            +-> media_search   +
+            |   (media.search.search_media -- off by default,
+            |    Settings.enable_media_search; local CLIP embeddings
+            |    over an untagged image/video library, see media/)
+            +-> attachments   -+
+                (attachments.graph.run_attachment_qa -- files the caller
+                 attached directly to this question, e.g. an uploaded
+                 image/PDF/DOCX/XLSX/PPTX/TXT/CSV/JSON, see attachments/.
+                 Unlike every other source above, availability depends on
+                 the request, not standing config, and router_node forces
+                 it into the route unconditionally once available -- see
+                 that node's own docstring)
 
 `route_after_router` returns a *list* of destination node names -- LangGraph
 runs every one of them as a parallel branch before the graph proceeds to
@@ -30,14 +38,19 @@ in place of `agent.graph.run_agent` directly. It is deliberately a
 two-path function, not a graph with one trivial branch:
 
   - `Settings.enable_multi_source_router` is False (the default -- see
-    `.env.example`): `run_orchestrated` calls `agent.graph.run_agent`
-    directly and returns its result completely unwrapped. This is not "the
-    orchestrator graph with one destination" -- it is the exact same
-    function call the API made before this package existed, so a fresh
-    clone with today's `.env` behaves identically to today's app, per
-    CLAUDE.md's Part 7 constraint. `eval/runner.py` and the standalone
-    scripts also keep calling `run_agent` directly and are entirely
-    unaffected by anything in this package.
+    `.env.example`) AND the caller attached no files: `run_orchestrated`
+    calls `agent.graph.run_agent` directly and returns its result
+    completely unwrapped. This is not "the orchestrator graph with one
+    destination" -- it is the exact same function call the API made before
+    this package existed, so a fresh clone with today's `.env` behaves
+    identically to today's app, per CLAUDE.md's Part 7 constraint.
+    `eval/runner.py` and the standalone scripts also keep calling
+    `run_agent` directly and are entirely unaffected by anything in this
+    package. A non-empty `attachment_ids` breaks this short-circuit
+    deliberately (see `run_orchestrated`'s own docstring) -- attaching a
+    file needs the orchestrator graph to actually run regardless of the
+    router flag, since there is no other path that would ever call
+    `attachments.graph.run_attachment_qa`.
   - True: the orchestrator graph below actually runs. With only `sql`
     configured (the common case even with the flag on), `router_node`
     short-circuits to `sql_subgraph_node`, which itself just calls
@@ -60,6 +73,7 @@ from langgraph.graph import END, StateGraph
 
 from agent.graph import run_agent
 from agent.orchestrator.nodes import (
+    attachment_node,
     document_rag_node,
     generation_node,
     media_search_node,
@@ -97,6 +111,7 @@ def build_orchestrator_graph():
     graph.add_node("web_search", web_search_node)
     graph.add_node("generation", generation_node)
     graph.add_node("media_search", media_search_node)
+    graph.add_node("attachments", attachment_node)
     graph.add_node("synthesis", synthesis_node)
 
     graph.set_entry_point("router")
@@ -110,6 +125,7 @@ def build_orchestrator_graph():
             "web_search": "web_search",
             "generation": "generation",
             "media_search": "media_search",
+            "attachments": "attachments",
         },
     )
     for destination in (
@@ -119,6 +135,7 @@ def build_orchestrator_graph():
         "web_search",
         "generation",
         "media_search",
+        "attachments",
     ):
         graph.add_edge(destination, "synthesis")
     graph.add_edge("synthesis", END)
@@ -133,6 +150,7 @@ def run_orchestrated(
     session_id: str | None = None,
     caller_roles: tuple[str, ...] = (),
     caller_subject: str | None = None,
+    attachment_ids: list[str] | None = None,
 ) -> AgentState | OrchestratorState:
     """Routes a question to one or more sources and returns the combined result.
 
@@ -163,20 +181,37 @@ def run_orchestrated(
             `router_node` prefers this over `session_id` to scope the
             session-level expensive-source cost ceiling, since unlike
             `session_id` it can't be reset by the caller at will.
+        attachment_ids: Files the caller attached directly to this question
+            (`AskRequest.attachment_ids`) -- `None`/empty means no
+            attachments, the common case and the only case that preserves
+            this function's pre-existing "flag off -> call run_agent
+            directly" short-circuit below. A non-empty value makes this
+            function run the orchestrator graph *even when*
+            `Settings.enable_multi_source_router` is off -- attaching a
+            file is a per-request opt-in the caller makes explicitly, not a
+            standing multi-source-routing decision, so it must not require
+            also opting into the (unrelated) multi-source router feature.
+            See `agent.orchestrator.nodes.attachment_node`/`attachments/graph.py`.
 
     Returns:
-        When `Settings.enable_multi_source_router` is off, exactly what
-        `agent.graph.run_agent` returns (an `AgentState`). When on, an
-        `OrchestratorState` -- a superset of `AgentState`'s keys, plus
-        `route_decision`, `sources_used`, and (when 2+ sources fired)
-        `synthesized_answer` -- so `state["status"]`, `state["sql"]`, etc.
-        are readable identically either way.
+        When `Settings.enable_multi_source_router` is off AND no
+        attachments were given, exactly what `agent.graph.run_agent`
+        returns (an `AgentState`). Otherwise an `OrchestratorState` -- a
+        superset of `AgentState`'s keys, plus `route_decision`,
+        `sources_used`, and (when 2+ sources fired) `synthesized_answer` --
+        so `state["status"]`, `state["sql"]`, etc. are readable identically
+        either way.
     """
     settings = get_settings()
-    if not settings.enable_multi_source_router:
+    has_attachments = bool(attachment_ids)
+    if not settings.enable_multi_source_router and not has_attachments:
         return run_agent(question, conversation_history, enable_insight, caller_roles)
 
-    logger.info("Starting orchestrated run for question=%r", question)
+    logger.info(
+        "Starting orchestrated run for question=%r (attachment_count=%d)",
+        question,
+        len(attachment_ids or []),
+    )
     compiled_graph = build_orchestrator_graph()
     # OrchestratorState inherits every AgentState field (see state.py), so
     # its accumulator channels (error_history/attempt_history/stage_timings/
@@ -189,6 +224,7 @@ def run_orchestrated(
         "caller_roles": caller_roles,
         "caller_subject": caller_subject,
         "session_id": session_id,
+        "pending_attachment_ids": attachment_ids or [],
         "rejection_reason": None,
         "rejection_message": None,
         "rate_limit_message": None,
@@ -217,6 +253,7 @@ def run_orchestrated(
         "policy_result": None,
         "web_result": None,
         "generation_result": None,
+        "attachment_result": None,
         "synthesized_answer": None,
     }
     final_state = compiled_graph.invoke(initial_state)

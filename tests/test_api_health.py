@@ -180,3 +180,146 @@ class TestHealth:
 
         assert response.status_code == 503
         assert response.json()["ollama"]["ok"] is False
+
+
+class TestHealthVisionDiagnostics:
+    """A real, reported bug this closes: there was previously no way to
+    tell "vision was never configured" from "configured but the model was
+    never actually pulled" until a user's image question failed at answer
+    time. See api.main._pulled_ollama_model_names's own docstring."""
+
+    def _mock_db_and_chroma(self, monkeypatch):
+        monkeypatch.setattr(
+            "api.main.test_connection",
+            lambda settings: ConnectionTestResult(success=True, message="Connection successful."),
+        )
+        monkeypatch.setattr("api.main.get_chroma_client", lambda settings: object.__new__(object))
+        monkeypatch.setattr(
+            "api.main.get_collection", lambda client, settings, db_name: _FakeCollection(31)
+        )
+
+    def test_vision_disabled_when_no_model_configured(self, monkeypatch, client):
+        self._mock_db_and_chroma(monkeypatch)
+        monkeypatch.setattr(
+            "api.main.get_settings", lambda: _SETTINGS.model_copy(update={"media_vision_model": ""})
+        )
+
+        class _FakeOllamaClient:
+            def __init__(self, host, timeout=None):
+                pass
+
+            def list(self):
+                return {"models": [{"name": "llama3.1:8b", "model": "llama3.1:8b"}]}
+
+        monkeypatch.setattr("ollama.Client", _FakeOllamaClient)
+
+        body = client.get("/health").json()
+        assert body["vision_enabled"] is False
+        assert body["vision_provider"] is None
+        assert body["vision_model"] is None
+        assert body["vision_model_available"] is None
+
+    def test_vision_model_available_true_when_the_configured_model_is_actually_pulled(
+        self, monkeypatch, client
+    ):
+        self._mock_db_and_chroma(monkeypatch)
+        monkeypatch.setattr(
+            "api.main.get_settings",
+            lambda: _SETTINGS.model_copy(update={"media_vision_model": "qwen3.8:27b"}),
+        )
+
+        class _FakeOllamaClient:
+            def __init__(self, host, timeout=None):
+                pass
+
+            def list(self):
+                # Realistic shape: a plain dict, both "name" and "model"
+                # keys present, matching the real /api/tags JSON response.
+                return {
+                    "models": [
+                        {"name": "qwen3.8:27b", "model": "qwen3.8:27b"},
+                        {"name": "llama3.1:8b", "model": "llama3.1:8b"},
+                    ]
+                }
+
+        monkeypatch.setattr("ollama.Client", _FakeOllamaClient)
+
+        body = client.get("/health").json()
+        assert body["vision_enabled"] is True
+        assert body["vision_provider"] == "ollama"
+        assert body["vision_model"] == "qwen3.8:27b"
+        assert body["vision_model_available"] is True
+
+    def test_vision_model_available_false_when_configured_but_never_pulled(
+        self, monkeypatch, client
+    ):
+        """The exact gap this closes: a typo'd or never-pulled model name
+        must be visibly False here, not indistinguishable from "working"
+        until a real user's image question fails."""
+        self._mock_db_and_chroma(monkeypatch)
+        monkeypatch.setattr(
+            "api.main.get_settings",
+            lambda: _SETTINGS.model_copy(update={"media_vision_model": "llava"}),
+        )
+
+        class _FakeOllamaClient:
+            def __init__(self, host, timeout=None):
+                pass
+
+            def list(self):
+                return {"models": [{"name": "llama3.1:8b", "model": "llama3.1:8b"}]}
+
+        monkeypatch.setattr("ollama.Client", _FakeOllamaClient)
+
+        body = client.get("/health").json()
+        assert body["vision_enabled"] is True
+        assert body["vision_model"] == "llava"
+        assert body["vision_model_available"] is False
+
+    def test_vision_model_available_is_none_when_ollama_itself_is_unreachable(
+        self, monkeypatch, client
+    ):
+        self._mock_db_and_chroma(monkeypatch)
+        monkeypatch.setattr(
+            "api.main.get_settings",
+            lambda: _SETTINGS.model_copy(update={"media_vision_model": "llava"}),
+        )
+
+        class _RaisingOllamaClient:
+            def __init__(self, host, timeout=None):
+                pass
+
+            def list(self):
+                raise ConnectionError("Connection refused")
+
+        monkeypatch.setattr("ollama.Client", _RaisingOllamaClient)
+
+        body = client.get("/health").json()
+        assert body["ollama"]["ok"] is False
+        # Ollama itself is unreachable, so the model-name lookup never ran
+        # at all -- vision_enabled stays True (a model IS configured), but
+        # availability honestly reports False (unconfirmed treated as
+        # unavailable) rather than a stale/misleading True.
+        assert body["vision_model_available"] is False
+
+    def test_ocr_enabled_reflects_pytesseract_importability(self, monkeypatch, client):
+        self._mock_db_and_chroma(monkeypatch)
+        monkeypatch.setattr("api.main.get_settings", lambda: _SETTINGS)
+
+        class _FakeOllamaClient:
+            def __init__(self, host, timeout=None):
+                pass
+
+            def list(self):
+                return {"models": []}
+
+        monkeypatch.setattr("ollama.Client", _FakeOllamaClient)
+
+        body = client.get("/health").json()
+        # pytesseract (the Python package) is a real, pinned dependency of
+        # this project (see requirements.txt) -- always importable here,
+        # independent of whether the system Tesseract *binary* is
+        # installed (a separate, request-time-only concern -- see
+        # attachments.capabilities.get_attachment_capabilities's own
+        # docstring for that distinction).
+        assert body["ocr_enabled"] is True

@@ -12,17 +12,22 @@ touched.
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
+from typing import cast
 
 import pytest
+from fastapi import Request
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, text
 
+import agent.rate_limit as rate_limit_module
 import api.main as api_main
 from agent.exceptions import SchemaRetrievalError
 from agent.orchestrator.state import OrchestratorState
 from agent.state import AgentState
 from config.settings import Settings
 from db.schema_introspection import ColumnInfo, TableSchemaInfo
+from security.oidc import AuthIdentity
 from security.secrets import SecretStr
 
 _BASE_SETTINGS = Settings(
@@ -83,6 +88,20 @@ def _reset_ip_limiters():
     api_main._ip_limiters.clear()
     yield
     api_main._ip_limiters.clear()
+
+
+@pytest.fixture(autouse=True)
+def _reset_ask_concurrency_limiters():
+    """`agent.rate_limit`'s ask-concurrency limiters (added in the
+    scale-out hardening pass) are process-wide singletons for the exact
+    same reason `_ip_limiters` above is -- reset before/after every test so
+    one test's un-released acquisitions (a deliberately-not-completed
+    background task, e.g.) can never leak into another."""
+    rate_limit_module._ask_concurrency_limiter = None
+    rate_limit_module._per_caller_ask_concurrency_limiters.clear()
+    yield
+    rate_limit_module._ask_concurrency_limiter = None
+    rate_limit_module._per_caller_ask_concurrency_limiters.clear()
 
 
 @pytest.fixture
@@ -163,6 +182,7 @@ class TestAsk:
             session_id=None,
             caller_roles=(),
             caller_subject=None,
+            attachment_ids=None,
         ):
             captured["question"] = question
             captured["conversation_history"] = conversation_history
@@ -170,6 +190,7 @@ class TestAsk:
             captured["session_id"] = session_id
             captured["caller_roles"] = caller_roles
             captured["caller_subject"] = caller_subject
+            captured["attachment_ids"] = attachment_ids
             return {"status": "succeeded", "error_history": []}
 
         monkeypatch.setattr("api.main.run_orchestrated", _capture)
@@ -212,6 +233,133 @@ class TestAsk:
         # module docstring and api/main.py's /ask handler.
         assert body["error_history"][0] == SchemaRetrievalError("x").safe_message
         assert "Chroma index is empty" not in body["error_history"][0]
+
+    def test_global_concurrency_limit_returns_429_before_any_work_starts(self, monkeypatch, client):
+        """Scale-out hardening pass (docs/SCALE_OUT_PROMPT.md bottleneck
+        #1/#4): once `Settings.max_concurrent_ask_requests` in-flight
+        requests are already admitted, a new one is rejected immediately,
+        with a Retry-After header -- and `run_orchestrated` must never even
+        be called for the rejected request."""
+        monkeypatch.setattr(
+            "api.main.get_settings",
+            lambda: _settings(
+                max_concurrent_ask_requests=1, max_concurrent_ask_requests_per_caller=5
+            ),
+        )
+        # Simulates one already-admitted, still-running request occupying
+        # the only global slot.
+        rate_limit_module.get_ask_concurrency_limiter(1).try_acquire()
+
+        def _fail_if_called(*a, **k):
+            raise AssertionError("run_orchestrated must not be called once the limit is exhausted")
+
+        monkeypatch.setattr("api.main.run_orchestrated", _fail_if_called)
+
+        response = client.post("/ask", json={"question": "How many rows are there?"})
+
+        assert response.status_code == 429
+        assert response.headers["Retry-After"] == "2"
+        assert "capacity" in response.json()["detail"].lower()
+
+    def test_per_caller_concurrency_limit_returns_429_even_with_global_room(
+        self, monkeypatch, client
+    ):
+        """A caller already at their own concurrency cap is rejected even
+        though the global budget still has room -- and the global slot
+        this request provisionally acquired is released again (not
+        leaked) when the per-caller check then fails."""
+        monkeypatch.setattr(
+            "api.main.get_settings",
+            lambda: _settings(
+                max_concurrent_ask_requests=10, max_concurrent_ask_requests_per_caller=1
+            ),
+        )
+        monkeypatch.setattr("api.main._rate_limit_key", lambda identity, request: "test-caller")
+        rate_limit_module.get_per_caller_ask_concurrency_limiter("test-caller", 1).try_acquire()
+
+        def _fail_if_called(*a, **k):
+            raise AssertionError("run_orchestrated must not be called once the limit is exhausted")
+
+        monkeypatch.setattr("api.main.run_orchestrated", _fail_if_called)
+
+        response = client.post("/ask", json={"question": "How many rows are there?"})
+
+        assert response.status_code == 429
+        assert response.headers["Retry-After"] == "2"
+        # The global slot this rejected request provisionally acquired
+        # must be released, not leaked -- proven by a *second* caller
+        # (a different key) still being able to acquire the global budget.
+        global_limiter = rate_limit_module.get_ask_concurrency_limiter(10)
+        assert global_limiter.try_acquire() is True
+
+    def test_successful_requests_release_their_concurrency_slots(self, monkeypatch, client):
+        """Two sequential (not concurrent) successful /ask calls from the
+        same caller both succeed with a per-caller limit of 1 -- proving
+        the slot acquired by the first is released once it actually
+        finishes, not held forever."""
+        monkeypatch.setattr(
+            "api.main.get_settings",
+            lambda: _settings(
+                max_concurrent_ask_requests=5, max_concurrent_ask_requests_per_caller=1
+            ),
+        )
+        monkeypatch.setattr(
+            "api.main.run_orchestrated",
+            lambda *a, **k: {"status": "succeeded", "error_history": []},
+        )
+
+        first = client.post("/ask", json={"question": "How many rows are there?"})
+        second = client.post("/ask", json={"question": "How many rows are there?"})
+
+        assert first.status_code == 200
+        assert second.status_code == 200
+
+    def test_concurrency_slots_are_not_released_until_the_abandoned_work_actually_finishes(
+        self, monkeypatch, client
+    ):
+        """The core release-semantics regression test: a timed-out request's
+        concurrency slot must stay held (not released early just because
+        the HTTP caller stopped waiting) until the abandoned background
+        work actually completes -- see `_run_orchestrated_with_timeout`'s
+        own docstring for why releasing early would defeat the whole point
+        of bounding concurrency. A second request from the same caller,
+        issued immediately after the first times out, must be rejected;
+        only once the background work has had time to actually finish does
+        a third request succeed again."""
+        import time as time_module
+
+        monkeypatch.setattr(
+            "api.main.get_settings",
+            lambda: _settings(
+                request_timeout_seconds=1,
+                max_concurrent_ask_requests=5,
+                max_concurrent_ask_requests_per_caller=1,
+            ),
+        )
+        monkeypatch.setattr("api.main._rate_limit_key", lambda identity, request: "slow-caller")
+
+        def _slow(*a, **k):
+            time_module.sleep(2)
+            return {"status": "succeeded", "error_history": []}
+
+        monkeypatch.setattr("api.main.run_orchestrated", _slow)
+
+        first = client.post("/ask", json={"question": "How many rows are there?"})
+        assert first.status_code == 200
+        assert first.json()["status"] == "failed"  # timed out at the API layer
+
+        # The abandoned background call is still running (it sleeps 2s,
+        # the request timed out after 1s) -- this caller's one concurrency
+        # slot is still held.
+        second = client.post("/ask", json={"question": "How many rows are there?"})
+        assert second.status_code == 429
+
+        # Give the abandoned background call time to actually finish and
+        # fire its release callback.
+        time_module.sleep(2)
+
+        third = client.post("/ask", json={"question": "How many rows are there?"})
+        assert third.status_code == 200
 
     def test_request_timeout_returns_a_failed_status_not_a_hang(self, monkeypatch, client):
         """2026 Phase 3 reliability fix: `POST /ask` no longer blocks
@@ -361,6 +509,55 @@ class TestAsk:
         assert no_header.status_code == 401
         assert wrong_token.status_code == 401
         assert right_token.status_code == 200
+
+
+def _fake_request(host: str | None) -> Request:
+    """A minimal duck-typed stand-in for `fastapi.Request` -- `_rate_limit_key`
+    only ever reads `request.client.host`, so a real `Request` (which needs
+    a full ASGI scope) would be pure ceremony here."""
+    client = SimpleNamespace(host=host) if host is not None else None
+    return cast(Request, SimpleNamespace(client=client))
+
+
+class TestRateLimitKey:
+    """Unit tests for `api.main._rate_limit_key` -- the scale-out
+    hardening pass's fix for bottleneck #3 (rate/concurrency limits keyed
+    by raw client IP, meaningless behind a load balancer or carrier NAT)."""
+
+    def test_local_auth_mode_keys_by_subject_not_ip(self):
+        identity = AuthIdentity(subject="user-123", roles=("user",), mode="local")
+
+        assert api_main._rate_limit_key(identity, _fake_request("10.0.0.5")) == "user:user-123"
+
+    def test_oidc_auth_mode_keys_by_subject_not_ip(self):
+        identity = AuthIdentity(subject="oidc-sub-456", roles=("user",), mode="oidc")
+
+        assert api_main._rate_limit_key(identity, _fake_request("10.0.0.5")) == "user:oidc-sub-456"
+
+    def test_none_auth_mode_falls_back_to_client_ip(self):
+        """`AuthIdentity.subject` is a fixed shared sentinel in "none" mode
+        (every caller looks identical) -- keying by it would put every
+        caller in one bucket, so this mode must fall back to IP."""
+        identity = AuthIdentity(subject="dev-mode", roles=("admin",), mode="none")
+
+        assert api_main._rate_limit_key(identity, _fake_request("203.0.113.7")) == "ip:203.0.113.7"
+
+    def test_static_token_auth_mode_falls_back_to_client_ip(self):
+        identity = AuthIdentity(subject="static-token", roles=("admin",), mode="static_token")
+
+        assert api_main._rate_limit_key(identity, _fake_request("203.0.113.7")) == "ip:203.0.113.7"
+
+    def test_missing_client_falls_back_to_unknown(self):
+        identity = AuthIdentity(subject="static-token", roles=("admin",), mode="static_token")
+
+        assert api_main._rate_limit_key(identity, _fake_request(None)) == "ip:unknown"
+
+    def test_two_different_subjects_get_different_keys(self):
+        request = _fake_request("10.0.0.5")
+        a = AuthIdentity(subject="user-a", roles=("user",), mode="local")
+        b = AuthIdentity(subject="user-b", roles=("user",), mode="local")
+
+        assert api_main._rate_limit_key(a, request) != api_main._rate_limit_key(b, request)
 
 
 class TestSchemaTables:

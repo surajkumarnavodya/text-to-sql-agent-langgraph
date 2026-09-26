@@ -19,14 +19,15 @@ programmatic/scripted access on its own.
 
 from __future__ import annotations
 
-import json
 import logging
 import sys
-import threading
 import time
 import uuid
-from collections.abc import AsyncIterator, Mapping
+from collections.abc import AsyncIterator, Callable, Mapping
+from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FuturesTimeoutError
 from contextlib import asynccontextmanager
+from functools import cache
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -47,10 +48,19 @@ from agent.exceptions import AgentError
 from agent.graph import build_graph
 from agent.llm_client import get_ollama_client
 from agent.orchestrator.graph import build_orchestrator_graph, run_orchestrated
-from agent.rate_limit import QUESTION_LIMIT_MESSAGE, BoundedLimiterCache, SlidingWindowRateLimiter
-from agent.result_charting import build_chart
+from agent.rate_limit import (
+    ASK_CONCURRENCY_LIMIT_MESSAGE,
+    PER_CALLER_ASK_CONCURRENCY_LIMIT_MESSAGE,
+    QUESTION_LIMIT_MESSAGE,
+    BoundedLimiterCache,
+    SlidingWindowRateLimiter,
+    get_ask_concurrency_limiter,
+    get_per_caller_ask_concurrency_limiter,
+)
+from agent.result_charting import classify_columns, recommend_chart
 from agent.sql_validator import enforce_row_limit, qualify_table_schema, validate_sql
 from agent.state import ConversationExchange
+from api.attachments import router as attachments_router
 from api.authz import require_permission
 from api.chat_history import router as chat_history_router
 from api.chat_persistence import persist_ask_turn
@@ -64,7 +74,9 @@ from api.rate_limit import enforce_api_action_rate_limit
 from api.schemas import (
     AskRequest,
     AskResponse,
+    AttachmentResultOut,
     AttemptRecordOut,
+    ChartRecommendationOut,
     CitationOut,
     ColumnOut,
     ComponentHealth,
@@ -78,6 +90,8 @@ from api.schemas import (
     MediaGenerationResultOut,
     MediaSearchHitOut,
     MediaSearchResultOut,
+    MessageFeedbackRequest,
+    MessageFeedbackResponse,
     PerformanceMetricsResponse,
     RequestMetricOut,
     SchemaRefreshResponse,
@@ -101,6 +115,7 @@ from db.execution import execute_readonly_sql
 from db.schema_introspection import introspect_schema
 from embeddings.golden_examples import save_golden_example
 from embeddings.schema_indexer import get_chroma_client, get_collection, refresh_all_schema_indexes
+from feedback.store import save_response_feedback
 from observability.metrics import get_default_metrics
 from security.audit_log import (
     get_correlation_id,
@@ -108,7 +123,7 @@ from security.audit_log import (
     reset_correlation_id,
     set_correlation_id,
 )
-from security.oidc import AuthIdentity
+from security.oidc import AuthIdentity, real_caller_subject
 from security.redaction import redact_configured_secrets, redact_secrets
 
 configure_logging()
@@ -255,6 +270,7 @@ app = FastAPI(
     version="0.1.0",
     lifespan=lifespan,
 )
+app.include_router(attachments_router)
 app.include_router(documents_router)
 app.include_router(media_router)
 app.include_router(generation_router)
@@ -437,24 +453,41 @@ async def _unhandled_exception_handler(request: Request, exc: Exception) -> JSON
     )
 
 
-# Per-client-IP question-submission limiter -- the API has no server-side
-# session concept, so client IP is the closest available scope. The
-# stricter, process-wide LLM-*call* limiter (agent.rate_limit's other
-# limiter) already applies automatically inside generate_sql_node -- this
-# one adds a separate question-submission-level layer on top of it.
-# Bounded (see BoundedLimiterCache's docstring) -- previously a bare dict
-# that grew one entry per distinct client IP forever (2026 Phase 1 security
-# review, finding API-02).
+# Per-caller question-submission limiter. The stricter, process-wide
+# LLM-*call* limiter (agent.rate_limit's other limiter) already applies
+# automatically inside generate_sql_node -- this one adds a separate
+# question-submission-level layer on top of it. Bounded (see
+# BoundedLimiterCache's docstring) -- previously a bare dict that grew one
+# entry per distinct key forever (2026 Phase 1 security review, finding
+# API-02).
 _ip_limiters = BoundedLimiterCache()
 
 
-def _limiter_for(client_ip: str) -> SlidingWindowRateLimiter:
+def _limiter_for(key: str) -> SlidingWindowRateLimiter:
     return _ip_limiters.get_or_create(
-        client_ip,
+        key,
         max_events=get_settings().question_rate_limit_per_minute,
         window_seconds=60.0,
-        name=f"api_questions[{client_ip}]",
+        name=f"api_questions[{key}]",
     )
+
+
+def _rate_limit_key(identity: AuthIdentity, request: Request) -> str:
+    """The key every `/ask`-scoped rate/concurrency limiter uses for one
+    caller -- scale-out hardening pass (`docs/SCALE_OUT_PROMPT.md`
+    bottleneck #3): raw client IP is meaningless behind a load balancer
+    (every caller shares the LB's IP) or carrier NAT (thousands of users
+    share one IP), and this app now has a real per-caller identity
+    whenever local/OIDC auth is configured. Falls back to client IP only
+    when `security.oidc.real_caller_subject` reports there isn't one
+    (`none`/`static_token` modes, where every caller shares one fixed
+    sentinel) -- see that function's own docstring.
+    """
+    subject = real_caller_subject(identity)
+    if subject is not None:
+        return f"user:{subject}"
+    client_ip = request.client.host if request.client else "unknown"
+    return f"ip:{client_ip}"
 
 
 @app.middleware("http")
@@ -486,6 +519,27 @@ def _attempt_records_out(state: Mapping[str, Any]) -> list[AttemptRecordOut]:
     ]
 
 
+def _json_safe_cell(value: Any) -> Any:
+    """Replaces a raw binary value with a short, readable placeholder.
+
+    A real crash, found via live use: `fastapi.encoders.jsonable_encoder`'s
+    default handling for `bytes` is `lambda o: o.decode()` -- a bare UTF-8
+    decode, which raises `UnicodeDecodeError` (crashing the *entire*
+    response, not just that one cell) the moment a SELECT touches a
+    genuinely binary column, e.g. AdventureWorks' own
+    `Production.ProductPhoto.LargePhoto` (a `varbinary(max)` storing real
+    JPEG bytes). This app's SQL validator has no reason to reject such a
+    column (it's an ordinary, safe, read-only SELECT), so this must be
+    handled at serialization time, not prevented upstream. A results table
+    has no useful way to render raw binary anyway, so this is a short
+    placeholder -- never a base64 dump, which could turn one cell into
+    several MB of response body for a large image/blob column.
+    """
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return f"<binary data, {len(value)} bytes>"
+    return value
+
+
 def _rows_to_json(rows: list[Any] | None) -> list[list[Any]] | None:
     """Converts DB result rows to plain JSON-encodable lists.
 
@@ -496,11 +550,12 @@ def _rows_to_json(rows: list[Any] | None) -> list[list[Any]] | None:
     (its dict()/vars() object-fallback path doesn't apply to Row either).
     Converting to `list(row)` first sidesteps that entirely; jsonable_encoder
     still does the real work of encoding each row's actual values (Decimal,
-    datetime, UUID, ...).
+    datetime, UUID, ...) -- `_json_safe_cell` runs first so a binary value
+    never reaches jsonable_encoder's own crash-prone default handling.
     """
     if rows is None:
         return None
-    return jsonable_encoder([list(row) for row in rows])
+    return jsonable_encoder([[_json_safe_cell(value) for value in row] for row in rows])
 
 
 def _redact_text(text: str | None, settings: Any) -> str | None:
@@ -574,6 +629,21 @@ def _media_search_result_out(
     )
 
 
+def _attachment_result_out(
+    result: Mapping[str, Any] | None, settings: Any
+) -> AttachmentResultOut | None:
+    """Converts one `agent.orchestrator.state.AttachmentResult` dict
+    (attachment_result) to its API shape -- None passes through as None."""
+    if result is None:
+        return None
+    return AttachmentResultOut(
+        answer=_redact_text(result.get("answer", ""), settings) or "",
+        status=result.get("status", "succeeded"),
+        used_attachment_ids=result.get("used_attachment_ids", []),
+        vision_unavailable=result.get("vision_unavailable", False),
+    )
+
+
 def _followup_resolved_against_out(
     exchange: Mapping[str, Any] | None,
 ) -> ConversationExchangeOut | None:
@@ -626,6 +696,7 @@ def _ask_response_from_state(
         web_result=_source_answer_out(state.get("web_result"), settings),
         generation_result=_media_generation_result_out(state.get("generation_result"), settings),
         media_search_result=_media_search_result_out(state.get("media_search_result"), settings),
+        attachment_result=_attachment_result_out(state.get("attachment_result"), settings),
         query_plan=(
             [redact_configured_secrets(step, settings) for step in query_plan]
             if query_plan is not None
@@ -645,6 +716,30 @@ def _ask_response_from_state(
         ),
         permission_denied_notice=_redact_text(state.get("permission_denied_notice"), settings),
     )
+
+
+def _pulled_ollama_model_names(list_response: object) -> set[str]:
+    """Extracts pulled model names from an `ollama.Client().list()` result --
+    tolerant of both the real client's `ListResponse` (a `.models` attribute
+    of `Model` objects, each with its own `.model` attribute) and a plain
+    `{"models": [...]}` dict (this project's own existing `/health` test
+    doubles, and what the raw `/api/tags` HTTP response itself looks like),
+    where each entry may be a dict with a `"model"` and/or `"name"` key.
+    Never raises -- an unrecognized shape just yields an empty set, which
+    `HealthResponse.vision_model_available` then correctly reports as
+    "not found" rather than crashing the whole health check.
+    """
+    models = getattr(list_response, "models", None)
+    if models is None and isinstance(list_response, dict):
+        models = list_response.get("models")
+    names: set[str] = set()
+    for model in models or []:
+        name = getattr(model, "model", None)
+        if name is None and isinstance(model, dict):
+            name = model.get("model") or model.get("name")
+        if name:
+            names.add(name)
+    return names
 
 
 @app.get("/health", response_model=HealthResponse)
@@ -697,11 +792,25 @@ def health(response: Response) -> HealthResponse:
             DatabaseHealth(name=config.name, connection=connection, schema_index=schema_index)
         )
 
+    # vision_model_available reuses this same `.list()` call rather than a
+    # second round-trip to Ollama -- see HealthResponse.vision_model_available's
+    # own docstring for why this specific check exists (a real, reported bug:
+    # no way to tell "vision never configured" from "configured but the
+    # model was never actually pulled" until a user's image question failed).
+    pulled_model_names: set[str] = set()
     try:
-        get_ollama_client(settings).list()
+        pulled_model_names = _pulled_ollama_model_names(get_ollama_client(settings).list())
         ollama_health = ComponentHealth(ok=True, detail=f"Reachable at {settings.ollama_host}.")
     except Exception as exc:  # noqa: BLE001 - health check must never crash the endpoint
         ollama_health = ComponentHealth(ok=False, detail=f"Unreachable: {redact_secrets(str(exc))}")
+
+    vision_enabled = bool(settings.media_vision_model)
+    try:
+        import pytesseract  # noqa: F401
+
+        ocr_enabled = True
+    except ImportError:
+        ocr_enabled = False
 
     overall_ok = ollama_health.ok and all(
         db.connection.ok and db.schema_index.ok for db in databases
@@ -714,6 +823,13 @@ def health(response: Response) -> HealthResponse:
         voice_enabled=settings.enable_voice_mode,
         media_search_enabled=settings.enable_media_search,
         local_auth_enabled=settings.local_auth_enabled,
+        vision_enabled=vision_enabled,
+        vision_provider="ollama" if vision_enabled else None,
+        vision_model=settings.media_vision_model or None,
+        vision_model_available=(
+            settings.media_vision_model in pulled_model_names if vision_enabled else None
+        ),
+        ocr_enabled=ocr_enabled,
     )
 
 
@@ -722,6 +838,32 @@ class _AskRequestTimedOut(Exception):
     hasn't returned within `Settings.request_timeout_seconds` -- see that
     setting's docstring for the reliability gap this closes and its
     "stop waiting, not true cancellation" caveat."""
+
+
+@cache
+def _get_ask_executor(max_workers: int) -> ThreadPoolExecutor:
+    """Process-wide bounded thread pool for `/ask` graph executions --
+    scale-out hardening pass (`docs/SCALE_OUT_PROMPT.md` bottleneck #1):
+    this replaced a raw `threading.Thread()` spawned fresh per request,
+    which under load could create an unbounded number of real OS threads
+    (each holding its own stack, DB connections, and an in-flight Ollama
+    call) with nothing to stop it. Sized to `Settings
+    .max_concurrent_ask_requests` -- `api/main.py`'s `ask()` admits at most
+    that many concurrent requests via `agent.rate_limit
+    .get_ask_concurrency_limiter` *before* ever submitting here, so this
+    pool is never oversubscribed by admitted work. `@cache`, same
+    process-lifetime-singleton pattern as `agent.llm_client
+    ._get_ollama_client` -- a `Settings` change takes effect on restart,
+    like every other cached-until-restart singleton in this codebase.
+
+    Still not true cancellation (see `_run_orchestrated_with_timeout`'s own
+    docstring) -- an abandoned task keeps running to completion inside this
+    pool. What bounding the pool buys is that an abandoned task now visibly
+    occupies one of a *fixed* number of slots (correct backpressure: fewer
+    slots free for new work under sustained overload, surfacing as more
+    429s) instead of an invisible, unbounded extra OS thread.
+    """
+    return ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="ask-worker")
 
 
 def _run_orchestrated_with_timeout(
@@ -733,20 +875,31 @@ def _run_orchestrated_with_timeout(
     caller_roles: tuple[str, ...],
     caller_subject: str | None,
     timeout_seconds: int,
+    max_workers: int,
+    on_done: Callable[[], None],
+    attachment_ids: list[str] | None = None,
 ) -> Mapping[str, Any]:
-    """Runs `run_orchestrated` on a background thread and gives up waiting
-    past `timeout_seconds`, raising `_AskRequestTimedOut` instead of letting
-    the calling (FastAPI request-handling) thread block indefinitely.
+    """Runs `run_orchestrated` on `_get_ask_executor`'s bounded pool and
+    gives up *waiting* past `timeout_seconds`, raising `_AskRequestTimedOut`
+    instead of letting the calling (FastAPI request-handling) thread block
+    indefinitely.
 
-    Mirrors `db.execution._execute_with_timeout`'s "background thread +
-    `join(timeout)`" idiom -- the one difference is there is no connection
-    to force-close here (an in-flight Ollama call has no clean cross-thread
-    cancellation), so the abandoned thread simply keeps running to
-    completion in the background with its result discarded; see
-    `Settings.request_timeout_seconds`'s docstring for why that's still
-    worth doing (it frees the request-handling thread and gives the caller
-    a timely response, even though it doesn't reduce backend load from the
-    already-in-flight call).
+    `on_done` is called exactly once, when the submitted task actually
+    finishes (success or exception) -- not when this function gives up
+    waiting on it. `ask()` uses this to release the concurrency-limiter
+    slots it acquired before calling this function: those slots represent
+    real, still-consumed resources (a pool worker, whatever the graph
+    execution itself is holding) for as long as the abandoned task keeps
+    running, so releasing them early (the moment the *caller* stops
+    waiting) would let a new request be admitted on top of resources the
+    old one hasn't actually freed yet -- exactly the unbounded-pileup
+    problem this whole change exists to prevent.
+
+    There is still no clean cross-thread cancellation of an in-flight
+    Ollama call or DB query once the task is running (same fundamental
+    limitation `db.execution._execute_with_timeout`'s own "background
+    thread + join" idiom has) -- what bounding the executor buys is
+    described in `_get_ask_executor`'s own docstring.
     """
     result: dict[str, Any] = {}
     error: dict[str, BaseException] = {}
@@ -760,16 +913,26 @@ def _run_orchestrated_with_timeout(
                 session_id=session_id,
                 caller_roles=caller_roles,
                 caller_subject=caller_subject,
+                attachment_ids=attachment_ids,
             )
         except BaseException as exc:  # noqa: BLE001 - re-raised on the caller's thread below
             error["error"] = exc
 
-    worker = threading.Thread(target=_run, daemon=True)
-    worker.start()
-    worker.join(timeout_seconds)
+    try:
+        future = _get_ask_executor(max_workers).submit(_run)
+        future.add_done_callback(lambda _f: on_done())
+    except BaseException:
+        # Defensive: submission itself failing (the executor singleton
+        # being unusable) is not expected in practice, but `on_done` must
+        # still fire exactly once so its caller's concurrency-limiter slots
+        # are never leaked permanently.
+        on_done()
+        raise
 
-    if worker.is_alive():
-        raise _AskRequestTimedOut(timeout_seconds)
+    try:
+        future.result(timeout_seconds)
+    except FuturesTimeoutError:
+        raise _AskRequestTimedOut(timeout_seconds) from None
     if "error" in error:
         raise error["error"]
     return result["state"]
@@ -799,9 +962,9 @@ def ask(
     session key).
     """
     session_id = payload.session_id or str(uuid.uuid4())
+    caller_key = _rate_limit_key(identity, request)
 
-    client_ip = request.client.host if request.client else "unknown"
-    rate_limit_result = _limiter_for(client_ip).check()
+    rate_limit_result = _limiter_for(caller_key).check()
     if not rate_limit_result.allowed:
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
@@ -817,6 +980,45 @@ def ask(
     ]
 
     settings = get_settings()
+
+    # Admission control (scale-out hardening pass, docs/SCALE_OUT_PROMPT.md
+    # bottleneck #1/#4): reject fast, before any LLM/DB work starts, once
+    # either the global or this caller's own concurrency budget is
+    # exhausted -- see agent.rate_limit.ConcurrencyLimiter's own docstring
+    # for why this is a separate control from the per-minute rate limit
+    # just above. Global is checked first (cheaper to release immediately
+    # if the per-caller check then fails) and both are only ever released
+    # by `_release_ask_slots`, called exactly once by
+    # `_run_orchestrated_with_timeout`'s done-callback -- never here on the
+    # happy path, and never twice.
+    global_limiter = get_ask_concurrency_limiter(settings.max_concurrent_ask_requests)
+    if not global_limiter.try_acquire():
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail=ASK_CONCURRENCY_LIMIT_MESSAGE,
+            headers={"Retry-After": "2"},
+        )
+    per_caller_limiter = get_per_caller_ask_concurrency_limiter(
+        caller_key, settings.max_concurrent_ask_requests_per_caller
+    )
+    if not per_caller_limiter.try_acquire():
+        global_limiter.release()
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail=PER_CALLER_ASK_CONCURRENCY_LIMIT_MESSAGE,
+            headers={"Retry-After": "2"},
+        )
+
+    _released = False
+
+    def _release_ask_slots() -> None:
+        nonlocal _released
+        if _released:
+            return
+        _released = True
+        per_caller_limiter.release()
+        global_limiter.release()
+
     try:
         final_state = _run_orchestrated_with_timeout(
             payload.question,
@@ -824,14 +1026,22 @@ def ask(
             enable_insight=payload.enable_insight,
             session_id=session_id,
             caller_roles=identity.roles,
-            caller_subject=identity.subject if identity.mode == "oidc" else None,
+            caller_subject=real_caller_subject(identity),
             timeout_seconds=settings.request_timeout_seconds,
+            max_workers=settings.max_concurrent_ask_requests,
+            on_done=_release_ask_slots,
+            attachment_ids=payload.attachment_ids,
         )
     except _AskRequestTimedOut:
         # See Settings.request_timeout_seconds's docstring: this is "stop
         # waiting," not true cancellation -- the abandoned background thread
         # keeps running and its result is discarded, but the caller gets a
-        # timely response instead of an indefinitely blocked request.
+        # timely response instead of an indefinitely blocked request. Note
+        # the concurrency slots acquired above are NOT released here --
+        # `_release_ask_slots` only runs once the abandoned work actually
+        # finishes (see `_run_orchestrated_with_timeout`'s own docstring for
+        # why releasing early here would defeat the whole point of bounding
+        # concurrency in the first place).
         logger.warning(
             "[api] /ask exceeded request_timeout_seconds=%ds (session_id=%s)",
             settings.request_timeout_seconds,
@@ -953,13 +1163,9 @@ def execute(
             status="failed", database=database_name, error=f"Execution failed: {safe_detail}"
         )
 
-    chart_json: dict[str, Any] | None = None
-    figure = build_chart(pd.DataFrame(rows, columns=columns))
-    if figure is not None:
-        # figure.to_json() (Plotly's own encoder, not jsonable_encoder) is
-        # what correctly handles the numpy arrays/pandas Timestamps a
-        # Plotly figure's data traces are built from.
-        chart_json = json.loads(figure.to_json())
+    result_df = pd.DataFrame(rows, columns=columns)
+    column_types: dict[str, str] = dict(classify_columns(result_df)) if not result_df.empty else {}
+    recommendation = recommend_chart(result_df, column_types)
 
     return ExecuteResponse(
         status="succeeded",
@@ -969,7 +1175,14 @@ def execute(
         result_rows=_rows_to_json(rows),
         row_count=len(rows),
         duration_ms=duration_ms,
-        chart=chart_json,
+        column_types=column_types,
+        chart_recommendation=(
+            ChartRecommendationOut(**recommendation) if recommendation is not None else None
+        ),
+        # Best-effort signal, not a real "is there more data" answer -- see
+        # ExecuteResponse.truncated's own docstring for why this app never
+        # runs a separate COUNT(*) query to know the true total.
+        truncated=len(rows) >= settings.max_result_rows,
     )
 
 
@@ -990,6 +1203,40 @@ def feedback_golden_example(
     """
     save_golden_example(payload.question, payload.sql, payload.database, get_settings())
     return GoldenExampleFeedbackResponse(saved=True)
+
+
+@app.post(
+    "/feedback/message",
+    response_model=MessageFeedbackResponse,
+)
+def feedback_message(
+    payload: MessageFeedbackRequest,
+    _identity: AuthIdentity = Depends(require_permission(Permission.GOLDEN_EXAMPLE_WRITE)),
+) -> MessageFeedbackResponse:
+    """Records a like/dislike (plus an optional free-text comment) on any
+    assistant answer -- SQL, document/policy RAG, web search, or media --
+    not just a confirmed-and-executed SQL result the way `/feedback/
+    golden-example` above is scoped. Reuses `Permission.GOLDEN_EXAMPLE_WRITE`
+    rather than introducing a new RBAC permission: both endpoints are the
+    same underlying capability ("this caller may submit feedback that
+    shapes future answers"), just against two different stores
+    (`embeddings.golden_examples`, few-shot prompt examples, confirmed SQL
+    only; `feedback.store` here, every answer). A thumbs-up on a confirmed
+    SQL answer still separately calls `/feedback/golden-example` too --
+    this endpoint is purely additive, never a replacement.
+    """
+    save_response_feedback(
+        payload.question,
+        payload.answer,
+        payload.rating,
+        sql=payload.sql,
+        database=payload.database,
+        sources_used=payload.sources_used,
+        comment=payload.comment,
+        conversation_id=payload.conversation_id,
+        settings=get_settings(),
+    )
+    return MessageFeedbackResponse(saved=True)
 
 
 @app.post("/schema/refresh", response_model=SchemaRefreshResponse)

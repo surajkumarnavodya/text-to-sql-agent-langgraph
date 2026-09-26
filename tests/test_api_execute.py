@@ -101,12 +101,19 @@ class TestExecute:
         assert body["result_columns"] == ["region", "revenue"]
         assert body["row_count"] == 2
         assert body["duration_ms"] is not None
-        # Two categories + one numeric column -> the auto-pick heuristic
-        # (agent.result_charting.build_chart) should produce a bar chart.
-        assert body["chart"] is not None
-        assert body["chart"]["data"][0]["type"] == "bar"
+        # Two categories + one numeric column -> classify_columns/recommend_chart
+        # (agent/result_charting.py) should suggest a bar chart, and never
+        # claim the result was truncated (2 rows, well under max_result_rows).
+        assert body["column_types"] == {"region": "text", "revenue": "numeric"}
+        assert body["chart_recommendation"] == {
+            "chart_type": "bar",
+            "reason": "A category column with a numeric measure compares cleanly as a bar chart.",
+            "x_column": "region",
+            "y_column": "revenue",
+        }
+        assert body["truncated"] is False
 
-    def test_no_chart_for_an_all_numeric_result(self, monkeypatch, client):
+    def test_two_numeric_columns_recommend_scatter_not_a_kpi(self, monkeypatch, client):
         monkeypatch.setattr(
             "api.main.execute_readonly_sql",
             lambda sql, timeout, max_rows, engine=None: (["a", "b"], [(1, 2)]),
@@ -115,7 +122,39 @@ class TestExecute:
         response = client.post("/execute", json={"sql": "SELECT a, b FROM t"})
 
         assert response.status_code == 200
-        assert response.json()["chart"] is None
+        body = response.json()
+        # Two numeric columns -> a scatter recommendation (a real, valid shape
+        # for one) -- the single-row/single-numeric-column KPI case doesn't
+        # apply here since there are two numeric columns, not one.
+        assert body["column_types"] == {"a": "numeric", "b": "numeric"}
+        assert body["chart_recommendation"]["chart_type"] == "scatter"
+
+    def test_no_chart_recommendation_for_an_all_text_result(self, monkeypatch, client):
+        monkeypatch.setattr(
+            "api.main.execute_readonly_sql",
+            lambda sql, timeout, max_rows, engine=None: (["name"], [("Alice",), ("Bob",)]),
+        )
+
+        response = client.post("/execute", json={"sql": "SELECT name FROM t"})
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body["column_types"] == {"name": "text"}
+        assert body["chart_recommendation"] is None
+
+    def test_truncated_flag_set_when_row_count_hits_the_configured_cap(self, monkeypatch, client):
+        monkeypatch.setattr(
+            "api.main.execute_readonly_sql",
+            lambda sql, timeout, max_rows, engine=None: (
+                ["a"],
+                [(i,) for i in range(_BASE_SETTINGS.max_result_rows)],
+            ),
+        )
+
+        response = client.post("/execute", json={"sql": "SELECT a FROM t"})
+
+        assert response.status_code == 200
+        assert response.json()["truncated"] is True
 
     def test_destructive_sql_is_rejected_not_executed(self, monkeypatch, client):
         called = False
@@ -202,3 +241,40 @@ class TestExecute:
         assert first.status_code == 200
         assert second.status_code == 429
         assert "Retry-After" in second.headers
+
+
+class TestRowsToJsonBinaryColumns:
+    """A real crash, found via live use, not a hypothetical: a SELECT
+    touching a genuinely binary column (e.g. AdventureWorks'
+    `Production.ProductPhoto.LargePhoto`, a `varbinary(max)` storing real
+    JPEG bytes) used to crash the *entire* `/ask`/`/execute` response with
+    an unhandled `UnicodeDecodeError` -- `fastapi.encoders.jsonable_encoder`'s
+    default `bytes` handling is a bare `.decode()` (UTF-8), which raises on
+    non-text binary data. `_json_safe_cell` (api/main.py) now replaces any
+    `bytes`/`bytearray`/`memoryview` value with a short, readable
+    placeholder before the row ever reaches `jsonable_encoder`."""
+
+    def test_binary_column_becomes_a_placeholder_not_a_crash(self):
+        jpeg_like_bytes = bytes([0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10])
+        rows = [(1, "cow.jpg", jpeg_like_bytes)]
+
+        result = api_main._rows_to_json(rows)
+
+        assert result == [[1, "cow.jpg", f"<binary data, {len(jpeg_like_bytes)} bytes>"]]
+
+    def test_bytearray_and_memoryview_are_also_handled(self):
+        rows = [(bytearray(b"\xff\x00"), memoryview(b"\xfe\x01"))]
+
+        result = api_main._rows_to_json(rows)
+
+        assert result == [["<binary data, 2 bytes>", "<binary data, 2 bytes>"]]
+
+    def test_ordinary_rows_are_unaffected(self):
+        rows = [(1, "Alice", 12.5, None)]
+
+        result = api_main._rows_to_json(rows)
+
+        assert result == [[1, "Alice", 12.5, None]]
+
+    def test_none_input_returns_none(self):
+        assert api_main._rows_to_json(None) is None

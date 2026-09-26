@@ -20,7 +20,7 @@ ignore = [
 ]
 
 [tool.ruff.lint.isort]
-known-first-party = ["agent", "api", "config", "db", "embeddings", "eval", "media_gen", "observability", "rag", "scripts", "search", "security"]
+known-first-party = ["agent", "api", "attachments", "config", "db", "embeddings", "eval", "feedback", "media_gen", "observability", "rag", "scripts", "search", "security"]
 
 [tool.ruff.lint.flake8-bugbear]
 # FastAPI's dependency-injection convention requires calling File()/Form()

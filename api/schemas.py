@@ -76,6 +76,18 @@ class AskRequest(BaseModel):
             "not a correlation token."
         ),
     )
+    attachment_ids: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Ids of files the caller attached to this question, from a prior "
+            "POST /attachments/upload response. Each is resolved server-side (scoped to "
+            "this caller -- see attachments/store.py's ownership check) and given to the "
+            "model as extra context/multimodal content via the 'attachments' orchestrator "
+            "source (see agent/orchestrator/nodes.py::attachment_node). Works even without "
+            "ENABLE_MULTI_SOURCE_ROUTER=true -- see agent.orchestrator.graph.run_orchestrated's "
+            "docstring."
+        ),
+    )
 
 
 class AttemptRecordOut(BaseModel):
@@ -158,6 +170,199 @@ class MediaSearchHitOut(BaseModel):
     caption: str
     timestamp_start: float | None = None
     timestamp_end: float | None = None
+
+
+class AttachmentErrorOut(BaseModel):
+    """Mirrors `attachments.models.AttachmentError` -- one structured,
+    user-friendly upload/processing failure. `code` is stable (an
+    `AttachmentErrorCode` value) so a client can branch on it rather than
+    string-matching `message`."""
+
+    model_config = ConfigDict(frozen=True)
+
+    code: str
+    attachment_id: str | None = None
+    filename: str
+    message: str
+
+
+class AttachmentOut(BaseModel):
+    """Mirrors the client-relevant subset of `attachments.models.Attachment`
+    -- backs `POST /attachments/upload`'s per-file response entry and the
+    composer's attachment card (filename/type/size/status/error). Never
+    includes `image_data_url`/`extracted_text` -- those can be large and are
+    only ever consumed server-side (`attachments.pipeline
+    .to_processed_attachment`); the client already has its own local object-
+    URL preview for an image (see `frontend/src/hooks/useImageAttachments.ts`),
+    so there's no reason to round-trip the same bytes back down re-encoded."""
+
+    model_config = ConfigDict(frozen=True)
+
+    attachment_id: str
+    filename: str
+    media_type: str
+    size_bytes: int
+    processing_status: str
+    processing_error: str | None = None
+
+
+class AttachmentUploadResponse(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    attachments: list[AttachmentOut] = Field(default_factory=list)
+    errors: list[AttachmentErrorOut] = Field(default_factory=list)
+
+
+class ImageResizePresetOut(BaseModel):
+    """Mirrors `attachments.image_ops.RESIZE_PRESETS`'s entries."""
+
+    model_config = ConfigDict(frozen=True)
+
+    name: str
+    width: int
+    height: int
+
+
+class AttachmentCapabilitiesResponse(BaseModel):
+    """Mirrors `attachments.capabilities.AttachmentCapabilitiesOut` -- what
+    `GET /attachments/capabilities` returns. The frontend uses this to
+    enable/disable each attachment action truthfully rather than assuming
+    vision/OCR/editing are always available (per this feature's own "do not
+    display a capability as working unless it actually is" requirement)."""
+
+    model_config = ConfigDict(frozen=True)
+
+    enabled: bool
+    vision_input: bool
+    vision_model: str | None = None
+    ocr: bool
+    image_resize: bool
+    image_text_removal: bool
+    image_text_removal_method: str | None = None
+    native_pdf_input: bool = False
+    max_image_bytes: int
+    max_document_bytes: int
+    max_attachments_per_message: int
+    max_total_attachment_bytes: int
+    max_resize_dimension_px: int
+    max_text_removal_regions: int
+    supported_image_extensions: list[str] = Field(default_factory=list)
+    supported_document_extensions: list[str] = Field(default_factory=list)
+    resize_presets: list[ImageResizePresetOut] = Field(default_factory=list)
+
+
+class TextRegionOut(BaseModel):
+    """Mirrors `attachments.ocr_extract.TextRegion` -- one recognized word
+    and its bounding box, for `POST /attachments/{id}/extract-text`."""
+
+    model_config = ConfigDict(frozen=True)
+
+    text: str
+    left: int
+    top: int
+    width: int
+    height: int
+    confidence: float
+    low_confidence: bool
+
+
+class OcrExtractResponse(BaseModel):
+    """Mirrors `attachments.ocr_extract.OcrExtractionResult`. Deliberately
+    keeps `raw_text` and `cleaned_text` as two separate fields -- see that
+    module's own docstring for why an OCR action must never silently
+    substitute an LLM paraphrase for the actual recognized text."""
+
+    model_config = ConfigDict(frozen=True)
+
+    attachment_id: str
+    operation: str = "extract_text"
+    raw_text: str
+    cleaned_text: str
+    regions: list[TextRegionOut] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+
+
+class TextLineRegionOut(BaseModel):
+    """Mirrors `attachments.inpaint.TextLineRegion` -- one OCR-proposed
+    text line, for the "Remove text" workflow's confirm/adjust step."""
+
+    model_config = ConfigDict(frozen=True)
+
+    region_id: int
+    text: str
+    left: int
+    top: int
+    width: int
+    height: int
+    confidence: float
+
+
+class DetectTextRegionsResponse(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    attachment_id: str
+    regions: list[TextLineRegionOut] = Field(default_factory=list)
+
+
+class ImageRegionIn(BaseModel):
+    """One rectangle, in source-image pixel coordinates -- either copied
+    from a `TextLineRegionOut` the caller confirmed, or drawn manually."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    left: int = Field(ge=0)
+    top: int = Field(ge=0)
+    width: int = Field(gt=0)
+    height: int = Field(gt=0)
+
+
+class RemoveTextRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    regions: list[ImageRegionIn] = Field(min_length=1)
+
+
+class ImageEditResultResponse(BaseModel):
+    """Shared response shape for both `POST /attachments/{id}/resize` and
+    `POST /attachments/{id}/remove-text` -- both produce a brand-new,
+    separately stored/downloadable image attachment (the original is never
+    mutated), so both return the same fields."""
+
+    model_config = ConfigDict(frozen=True)
+
+    attachment_id: str
+    source_attachment_id: str
+    operation: str
+    image_data_url: str
+    media_type: str
+    width: int
+    height: int
+    original_width: int | None = None
+    original_height: int | None = None
+    size_bytes: int
+    warnings: list[str] = Field(default_factory=list)
+
+
+class ImageResizeRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    width: int | None = Field(default=None, gt=0)
+    height: int | None = Field(default=None, gt=0)
+    fit: Literal["contain", "cover", "stretch"] = "contain"
+    output_format: Literal["png", "jpeg", "webp"] | None = None
+    quality: int = Field(default=90, ge=1, le=100)
+
+
+class AttachmentResultOut(BaseModel):
+    """Mirrors `agent.orchestrator.state.AttachmentResult` -- the
+    "attachments" source's contribution to an `/ask` answer."""
+
+    model_config = ConfigDict(frozen=True)
+
+    answer: str
+    status: str
+    used_attachment_ids: list[str] = Field(default_factory=list)
+    vision_unavailable: bool = False
 
 
 class MediaSearchResultOut(BaseModel):
@@ -266,6 +471,7 @@ class AskResponse(BaseModel):
     web_result: SourceAnswerOut | None = None
     generation_result: MediaGenerationResultOut | None = None
     media_search_result: MediaSearchResultOut | None = None
+    attachment_result: AttachmentResultOut | None = None
     query_plan: list[str] | None = Field(
         default=None,
         description="Ordered plan steps for a complexity-flagged question; None if planning was skipped.",
@@ -323,6 +529,20 @@ class GenerateConfirmRequest(BaseModel):
     question: str = Field(..., min_length=1)
 
 
+class ChartRecommendationOut(BaseModel):
+    """Mirrors `agent.result_charting.ChartRecommendation` -- one suggested
+    starting chart type + a short reason, never treated by the frontend as
+    proof that type is actually valid for this result (see that module's
+    own docstring)."""
+
+    model_config = ConfigDict(frozen=True)
+
+    chart_type: str
+    reason: str
+    x_column: str | None = None
+    y_column: str | None = None
+
+
 class ExecuteResponse(BaseModel):
     model_config = ConfigDict(frozen=True)
 
@@ -336,14 +556,32 @@ class ExecuteResponse(BaseModel):
     result_rows: list[list[Any]] | None = None
     row_count: int | None = None
     duration_ms: float | None = None
-    chart: dict[str, Any] | None = Field(
+    column_types: dict[str, str] = Field(
+        default_factory=dict,
+        description=(
+            "Per-column inferred type ('numeric' | 'date' | 'text'), from "
+            "agent.result_charting.classify_columns -- lets the client's chart "
+            "engine (frontend/src/lib/chartEngine.ts) validate and build every "
+            "chart type without re-guessing types from raw JSON values."
+        ),
+    )
+    chart_recommendation: ChartRecommendationOut | None = Field(
         default=None,
         description=(
-            "A Plotly figure spec (result of Figure.to_plotly_json(), JSON-"
-            "serializable) auto-picked from the result shape, or None if no "
-            "suitable chart exists -- render directly with a Plotly client "
-            "(e.g. react-plotly.js) with no client-side re-implementation of "
-            "the auto-pick heuristic (see agent/result_charting.py)."
+            "A suggested starting chart type + reason (agent.result_charting"
+            ".recommend_chart), or None if nothing about this shape suggests "
+            "one. Purely a starting point for the client's chart picker -- "
+            "never rendered automatically, and never trusted as valid without "
+            "the client's own independent validation against the actual rows."
+        ),
+    )
+    truncated: bool = Field(
+        default=False,
+        description=(
+            "True when row_count reached Settings.max_result_rows -- the "
+            "result may be missing rows beyond that cap. The UI must show a "
+            "visible notice (and a chart, if the user requests one, must "
+            "disclose it only reflects the returned/possibly-truncated rows)."
         ),
     )
     error: str | None = None
@@ -361,6 +599,31 @@ class GoldenExampleFeedbackRequest(BaseModel):
 
 
 class GoldenExampleFeedbackResponse(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    saved: bool
+
+
+class MessageFeedbackRequest(BaseModel):
+    """Records a like/dislike (plus an optional free-text comment) on any
+    assistant answer -- SQL, document/policy RAG, web search, or media --
+    the general-purpose counterpart to `GoldenExampleFeedbackRequest`, which
+    only ever covers a confirmed, executed SQL result. Backs
+    `frontend/src/components/chat/ResponseFeedbackWidget.tsx`."""
+
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    question: str = Field(..., min_length=1)
+    answer: str = Field(..., min_length=1)
+    rating: Literal["positive", "negative"]
+    sql: str | None = None
+    database: str | None = None
+    sources_used: list[str] = Field(default_factory=list)
+    comment: str | None = None
+    conversation_id: str | None = None
+
+
+class MessageFeedbackResponse(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     saved: bool
@@ -457,6 +720,21 @@ class HealthResponse(BaseModel):
     # "configured, not necessarily healthy" contract those two fields
     # already have.
     local_auth_enabled: bool
+    # Startup/operator diagnostic for chat-image vision support -- a real,
+    # reported bug (an attached image silently answering "vision not
+    # configured" with no way to tell whether that meant "never set up" or
+    # "set up but the model isn't actually pulled") is what this closes.
+    # `vision_model_available` is `None` whenever `vision_enabled` is
+    # False (nothing to check); when True, it's a real, live lookup against
+    # Ollama's own `/api/tags` -- reusing the exact same `.list()` call
+    # `ollama` health above already makes, not a second round-trip -- so a
+    # configured-but-never-pulled model name is caught here, not just
+    # discovered the first time a user attaches an image.
+    vision_enabled: bool
+    vision_provider: Literal["ollama"] | None = None
+    vision_model: str | None = None
+    vision_model_available: bool | None = None
+    ocr_enabled: bool
 
 
 class ColumnOut(BaseModel):

@@ -30,15 +30,22 @@ class RouteDecision(TypedDict):
             rather than re-deriving it.
         short_circuited: True when routing skipped classification entirely
             because fewer than two sources are configured (see
-            `agent.orchestrator.nodes.get_available_sources`) -- mirrors
-            `embeddings.retriever.select_database`'s single-database
-            short-circuit, so a plain SQL-only setup never pays for a
-            classification call it doesn't need.
+            `agent.orchestrator.nodes.get_available_sources`), or because
+            the deterministic attachment-only pre-check matched (see
+            `agent.orchestrator.nodes._looks_like_attachment_only_question`)
+            -- either way, no LLM classification call was made for this
+            question.
+        requires_database: Whether "sql" ended up in `sources` -- a plain,
+            debuggable summary of "did this question actually touch the
+            database," independent of parsing `sources` yourself. Always
+            `False` for a question the deterministic attachment-only
+            pre-check routed, since that path never includes "sql".
     """
 
     sources: list[str]
     reasoning: str
     short_circuited: bool
+    requires_database: bool
 
 
 class SourceAnswer(TypedDict):
@@ -86,6 +93,17 @@ class MediaSearchHit(TypedDict):
     timestamp_end: float | None
 
 
+class AttachmentResult(SourceAnswer):
+    """The "attachments" source's contribution -- files the user attached
+    directly to this question (see `attachments/graph.py`), extending
+    `SourceAnswer` with which attachment(s) actually contributed and
+    whether an image had to fall back to OCR-only text because no vision
+    model is configured (`Settings.media_vision_model`)."""
+
+    used_attachment_ids: list[str]
+    vision_unavailable: bool
+
+
 class MediaSearchResult(SourceAnswer):
     """The "media_search" source's contribution -- extends `SourceAnswer`
     (a real citable text answer, unlike `MediaGenerationResult`'s -- see
@@ -109,6 +127,17 @@ class OrchestratorState(AgentState, total=False):
     # caller that never supplied one (e.g. eval/runner.py, scripts) -- the
     # ceiling simply doesn't apply when there's no session to scope it to.
     session_id: str | None
+
+    # Input, set once by run_orchestrated from AskRequest.attachment_ids --
+    # files the caller attached directly to this question (see
+    # attachments/graph.py). Empty list means no attachments. A non-empty
+    # value both makes "attachments" available to router_node (forced into
+    # the final route regardless of what the classifier picks -- see that
+    # node's docstring) and, per agent/orchestrator/graph.py's
+    # run_orchestrated, makes this graph run at all even when
+    # Settings.enable_multi_source_router is off -- attaching a file is a
+    # per-request opt-in, not a standing multi-source-routing decision.
+    pending_attachment_ids: list[str]
 
     # Set by router_node -- see RouteDecision above.
     route_decision: RouteDecision | None
@@ -141,6 +170,8 @@ class OrchestratorState(AgentState, total=False):
     generation_result: MediaGenerationResult | None
     # Set by media_search_node -- see media/ and Settings.enable_media_search.
     media_search_result: MediaSearchResult | None
+    # Set by attachment_node -- see attachments/graph.py and Settings.enable_chat_attachments.
+    attachment_result: AttachmentResult | None
 
     # Set by synthesis_node -- None when only one source fired (that source's
     # own answer stands unedited; see synthesis_node's docstring).

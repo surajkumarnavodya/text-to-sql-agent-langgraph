@@ -211,7 +211,15 @@ class TestProductionRequiresIdentity:
             _settings(environment="production")
 
     def test_production_with_static_token_is_accepted(self):
-        settings = _settings(environment="production", api_auth_token=SecretStr("s3cret"))
+        # malware_scan_provider="clamav" -- production also now requires
+        # malware scanning configured whenever chat attachments (on by
+        # default) are enabled, see TestProductionRequiresMalwareScanning
+        # below; unrelated to the identity check this test itself covers.
+        settings = _settings(
+            environment="production",
+            api_auth_token=SecretStr("s3cret"),
+            malware_scan_provider="clamav",
+        )
         assert settings.auth_mode == "static_token"
 
     def test_production_with_oidc_is_accepted(self):
@@ -219,8 +227,62 @@ class TestProductionRequiresIdentity:
             environment="production",
             oidc_issuer="https://idp.example.com/",
             oidc_audience="my-api",
+            malware_scan_provider="clamav",
         )
         assert settings.auth_mode == "oidc"
+
+
+class TestProductionRequiresMalwareScanning:
+    """`ENVIRONMENT=production` must refuse to start with an untrusted-
+    file-accepting feature enabled but no malware scanner configured --
+    mirrors TestProductionRequiresIdentity's own shape for the identical
+    "fail closed at startup" guarantee, applied to file uploads instead of
+    authentication."""
+
+    def test_development_with_scanning_disabled_is_accepted(self):
+        settings = _settings(environment="development")
+        assert settings.malware_scan_provider == "disabled"
+
+    def test_production_with_attachments_enabled_and_no_scanner_raises(self):
+        with pytest.raises(ConfigurationError, match="MALWARE_SCAN_PROVIDER"):
+            _settings(
+                environment="production",
+                api_auth_token=SecretStr("s3cret"),
+                enable_chat_attachments=True,
+                malware_scan_provider="disabled",
+            )
+
+    def test_production_with_document_rag_enabled_and_no_scanner_raises(self):
+        with pytest.raises(ConfigurationError, match="MALWARE_SCAN_PROVIDER"):
+            _settings(
+                environment="production",
+                api_auth_token=SecretStr("s3cret"),
+                enable_chat_attachments=False,
+                enable_document_rag=True,
+                rag_store_connection_string=SecretStr("mssql+pyodbc://x"),
+                malware_scan_provider="disabled",
+            )
+
+    def test_production_with_scanner_configured_is_accepted(self):
+        settings = _settings(
+            environment="production",
+            api_auth_token=SecretStr("s3cret"),
+            enable_chat_attachments=True,
+            malware_scan_provider="clamav",
+        )
+        assert settings.malware_scan_provider == "clamav"
+
+    def test_production_with_no_upload_features_enabled_is_accepted_without_a_scanner(self):
+        settings = _settings(
+            environment="production",
+            api_auth_token=SecretStr("s3cret"),
+            enable_chat_attachments=False,
+            enable_document_rag=False,
+            enable_policy_rag=False,
+            enable_media_search=False,
+            malware_scan_provider="disabled",
+        )
+        assert settings.malware_scan_provider == "disabled"
 
     def test_unknown_environment_value_raises(self):
         with pytest.raises(ConfigurationError):

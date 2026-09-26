@@ -27,6 +27,8 @@ import pytest
 from agent.orchestrator import graph as orchestrator_graph
 from agent.orchestrator import nodes as orchestrator_nodes
 from agent.orchestrator.nodes import (
+    _looks_like_attachment_only_question,
+    attachment_node,
     classify_sources,
     document_rag_node,
     generation_node,
@@ -132,6 +134,14 @@ class TestGetAvailableSources:
             _settings(enable_media_search=True, media_library_path=tmp_path)
         ) == ["sql", "media_search"]
 
+    def test_attachments_only_available_when_the_request_has_attachments(self):
+        assert get_available_sources(_settings(), has_attachments=False) == ["sql"]
+        assert get_available_sources(_settings(), has_attachments=True) == ["sql", "attachments"]
+
+    def test_attachments_still_gated_by_the_feature_flag(self):
+        settings = _settings(enable_chat_attachments=False)
+        assert get_available_sources(settings, has_attachments=True) == ["sql"]
+
 
 class TestClassifySources:
     def test_parses_a_single_source_response(self, monkeypatch):
@@ -213,6 +223,100 @@ class TestClassifySources:
         assert "Create an image of the top 5 merchants" not in captured["system_prompt"]
 
 
+class TestLooksLikeAttachmentOnlyQuestion:
+    """Unit tests for the deterministic, zero-LLM-call pre-check that
+    closes the reported bug: an attachment-only question like "Extract
+    text" must never route to SQL just because a database happens to
+    always be configured. See TestRouterNode's own
+    `test_extract_text_with_image_skips_classification_entirely` below for
+    the end-to-end proof this pre-check actually prevents
+    `classify_sources` from being called at all."""
+
+    @pytest.mark.parametrize(
+        "question",
+        [
+            "Extract text",
+            "Extract text from this image.",
+            "extract image text",
+            "Extract image text",
+            "Read this image.",
+            "What does this image say?",
+            "What is written in this screenshot?",
+            "Summarize this PDF.",
+            "What does this document contain?",
+            "Read the attached document.",
+            "Resize this image.",
+            "Remove text from this image.",
+            "Translate this attached file.",
+            "describe this image",
+            "Explain this screenshot.",
+        ],
+    )
+    def test_matches_the_reported_bugs_own_repro_questions(self, question):
+        assert _looks_like_attachment_only_question(question) is True
+
+    @pytest.mark.parametrize(
+        "question",
+        [
+            "How many employees are in the database?",
+            "Show monthly revenue from the database.",
+            "Find all orders for customer 123.",
+            "Query the sales table.",
+            "Generate SQL for active users.",
+            "Use this PDF's business definitions to query the database.",
+            "Compare this uploaded report with database results.",
+            "Generate SQL based on the metrics shown in this image.",
+            "Use the attached file to filter database records.",
+            "Summarize this file and compare it with our database records.",
+        ],
+    )
+    def test_a_single_database_keyword_anywhere_defers_to_the_classifier(self, question):
+        assert _looks_like_attachment_only_question(question) is False
+
+    def test_an_unrecognized_ambiguous_phrasing_also_defers_to_the_classifier(self):
+        # Per Rule E (ambiguous requests): "Analyze this" alone isn't in the
+        # pattern list, so this deterministic pre-check must NOT force a
+        # route decision either way -- it falls through to whatever
+        # existing behavior handles an ambiguous question (the classifier,
+        # or -- unaffected by this change -- clarification handling
+        # elsewhere in the stack).
+        assert _looks_like_attachment_only_question("Analyze this") is False
+
+
+class TestAttachmentVsSqlGuidance:
+    def test_prompt_includes_guidance_only_when_both_attachments_and_sql_are_available(
+        self, monkeypatch
+    ):
+        """Regression guard, mirroring
+        test_generation_prompt_includes_few_shot_guidance_only_when_available's
+        own shape: the attachment-vs-sql few-shot guidance is defense-in-depth
+        for the questions the deterministic pre-check above doesn't
+        confidently catch -- it must reach the prompt when both sources are
+        options, and must not bloat the prompt otherwise."""
+        import rag.llm
+
+        captured: dict[str, str] = {}
+
+        def _capture(system_prompt, user_prompt, settings, max_tokens):
+            captured["system_prompt"] = system_prompt
+            return "attachments"
+
+        monkeypatch.setattr(rag.llm, "call_ollama", _capture)
+
+        classify_sources("x", ["sql", "attachments"], _settings())
+        assert "Extract text from this image" in captured["system_prompt"]
+        assert "do not add 'sql'" in captured["system_prompt"].lower()
+
+        classify_sources("x", ["sql", "policy"], _settings())
+        assert "Extract text from this image" not in captured["system_prompt"]
+
+        # "attachments" available without "sql" can't happen in practice
+        # (get_available_sources always includes "sql"), but confirms the
+        # guidance is gated on both, not just "attachments" alone.
+        classify_sources("x", ["attachments", "documents"], _settings())
+        assert "Extract text from this image" not in captured["system_prompt"]
+
+
 class TestRouterNode:
     def test_short_circuits_when_only_sql_is_available(self, monkeypatch):
         monkeypatch.setattr(orchestrator_nodes, "get_settings", lambda: _settings())
@@ -234,6 +338,129 @@ class TestRouterNode:
         decision = result["route_decision"]
         assert decision["sources"] == ["sql", "policy"]
         assert decision["short_circuited"] is False
+
+    def test_attachments_are_forced_into_the_route_even_if_the_classifier_omits_them(
+        self, monkeypatch
+    ):
+        """The user explicitly attached a file to this question -- the
+        classifier's job is only to decide whether some OTHER source is
+        ALSO needed, never whether to include attachments at all (see
+        router_node's own docstring). Question deliberately names a
+        database keyword ("database records") so the deterministic
+        attachment-only pre-check (`_looks_like_attachment_only_question`)
+        defers to the classifier here, exactly as it's designed to for a
+        genuinely mixed question -- see TestLooksLikeAttachmentOnlyQuestion
+        below for that pre-check's own dedicated tests."""
+        monkeypatch.setattr(orchestrator_nodes, "get_settings", lambda: _settings())
+        monkeypatch.setattr(
+            orchestrator_nodes,
+            "classify_sources",
+            lambda q, avail, s: (["sql"], "classifier picked only sql"),
+        )
+        result = router_node(
+            {
+                "question": "summarize this file and compare it with our database records",
+                "pending_attachment_ids": ["att_1"],
+            }
+        )
+        decision = result["route_decision"]
+        assert "attachments" in decision["sources"]
+        assert "sql" in decision["sources"]
+
+    # -- The actual reported bug: attachment-only questions must never
+    # reach SQL generation/schema retrieval -- and its fix. --
+
+    def test_extract_text_with_image_skips_classification_entirely(self, monkeypatch):
+        """The exact reported bug: an image attached plus "Extract text"
+        used to sometimes end up with "sql" in the route (the LLM
+        classifier had no reason not to pick it, since a database is
+        always configured/available). This asserts the strongest possible
+        version of the fix -- classify_sources is never even called, so it
+        cannot possibly pick "sql" for this question."""
+        monkeypatch.setattr(orchestrator_nodes, "get_settings", lambda: _settings())
+
+        def _must_not_be_called(question, available, settings):
+            raise AssertionError(
+                "classify_sources must not be called for an unambiguous " "attachment-only question"
+            )
+
+        monkeypatch.setattr(orchestrator_nodes, "classify_sources", _must_not_be_called)
+
+        result = router_node(
+            {"question": "Extract text from this image.", "pending_attachment_ids": ["att_1"]}
+        )
+        decision = result["route_decision"]
+        assert decision["sources"] == ["attachments"]
+        assert "sql" not in decision["sources"]
+        assert decision["requires_database"] is False
+        assert decision["short_circuited"] is True
+
+    @pytest.mark.parametrize(
+        "question",
+        [
+            "Read this image.",
+            "What does this image say?",
+            "Summarize this PDF.",
+            "Read the attached document.",
+            "Resize this image.",
+            "Remove text from this image.",
+            # The exact phrase from a later real bug report -- "extract
+            # text" alone matched, but "extract image text" (a different
+            # word order) originally did not, so it fell through to the
+            # LLM classifier instead of the deterministic override.
+            "extract image text",
+        ],
+    )
+    def test_every_bug_repro_question_never_calls_the_classifier(self, monkeypatch, question):
+        monkeypatch.setattr(orchestrator_nodes, "get_settings", lambda: _settings())
+
+        def _must_not_be_called(q, available, settings):
+            raise AssertionError(f"classify_sources must not be called for {q!r}")
+
+        monkeypatch.setattr(orchestrator_nodes, "classify_sources", _must_not_be_called)
+
+        result = router_node({"question": question, "pending_attachment_ids": ["att_1"]})
+        decision = result["route_decision"]
+        assert decision["sources"] == ["attachments"]
+        assert decision["requires_database"] is False
+
+    def test_mixed_attachment_and_database_question_still_reaches_the_classifier(self, monkeypatch):
+        """Rule C (attachment plus database request): the deterministic
+        pre-check must defer to the classifier -- never silently force
+        attachment-only -- once the question itself names a database
+        keyword, so "compare this file with the database" keeps working."""
+        monkeypatch.setattr(orchestrator_nodes, "get_settings", lambda: _settings())
+        monkeypatch.setattr(
+            orchestrator_nodes,
+            "classify_sources",
+            lambda q, avail, s: (["sql", "attachments"], "classified"),
+        )
+        result = router_node(
+            {
+                "question": "Show database records matching the category shown in this image.",
+                "pending_attachment_ids": ["att_1"],
+            }
+        )
+        decision = result["route_decision"]
+        assert decision["sources"] == ["sql", "attachments"]
+        assert decision["requires_database"] is True
+        assert decision["short_circuited"] is False
+
+    def test_explicit_database_question_without_attachments_is_unaffected(self, monkeypatch):
+        """Rule B (explicit database request): unchanged behavior -- no
+        attachments means the deterministic pre-check never applies at
+        all, so a plain database question still short-circuits to "sql"
+        exactly as it did before this fix."""
+        monkeypatch.setattr(orchestrator_nodes, "get_settings", lambda: _settings())
+        result = router_node({"question": "Show monthly revenue from the database."})
+        decision = result["route_decision"]
+        assert decision["sources"] == ["sql"]
+        assert decision["requires_database"] is True
+
+    def test_no_attachments_means_attachments_is_not_a_route_option(self, monkeypatch):
+        monkeypatch.setattr(orchestrator_nodes, "get_settings", lambda: _settings())
+        result = router_node({"question": "how many orders?", "pending_attachment_ids": []})
+        assert "attachments" not in result["route_decision"]["sources"]
 
     # -- SEC-10: session-scoped expensive-source (generation/web) ceiling --
 
@@ -1534,3 +1761,108 @@ class TestRunOrchestrated:
         assert final_state["policy_result"]["answer"] == "Policy allows 20 days leave."
         assert "Policy allows 20 days leave." in final_state["synthesized_answer"]
         assert "Database" in final_state["synthesized_answer"]
+
+    def test_flag_off_with_attachments_still_runs_the_orchestrator_graph(self, monkeypatch):
+        """Attaching a file is a per-request opt-in the caller makes
+        explicitly -- it must not require also enabling the unrelated
+        multi-source router feature (see run_orchestrated's own docstring)."""
+        settings = _settings(enable_multi_source_router=False)
+        monkeypatch.setattr(orchestrator_graph, "get_settings", lambda: settings)
+        monkeypatch.setattr(orchestrator_nodes, "get_settings", lambda: settings)
+
+        def _should_not_be_called(*args, **kwargs):
+            raise AssertionError(
+                "run_agent must not be called directly when attachments are present"
+            )
+
+        monkeypatch.setattr(orchestrator_graph, "run_agent", _should_not_be_called)
+        # attachment_node imports run_attachment_qa locally (from
+        # attachments.graph import run_attachment_qa) at call time, not at
+        # agent.orchestrator.nodes's own module scope -- patch it at its
+        # real source location.
+        import attachments.graph as attachments_graph_module
+
+        monkeypatch.setattr(
+            attachments_graph_module,
+            "run_attachment_qa",
+            lambda question, ids, settings=None, owner_subject=None: {
+                "status": "succeeded",
+                "answer": "The file says revenue was 42000.",
+                "used_attachment_ids": ids,
+                "vision_unavailable": False,
+            },
+        )
+
+        final_state = orchestrator_graph.run_orchestrated(
+            "what does the file say?", None, True, attachment_ids=["att_1"]
+        )
+
+        assert final_state["sources_used"] == ["attachments"]
+        assert final_state["attachment_result"]["answer"] == "The file says revenue was 42000."
+        assert final_state["status"] == "succeeded"
+
+    def test_no_attachments_and_flag_off_is_still_the_pure_pass_through(self, monkeypatch):
+        monkeypatch.setattr(orchestrator_graph, "get_settings", lambda: _settings())
+        fake_result: AgentState = {"status": "succeeded", "sql": "SELECT 1"}
+        monkeypatch.setattr(
+            orchestrator_graph,
+            "run_agent",
+            lambda question, conversation_history, enable_insight, caller_roles: fake_result,
+        )
+        result = orchestrator_graph.run_orchestrated("how many orders?", attachment_ids=None)
+        assert result is fake_result
+
+
+class TestAttachmentNode:
+    def test_calls_run_attachment_qa_and_shapes_the_result(self, monkeypatch):
+        import attachments.graph as nodes_module
+
+        monkeypatch.setattr(
+            nodes_module,
+            "run_attachment_qa",
+            lambda question, ids, settings=None, owner_subject=None: {
+                "status": "succeeded",
+                "answer": "Revenue was 42000, per report.txt.",
+                "used_attachment_ids": ["att_1"],
+                "vision_unavailable": False,
+            },
+        )
+        result = attachment_node(
+            {"question": "what's the revenue?", "pending_attachment_ids": ["att_1"]}
+        )
+        assert result["sources_used"] == ["attachments"]
+        assert result["attachment_result"]["status"] == "succeeded"
+        assert result["attachment_result"]["used_attachment_ids"] == ["att_1"]
+
+    def test_no_attachments_status_maps_to_insufficient_information(self, monkeypatch):
+        import attachments.graph as nodes_module
+
+        monkeypatch.setattr(
+            nodes_module,
+            "run_attachment_qa",
+            lambda question, ids, settings=None, owner_subject=None: {
+                "status": "no_attachments",
+                "answer": None,
+                "used_attachment_ids": [],
+                "vision_unavailable": False,
+            },
+        )
+        result = attachment_node({"question": "hi", "pending_attachment_ids": []})
+        assert result["attachment_result"]["status"] == "insufficient_information"
+
+    def test_never_raises_when_run_attachment_qa_fails(self, monkeypatch):
+        import attachments.graph as nodes_module
+
+        monkeypatch.setattr(
+            nodes_module,
+            "run_attachment_qa",
+            lambda question, ids, settings=None, owner_subject=None: {
+                "status": "failed",
+                "answer": None,
+                "used_attachment_ids": [],
+                "vision_unavailable": False,
+            },
+        )
+        result = attachment_node({"question": "hi", "pending_attachment_ids": ["att_1"]})
+        assert result["attachment_result"]["status"] == "failed"
+        assert result["attachment_result"]["answer"]  # a fallback message, never empty/None

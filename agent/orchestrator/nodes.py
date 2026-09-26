@@ -22,12 +22,14 @@ logic here -- this module is purely the wiring between them and
 from __future__ import annotations
 
 import logging
+import re
 from collections.abc import Hashable
 from typing import Any, Literal, cast
 
 from agent.authz import Permission, has_role_permission
 from agent.graph import run_agent
 from agent.orchestrator.state import (
+    AttachmentResult,
     MediaGenerationResult,
     MediaSearchHit,
     MediaSearchResult,
@@ -95,7 +97,189 @@ _SOURCE_DESCRIPTIONS: dict[str, str] = {
         "creating brand-new media (that's 'generation') or for structured "
         "data (that's 'sql')"
     ),
+    "attachments": (
+        "a file the user attached directly to THIS specific question -- an "
+        "image, PDF, Word/Excel/PowerPoint document, or plain text/CSV/"
+        "JSON file uploaded just now, not anything already stored in the "
+        "company's own systems. Use this whenever the question refers to "
+        "'this file', 'the attached image/document', 'what I just "
+        "uploaded', or similar"
+    ),
 }
+
+# A real, reported bug this closes: `get_available_sources` always includes
+# "sql" (a database is always configured -- see that function's own
+# docstring), so attaching a file to ANY question makes 2+ sources
+# available, which forces classify_sources (an LLM call) to run -- and a
+# bare "Extract text"/"Read this image"-shaped question, with no guidance
+# telling the model a database is not what's being asked for, sometimes got
+# "sql" picked alongside "attachments" anyway, triggering full schema
+# retrieval + SQL generation for a request that was never about the
+# database at all. `_looks_like_attachment_only_question` below is a
+# deterministic, zero-LLM-call pre-check (mirrors `agent.complexity`'s own
+# "cheap regex heuristic, computed once" style) that skips classify_sources
+# entirely for the unambiguous case -- see that function's own docstring
+# for exactly how conservative it is and why.
+#
+# Deliberately plain substring matches (not regex), matching this module's
+# own `_VIDEO_INTENT_KEYWORDS`/`_DISALLOWED_PROMPT_SUBSTRINGS` convention --
+# grouped by the four attachment-only capabilities this app actually
+# implements as explicit actions (see CLAUDE.md's "Explicit image actions"
+# section: OCR, image understanding, deterministic resize, text removal),
+# plus document-only phrasing.
+_ATTACHMENT_ONLY_INTENT_PATTERNS: tuple[str, ...] = (
+    # Image OCR / text extraction
+    "extract text",
+    "extract all text",
+    "extract the text",
+    "extract image text",
+    "extract the image text",
+    "extract this image's text",
+    "read text",
+    "read this image",
+    "read this photo",
+    "read this picture",
+    "read the text",
+    "what is written",
+    "what does this say",
+    "what does this image say",
+    "ocr",
+    "transcribe",
+    "recognize text",
+    "get the text from this image",
+    "convert image to text",
+    "what text is in this image",
+    # Image understanding
+    "describe this image",
+    "analyze this image",
+    "analyze this photo",
+    "what is shown",
+    "what does this image show",
+    "explain this screenshot",
+    "explain this image",
+    "identify the objects",
+    "summarize this image",
+    "understand this image",
+    "what's in this image",
+    "what is in this image",
+    "what does this picture show",
+    # Deterministic image manipulation (resize/crop/rotate/convert/compress)
+    "resize",
+    "change dimensions",
+    "change the dimensions",
+    "make it larger",
+    "make it smaller",
+    "compress image",
+    "compress this image",
+    "reduce image size",
+    "reduce the image size",
+    "set width",
+    "set height",
+    "crop this image",
+    "rotate this image",
+    # Image editing / text removal
+    "remove text",
+    "erase text",
+    "delete text",
+    "clean the image",
+    "remove watermark",
+    "edit this image",
+    "replace text",
+    "inpaint",
+    # Document-only questions
+    "summarize this document",
+    "summarize this pdf",
+    "summarize this file",
+    "read this pdf",
+    "read this document",
+    "read the attached document",
+    "explain this file",
+    "what does this document say",
+    "what does this document contain",
+    "what does this report say",
+    "extract information from the document",
+    "what does this file contain",
+    "compare these files",
+    "compare these two files",
+    "translate this",
+    "translate the attached",
+)
+
+# The exact keyword set the user's own routing spec named (database, SQL,
+# table, records, rows, columns, query, report, revenue, count, filter),
+# plus a few unambiguous plurals -- word-boundary matched (unlike the
+# substring list above) since several of these are short, common words
+# where a bare substring check would false-positive too easily (e.g. "row"
+# inside "arrow", "count" inside "discount"). A single match anywhere in
+# the question is enough to defer to the LLM classifier instead of the
+# deterministic override -- see `_looks_like_attachment_only_question`'s
+# own docstring for why that asymmetry (conservative about false positives,
+# not about false negatives) is deliberate.
+_DATABASE_KEYWORD_RE = re.compile(
+    r"\b(?:database|databases|sql|table|tables|record|records|row|rows|column|columns|"
+    r"quer(?:y|ies)|report|reports|revenue|count|filter|filters)\b",
+    re.IGNORECASE,
+)
+
+
+def _looks_like_attachment_only_question(question: str) -> bool:
+    """True when `question` reads as an OCR/vision/resize/edit/document-
+    summary request about an attached file's own content, with no explicit
+    database keyword anywhere in it.
+
+    Used by `router_node` to skip `classify_sources` (an LLM call)
+    entirely for the unambiguous case -- see the module-level comment above
+    `_ATTACHMENT_ONLY_INTENT_PATTERNS` for the real bug this closes.
+
+    Deliberately asymmetric: a false negative (missing a genuine
+    attachment-only phrasing not in the pattern list) just falls through to
+    `classify_sources` exactly as before this function existed -- no worse
+    than the pre-existing behavior. A false positive (wrongly skipping the
+    classifier for a question that actually needed the database) is the
+    real risk, so this requires BOTH a matched attachment-only phrase AND
+    the complete absence of any database keyword; a single database keyword
+    anywhere in the question defers to the classifier instead, which is why
+    a mixed question like "use this file to query the database" or "what
+    does this report say about database revenue" never gets short-circuited
+    here.
+    """
+    lowered = question.lower()
+    if _DATABASE_KEYWORD_RE.search(lowered):
+        return False
+    return any(pattern in lowered for pattern in _ATTACHMENT_ONLY_INTENT_PATTERNS)
+
+
+# Appended to classify_sources's system prompt whenever "attachments" is
+# available, as defense-in-depth for the questions
+# `_looks_like_attachment_only_question` doesn't confidently catch (an
+# attachment-only phrasing not in that pattern list, or a genuinely
+# ambiguous one like "analyze this") -- mirrors
+# `_GENERATION_FEW_SHOT_GUIDANCE`'s own "explicit examples of what NOT to
+# also pick" shape.
+_ATTACHMENT_VS_SQL_GUIDANCE = (
+    "\n\nA database is always technically available as an option here, but "
+    "that does not mean every question needs it -- only pick 'sql' when the "
+    "question itself asks to look something up, calculate, filter, or "
+    "compare against the company's own database.\n\n"
+    "Examples that mean 'attachments' ONLY (do NOT also add 'sql', even "
+    "though it's listed as an option):\n"
+    '- "Extract text from this image"\n'
+    '- "What does this image show?"\n'
+    '- "Summarize this PDF"\n'
+    '- "Read the attached document"\n'
+    '- "Resize this image" / "Remove the text from this image"\n\n'
+    "Examples that genuinely need 'sql' alongside 'attachments' -- only "
+    "when the question explicitly asks to query, calculate, filter, or "
+    "compare against the database, using the attachment as supporting "
+    "context:\n"
+    '- "Use this PDF\'s definitions to calculate revenue from the database"\n'
+    '- "Find database customers listed in this CSV"\n'
+    '- "Compare this uploaded report with the database results"\n\n'
+    "Rule: do not add 'sql' just because a database happens to be "
+    "configured or because the attachment's subject matter loosely relates "
+    "to business data -- only when the question itself asks for a database "
+    "lookup, calculation, or comparison."
+)
 
 # Few-shot guidance for the "generation" option specifically, appended to
 # classify_sources's system prompt only when "generation" is one of the
@@ -166,7 +350,7 @@ _MEDIA_SEARCH_VS_GENERATION_GUIDANCE = (
 )
 
 
-def get_available_sources(settings: Settings) -> list[str]:
+def get_available_sources(settings: Settings, *, has_attachments: bool = False) -> list[str]:
     """Returns every data source currently configured and available to route to.
 
     `sql` is always available (`Settings.databases` always has >=1 entry --
@@ -180,6 +364,13 @@ def get_available_sources(settings: Settings) -> list[str]:
     confirmed to actually work (see `Settings.enable_media_generation`'s
     docstring); enabling this without a confirmed API reference will make
     the router route real questions to a source that fails.
+
+    Args:
+        has_attachments: Whether the caller attached file(s) to this
+            specific question (`OrchestratorState["pending_attachment_ids"]`)
+            -- unlike every other source here, "attachments" availability
+            depends on the current *request*, not just standing config, so
+            it's a parameter rather than another `Settings` flag check.
     """
     sources = ["sql"]
     if settings.enable_document_rag and settings.rag_store_connection_string:
@@ -192,6 +383,8 @@ def get_available_sources(settings: Settings) -> list[str]:
         sources.append("generation")
     if settings.enable_media_search and settings.media_library_path:
         sources.append("media_search")
+    if has_attachments and settings.enable_chat_attachments:
+        sources.append("attachments")
     return sources
 
 
@@ -220,6 +413,8 @@ def classify_sources(
         "question can need more than one (e.g. comparing a database figure "
         "against a policy document)."
     )
+    if "attachments" in available and "sql" in available:
+        system_prompt += _ATTACHMENT_VS_SQL_GUIDANCE
     if "generation" in available:
         system_prompt += _GENERATION_FEW_SHOT_GUIDANCE
         if "media_search" in available:
@@ -323,14 +518,44 @@ def router_node(state: OrchestratorState) -> dict[str, Any]:
     once a session's expensive-source budget is spent.
     """
     settings = get_settings()
-    available = get_available_sources(settings)
+    has_attachments = bool(state.get("pending_attachment_ids"))
+    available = get_available_sources(settings, has_attachments=has_attachments)
+    question = state["question"]
 
     if len(available) <= 1:
         reasoning = f"only {available[0]!r} is configured -- routed without a classification call"
         sources, short_circuited = available, True
+    elif has_attachments and _looks_like_attachment_only_question(question):
+        # Deterministic override, checked before the LLM classifier ever
+        # runs -- see `_looks_like_attachment_only_question`'s own
+        # docstring for the real, reported bug this closes (schema
+        # retrieval + SQL generation firing for a plain "extract text"
+        # request just because a database happens to always be
+        # configured). Every other case -- no attachments, or an
+        # attachment question that also names a database keyword -- is
+        # unaffected and still goes through classify_sources below exactly
+        # as before.
+        sources = ["attachments"]
+        reasoning = (
+            "deterministic attachment-only pattern matched with no database keyword "
+            "present -- classification skipped"
+        )
+        short_circuited = True
     else:
-        sources, reasoning = classify_sources(state["question"], available, settings)
+        sources, reasoning = classify_sources(question, available, settings)
         short_circuited = False
+
+    # "attachments" is never left to the classifier's discretion -- the
+    # user explicitly attached file(s) to this exact question, so silently
+    # dropping them (e.g. the classifier deciding the question "sounds
+    # like SQL" and omitting attachments entirely) would violate this
+    # feature's own "never silently discard an attachment" requirement.
+    # The classifier's job here is only to decide whether some OTHER
+    # source is ALSO needed alongside it (e.g. "compare this file with the
+    # database" genuinely needs both "attachments" and "sql").
+    if "attachments" in available and "attachments" not in sources:
+        sources.append("attachments")
+        reasoning += " (attachments forced into the route -- explicitly attached by the user)"
 
     # 2026 Phase 2 security review: prefer the authenticated caller's real
     # subject (security.oidc.AuthIdentity.subject, set whenever OIDC auth
@@ -401,12 +626,14 @@ def router_node(state: OrchestratorState) -> dict[str, Any]:
         "sources": sources,
         "reasoning": reasoning,
         "short_circuited": short_circuited,
+        "requires_database": "sql" in sources,
     }
     logger.info(
-        "[router] available=%s sources=%s short_circuited=%s reasoning=%s",
+        "[router] available=%s sources=%s short_circuited=%s requires_database=%s reasoning=%s",
         available,
         route_decision["sources"],
         route_decision["short_circuited"],
+        route_decision["requires_database"],
         reasoning,
     )
     if "generation" in sources:
@@ -433,6 +660,7 @@ _DESTINATION_NODE_NAMES: dict[str, str] = {
     "web": "web_search",
     "generation": "generation",
     "media_search": "media_search",
+    "attachments": "attachments",
 }
 
 
@@ -1002,6 +1230,50 @@ def media_search_node(state: OrchestratorState) -> dict[str, Any]:
     }
 
 
+def attachment_node(state: OrchestratorState) -> dict[str, Any]:
+    """Handles a question routed to the "attachments" source -- files the
+    user attached directly to this question (see `attachments/graph.py`).
+
+    Unlike every other source here, "attachments" is never something the
+    router *discovers* is relevant from question phrasing alone -- it's
+    only ever available at all when the caller actually attached
+    something (`OrchestratorState["pending_attachment_ids"]`,
+    threaded from `AskRequest.attachment_ids`), and `router_node` forces it
+    into the final route unconditionally once available (see that node's
+    own docstring) rather than leaving it to LLM classification.
+
+    Ownership: `attachments.graph.run_attachment_qa`'s own `owner_subject`
+    check (via `attachments.store.AttachmentStore`) is what actually
+    prevents this node from resolving another caller's attachment_id --
+    `state["caller_subject"]` is threaded through unchanged from
+    `agent.graph.run_agent`'s own caller-identity convention.
+    """
+    from attachments.graph import run_attachment_qa
+
+    attachment_ids = state.get("pending_attachment_ids") or []
+    result = run_attachment_qa(
+        state["question"], attachment_ids, owner_subject=state.get("caller_subject")
+    )
+
+    graph_status = result.get("status")
+    if graph_status == "succeeded":
+        status = "succeeded"
+    elif graph_status == "no_attachments":
+        status = "insufficient_information"
+    else:
+        status = "failed"
+
+    attachment_result: AttachmentResult = {
+        "answer": result.get("answer")
+        or "No usable content could be extracted from the attached file(s).",
+        "citations": [],
+        "status": status,
+        "used_attachment_ids": result.get("used_attachment_ids", []),
+        "vision_unavailable": result.get("vision_unavailable", False),
+    }
+    return {"attachment_result": attachment_result, "sources_used": ["attachments"]}
+
+
 _SOURCE_LABELS: dict[str, str] = {
     "sql": "Database",
     "documents": "Documents",
@@ -1009,6 +1281,7 @@ _SOURCE_LABELS: dict[str, str] = {
     "web": "Web (external, live)",
     "generation": "Generated Media",
     "media_search": "Media Library",
+    "attachments": "Attached Files",
 }
 
 _SOURCE_RESULT_KEYS: dict[str, str] = {
@@ -1016,6 +1289,7 @@ _SOURCE_RESULT_KEYS: dict[str, str] = {
     "policy": "policy_result",
     "web": "web_result",
     "generation": "generation_result",
+    "attachments": "attachment_result",
     "media_search": "media_search_result",
 }
 
@@ -1140,6 +1414,7 @@ def synthesis_node(state: OrchestratorState) -> dict[str, Any]:
         ("policy_result", "policy"),
         ("web_result", "web"),
         ("media_search_result", "media_search"),
+        ("attachment_result", "attachments"),
     ):
         result = cast("SourceAnswer | None", state.get(key))
         if not result:

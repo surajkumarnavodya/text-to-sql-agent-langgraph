@@ -52,6 +52,12 @@ _BASE_SETTINGS = Settings(
     log_level="INFO",
     log_redaction_level="standard",
     api_auth_token=SecretStr("dummy-token"),
+    # This file's own production-environment tests are about write-privilege
+    # enforcement, not file uploads -- satisfies
+    # Settings._require_malware_scanning_in_production (chat attachments
+    # default on) so those tests can still construct a production Settings
+    # at all, same reason api_auth_token above satisfies the identity check.
+    malware_scan_provider="clamav",
 )
 
 

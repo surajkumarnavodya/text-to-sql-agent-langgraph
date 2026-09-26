@@ -396,6 +396,29 @@ class Settings(BaseSettings):
             question's self-correction retries (up to `max_retries + 1`
             calls) could otherwise multiply load well past what the
             question-level limit alone would suggest.
+        max_concurrent_ask_requests: Max `POST /ask` graph executions
+            allowed to run at once, process-wide -- an *in-flight*
+            concurrency cap, not a per-minute rate limit (see
+            `agent.rate_limit.ConcurrencyLimiter`'s own docstring for why
+            the two are complementary). This is also what sizes
+            `api/main.py`'s bounded ask-worker thread pool (one worker per
+            admitted concurrent request), which replaced an unbounded
+            raw-`threading.Thread`-per-request pattern -- scale-out hardening
+            pass, see `docs/SCALE_OUT_PROMPT.md`'s bottleneck #1. Sized
+            generously above this app's own measured per-question latency
+            profile (`docs/PERFORMANCE_BASELINE.md`'s P95 ~158s) so ordinary
+            multi-tab/multi-caller use is never throttled; a caller past
+            this limit gets an immediate 429, not a queued wait -- there is
+            no work queue yet (Phase 4 of the scale-out program).
+        max_concurrent_ask_requests_per_caller: Max `POST /ask` executions
+            one caller (an authenticated subject when available, else
+            client IP -- see `api/main.py`'s `_rate_limit_key`) may have in
+            flight at once. Deliberately small (2) -- this is a fairness/
+            isolation bound (one chatty caller can't consume a large share
+            of `max_concurrent_ask_requests`'s shared budget), not a
+            throughput control; a real "wait for my last answer before
+            asking again" UI never needs more than one or two in flight per
+            caller (a second tab, or a retry racing a slow first attempt).
         api_action_rate_limit_per_minute: Max calls per minute, per client
             IP, to `POST /execute`, `POST /schema/refresh`, the mutating
             `/documents` routes (upload/delete), and `POST /generate/confirm`
@@ -1002,6 +1025,114 @@ class Settings(BaseSettings):
             questions are already bounded by `/ask`'s own limiter, the
             same reasoning document/policy RAG have no dedicated limiter
             of their own either.
+        enable_chat_attachments: Whether a question submitted to `POST /ask`
+            may carry `attachment_ids` (files uploaded via `POST
+            /attachments/upload` -- images, PDFs, Office documents, plain
+            text/CSV/JSON) that get processed and given to the model as
+            extra context/multimodal content, via a new
+            `agent.orchestrator.nodes.attachment_node` orchestrator source
+            (`attachments/graph.py`). On by default -- like
+            `enable_voice_mode`, this spends no money and makes no outbound
+            network call (image description reuses the already-local
+            `media_vision_model` Ollama call, exactly like
+            `media/captioning.py`) and previously "attaching" a file in the
+            React dashboard only held it in browser memory for local
+            preview/editing with no way to reach the model at all (see
+            `docs/image-editing-architecture.md`'s "no backend endpoint
+            accepts a chat image attachment" disclosure -- that's the gap
+            this closes). Deliberately checked without also requiring
+            `ENABLE_MULTI_SOURCE_ROUTER`: attaching a file to a question is
+            a per-request capability the caller opts into by attaching a
+            file at all, not a standing multi-source-routing decision --
+            `agent.orchestrator.graph.run_orchestrated` runs its graph
+            whenever attachments are present even with the router flag off,
+            mirroring `attachments` into the orchestrator's normal
+            single-branch short-circuit instead of a second code path.
+        max_attachment_image_bytes: Upper bound on one image attachment's
+            size, read-and-reject-if-over before decoding -- mirrors
+            `Settings.max_document_upload_mb`'s own "reject before doing any
+            real work" pattern, scaled down since an image this app embeds
+            as a base64 data URL costs real prompt/context budget per byte,
+            unlike a PDF whose bytes are only ever parsed, never sent whole.
+        max_attachment_document_bytes: Upper bound on one non-image
+            attachment's size (PDF/DOCX/XLSX/PPTX/TXT/MD/JSON/CSV),
+            enforced the same read-and-reject-if-over way.
+        max_attachments_per_message: Max number of files one `/ask` call may
+            attach at once (`AskRequest.attachment_ids`) -- bounds both
+            upload abuse and how much attachment context a single question
+            can inject into one prompt.
+        max_total_attachment_bytes: Upper bound on the *combined* size of
+            every attachment on one message -- closes the gap
+            `max_attachment_document_bytes` alone leaves open (many
+            individually-small files summing to something huge).
+        max_attachment_text_chars: Upper bound on how many characters of
+            extracted text `attachments.context_builder.build_attachment_context`
+            will inject into one prompt, across all attachments combined --
+            the single hard ceiling that keeps one huge PDF/spreadsheet from
+            consuming the entire model context window. See that function's
+            own docstring for the truncation/notice behavior once this is
+            hit.
+        max_attachment_document_pages: Upper bound on one attached PDF's
+            page count, mirroring `Settings.max_document_pages`'s own
+            decompression-bomb-shaped rationale (a PDF's byte size alone
+            says little about how many pages -- and therefore how much
+            CPU/memory extracting its text costs -- it declares). A smaller
+            default than the persistent-knowledge-base PDF pipeline's own
+            limit, since a chat attachment's content is re-sent to the
+            model on every follow-up turn in the same conversation, not
+            embedded once into a vector store.
+        max_attachment_spreadsheet_rows: Upper bound on how many rows
+            `attachments.processors.xlsx_processor`/`csv_processor` will
+            read from one sheet/file before truncating (with an explicit
+            "truncated" notice in the extracted text, never a silent cut).
+        attachment_storage_dir: Directory attachment bytes are saved under,
+            one file per `Attachment.attachment_id` (never the caller's
+            original filename -- see `attachments.storage.sanitize_filename`)
+            -- outside any directory this app serves as static content, the
+            same "store files outside the public web root" rule
+            `Settings.chroma_persist_dir`/`voice/models/` already follow.
+            Gitignored and regenerated, like every other local-state
+            directory this app creates.
+        max_attachment_image_dimension_px: An attached image wider or taller
+            than this is downscaled (preserving aspect ratio) before it's
+            ever turned into a base64 data URL for the vision model --
+            bounds both the prompt-size cost of embedding it and, for a
+            local vision model with a fixed effective input resolution
+            (`Settings.media_vision_model`), wasted bytes the model
+            couldn't use anyway. 1568px matches the long-edge figure
+            several hosted vision APIs document as their own effective
+            resolution ceiling -- a reasonable default even though this
+            app's actual (local Ollama) vision model's own ceiling varies
+            by checkpoint.
+        max_attachment_resize_dimension_px: Upper bound on a requested
+            `POST /attachments/{id}/resize` target width/height, and the
+            working long-edge cap `attachments.ocr_extract`/
+            `attachments.inpaint` downscale an oversized source image to
+            before running OCR/inpainting -- both a decompression-bomb-style
+            guard (an on-disk attachment's original bytes are never
+            downscaled at upload time, unlike the vision-model data URL
+            path -- see `max_attachment_image_dimension_px`) and a sane UX
+            ceiling for the resize dialog's own numeric inputs.
+        attachment_ocr_timeout_seconds: Per-call timeout for a `pytesseract`
+            OCR pass (`attachments.ocr_extract`, and the text-region
+            detection step `attachments.inpaint` reuses) -- passed straight
+            through to `pytesseract`'s own `timeout=` kwarg, which raises on
+            expiry rather than hanging the request indefinitely on a
+            pathological image.
+        max_text_removal_regions: Upper bound on how many text regions one
+            `POST /attachments/{id}/remove-text` call will mask and inpaint
+            in a single request -- bounds both OCR-detection cost and how
+            large the generated inpainting mask (and therefore the
+            `cv2.inpaint` call) can get.
+        attachment_retention_hours: How long an uploaded attachment's bytes
+            and in-memory processed record are kept before
+            `attachments.storage.purge_expired_attachments` considers them
+            eligible for deletion -- bounds how long a stale chat upload
+            lingers on disk. This app has no background scheduler (a
+            deliberate, disclosed limitation shared with
+            `media_gen.cache.MediaCache`'s own FIFO-only eviction); the
+            purge function is called opportunistically (on each new upload)
+            rather than on a timer.
         moderation_provider: Which content-moderation backend
             `moderation/provider.py` uses to check a chunk before it's ever
             embedded/stored. Only `azure_content_safety` is implemented
@@ -1209,6 +1340,8 @@ class Settings(BaseSettings):
     max_conversation_history_turns: int = Field(default=20, gt=0)
     question_rate_limit_per_minute: int = Field(default=10, gt=0)
     llm_call_rate_limit_per_minute: int = Field(default=20, gt=0)
+    max_concurrent_ask_requests: int = Field(default=50, gt=0)
+    max_concurrent_ask_requests_per_caller: int = Field(default=2, gt=0)
     api_action_rate_limit_per_minute: int = Field(default=20, gt=0)
     cost_estimation_enabled: bool = True
     cost_estimation_timeout_seconds: int = Field(default=3, gt=0)
@@ -1378,6 +1511,36 @@ class Settings(BaseSettings):
     media_max_file_mb: int = Field(default=200, gt=0)
     media_search_top_k: int = Field(default=5, gt=0)
     media_scene_detect_threshold: float = Field(default=27.0, gt=0)
+    enable_chat_attachments: bool = True
+    max_attachment_image_bytes: int = Field(default=10 * 1024 * 1024, gt=0)
+    max_attachment_document_bytes: int = Field(default=25 * 1024 * 1024, gt=0)
+    max_attachments_per_message: int = Field(default=5, gt=0)
+    max_total_attachment_bytes: int = Field(default=50 * 1024 * 1024, gt=0)
+    max_attachment_text_chars: int = Field(default=80_000, gt=0)
+    max_attachment_document_pages: int = Field(default=200, gt=0)
+    max_attachment_spreadsheet_rows: int = Field(default=500, gt=0)
+    max_attachment_image_dimension_px: int = Field(default=1568, gt=0)
+    max_attachment_resize_dimension_px: int = Field(default=4096, gt=0)
+    attachment_ocr_timeout_seconds: float = Field(default=20.0, gt=0)
+    max_text_removal_regions: int = Field(default=20, gt=0)
+    # Zip-container (DOCX/XLSX/PPTX) decompression-bomb guard -- checked
+    # against the archive's own central-directory metadata
+    # (`attachments.zip_safety.check_zip_safety`) before python-docx/
+    # openpyxl/python-pptx ever decompresses a single entry. Independent of
+    # max_attachment_document_bytes (that caps the *compressed* upload
+    # size; a small, maliciously crafted archive can still expand to many
+    # times that once decompressed).
+    max_attachment_zip_uncompressed_bytes: int = Field(default=200 * 1024 * 1024, gt=0)
+    max_attachment_zip_entries: int = Field(default=2_000, gt=0)
+    # Hard wall-clock bound on one attachment's processor.process() call
+    # (attachments.pipeline.process_attachment) -- a pathological but
+    # otherwise-valid file (e.g. a PDF with a deeply nested object graph)
+    # could otherwise tie up a request thread indefinitely; enforced via a
+    # background-thread-plus-join timeout, the same mechanism
+    # db/execution.py::_execute_with_timeout already uses for SQL queries.
+    attachment_processing_timeout_seconds: float = Field(default=30.0, gt=0)
+    attachment_storage_dir: Path = Path("./data/attachments")
+    attachment_retention_hours: int = Field(default=24, gt=0)
     moderation_provider: Literal["azure_content_safety"] = "azure_content_safety"
     azure_content_safety_endpoint: str = ""
     azure_content_safety_key: SecretStr | None = None
@@ -1668,6 +1831,45 @@ class Settings(BaseSettings):
                 "OIDC_ISSUER (+ OIDC_AUDIENCE) for production-grade OIDC/JWT "
                 "authentication, or API_AUTH_TOKEN for a lighter-weight static shared "
                 "secret -- see docs/AUTHENTICATION.md."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _require_malware_scanning_in_production(self) -> Settings:
+        """`ENVIRONMENT=production` with at least one untrusted-file-accepting
+        feature enabled (chat attachments, document RAG, policy RAG, media
+        search) but `MALWARE_SCAN_PROVIDER=disabled` refuses to start --
+        the same "fail closed at startup, not silently at request time"
+        posture `_require_identity_in_production` above already has for
+        authentication. `malware_scan_provider` defaults to `"disabled"`
+        deliberately (see that field's own docstring: no scanning
+        capability existed before it was added, so defaulting it "on"
+        would break every existing deployment without a ClamAV daemon) --
+        this validator is what turns "off by default" into "must be
+        explicitly turned on before this goes to production," rather than
+        leaving that as an easy-to-miss deployment checklist item.
+        `ENVIRONMENT` defaults to "development", where this never fires.
+        """
+        untrusted_upload_features_enabled = (
+            self.enable_chat_attachments
+            or self.enable_document_rag
+            or self.enable_policy_rag
+            or self.enable_media_search
+        )
+        if (
+            self.environment == "production"
+            and untrusted_upload_features_enabled
+            and self.malware_scan_provider == "disabled"
+        ):
+            raise ConfigurationError(
+                "ENVIRONMENT=production has at least one file-upload-accepting feature "
+                "enabled (chat attachments, document/policy RAG, or media search) but "
+                "MALWARE_SCAN_PROVIDER=disabled -- refusing to start with untrusted "
+                "uploads reaching parsers/OCR/vision models with no malware scanning "
+                "at all. Set MALWARE_SCAN_PROVIDER=clamav (and CLAMAV_HOST/"
+                "CLAMAV_PORT) before deploying to production, or set "
+                "ENABLE_CHAT_ATTACHMENTS/ENABLE_DOCUMENT_RAG/ENABLE_POLICY_RAG/"
+                "ENABLE_MEDIA_SEARCH=false if this deployment doesn't need file uploads."
             )
         return self
 
