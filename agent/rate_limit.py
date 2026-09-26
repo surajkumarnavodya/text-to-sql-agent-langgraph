@@ -1,31 +1,50 @@
-"""In-memory sliding-window rate limiting.
+"""In-memory sliding-window rate limiting, plus in-flight concurrency
+limiting (`ConcurrencyLimiter`/`BoundedConcurrencyLimiterCache`, added
+alongside the scale-out hardening pass -- see
+`docs/SCALE_OUT_PROMPT.md`).
 
-A basic safeguard appropriate for a local, single-user-oriented tool -- not
-a substitute for real rate limiting in a multi-tenant deployment (see
-SECURITY.md). Deliberately simple: no persistence, no distributed
-coordination, resets on every app restart. Two independent limiters are
-built from the same `SlidingWindowRateLimiter` class, at different scopes:
+A real safeguard, but still process-local -- not a substitute for
+distributed rate limiting across multiple replicas (see SECURITY.md and
+`docs/SCALE_OUT_PROMPT.md`'s Phase 3, which moves this to Redis). No
+persistence, no cross-process coordination, resets on every app restart.
+Several independent limiters are built from the same
+`SlidingWindowRateLimiter`/`ConcurrencyLimiter` classes, at different
+scopes:
 
   - **Question submissions** (`Settings.question_rate_limit_per_minute`,
-    default 10/min): per client IP -- `api/main.py` owns one instance per
+    default 10/min): keyed by authenticated subject when one exists
+    (`local`/`oidc` auth modes), else client IP (`none`/`static_token`
+    modes, where every caller is otherwise indistinguishable) -- see
+    `api/main.py`'s `_rate_limit_key`. `api/main.py` owns one instance per
     caller and checks it before ever calling
     `agent.orchestrator.graph.run_orchestrated`. Protects against a human
     (or a script) hammering the chat box faster than the pipeline can
     reasonably keep up.
+  - **`/ask` in-flight concurrency** (`ConcurrencyLimiter`,
+    `Settings.max_concurrent_ask_requests` process-global +
+    `max_concurrent_ask_requests_per_caller` per the same caller key as
+    above): a *rate* limit alone doesn't stop one caller from having
+    several slow requests running at once, each holding a thread-pool
+    slot, a DB connection, and an in-flight LLM call -- this bounds
+    *concurrent* load directly. Checked before any work starts (a full
+    limiter is an immediate 429, not a queued wait); released only when
+    the underlying graph execution actually finishes, not when
+    `api/main.py`'s outer request-timeout gives up waiting on it, so an
+    abandoned-but-still-running call still correctly occupies its slot.
   - **LLM generation calls** (`Settings.llm_call_rate_limit_per_minute`,
     default 20/min, deliberately *stricter*): process-global, checked
     inside `agent.nodes.generate_sql_node` before every actual call to
     Ollama -- including retries. This is what actually bounds the retry
     loop: a single question can burn up to `MAX_RETRIES + 1` LLM calls on
     its own, so the question-level limit alone doesn't cap total LLM load.
-    Process-global rather than per-session is a deliberate simplification:
+    Process-global rather than per-caller is a deliberate simplification:
     the retry loop lives inside a single `run_agent()` graph execution,
-    which is rebuilt fresh every call, so there's no natural per-session
+    which is rebuilt fresh every call, so there's no natural per-caller
     object to thread a stateful limiter through without passing it as a
     live object inside `AgentState` (awkward next to the otherwise-plain-
-    data state model). For this app's actual target -- one local user --
-    process-global and per-session are practically equivalent; a real
-    multi-session deployment would need to revisit this.
+    data state model) -- a real multi-replica deployment needs to revisit
+    this regardless (see Phase 3 above), so a per-caller refinement here
+    specifically wasn't prioritized ahead of that.
 
 Every trip logs through this module's own logger (`agent.rate_limit` --
 distinct from `agent.nodes`'/`agent.input_guard`'s categories, so rate-limit
@@ -36,6 +55,7 @@ rejections or retry-loop errors).
 from __future__ import annotations
 
 import logging
+import threading
 import time
 from collections import OrderedDict, deque
 from dataclasses import dataclass
@@ -206,6 +226,109 @@ class BoundedLimiterCache:
         return len(self._cache)
 
 
+ASK_CONCURRENCY_LIMIT_MESSAGE = (
+    "The system is at capacity right now -- please wait a moment and try again."
+)
+PER_CALLER_ASK_CONCURRENCY_LIMIT_MESSAGE = (
+    "You already have a question being processed -- please wait for it to finish before "
+    "asking another."
+)
+
+
+class ConcurrencyLimiter:
+    """Bounds how many events may be *concurrently in flight* at once --
+    complementary to, not a replacement for, `SlidingWindowRateLimiter`'s
+    per-time-window cap. A caller comfortably under a 10/minute rate limit
+    can still have several of those ten requests still running
+    simultaneously (the UI has no "wait for the last answer" lock, and a
+    scripted caller has even less reason to wait) -- each one holds a
+    thread-pool slot, a DB connection, and an in-flight LLM call for its
+    full duration, so *concurrent* load, not just *rate*, is what actually
+    exhausts shared worker capacity under a burst.
+
+    `try_acquire()`/`release()` deliberately never block -- a full limiter
+    means "reject this admission attempt now" (`api/main.py`'s `/ask`
+    turns a failed `try_acquire()` into an immediate 429, before any LLM/DB
+    work starts), not "queue and wait," which is what a real work queue
+    (out of scope for this pass -- see `docs/SCALE_OUT_PROMPT.md` Phase 4)
+    would be for.
+    """
+
+    def __init__(self, max_concurrent: int, name: str) -> None:
+        self._max_concurrent = max_concurrent
+        self._name = name
+        self._lock = threading.Lock()
+        self._in_flight = 0
+
+    def try_acquire(self) -> bool:
+        with self._lock:
+            if self._in_flight >= self._max_concurrent:
+                logger.warning(
+                    "[rate_limit] %s concurrency limiter tripped: %d/%d in flight",
+                    self._name,
+                    self._in_flight,
+                    self._max_concurrent,
+                )
+                return False
+            self._in_flight += 1
+            return True
+
+    def release(self) -> None:
+        """Idempotent-safe against being called more times than
+        `try_acquire()` succeeded (clamped at 0) -- a caller that's already
+        handling its own "did I actually acquire this" bookkeeping (see
+        `api/main.py`'s `_release_ask_slots`) still gets a harmless no-op
+        rather than an assertion if something calls this defensively."""
+        with self._lock:
+            self._in_flight = max(0, self._in_flight - 1)
+
+    def __len__(self) -> int:
+        with self._lock:
+            return self._in_flight
+
+
+class BoundedConcurrencyLimiterCache:
+    """A dict of `ConcurrencyLimiter`, keyed by an arbitrary string and
+    bounded to `max_entries` via least-recently-used eviction -- the
+    concurrency-limiter analog of `BoundedLimiterCache` above (same
+    unbounded-key-growth concern: a caller key here is an authenticated
+    subject when one exists, but still client IP otherwise, exactly like
+    `BoundedLimiterCache`'s own keys -- see that class's docstring for the
+    finding this pattern already closed once)."""
+
+    def __init__(self, max_entries: int = 10_000) -> None:
+        self._max_entries = max_entries
+        self._cache: OrderedDict[str, ConcurrencyLimiter] = OrderedDict()
+        self._lock = threading.Lock()
+
+    def get_or_create(self, key: str, max_concurrent: int, name: str) -> ConcurrencyLimiter:
+        with self._lock:
+            limiter = self._cache.get(key)
+            if limiter is not None:
+                self._cache.move_to_end(key)
+                return limiter
+
+            limiter = ConcurrencyLimiter(max_concurrent=max_concurrent, name=name)
+            self._cache[key] = limiter
+            if len(self._cache) > self._max_entries:
+                evicted_key, _ = self._cache.popitem(last=False)
+                logger.info(
+                    "[rate_limit] bounded concurrency-limiter cache at capacity (%d entries) "
+                    "-- evicted least-recently-used key %r to admit %r",
+                    self._max_entries,
+                    evicted_key,
+                    key,
+                )
+            return limiter
+
+    def clear(self) -> None:
+        with self._lock:
+            self._cache.clear()
+
+    def __len__(self) -> int:
+        return len(self._cache)
+
+
 _llm_call_limiter: SlidingWindowRateLimiter | None = None
 _media_generation_limiter: SlidingWindowRateLimiter | None = None
 
@@ -228,6 +351,42 @@ def get_llm_call_limiter(max_calls_per_minute: int) -> SlidingWindowRateLimiter:
             max_events=max_calls_per_minute, window_seconds=60.0, name="llm_generation_calls"
         )
     return _llm_call_limiter
+
+
+_ask_concurrency_limiter: ConcurrencyLimiter | None = None
+_per_caller_ask_concurrency_limiters = BoundedConcurrencyLimiterCache()
+
+
+def get_ask_concurrency_limiter(max_concurrent: int) -> ConcurrencyLimiter:
+    """Returns the process-wide `/ask` in-flight-request limiter, creating
+    it on first use -- same first-call-wins singleton pattern as
+    `get_llm_call_limiter`. This is the *global* admission gate
+    `api/main.py`'s `ask()` checks before doing any work; see
+    `get_per_caller_ask_concurrency_limiter` for the complementary
+    per-caller one."""
+    global _ask_concurrency_limiter
+    if _ask_concurrency_limiter is None:
+        _ask_concurrency_limiter = ConcurrencyLimiter(
+            max_concurrent=max_concurrent, name="ask_requests_global"
+        )
+    return _ask_concurrency_limiter
+
+
+def get_per_caller_ask_concurrency_limiter(
+    caller_key: str, max_concurrent: int
+) -> ConcurrencyLimiter:
+    """Returns the in-flight `/ask` limiter for one caller (an authenticated
+    subject when available, else client IP -- see `api/main.py`'s
+    `_rate_limit_key`), creating it on first use for that key. Deliberately
+    a *small* default (`Settings.max_concurrent_ask_requests_per_caller`,
+    e.g. 2) -- this bounds one chatty caller (or a buggy client retrying
+    without waiting) from occupying a large share of the global limiter's
+    shared budget above."""
+    return _per_caller_ask_concurrency_limiters.get_or_create(
+        caller_key,
+        max_concurrent=max_concurrent,
+        name=f"ask_requests_per_caller[{caller_key}]",
+    )
 
 
 def get_media_generation_limiter(

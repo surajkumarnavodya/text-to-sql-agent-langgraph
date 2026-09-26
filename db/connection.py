@@ -238,7 +238,23 @@ def get_engine(settings: DbConnectionLike | None = None) -> Engine:
     settings = settings or get_settings()
     url = build_connection_url(settings)
     logger.debug("Resolved database target: %s", _describe_target(settings))
-    return _cached_engine(str(url))
+    # Real bug, found via the scale-out load-test harness (docs/SCALE_OUT_PROMPT.md
+    # Phase 0 -- the first thing to ever exercise a real discrete-field
+    # (DB_HOST/DB_USER/DB_PASSWORD, not DB_CONNECTION_STRING) connection
+    # with a real password against a real database): `str(url)` on a
+    # `sqlalchemy.engine.URL` object masks the password as `"***"` by
+    # design (URL.__str__ is meant for safe logging/printing, per
+    # SQLAlchemy's own docs) -- passing that straight into `create_engine`
+    # makes it *literally* try to authenticate with the password `"***"`.
+    # `DB_CONNECTION_STRING` (where `build_connection_url` returns a plain
+    # `str`, never a `URL` object -- see that function's own branching) was
+    # never affected; only the discrete-fields path was. Zero test coverage
+    # caught this before now because this project's test suite is fully
+    # mocked and never makes a real password-authenticated connection (see
+    # CLAUDE.md's `tests/` section) -- `render_as_string(hide_password=False)`
+    # is the real, unmasked string `_cached_engine` actually needs.
+    connection_string = url if isinstance(url, str) else url.render_as_string(hide_password=False)
+    return _cached_engine(connection_string)
 
 
 def get_read_only_engine(settings: DbConnectionLike | None = None) -> Engine:

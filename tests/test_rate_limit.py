@@ -8,11 +8,17 @@ exercises the exact same code path the real clock would.
 from __future__ import annotations
 
 from agent.rate_limit import (
+    ASK_CONCURRENCY_LIMIT_MESSAGE,
     LLM_CALL_LIMIT_MESSAGE,
+    PER_CALLER_ASK_CONCURRENCY_LIMIT_MESSAGE,
     QUESTION_LIMIT_MESSAGE,
+    BoundedConcurrencyLimiterCache,
     BoundedLimiterCache,
+    ConcurrencyLimiter,
     SlidingWindowRateLimiter,
+    get_ask_concurrency_limiter,
     get_llm_call_limiter,
+    get_per_caller_ask_concurrency_limiter,
 )
 
 
@@ -178,11 +184,127 @@ class TestBoundedLimiterCache:
         assert len(cache) == 0
 
 
+class TestConcurrencyLimiter:
+    """Unit tests for the in-flight (not per-time-window) concurrency
+    limiter added in the scale-out hardening pass -- see
+    docs/SCALE_OUT_PROMPT.md and `agent.rate_limit.ConcurrencyLimiter`'s
+    own docstring for why this is a separate control from
+    `SlidingWindowRateLimiter` above."""
+
+    def test_allows_acquisitions_up_to_the_limit(self):
+        limiter = ConcurrencyLimiter(max_concurrent=2, name="test")
+        assert limiter.try_acquire() is True
+        assert limiter.try_acquire() is True
+        assert len(limiter) == 2
+
+    def test_denies_acquisition_past_the_limit(self):
+        limiter = ConcurrencyLimiter(max_concurrent=1, name="test")
+        assert limiter.try_acquire() is True
+        assert limiter.try_acquire() is False
+        assert len(limiter) == 1  # the denied attempt is not counted
+
+    def test_release_frees_a_slot_for_a_later_acquisition(self):
+        limiter = ConcurrencyLimiter(max_concurrent=1, name="test")
+        limiter.try_acquire()
+        assert limiter.try_acquire() is False
+
+        limiter.release()
+
+        assert limiter.try_acquire() is True
+
+    def test_release_never_goes_negative_past_zero(self):
+        """Releasing more times than acquired (a defensive-coding
+        possibility, e.g. a double-release bug elsewhere) must clamp at
+        zero, never wrap or go negative and silently corrupt future
+        capacity accounting."""
+        limiter = ConcurrencyLimiter(max_concurrent=1, name="test")
+        limiter.release()
+        limiter.release()
+        assert len(limiter) == 0
+        assert limiter.try_acquire() is True
+
+    def test_independent_limiters_do_not_share_state(self):
+        a = ConcurrencyLimiter(max_concurrent=1, name="a")
+        b = ConcurrencyLimiter(max_concurrent=1, name="b")
+        a.try_acquire()
+        assert b.try_acquire() is True
+
+
+class TestBoundedConcurrencyLimiterCache:
+    def test_returns_the_same_instance_for_the_same_key(self):
+        cache = BoundedConcurrencyLimiterCache(max_entries=10)
+        first = cache.get_or_create("a", max_concurrent=2, name="a")
+        second = cache.get_or_create("a", max_concurrent=2, name="a")
+        assert first is second
+
+    def test_state_is_preserved_per_key(self):
+        cache = BoundedConcurrencyLimiterCache(max_entries=10)
+        limiter = cache.get_or_create("a", max_concurrent=1, name="a")
+        assert limiter.try_acquire() is True
+        assert limiter.try_acquire() is False  # same key, budget already spent
+
+        other = cache.get_or_create("b", max_concurrent=1, name="b")
+        assert other.try_acquire() is True  # different key, fresh budget
+
+    def test_evicts_the_least_recently_used_key_once_over_capacity(self):
+        cache = BoundedConcurrencyLimiterCache(max_entries=2)
+        cache.get_or_create("a", max_concurrent=5, name="a")
+        cache.get_or_create("b", max_concurrent=5, name="b")
+        cache.get_or_create("c", max_concurrent=5, name="c")  # evicts "a"
+
+        assert len(cache) == 2
+        recreated = cache.get_or_create("a", max_concurrent=1, name="a")
+        assert recreated.try_acquire() is True
+        assert recreated.try_acquire() is False
+
+    def test_unbounded_key_growth_never_exceeds_max_entries(self):
+        """Same DoS-shaped concern `TestBoundedLimiterCache` already covers
+        for the sliding-window cache -- this cache is keyed the same way
+        (an authenticated subject when available, else client IP) and
+        needs the identical bound."""
+        cache = BoundedConcurrencyLimiterCache(max_entries=100)
+        for i in range(10_000):
+            cache.get_or_create(f"key-{i}", max_concurrent=2, name="k")
+        assert len(cache) == 100
+
+    def test_clear_drops_every_entry(self):
+        cache = BoundedConcurrencyLimiterCache(max_entries=10)
+        cache.get_or_create("a", max_concurrent=5, name="a")
+        cache.clear()
+        assert len(cache) == 0
+
+
+class TestGetAskConcurrencyLimiter:
+    def test_returns_the_same_instance_on_repeated_calls(self):
+        first = get_ask_concurrency_limiter(50)
+        second = get_ask_concurrency_limiter(50)
+        assert first is second
+
+
+class TestGetPerCallerAskConcurrencyLimiter:
+    def test_returns_the_same_instance_for_the_same_caller_key(self):
+        first = get_per_caller_ask_concurrency_limiter("user:abc", 2)
+        second = get_per_caller_ask_concurrency_limiter("user:abc", 2)
+        assert first is second
+
+    def test_different_caller_keys_get_independent_budgets(self):
+        a = get_per_caller_ask_concurrency_limiter("user:caller-a", 1)
+        b = get_per_caller_ask_concurrency_limiter("user:caller-b", 1)
+        a.try_acquire()
+        assert b.try_acquire() is True
+
+
 class TestMessages:
     def test_question_and_llm_call_messages_are_distinct_and_calm(self):
         """Different wording for the two limiters (submission-time vs.
         mid-retry-loop) -- both non-technical, no raw counters/exceptions."""
         assert QUESTION_LIMIT_MESSAGE != LLM_CALL_LIMIT_MESSAGE
         for message in (QUESTION_LIMIT_MESSAGE, LLM_CALL_LIMIT_MESSAGE):
+            assert "Exception" not in message
+            assert "Traceback" not in message
+
+    def test_concurrency_limit_messages_are_distinct_and_calm(self):
+        assert ASK_CONCURRENCY_LIMIT_MESSAGE != PER_CALLER_ASK_CONCURRENCY_LIMIT_MESSAGE
+        for message in (ASK_CONCURRENCY_LIMIT_MESSAGE, PER_CALLER_ASK_CONCURRENCY_LIMIT_MESSAGE):
             assert "Exception" not in message
             assert "Traceback" not in message

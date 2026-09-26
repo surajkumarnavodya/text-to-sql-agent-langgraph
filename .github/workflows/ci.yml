@@ -212,6 +212,26 @@ jobs:
           severity: CRITICAL,HIGH
         continue-on-error: true
 
+  # Phase 0 of the scale-out program (docs/SCALE_OUT_PROMPT.md) -- a short
+  # smoke run of the load-test harness (eval/load/) against a throwaway
+  # Postgres + mock-Ollama + the real api image, all inside this runner
+  # (Docker/Compose are preinstalled on GitHub-hosted runners, unlike the
+  # live-Ollama/live-DB requirement that keeps `benchmark-regression`
+  # below manual-only). Report-only for now (continue-on-error), same
+  # pattern as gitleaks/Trivy elsewhere in this file: this is the first
+  # time this job has run in CI, so its numbers haven't been triaged into
+  # a real pass/fail threshold yet -- see docs/SCALE_BASELINE.md. Flip to
+  # blocking once a few runs' worth of numbers have been reviewed by a
+  # human.
+  load-test-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run load-test smoke scenario
+        run: bash eval/load/run_load_test.sh smoke
+        continue-on-error: true
+
   # 2026 Phase 2 security review: a real Text-to-SQL accuracy/security-
   # rejection regression check (scripts/run_benchmark.py --check-
   # regression against eval/baselines/latest.json), deliberately gated

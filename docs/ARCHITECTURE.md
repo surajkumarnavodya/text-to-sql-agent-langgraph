@@ -714,3 +714,59 @@ came from the company's own systems. Same "data, not instructions"
 untrusted-content principle as ingested PDF content, since a search
 result's content is exactly as attacker-influenceable as a stored database
 value or an uploaded document.
+
+## 5. Scale-out program
+
+Everything described in sections 1-4 above is the enduring architecture;
+this section covers the ongoing effort to take it from single-instance to
+horizontally scalable. [`docs/SCALE_OUT_PROMPT.md`](SCALE_OUT_PROMPT.md) is
+the 11-phase program (Phase 0-10) driving it — stateless API tier,
+streamed responses, distributed rate limiting, a real inference gateway, a
+shared data tier, multi-tenancy, and production observability/deployment.
+
+**Phase 0** (done): a load-test harness (`eval/load/` — a mock-Ollama
+server, a throwaway Postgres + seeded schema/local-auth users, k6
+scenarios) and a measured baseline
+([`docs/SCALE_BASELINE.md`](SCALE_BASELINE.md)). Zero application code
+changed for Phase 0 itself — but actually *running* the harness surfaced
+one real, previously-invisible application bug (`db/connection.py::get_engine`
+was passing a *password-masked* connection string to `create_engine`,
+silently breaking every discrete-field database connection with a real
+password — fixed, with a regression test) and several load-test-infrastructure-only
+bugs (missing shared volumes, a `Content-Length` bug in the mock server) —
+see `SCALE_BASELINE.md`'s own "What this harness found and fixed" section.
+
+**A same-session hardening pass** (ahead of Phase 1's full async rewrite,
+which needs its own dedicated plan) added the highest-impact, lowest-risk
+concurrency and isolation fixes bottleneck #1 and #3 called for, without
+new infrastructure:
+
+- **Bounded `/ask` concurrency, real admission control**
+  (`api/main.py`, `agent/rate_limit.py`'s new `ConcurrencyLimiter`/
+  `BoundedConcurrencyLimiterCache`). The unbounded `threading.Thread`-per-request
+  pattern is now a `ThreadPoolExecutor` sized to
+  `Settings.max_concurrent_ask_requests` (default 50) — a caller past
+  that global cap, or past their own `max_concurrent_ask_requests_per_caller`
+  cap (default 2), gets an immediate 429 with `Retry-After`, *before* any
+  LLM/DB work starts. Concurrency slots are released only when the
+  underlying graph execution actually finishes — not when the outer
+  request-timeout gives up waiting on it — so an abandoned-but-still-running
+  call still correctly occupies its slot (real backpressure under
+  sustained overload, not an invisible thread leak). Still not true
+  cancellation (Phase 1's job); what this buys is described in
+  `api/main.py::_get_ask_executor`'s own docstring.
+- **Rate/concurrency limits keyed by real identity, not raw IP**
+  (`security.oidc.real_caller_subject`, used by `api/main.py`'s
+  `_rate_limit_key` and `api/attachments.py`'s `_owner_subject`). Closes
+  two related gaps at once: IP-keying is meaningless behind a load
+  balancer or carrier NAT, *and* — a genuine cross-user data-isolation bug,
+  found while fixing this — both call sites used to treat `mode="local"`
+  (this app's own real per-user JWT accounts) exactly like the two modes
+  with no real per-caller identity at all, silently pooling every distinct
+  local-auth user's attachments and rate/concurrency budget into one
+  shared "no owner" bucket.
+
+See `docs/SCALE_OUT_PROMPT.md`'s own working rules for the cadence going
+forward: one phase per session/PR, plan-mode-first for anything that
+qualifies as a large refactor, every phase re-runs `SCALE_BASELINE.md`'s
+harness and appends its numbers.

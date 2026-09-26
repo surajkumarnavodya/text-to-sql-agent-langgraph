@@ -1,0 +1,145 @@
+# Phase 0 load-test stack -- see docs/SCALE_OUT_PROMPT.md's Phase 0
+# section. Entirely separate from the repo-root docker-compose.yml (which
+# stays untouched -- this file changes nothing about the real production
+# deployment shape). Everything here is throwaway: a fresh Postgres with
+# no persisted volume (removed with `down -v`), a mock LLM, and the real
+# `api` image built from the repo's own Dockerfile.
+#
+# Usage: see `make load-test` (repo-root Makefile), which drives the full
+# up -> migrate -> seed -> k6 -> down sequence. To run by hand:
+#   cd eval/load
+#   docker compose -f docker-compose.loadtest.yml --env-file .env.loadtest up -d --build
+#   docker compose -f docker-compose.loadtest.yml --env-file .env.loadtest \
+#     run --rm api alembic -c identity/alembic.ini upgrade head
+#   docker compose -f docker-compose.loadtest.yml --env-file .env.loadtest \
+#     run --rm api python scripts/build_embeddings.py
+#   docker compose -f docker-compose.loadtest.yml --env-file .env.loadtest \
+#     run --rm api python -m eval.load.seed_users
+#   docker run --rm --network eval_load_default -v "$(pwd)/k6:/scripts" \
+#     -e BASE_URL=http://api:8000 grafana/k6 run /scripts/scenario_ask_flow.js
+#   docker compose -f docker-compose.loadtest.yml --env-file .env.loadtest down -v
+
+services:
+  postgres:
+    # Deliberately NOT digest-pinned, unlike the repo-root Dockerfile's own
+    # base images (see that file's comment for why production images are
+    # pinned) -- this is throwaway, rebuilt-every-session load-test
+    # infrastructure, and pinning a digest here would mean fabricating one
+    # rather than verifying it against the registry, which this pass has
+    # no way to do reliably. Revisit if this stack starts running
+    # unattended/scheduled rather than by hand per load-test session.
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: loadtest
+      POSTGRES_PASSWORD: loadtest
+      POSTGRES_DB: loadtest_business
+    volumes:
+      - ./seed/00-create-identity-db.sh:/docker-entrypoint-initdb.d/00-create-identity-db.sh:ro
+      - ./seed/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
+    # No named volume -- a fresh, empty database every `up`, on purpose:
+    # this stack's whole point is a clean, reproducible baseline per run,
+    # not a persistent database to accumulate load-test data in.
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U loadtest -d loadtest_business"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    ports:
+      - "127.0.0.1:${LOADTEST_POSTGRES_PORT:-5433}:5432"
+
+  mock-ollama:
+    build:
+      context: ..
+      dockerfile_inline: |
+        FROM python:3.11-slim@sha256:9534e5a8e315485d4061ed659af0fd78a284c015f9b73661b41d6bab25604534
+        WORKDIR /app
+        COPY load/mock_ollama_server.py .
+        CMD ["python", "mock_ollama_server.py"]
+    environment:
+      MOCK_OLLAMA_LATENCY_MS: ${MOCK_OLLAMA_LATENCY_MS:-800}
+      MOCK_OLLAMA_LATENCY_JITTER_MS: ${MOCK_OLLAMA_LATENCY_JITTER_MS:-300}
+    ports:
+      - "127.0.0.1:${LOADTEST_MOCK_OLLAMA_PORT:-11435}:11434"
+
+  api:
+    build:
+      # The real app image, from the real repo-root Dockerfile -- Phase 0
+      # deliberately measures the actual deployable artifact, not a
+      # stand-in.
+      context: ../..
+      dockerfile: Dockerfile
+    image: text-to-sql-dashboard:loadtest
+    env_file:
+      - .env.loadtest
+    volumes:
+      # Real bug, found via this exact harness: without a shared volume
+      # here, `docker compose run --rm api ...` (migrations, embeddings,
+      # seeding) and the persistent `api` service each get their own
+      # throwaway container filesystem -- schema embeddings built by the
+      # one-off `scripts/build_embeddings.py` run never reached the
+      # actual running service, which then had an empty schema index and
+      # failed every real `/ask` call with "reached with no
+      # selected_database". Named volume (not a bind mount) for the same
+      # reason the repo-root docker-compose.yml's own `chroma_index`
+      # volume is one -- see that file's comment.
+      - loadtest_chroma_index:/app/embeddings/.chroma
+      # A second, real, related bug found the same way: sentence-
+      # transformers/Chroma's ONNX embedding model weights (~79MB) cache
+      # to /home/app/.cache, a *different* path than the collection above
+      # -- without sharing this too, every fresh container instance
+      # (every `run --rm`, and any restart of the persistent service)
+      # re-downloads the model from scratch, a ~3-4 minute tax on the
+      # *first* real `/ask` call (retrieve_schema_node embeds the
+      # question with this same model) every single time. Shared so the
+      # download happens once per `docker compose up`, not once per
+      # container instance.
+      - loadtest_model_cache:/home/app/.cache
+    depends_on:
+      postgres:
+        condition: service_healthy
+      mock-ollama:
+        condition: service_started
+    ports:
+      - "127.0.0.1:${LOADTEST_API_PORT:-8001}:8000"
+    healthcheck:
+      # Explicitly DISABLED -- a real bug, found by running this for real
+      # (not a hypothetical), and initially misdiagnosed twice:
+      # `/health` (agent.embeddings.get_chroma_client) is this process's
+      # *first* real touch of the Chroma persist directory. If it fires
+      # before the *separate* `build_embeddings.py` container invocation
+      # has populated the schema collection, this process's cached Chroma
+      # client is permanently poisoned -- every real `/ask` for the rest
+      # of that process's life then fails with `RuntimeError: reached
+      # with no selected_database`.
+      #
+      # Misdiagnosis #1: raising `start_period` to 300s, on the theory
+      # that it *delays* the first probe. It does not -- per Docker's own
+      # semantics, `start_period` only changes whether a *failing* probe
+      # counts toward `retries`/"unhealthy"; the healthcheck command still
+      # *runs* on the normal `interval` from the moment the container
+      # starts. Confirmed via `docker inspect --format
+      # '{{json .State.Health}}'`: two probe attempts logged within 5s of
+      # container start, both `503`, despite `start_period: 300s` being
+      # set at the time.
+      #
+      # Misdiagnosis #2: removing this `healthcheck:` block entirely, on
+      # the theory that no override means no probe. It does not --
+      # Compose only overrides an image's own `HEALTHCHECK` instruction
+      # when a `healthcheck:` key is *present*; omitting it falls back to
+      # the repo-root Dockerfile's baked-in
+      # `HEALTHCHECK --start-period=20s CMD curl -f
+      # http://localhost:8000/health` (see that file), which races the
+      # same way.
+      #
+      # `disable: true` is the documented Compose way to override an
+      # image's `HEALTHCHECK` with a genuine no-op. Nothing in this
+      # compose file depends on `api`'s own health (only `postgres` is a
+      # `depends_on: condition: service_healthy` target), so this is safe
+      # -- `run_load_test.sh`'s own explicit `/health` polling loop, which
+      # correctly runs *after* `build_embeddings.py` has already
+      # finished, is what actually gates readiness for this harness.
+      disable: true
+
+volumes:
+  loadtest_chroma_index:
+  loadtest_model_cache:

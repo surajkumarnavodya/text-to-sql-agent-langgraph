@@ -92,11 +92,17 @@ class AuthIdentity:
     separated from "what may they do" (authorization, `agent/authz.py`).
 
     Attributes:
-        subject: Stable caller identifier -- the JWT `sub` claim for
-            `mode="oidc"`, a fixed sentinel for the other two modes (see
-            `api/auth.py`). Used only for audit-trail correlation and as
-            the cost-ceiling key (`agent/rate_limit.py`) once real identity
-            exists -- never treated as authorization by itself.
+        subject: Stable caller identifier -- a genuine, distinct per-caller
+            id (the JWT `sub` claim) for `mode="oidc"` **and** `mode="local"`
+            (this app's own self-hosted accounts, `identity/`), a *fixed
+            shared sentinel* for `mode="none"`/`"static_token"` (every
+            caller under either of those two modes is indistinguishable --
+            see `api/auth.py`). Used for audit-trail correlation and as the
+            key for every per-caller control that needs one (rate/
+            concurrency limits in `agent/rate_limit.py`, attachment
+            ownership in `attachments/store.py`) -- see
+            `real_caller_subject` below, the one function that knows this
+            distinction; never treated as authorization by itself.
         roles: Role names this caller has, lowest-privilege-safe default
             being an *empty* tuple, not an implicit role -- an identity
             with no roles claim gets no roles, not "trusted".
@@ -110,6 +116,29 @@ class AuthIdentity:
     subject: str
     roles: tuple[str, ...]
     mode: Literal["none", "static_token", "oidc", "local"]
+
+
+def real_caller_subject(identity: AuthIdentity) -> str | None:
+    """Returns `identity.subject` if it's a genuine, distinct per-caller
+    identifier, else `None` -- the single, shared answer to "does this
+    identity actually distinguish one caller from another," used
+    everywhere that distinction matters (rate/concurrency-limit keys in
+    `api/main.py`, attachment ownership in `api/attachments.py`,
+    `AgentState.caller_subject`).
+
+    2026 scale-out hardening pass finding: before this function existed,
+    three separate call sites each independently spelled out `identity.mode
+    == "oidc"` (treating `"local"` -- this app's own real, per-user
+    JWT-based accounts, `identity/` -- as if it were as anonymous as
+    `"none"`/`"static_token"`). That meant every *actual* distinct local
+    user shared one "no owner" bucket for rate limits, concurrency limits,
+    and attachment ownership alike -- a real cross-user data-isolation gap
+    for the one auth mode this app's own multi-user story is built on. Both
+    `"local"` and `"oidc"` set `identity.subject` to a real per-caller id
+    (see `AuthIdentity`'s own docstring); only `"none"`/`"static_token"`
+    don't.
+    """
+    return identity.subject if identity.mode in ("local", "oidc") else None
 
 
 def extract_roles(claims: Mapping[str, Any], role_claim: str) -> tuple[str, ...]:

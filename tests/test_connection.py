@@ -132,6 +132,63 @@ class TestBuildConnectionUrl:
             build_connection_url(_settings(db_host=None))
 
 
+class TestGetEngine:
+    """Regression test for a real bug found via the scale-out load-test
+    harness (docs/SCALE_OUT_PROMPT.md Phase 0): `get_engine` used to call
+    `_cached_engine(str(url))` -- and `sqlalchemy.engine.URL.__str__`
+    masks the password as the literal string `"***"` (by design, for safe
+    logging), so a discrete-field (`DB_HOST`/`DB_USER`/`DB_PASSWORD`)
+    connection with a real password could never actually authenticate.
+    Only ever caught because the load-test harness is the first thing in
+    this project's history to make a real, password-authenticated
+    connection against a real database using this exact code path --
+    every existing test mocks the DB layer entirely (see CLAUDE.md's
+    `tests/` section)."""
+
+    def test_the_real_password_reaches_create_engine_not_a_masked_placeholder(self, monkeypatch):
+        import db.connection as db_connection
+
+        settings = _settings(db_password=SecretStr("a-real-password"))
+        monkeypatch.setattr(db_connection, "get_settings", lambda: settings)
+
+        captured: dict[str, str] = {}
+
+        def _fake_create_engine(connection_string, **kwargs):
+            captured["connection_string"] = connection_string
+            return MagicMock()
+
+        monkeypatch.setattr(db_connection, "create_engine", _fake_create_engine)
+
+        db_connection.get_engine(settings)
+
+        assert "a-real-password" in captured["connection_string"]
+        assert "***" not in captured["connection_string"]
+
+    def test_a_db_connection_string_override_is_passed_through_unmodified(self, monkeypatch):
+        """The `DB_CONNECTION_STRING` override path returns a plain `str`
+        from `build_connection_url` (never a `URL` object), so it was never
+        affected by the masking bug above -- confirmed explicitly so a
+        future refactor can't accidentally break this branch while fixing
+        the other one."""
+        import db.connection as db_connection
+
+        raw = "postgresql+psycopg2://u:a-real-password@host/db"
+        settings = _settings(db_connection_string=SecretStr(raw))
+        monkeypatch.setattr(db_connection, "get_settings", lambda: settings)
+
+        captured: dict[str, str] = {}
+
+        def _fake_create_engine(connection_string, **kwargs):
+            captured["connection_string"] = connection_string
+            return MagicMock()
+
+        monkeypatch.setattr(db_connection, "create_engine", _fake_create_engine)
+
+        db_connection.get_engine(settings)
+
+        assert captured["connection_string"] == raw
+
+
 class TestEnginePoolSizing:
     """2026 Phase 3 performance review: `_cached_engine` now passes
     `Settings.db_pool_size`/`db_max_overflow` to `create_engine` instead of

@@ -1,4 +1,4 @@
-.PHONY: setup check-db embed run frontend-install frontend-build frontend-dev test lint format clean
+.PHONY: setup check-db embed run frontend-install frontend-build frontend-dev test lint format clean load-test
 
 VENV := .venv
 PYTHON := $(VENV)/bin/python
@@ -49,3 +49,11 @@ format:
 clean:
 	find . -type d -name __pycache__ -exec rm -rf {} +
 	rm -rf .pytest_cache .ruff_cache .mypy_cache
+
+# Phase 0 load-test harness -- see docs/SCALE_OUT_PROMPT.md and
+# docs/SCALE_BASELINE.md. Brings up a throwaway Postgres + mock-Ollama +
+# the real api image, seeds it, runs a short k6 smoke scenario, tears
+# everything down. `MODE=full` (see eval/load/run_load_test.sh) runs the
+# longer scenario set used to produce docs/SCALE_BASELINE.md's own numbers.
+load-test:
+	bash eval/load/run_load_test.sh $(MODE)
