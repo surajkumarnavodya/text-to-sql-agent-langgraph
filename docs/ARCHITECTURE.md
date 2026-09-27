@@ -770,3 +770,72 @@ See `docs/SCALE_OUT_PROMPT.md`'s own working rules for the cadence going
 forward: one phase per session/PR, plan-mode-first for anything that
 qualifies as a large refactor, every phase re-runs `SCALE_BASELINE.md`'s
 harness and appends its numbers.
+
+## 6. Configurable Ollama model selection
+
+A caller may pick which locally-installed Ollama model answers a given
+question (`POST /ask`'s optional `model` field) instead of always using
+`Settings.ollama_model`. The four LLM call sites in `agent/llm_client.py`
+(generation, planning, review, insight) each gained an optional `model`
+parameter (`None` uses the configured default, preserving every pre-existing
+call site); `agent.graph.run_agent` resolves the effective model once per
+question and stores it in `AgentState["selected_model"]` — the identical
+request-scoped pattern `selected_database` already establishes, so a
+question's model choice, like its database, stays fixed for the life of one
+run and is never a process-global variable two concurrent requests could
+clobber.
+
+`agent/model_registry.py` is the one place three deliberately separate
+concepts meet: **configured/allowed** (`Settings.ollama_allowed_models`,
+validated server-side before any work starts — an invalid selection returns
+`HTTP 400`), **installed locally** (a live `ollama.Client().list()` lookup,
+queried only by `GET /models`, never by `/ask` itself), and **this app's own
+curated display metadata** (`config/ollama_models.yaml`, cosmetic only). The
+online Ollama Library was consulted exactly once, during development, to
+pick a small starter allowlist — it is never a runtime dependency.
+
+Full design, security posture, and the concurrency regression test proving
+no global mutable state exists: `CLAUDE.md`'s "Configurable Ollama model
+selection for Text-to-SQL" section. Configuration reference:
+`docs/CONFIGURATION.md`'s "Model selection" section.
+
+## 7. Enterprise scalability/security assessment
+
+A follow-up assessment pass (synthesizing, not re-deriving, the Scale-out
+program above plus `docs/THREAT_MODEL.md`) found and fixed six further,
+in-place gaps without introducing any new infrastructure: identity-aware
+rate limiting extended to every remaining rate-limited route (not just
+`/ask`), opt-in trusted-proxy IP resolution (`security/client_ip.py`,
+`Settings.trusted_proxy_count` — off by default, byte-for-byte unchanged
+behavior until an operator explicitly sets it), structured JSON logging
+(`Settings.log_format="json"`, opt-in), a liveness/readiness split
+(`GET /live` alongside the existing `GET /health`), graceful shutdown of
+the bounded `/ask` thread pool on process exit, and a startup warning when
+`MAX_CONCURRENT_ASK_REQUESTS` exceeds a replica's own DB-pool capacity.
+
+Full report, current-state/target-state diagrams, and the honest capacity
+statement (no million-user or specific-concurrent-user claim is made
+anywhere): [`docs/ENTERPRISE_SCALABILITY_SECURITY_ASSESSMENT.md`](ENTERPRISE_SCALABILITY_SECURITY_ASSESSMENT.md).
+Deployment-facing configuration: `docs/DEPLOYMENT.md`'s "Reverse proxy and
+auth" and related sections; `docs/CONFIGURATION.md`'s `TRUSTED_PROXY_COUNT`/
+`LOG_FORMAT` entries.
+
+## 8. AI-guided (generative) image editing
+
+A real, provider-backed generative image edit (`POST
+/attachments/{id}/ai-edit`, IMA Studio's `image_to_image` task category)
+sits alongside the deterministic local image actions described under
+"Chat attachments"/"Explicit image actions" in `CLAUDE.md` — the two are
+deliberately kept on separate code paths (`attachments/ai_edit.py` vs.
+`attachments/blur.py`/`image_ops.py`/`inpaint.py`), never a shared
+"call the model for everything" handler, so a deterministic action (blur,
+resize, OCR) keeps working even when the paid AI-edit provider isn't
+configured. The editor's own quick-action buttons are routed accordingly
+— only the genuinely generative presets (remove object, replace
+background/sky, enhance) reach the paid endpoint.
+
+Full design (provider verification, the canonical-mask-to-provider-overlay
+conversion, pixel-alignment fix, backend contract, and disclosed
+limitations): [`docs/image-editing-architecture.md`](image-editing-architecture.md).
+Configuration reference: `docs/CONFIGURATION.md`'s "AI-guided (generative)
+image editing" section.

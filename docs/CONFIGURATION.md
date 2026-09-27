@@ -13,8 +13,111 @@ malformed values (not missing ones) fail fast at startup with a
 | Variable | Default | Purpose |
 |---|---|---|
 | `OLLAMA_HOST` | `http://localhost:11434` | Base URL of the Ollama server. `agent/llm_client.py`, `api/main.py`'s health check. |
-| `OLLAMA_MODEL` | `llama3.1:8b` | Model name for SQL generation/insight. Swap to try `sqlcoder`, `duckdb-nsql`, etc. |
+| `OLLAMA_MODEL` | `llama3.1:8b` | Default model for SQL generation/planning/review/insight. Always selectable, and always the fallback when a caller doesn't pick a model — see "Model selection" below. |
 | `OLLAMA_REQUEST_TIMEOUT_SECONDS` | `300` | Per-request timeout for Ollama calls. Raise further if you see `httpx.ReadTimeout`/`ConnectTimeout` on slower hardware. |
+| `OLLAMA_MODEL_SELECTION_ENABLED` | `true` | Master switch for per-question model selection (see below). `false` collapses every request to `OLLAMA_MODEL`, matching this app's behavior before this feature existed. |
+| `OLLAMA_ALLOWED_MODELS` | *(unset → a small starter set)* | Comma-separated list of additional Ollama model names selectable for Text-to-SQL. `OLLAMA_MODEL` is always included even if you omit it here. |
+
+### Model selection
+
+Users (or any `POST /ask` caller) can choose which locally-installed Ollama
+model answers a given question, instead of the server always using
+`OLLAMA_MODEL`. Three distinct, deliberately separate concepts are involved
+— conflating them is the most common source of confusion:
+
+1. **Available in the online Ollama Library** (https://ollama.com/library) —
+   this application never queries that site at runtime; it was only used as
+   a one-time research input (2026-09-27) to pick the starter set below.
+2. **Configured/allowed** — `OLLAMA_ALLOWED_MODELS` (plus `OLLAMA_MODEL`,
+   always implicitly included). This is the *only* thing that gates what a
+   caller may request; a model not in this set is rejected with HTTP 400
+   before any Ollama call is made, regardless of whether it's a real,
+   installable Ollama model.
+3. **Installed locally** — whatever `ollama list` actually shows on the
+   machine `OLLAMA_HOST` points at, checked live by `GET /models`. A model
+   can be "configured" but not yet "installed" — the UI shows it as
+   *Not installed* rather than hiding it, and selecting it is disabled
+   until you run `ollama pull <model>`.
+
+**Leaving `OLLAMA_ALLOWED_MODELS` unset does not mean "only the default
+model"** — it falls back to a small, practical starter set
+(`config/settings.py`'s `_DEFAULT_OLLAMA_ALLOWED_MODELS`, evaluated against
+the live Ollama Library on 2026-09-27 for local Text-to-SQL suitability —
+instruction-following, structured/JSON output, a spread of sizes):
+
+| Model | Size | Notes |
+|---|---|---|
+| `llama3.1:8b` | 8B | This app's own default. |
+| `qwen2.5:7b` | 7B | Strong structured/JSON output and coding/math; a close alternative to the default. |
+| `qwen2.5:14b` | 14B | Same family, more capacity, for more capable hardware. |
+| `llama3.2:3b` | 3B | Lightweight option for limited hardware. |
+| `mistral:7b` | 7B | Function-calling support (v0.3+). |
+| `deepseek-r1:8b` | 8B | Reasoning-focused — worth trying for harder multi-step questions (top-N-per-group, period-over-period comparisons). |
+
+None of this is a claim that these are the *only* good choices, or that
+every one of them is already pulled on your machine — see
+`config/ollama_models.yaml` for the full hand-authored metadata (display
+name, size, capabilities, description) behind each entry, and add your own
+entry there for a model with no curated description (it'll still work fine
+without one — see `config/ollama_models.py::describe_model`'s fallback).
+
+**How to change what's offered:**
+- **Add a model**: `ollama pull <model>` locally, then add its name to
+  `OLLAMA_ALLOWED_MODELS` in `.env` (comma-separated) and restart the app.
+  Optionally add a `config/ollama_models.yaml` entry for a friendlier
+  display name/description.
+- **Remove a model**: delete it from `OLLAMA_ALLOWED_MODELS` and restart —
+  no React or LangGraph code change needed either way. (Settings are a
+  cached-per-process singleton like everywhere else in this app — a
+  restart is what makes any `.env` change take effect, this one included.)
+- **Change the default**: change `OLLAMA_MODEL` and restart.
+- **Disable selection entirely**: `OLLAMA_MODEL_SELECTION_ENABLED=false`.
+
+**How local availability is detected**: `GET /models` calls the same
+`ollama.Client().list()` API `ollama list` itself uses against
+`OLLAMA_HOST`, live, on every call to that endpoint — never cached
+server-side, and never called from `/ask` itself (the frontend caches the
+`/models` response for 30 seconds, matching `GET /health`'s own caching).
+If Ollama itself is unreachable, `GET /models` still returns every
+configured model, each marked `installed: false`, rather than failing —
+see `agent/model_registry.py`'s module docstring.
+
+**Request-scoped, never global**: `POST /ask`'s optional `model` field
+(validated against `OLLAMA_ALLOWED_MODELS` before anything else runs) flows
+through `AgentState["selected_model"]` for the life of that one request
+only — concurrent callers with different `model` values never interfere
+with each other, and no process-wide "current model" variable exists
+anywhere in this codebase. See `agent/model_registry.py` and
+`agent/state.py`'s `selected_model` field docstring for the full design.
+
+**What this does *not* affect**: the embedding model
+(`EMBEDDING_MODEL_NAME`), the vision model (`MEDIA_VISION_MODEL`), voice
+transcription/synthesis, document/policy RAG's own LLM calls
+(`rag/llm.py`), and web-search answer synthesis all keep using their own,
+separately-configured models regardless of what's picked here — Text-to-SQL
+model selection is deliberately scoped to generation/planning/review/insight
+only (the four LLM calls `agent/llm_client.py` makes for one question), per
+this feature's own design boundary.
+
+Example request:
+
+```bash
+curl -X POST http://localhost:8000/ask \
+  -H "Content-Type: application/json" \
+  -d '{"question": "What were total sales last quarter?", "model": "qwen2.5:7b"}'
+```
+
+Omit `model` entirely to keep using `OLLAMA_MODEL` — every existing
+integration continues to work unchanged.
+
+**Troubleshooting:**
+- `400 Bad Request` naming your model: it isn't in `OLLAMA_ALLOWED_MODELS`
+  (or selection is disabled) — check `.env` and restart.
+- A model shows "Not installed" and can't be selected: run
+  `ollama pull <model>`, no restart needed (`GET /models` re-checks live).
+- A question fails with "Is `ollama serve` running and has the model been
+  pulled?": the model passed every allowlist check but isn't actually
+  installed on the server Ollama instance — same fix as above.
 
 ## Database connection
 
@@ -104,6 +207,7 @@ Real, in-process safeguards — not yet distributed across replicas (see
 |---|---|---|
 | `LOG_LEVEL` | `INFO` | Root logging level. |
 | `LOG_REDACTION_LEVEL` | `standard` | `standard` (row/column counts + column names) or `strict` (counts only) — how much result-set shape gets logged. Never cell values, at either level. |
+| `LOG_FORMAT` | `text` | `text` (this app's original terminal-friendly format, unchanged) or `json` (one JSON object per line — `timestamp`/`level`/`logger`/`correlation_id`/`message`, plus `exception` when present) for a real log-aggregation pipeline (ELK/CloudWatch/Datadog/Loki). Same underlying log calls either way — only the rendering changes. See `config.settings._JsonLogFormatter`. |
 
 ## REST API (`api/`)
 
@@ -111,6 +215,7 @@ Real, in-process safeguards — not yet distributed across replicas (see
 |---|---|---|
 | `API_AUTH_TOKEN` | *(unset)* | Optional shared bearer token, checked when no OIDC identity is present. Grants a fixed admin-equivalent identity — see `docs/AUTHENTICATION.md`. Can be set alongside OIDC below ("Combining modes"). |
 | `ENVIRONMENT` | `development` | `development` or `production`. Only consequence today: `production` refuses to start at all if neither `API_AUTH_TOKEN` nor `OIDC_ISSUER` is configured, and refuses to start if any configured database's role appears to hold write privileges — see `docs/AUTHENTICATION.md`. |
+| `TRUSTED_PROXY_COUNT` | `0` | Number of trusted reverse proxies/load balancers between the internet and this process. `0` (default) never reads `X-Forwarded-For` (the original, tested-safe behavior for a directly-exposed instance). Set to the *exact* number of hops you've deliberately put in front of this app (usually `1`) to key rate limiting/audit logging on the real client IP instead of the proxy's own — see `security/client_ip.py` and `docs/DEPLOYMENT.md`. |
 
 ### Authentication (OIDC/JWT) and authorization (see [`docs/AUTHENTICATION.md`](AUTHENTICATION.md) / [`docs/AUTHORIZATION.md`](AUTHORIZATION.md))
 
@@ -294,10 +399,39 @@ Tesseract OCR, distinct from vision-model description), `POST
 /attachments/{id}/resize` (deterministic Pillow work, no model call),
 `GET /attachments/{id}/detect-text-regions` + `POST
 /attachments/{id}/remove-text` (classical OpenCV inpainting — explicitly
-**not** generative AI, and never a solid rectangle) all reuse the settings
-above; see `docs/API.md`'s "Attachments" section for the request/response
-shapes and `GET /attachments/capabilities` for a live, per-deployment
-capability report.
+**not** generative AI, and never a solid rectangle), and `POST
+/attachments/{id}/blur-region` (deterministic Pillow Gaussian blur, no
+model call — see the AI-guided editing subsection below for why this one
+is deliberately kept free/local rather than routed through a paid
+provider) all reuse the settings above; see `docs/API.md`'s "Attachments"
+section for the request/response shapes and `GET
+/attachments/capabilities` for a live, per-deployment capability report.
+
+### AI-guided (generative) image editing
+
+Off by default — unlike the deterministic actions above, this spends real
+money per call. Reuses the same `IMA_API_KEY` this app's separate
+`ENABLE_MEDIA_GENERATION` image/video-generation feature uses (see
+`CLAUDE.md`'s "Media generation" section — that setting isn't in this
+table, only its key is reused here) — this flag only gates whether `POST
+/attachments/{id}/ai-edit` is willing to use it. Local editing
+(crop/rotate/draw), OCR, resize, and blur all keep working regardless of
+this flag.
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `ENABLE_IMAGE_EDITING` | `false` | Whether `POST /attachments/{id}/ai-edit` will call the real IMA Studio `image_to_image` provider. Requires `IMA_API_KEY` to also be set — an enabled flag with no key still reports `image_ai_editing: false` from `GET /attachments/capabilities`. |
+| `IMAGE_EDIT_TIMEOUT_SECONDS` | `90` | Hard ceiling on one provider poll (task creation → completion) — not the whole request end-to-end; the upload and result-download legs are bounded separately by their own HTTP client timeouts. |
+| `IMAGE_EDIT_POLL_INTERVAL_SECONDS` | `3.0` | How often to poll IMA for a task's status while waiting for it to complete. |
+| `IMAGE_EDIT_MAX_PROMPT_LENGTH` | `500` | Max length of the free-text edit instruction (`AiImageEditRequest.prompt`). |
+
+IMA's `image_to_image` models have no native mask/inpainting parameter
+(verified live against the real provider) — a painted mask is conveyed as
+a translucent overlay baked into the image plus a text instruction, never
+presented as pixel-exact masking; this is disclosed to the caller via the
+response's own `warnings` field, not a separate setting. See
+`docs/image-editing-architecture.md` for the full design and
+`CLAUDE.md`'s "AI-guided (generative) image editing" section.
 
 ## Malware scanning
 

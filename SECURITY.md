@@ -715,6 +715,100 @@ See `CLAUDE.md`'s "Chat attachments" and "Explicit image actions" sections
 for the full design and `docs/API.md`'s "Attachments" section for the
 request/response contracts.
 
+## AI-guided (generative) image editing — security controls
+
+`POST /attachments/{id}/ai-edit` (`attachments/ai_edit.py`,
+`media_gen/image_edit_provider.py`) is the one attachment action that
+calls a third-party generative provider (IMA Studio), so it carries
+additional controls beyond the deterministic actions above:
+
+- **Off by default, requiring both a feature flag and a real credential**
+  (`ENABLE_IMAGE_EDITING` + `IMA_API_KEY`) — a flag with no key still
+  reports `image_ai_editing: false` from `GET /attachments/capabilities`,
+  never a half-enabled state that fails opaquely at call time.
+- **Operation allowlist, enforced at the schema layer.** `operation` is a
+  closed `Literal` (`remove_object`/`replace_background`/`replace_sky`/
+  `region_edit`/`enhance`) — an unrecognized value is a `422` before any
+  application code runs, not a string passed through to the provider.
+- **The same content-policy check plain media generation already uses**
+  (`media_gen/content_policy.py::basic_prompt_safety_check`, extracted
+  into a shared module specifically so both call sites enforce identically
+  rather than drifting).
+- **The source image is always the current, freshly re-uploaded canvas
+  export** — never a stale reference, never a client-supplied URL/path.
+  The frontend uploads it through the same validated/malware-scanned
+  `POST /attachments/upload` path any other attachment uses, then deletes
+  that transient scratch attachment once the edit completes or fails.
+- **Generated output is treated as untrusted, exactly like SQL output is.**
+  The result is downloaded via the existing SSRF-hardened
+  `media_gen.download.download_media_bytes` and decoded/verified with
+  Pillow before ever being stored — a malformed or non-image response from
+  the provider is rejected, never written to disk unverified.
+- **Rate-limited and idempotent.** Shares the existing
+  `agent.rate_limit.get_media_generation_limiter` with plain media
+  generation (an image edit is exactly as metered as a fresh generation),
+  plus a bounded, TTL'd, per-caller idempotency cache keyed by an optional
+  `idempotency_key` so a duplicate click/retry never triggers a second,
+  separately-billed generation.
+- **No mask channel means no false precision.** IMA's `image_to_image`
+  models have no native mask/inpainting parameter (verified live against
+  the real provider) — a painted mask is conveyed as a translucent overlay
+  baked into the image plus a text instruction, and this is disclosed to
+  the caller via the response's own `warnings` field. This is a UX/honesty
+  control, not a security boundary, but it's listed here because silently
+  presenting a best-effort overlay as pixel-exact masking would itself be
+  a form of misleading the caller about what happened to their data.
+- **Every outcome is audit-logged** the same way plain media generation's
+  approval/execution events already are (`security.audit_log`).
+
+See `docs/image-editing-architecture.md` for the full design and
+`CLAUDE.md`'s "AI-guided (generative) image editing" section.
+
+## Ollama model selection — security controls
+
+`POST /ask`'s optional `model` field (letting a caller pick which locally
+installed Ollama model answers a question, `agent/model_registry.py`)
+never becomes an unrestricted way to reach an arbitrary local resource:
+
+- **Allowlist-only, validated server-side before anything else runs.**
+  `agent.model_registry.validate_model_selection` checks the requested
+  model against `Settings.ollama_allowed_models` (`OLLAMA_ALLOWED_MODELS`)
+  *before* any admission-control slot is acquired or LLM/DB work starts —
+  an unrecognized or disallowed value is rejected with `HTTP 400`, never
+  silently substituted with the default or passed through to
+  `ollama.Client.chat(model=...)` unchecked. `OLLAMA_MODEL_SELECTION_ENABLED=false`
+  is a hard kill switch, collapsing the allowed set to exactly the
+  configured default regardless of what else is listed.
+- **Every rejection is audit-logged** (`invalid_model_selection`, mirroring
+  `api.authz.require_permission`'s existing `authz_denied` event) with the
+  caller's subject and the requested model name — a model name isn't a
+  secret, so logging it plainly is what makes a client-integration bug or
+  a probing attempt investigable after the fact.
+- **The Ollama host is never client-controlled.** `model` is a bare model
+  identifier string, never a URL — `OLLAMA_HOST` remains a `.env`-only
+  server setting with no field anywhere that lets a caller point this
+  application's Ollama calls at a different host. `GET /models`'s response
+  never includes `OLLAMA_HOST` or any other connection/environment detail.
+- **The online Ollama Library (`ollama.com`) is never a runtime dependency**
+  — it was used exactly once, during development, to evaluate candidate
+  models for the starter allowlist; no code path in this application calls
+  it. Local model *availability* (`GET /models`'s `installed`/`available`
+  fields) is always a live check against the *connected* Ollama instance
+  only (`ollama.Client().list()`), the same call `GET /health`'s
+  pre-existing vision-model check already made.
+- **Request-scoped, never global** — the selected model lives in
+  `AgentState["selected_model"]` for the lifetime of one graph run only;
+  there is no process-wide "current model" variable a concurrent request
+  could read or overwrite. See `CLAUDE.md`'s "Configurable Ollama model
+  selection" section for the concurrency regression test that verifies
+  this directly.
+- **Same authentication/authorization/rate-limiting as every other `/ask`
+  call** — `GET /models` and the `model` field on `/ask` require exactly
+  `Permission.ASK` (the same permission every existing caller already
+  needs), and model validation happens inside the same request the
+  existing per-minute and concurrency limiters already govern; nothing
+  about model selection bypasses either.
+
 ## Resource exhaustion / abuse protections
 
 Two independent, deliberately simple protections guard against both
@@ -737,7 +831,22 @@ enforced" above; none of this replaces those).
     a load balancer or carrier NAT, where many real callers would
     otherwise share one bucket. Falls back to client IP only for the
     `none`/`static_token` auth modes, where every caller is genuinely
-    indistinguishable anyway.
+    indistinguishable anyway. **Enterprise scalability assessment
+    (2026-09-27)**: that IP fallback (plus `api/rate_limit.py`'s own
+    per-action limiter for `/execute`/`/schema/refresh`/document routes/
+    `/generate/confirm`, and pre-authentication login/register/refresh/
+    password-reset limiting in `api/identity_auth.py`) now resolves through
+    `security/client_ip.py::resolve_client_ip` — with the new
+    `TRUSTED_PROXY_COUNT` setting at its default of `0`, this is
+    byte-for-byte the previous "trust only the direct TCP peer" behavior
+    (still locked in by `tests/security/test_rate_limit_header_spoofing.py`);
+    an operator who deliberately puts exactly N reverse proxies in front of
+    this app can opt into reading the correct hop from `X-Forwarded-For`
+    instead of every real caller collapsing into the proxy's own shared
+    bucket. `api/rate_limit.py`'s action limiter was also made
+    identity-aware the same way `/ask`'s own limiter already was, closing a
+    gap where those routes rate-limited purely by IP even for an
+    authenticated caller.
   - **LLM generation calls** (default 20/minute, stricter,
     `LLM_CALL_RATE_LIMIT_PER_MINUTE`): process-wide, checked inside
     `generate_sql_node` before *every* attempt, including retries within

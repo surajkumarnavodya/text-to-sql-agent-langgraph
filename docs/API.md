@@ -76,6 +76,17 @@ rather than only discovered the first time a user attaches an image.
 }
 ```
 
+### `GET /live`
+
+Pure liveness — `{"status": "alive"}`, always, with no dependency check at
+all (never touches the database, Chroma, or Ollama). Added alongside
+`/health` above (2026-09-27) so a container orchestrator's liveness probe
+and readiness probe can point at different things: a slow/degraded
+dependency should never cause a healthy process to be killed and
+restarted (liveness → `/live`), while a process that genuinely can't reach
+its database shouldn't receive new traffic (readiness → `/health`). Never
+requires auth, same reasoning as `/health`.
+
 ### `POST /ask`
 
 Runs one question through the full agent graph — schema retrieval,
@@ -96,9 +107,21 @@ Request:
   "conversation_history": [
     {"question": "prior question", "sql": "SELECT ...", "tables": ["FactInternetSales"], "status": "succeeded"}
   ],
-  "enable_insight": true
+  "enable_insight": true,
+  "model": "qwen2.5:7b"
 }
 ```
+
+`model` is optional (from a prior `GET /models` response's `models[].id`) —
+omit it to use the server-configured default (`Settings.ollama_model`);
+every existing caller from before this field existed keeps working
+unchanged. If provided, it's validated against `Settings.ollama_allowed_models`
+*before* any LLM/DB work starts — an unrecognized or disallowed value
+returns `400 Bad Request` naming the model, never a silent fallback or a
+raw string passed through to Ollama unchecked. See
+[`docs/CONFIGURATION.md`](CONFIGURATION.md#model-selection) for the full
+online-catalog/configured/installed/selectable distinction and how to add
+or remove a model.
 
 `conversation_history` is optional and, unlike the UI (which reconstructs
 it client-side from `frontend/src/store/chatStore.ts`'s `queryHistory`),
@@ -110,6 +133,7 @@ Response (mirrors what the React dashboard renders — see `agent.state.AgentSta
 ```json
 {
   "status": "succeeded",
+  "model": "qwen2.5:7b",
   "sql": "SELECT SUM(SalesAmount) FROM FactInternetSales WHERE ...",
   "result_columns": ["TotalSales"],
   "result_rows": [[1234567.89]],
@@ -136,7 +160,9 @@ non-null only for a question `agent/complexity.py` judged non-trivial
 (see `docs/ARCHITECTURE.md`) — the ordered plan steps the SQL above was
 generated and checked against; `max_retries` is this question's actual
 retry budget, which can exceed the configured `MAX_RETRIES` for that same
-class of question.
+class of question. `model` echoes back whichever model actually answered
+this question (the request's own `model`, once validated, or the server
+default).
 
 Rate limiting: a per-client-IP question-submission limiter
 (`Settings.question_rate_limit_per_minute`, mirroring the UI's
@@ -191,8 +217,11 @@ another caller's id resolves to a `404`, never confirming it exists).
   "vision_model": "llava",
   "ocr": true,
   "image_resize": true,
+  "image_blur": true,
   "image_text_removal": true,
   "image_text_removal_method": "opencv_telea_inpaint",
+  "image_ai_editing": false,
+  "image_ai_editing_provider": null,
   "native_pdf_input": false,
   "max_image_bytes": 10485760,
   "max_document_bytes": 26214400,
@@ -200,6 +229,7 @@ another caller's id resolves to a `404`, never confirming it exists).
   "max_total_attachment_bytes": 52428800,
   "max_resize_dimension_px": 4096,
   "max_text_removal_regions": 20,
+  "max_ai_edit_prompt_length": 500,
   "supported_image_extensions": [".gif", ".jpeg", ".jpg", ".png", ".webp"],
   "supported_document_extensions": [".csv", ".docx", ".json", ".md", ".pdf", ".pptx", ".txt", ".xlsx"],
   "resize_presets": [{"name": "medium_800", "width": 800, "height": 800}]
@@ -220,10 +250,71 @@ for a document attachment or an id the caller doesn't own):
 | `POST /attachments/{id}/resize` | Deterministic Pillow resize — `{"width": 800, "height": null, "fit": "contain", "output_format": null}`. No model call. Always returns a brand-new attachment (the original is never mutated). |
 | `GET /attachments/{id}/detect-text-regions` | OCR-proposed text-line regions, for the "Remove text" workflow's confirm/adjust step. Returns `[]` (not an error) if OCR is unavailable or finds nothing — the caller falls back to manual region selection. |
 | `POST /attachments/{id}/remove-text` | Real pixel editing via classical OpenCV inpainting (Telea's algorithm) — `{"regions": [{"left": 10, "top": 10, "width": 80, "height": 20}]}`, either OCR-proposed (caller-confirmed) or manually drawn. **Not** generative AI and never a solid-color rectangle; the response's `warnings` field says so explicitly. Always returns a brand-new attachment. |
+| `POST /attachments/{id}/blur-region` | Deterministic, local Pillow Gaussian blur over a painted mask — `{"mask_data_url": "data:image/png;base64,...", "radius": 18}`. No model call; works even when AI-guided editing (`image_ai_editing`) is off. Always returns a brand-new attachment. |
+| `POST /attachments/{id}/ai-edit` | **Real, generative** AI-guided editing (IMA Studio `image_to_image`) — `{"operation": "remove_object", "prompt": "Remove the selected object.", "mask_data_url": "data:image/png;base64,..."}` (`operation` is one of `remove_object`/`replace_background`/`replace_sky`/`region_edit`/`enhance`; `mask_data_url` is optional). Returns `404`-shaped `{"status": "failed", "error_code": "not_configured", ...}` when `image_ai_editing` is `false` — never a raw exception. IMA has no native mask channel, so a provided mask is conveyed as a translucent overlay + text instruction, disclosed via the response's `warnings`, never presented as pixel-exact. Shares this app's existing media-generation rate limit and a per-caller idempotency key (`idempotency_key`, optional) so a duplicate click never pays for a second generation. See [`docs/image-editing-architecture.md`](image-editing-architecture.md) for the full design. |
 
-The last two share the `ImageEditResultResponse` shape
-(`attachment_id`, `source_attachment_id`, `operation`, `image_data_url`,
-`media_type`, `width`, `height`, `size_bytes`, `warnings`).
+The middle three (`remove-text`/`blur-region`/`ai-edit`'s success case)
+share the `ImageEditResultResponse`-shaped fields (`attachment_id`,
+`source_attachment_id`, `operation`, `image_data_url`, `media_type`,
+`width`, `height`, `size_bytes`, `warnings`) — `ai-edit`'s own response
+additionally carries `status`, `mask_provided`, `provider`, `model`,
+`error_code`, `error_message` since an edit can fail in ways local
+resize/remove-text/blur cannot (no credentials, content-policy rejection,
+provider timeout).
+
+### `GET /models`
+
+The Ollama Text-to-SQL model registry — every model
+`Settings.ollama_allowed_models` configures, enriched with a live
+"is it actually installed on the connected Ollama instance right now"
+check. Same `Permission.ASK` gate as everything else asking-adjacent.
+Never calls the online Ollama Library — see
+[`docs/CONFIGURATION.md`](CONFIGURATION.md#model-selection).
+
+```json
+{
+  "provider": "ollama",
+  "default_model": "llama3.1:8b",
+  "selection_enabled": true,
+  "models": [
+    {
+      "id": "llama3.1:8b",
+      "display_name": "Llama 3.1 8B",
+      "is_default": true,
+      "enabled": true,
+      "installed": true,
+      "available": true,
+      "recommended": true,
+      "parameter_size": "8B",
+      "context_length": 128000,
+      "resource_level": "medium",
+      "capabilities": ["text", "sql", "reasoning", "tools"],
+      "description": "This application's own default model. ..."
+    },
+    {
+      "id": "qwen2.5:7b",
+      "display_name": "Qwen 2.5 7B",
+      "is_default": false,
+      "enabled": true,
+      "installed": false,
+      "available": false,
+      "recommended": true,
+      "parameter_size": "7B",
+      "context_length": 32000,
+      "resource_level": "medium",
+      "capabilities": ["text", "sql", "reasoning", "tools"],
+      "description": "..."
+    }
+  ]
+}
+```
+
+A model that's configured but not yet `ollama pull`ed on the server's own
+machine still appears here (`installed: false`) rather than being hidden —
+the frontend disables selecting it and shows "Not installed" instead. Never
+exposes `OLLAMA_HOST`, secrets, or any other environment/connection detail.
+Cache this response client-side (the React dashboard does, 30 seconds,
+matching `GET /health`) — this endpoint is never called from `/ask` itself.
 
 ### `GET /schema/tables`
 

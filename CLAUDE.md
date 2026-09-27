@@ -68,7 +68,7 @@ below, and `docs/MULTI_SOURCE_GUIDE.md` for how to configure each source.
 
 | Concern | Choice |
 |---|---|
-| LLM runtime | Ollama, default model `llama3.1:8b` (swap via `.env` / `config/settings.py`, e.g. `sqlcoder`, `duckdb-nsql`) |
+| LLM runtime | Ollama, default model `llama3.1:8b` (swap via `.env` / `config/settings.py`, e.g. `sqlcoder`, `duckdb-nsql`). Per-question model selection is also supported (`AskRequest.model`, validated against `Settings.ollama_allowed_models`) — see "Configurable Ollama model selection for Text-to-SQL" below |
 | Config / validation | Pydantic v2 — `config/settings.py`'s `Settings` is a `pydantic_settings.BaseSettings` (env-var-driven, `Field`/`Literal`-validated); secrets are `pydantic.SecretStr`; request/response models (`api/schemas.py`) and several boundary dataclasses were converted to `BaseModel` too. See "Pydantic-based configuration and validation" below |
 | Orchestration | LangGraph — explicit state machine, not a black-box agent. Two graphs: `agent/graph.py` (the SQL pipeline, always present) and, when multi-source is enabled, `agent/orchestrator/graph.py` (router + fan-out, sitting in front of it) |
 | Schema retrieval | ChromaDB (persisted locally) — embeds table DDL synthesized from live introspection, retrieves top-k relevant tables per question |
@@ -183,6 +183,11 @@ below, and `docs/MULTI_SOURCE_GUIDE.md` for how to configure each source.
   estimation is resolved from *that* database's `db_type`
   (`db.connection.get_connection(settings, selected_database)` +
   `get_sqlglot_dialect()`) — never a single hardcoded/global engine.
+  `AgentState["selected_model"]` is the identical pattern applied to Ollama
+  model selection (`model_registry.py` — configured/allowed vs. installed
+  vs. selectable, see "Configurable Ollama model selection" below): resolved
+  once by `run_agent()`, read (never re-selected) by every LLM call
+  `nodes.py` makes for that question.
   `complexity.py` is the source of the adaptive retry budget and the
   planning/review gate (`detect_complexity_signals`/`compute_max_retries`,
   see "Agentic query planning + plan-conformance self-correction" below) —
@@ -1548,10 +1553,32 @@ API.
 **Known limitation, named not hidden**: only a locally-authenticated user
 gets this — an OIDC or unauthenticated caller's questions are still
 answered normally, nothing is persisted for them (no `identity.users` row
-to attach a conversation to). A reloaded past turn also only shows the
-answer text + SQL (if any), not the full `AskResponse` (charts,
-citations, the schema DDL shown at generation time) — see
-`docs/chat-history-architecture.md`'s own "Known limitations" section.
+to attach a conversation to).
+
+**Universal conversation history fix (2026-09-27)**: before this pass, a
+reloaded past turn only ever showed the plain answer text plus SQL (if
+any) — every other route's contribution (web/document/policy/generation/
+media-search/attachment answers and citations, which source(s) actually
+fired, a confirmed execution's rows/chart) was silently dropped at save
+time, which is what made reopening a saved conversation show no assistant
+answer, an empty SQL editor with "Confirm and Run" (`TurnCard.tsx`'s own
+"empty `sources_used` means the SQL path" convention misfiring on a
+fabricated empty array), or `[object Object]` (a separate bug in
+`frontend/src/lib/api.ts`'s error-detail parsing — a FastAPI 422
+validation error's `detail` is an array of objects, not a string).
+`api/chat_persistence.py::_build_history_metadata` now snapshots a
+bounded, redacted superset of `AskResponse` into the same `AiOutput
+.metadata_json` JSONB column (no migration needed — it was already an
+arbitrary-shape JSON column), versioned via `schema_version` so a legacy
+pre-fix record degrades gracefully rather than guessing. `POST /execute`
+can now attach a confirmed result to the exact turn it came from
+(`AskResponse.message_id`, a new field) so reopening a conversation whose
+SQL was already run shows those rows/chart immediately — **opening a
+saved conversation never re-executes SQL, re-fetches a web page, or
+re-runs OCR/vision**; only an explicit "Confirm and Run" click does. See
+`docs/chat-history-architecture.md`'s §6.5 for the full design and what
+still isn't restored (retrieved-schema DDL, a chart's own free-text
+customization).
 
 ### Frontend UI redesign (2026 UI pass)
 A ground-up-in-appearance, additive-in-substance redesign of `frontend/`
@@ -2699,6 +2726,505 @@ process-local (Phase 3/5's job), and there is still no true
 cross-thread cancellation, streaming, or distributed coordination (Phases
 1-4). Nothing here changes `/ask`/`/execute`'s request/response shape or
 any existing security control's behavior.
+
+### Configurable Ollama model selection for Text-to-SQL (2026-09-27)
+
+Before this pass, `Settings.ollama_model` (`OLLAMA_MODEL`, default
+`llama3.1:8b`) was the *only* model any of `agent/llm_client.py`'s four
+Ollama call sites (`generate_sql_from_llm`, `generate_query_plan_from_llm`,
+`review_sql_against_plan_from_llm`, `generate_insight_from_llm`) could ever
+use — set once per process, read fresh from the same cached `Settings`
+singleton by every node, with no per-request concept at all. This pass adds
+configurable, request-scoped model selection without replacing any of that
+architecture: the same four call sites, the same cached `ollama.Client`,
+the same LangGraph graph shape.
+
+**Three deliberately separate concepts** (see `agent/model_registry.py`'s
+own module docstring for the full reasoning), mirrored throughout this
+feature's naming:
+
+1. **Configured/allowed** — `Settings.ollama_allowed_models`
+   (`OLLAMA_ALLOWED_MODELS`, comma-separated, mirroring `DB_CONNECTIONS`'/
+   `CORS_ALLOWED_ORIGINS`' own convention) — the only thing that actually
+   gates what `AskRequest.model` may request. `Settings.ollama_model` is
+   always unioned in even if an operator's own list omits it
+   (`_fill_default_ollama_allowed_models`, a `model_validator(mode="after")`
+   mirroring `_fill_default_database`'s exact `object.__setattr__` escape
+   hatch for a frozen model). Left unset, it falls back to
+   `_DEFAULT_OLLAMA_ALLOWED_MODELS` — a small starter set
+   (`qwen2.5:7b`/`qwen2.5:14b`/`llama3.2:3b`/`mistral:7b`/`deepseek-r1:8b`
+   alongside the configured default) evaluated against the live
+   https://ollama.com/library on 2026-09-27 for local Text-to-SQL
+   suitability (instruction-following, structured/JSON output, a spread of
+   sizes) — **not a claim that this is every good model, or the full online
+   catalog**; an operator may list any model name regardless of whether
+   this starter set or `config/ollama_models.yaml`'s curated metadata has
+   ever heard of it. `Settings.ollama_model_selection_enabled`
+   (`OLLAMA_MODEL_SELECTION_ENABLED`, default `true`) is the kill switch --
+   `false` collapses the allowed set to exactly `(ollama_model,)` regardless
+   of `OLLAMA_ALLOWED_MODELS`, so every other check downstream needs no
+   separate "is selection enabled" branch of its own.
+2. **This application's own curated display metadata** --
+   `config/ollama_models.yaml` + `config/ollama_models.py`, the exact same
+   hand-authored/uncached/graceful-missing-entry convention
+   `config/table_descriptions.py` already established (display name,
+   parameter size, context length, resource level, capabilities,
+   description, `recommended`) -- purely cosmetic, never a gate. A model
+   with no catalog entry gets a generic fallback
+   (`describe_model`/`_fallback_display_name`), never dropped.
+3. **Installed locally** -- a live `ollama.Client().list()` lookup against
+   the *connected* Ollama instance, queried only by `GET /models`
+   (`agent.model_registry.discover_installed_models`) and, independently,
+   by `GET /health`'s own pre-existing vision-model-availability check --
+   **never called from `/ask` itself**, satisfying this feature's own
+   performance requirement. `agent.model_registry.installed_model_names`
+   (the same tolerant dict-or-`ListResponse`-shape parser `GET /health`
+   already needed) was moved here from a private `api/main.py` helper
+   (`_pulled_ollama_model_names`) so both call sites share one
+   implementation instead of two copies drifting apart.
+
+**`GET /models`** (`api/main.py`, `Permission.ASK` -- the same gate
+`/schema/tables` already uses, since seeing available models is the same
+capability level as asking a question) returns every configured model
+enriched with live installed status via
+`agent.model_registry.build_model_options` -- never hides an
+allowed-but-uninstalled model, only flags it (`installed: false`), so the
+frontend can show "Not installed" rather than silently dropping it from the
+list. Never exposes `OLLAMA_HOST`/secrets/connection details.
+
+**`POST /ask`'s optional `model` field** is validated *before* any
+admission-control slot is acquired or LLM/DB work starts
+(`agent.model_registry.validate_model_selection`, called in `api/main.py`'s
+`ask()` right after `settings = get_settings()`) -- an unrecognized/
+disallowed value raises `InvalidModelSelectionError` (a plain `ValueError`
+subclass, deliberately *not* an `agent.exceptions.AgentError`, since this
+is a malformed-request condition meant to become `HTTP 400`, not a graceful
+`AgentState` "failed" run) and is audit-logged
+(`invalid_model_selection`, mirroring `api.authz.require_permission`'s
+`authz_denied` event -- a requested model name isn't a secret, so logging
+it plainly is what makes a client-integration bug or a probing attempt
+investigable after the fact). Deliberately does **not** also verify live
+installed status on every `/ask` (that would mean a second Ollama round
+trip per request, contradicting this feature's own performance
+requirement) -- a configured-but-never-`ollama pull`ed model instead
+surfaces naturally through the *existing* `OllamaUnavailableError` handling
+the four LLM call sites already had (its message now names whichever model
+was actually tried, not always `settings.ollama_model`), which
+`generate_sql_node` already turns into a clean `status="failed"` on the
+first attempt -- no retries wasted hitting the same missing-model error
+repeatedly.
+
+**Request-scoped, never global** (`agent/state.py`'s
+`AgentState["selected_model"]`, mirroring `selected_database`'s exact
+"resolved once by the caller, read-never-re-selected by every node" shape):
+`agent.graph.run_agent` gained a `model: str | None = None` parameter,
+resolves it to `model or settings.ollama_model` once up front, and stores
+it in `initial_state` -- `agent/nodes.py`'s `generate_sql_node`/
+`plan_query_node`/`review_sql_node`/`generate_insight_node` all read
+`state.get("selected_model")` and pass it straight through to
+`agent.llm_client`'s new `model: str | None = None` parameter on all four
+functions (`None` there means "use `settings.ollama_model`," preserving
+every pre-existing call site's behavior unchanged). Threaded through
+`agent.orchestrator.graph.run_orchestrated`/`sql_subgraph_node` the same
+way. **No process-global mutable model variable was introduced anywhere**
+-- verified with a real-`threading.Thread` regression test
+(`tests/test_model_selection_concurrency.py`) that forces a race window
+open (a `time.sleep` inside the fake Ollama client, between reading
+`model` and recording it) and confirms two concurrent calls with different
+models never cross-contaminate, at both the `agent.llm_client` layer and
+the `generate_sql_node` layer.
+
+**Model boundaries preserved, per this feature's own explicit scope**: the
+embedding model (`EMBEDDING_MODEL_NAME`), the vision model
+(`Settings.media_vision_model`), voice transcription/synthesis, document/
+policy RAG's own LLM calls (`rag/llm.py`), and web-search answer synthesis
+are all completely untouched -- this feature only ever threads `model`
+through the four SQL-pipeline LLM calls, never anything else.
+
+**A real, previously-latent bug found and fixed while building this**:
+`Settings.ollama_allowed_models`/`cors_allowed_origins` (the latter already
+existed, using the identical comma-separated-string
+`field_validator(mode="before")` convention) both raised
+`pydantic_settings.exceptions.SettingsError` when set via a genuine `.env`/
+environment-variable value -- pydantic-settings attempts its own JSON-array
+decoding of a compound-typed (`tuple[str, ...]`) field *before* any field
+validator runs, a distinct, earlier layer than Pydantic's own validation
+pipeline. Every existing CORS test had only ever exercised direct
+`Settings(cors_allowed_origins=(...))` construction (bypassing env-source
+decoding entirely), so this was never caught. Fixed on both fields via
+`Annotated[tuple[str, ...], NoDecode]` (`pydantic_settings.NoDecode`),
+which tells the env source to pass the raw string through to Pydantic's
+own validation machinery unchanged, letting `_split_ollama_allowed_models`/
+`_split_cors_origins` handle it as before. New regression tests confirm
+both now parse correctly from a real environment variable, not just a
+direct kwarg (`tests/test_settings_validation.py`,
+`tests/test_security_headers.py`).
+
+**React UI**: `components/settings/ModelSelector.tsx` -- a new picker
+alongside `FontPicker`/`LanguageSelector`/`ThemeToggle` in the same
+`components/settings/` folder, reusing the existing `<Select>` primitive
+(a plain native `<select>`, per that component's own docstring on why --
+identical reasoning to every other simple picker in this Settings panel)
+rather than building a new radio-list component. Backed by
+`useAvailableModels()` (`hooks/queries.ts`, the same `staleTime: 30_000`
+react-query pattern `useHealth`/`useAttachmentCapabilities` already
+establish -- `GET /models` is never called on every keystroke or question).
+An uninstalled model's `<option>` is rendered `disabled` -- the browser
+itself refuses to let it be selected, so "unavailable models cannot be
+selected" needs no extra client-side validation logic; server-side
+validation (`validate_model_selection`) still re-checks independently
+regardless, since a frontend restriction is never treated as a security
+boundary anywhere in this codebase. The user's choice
+(`settingsStore.ts`'s new `selectedModel`/`setSelectedModel`, persisted
+like `voiceModeEnabled`) is read by `chatStore.ts`'s `askQuestion` via a
+cross-store `useSettingsStore.getState()` call (the same pattern
+`localSettingsStore`-adjacent cross-store reads already use elsewhere in
+this file) and sent as `AskRequest.model`. A reconciliation effect in
+`ModelSelector.tsx` resets a persisted selection back to "use the default"
+if a later `GET /models` response no longer includes it (an operator's
+`.env` change since the selection was made) -- otherwise every subsequent
+`/ask` would keep failing with `HTTP 400` until the user noticed and
+re-opened the picker themselves; a merely-not-installed-yet selection is
+deliberately *not* reset the same way, since that's still a valid, allowed
+choice the user may be mid-`ollama pull` for.
+`components/chat/TurnCard.tsx`'s existing "Query information" panel
+(previously shown only when `isMultiDb`, for `database`) now also shows
+`model` whenever a run reached generation, regardless of database count.
+
+**Verified**: 1974 backend tests (43 new --
+`tests/test_model_registry.py`, `tests/test_api_models.py`,
+`tests/test_model_selection_concurrency.py`, plus additions to
+`tests/test_settings_validation.py`/`tests/test_api_ask.py`/
+`tests/test_security_headers.py`) and 216 frontend tests (8 new,
+`ModelSelector.test.tsx`) all pass; `tsc --noEmit` clean; a production
+frontend build succeeds. Every pre-existing `run_agent`/`run_orchestrated`
+test-double fake with a fixed positional signature needed a `model=None`
+parameter added (the new parameter is positional-compatible, so every real
+call site outside tests -- `agent/tools/definitions.py`'s
+`_sql_query_handler`, `eval/runner.py`, `scripts/run_eval.py`,
+`scripts/profile_pipeline.py` -- needed no changes at all, only test
+doubles that reimplemented the signature by hand).
+
+**Remaining limitations, disclosed rather than silently left**: model
+availability is not live-reloaded mid-process -- like every other
+`Settings` field in this codebase, an `OLLAMA_ALLOWED_MODELS`/
+`OLLAMA_MODEL` change needs a process restart to take effect
+(`config.settings.get_settings`'s `lru_cache`). Per-model role-based
+restriction (e.g. reserving a larger/more expensive model for `analyst`+)
+was not requested and was not built -- every role that can reach `/ask` at
+all (`Permission.ASK`, granted starting at `viewer`) can select any
+configured/installed model. Insight/planning/review always use the exact
+same model chosen for generation, by design -- there is no way to pick a
+different model for the narrative insight step alone.
+
+### Enterprise scalability/security assessment: identity-aware rate limiting, trusted-proxy IP resolution, structured logging, graceful shutdown (2026-09-27)
+
+A dedicated architecture/scalability/security assessment (not tied to a
+single feature — a full pass over request lifecycle, capacity, auth/authz,
+multi-tenancy, DB/caching/AI/queue scalability, and a STRIDE-style threat
+model) was run against the whole application per an external 39-phase
+assessment prompt, deliberately synthesizing rather than re-deriving the
+prior session's own `docs/SCALE_OUT_PROMPT.md`/`docs/SCALE_BASELINE.md`/
+`docs/THREAT_MODEL.md` work (see "Scale-out program" above) — new
+investigative effort went into angles those docs hadn't already covered.
+Per that prompt's own explicit rules (never rewrite the whole app, never
+introduce microservices for their own sake, never claim untested scale),
+only a bounded set of safe, in-place P0/P1 fixes were implemented — the
+"big Phase 1" async/Redis/streaming rewrite `docs/SCALE_OUT_PROMPT.md`
+already scopes as separate future work was deliberately left alone again.
+
+**Six concrete, independently-testable changes:**
+
+- **`security/client_ip.py`** (new) — `resolve_client_ip(request, settings)`
+  is the one place client-IP resolution now happens, replacing the raw
+  `request.client.host` reads that used to be duplicated across
+  `api/main.py::_rate_limit_key`, `api/rate_limit.py`, and
+  `api/identity_auth.py::_client_ip`. A new `Settings.trusted_proxy_count`
+  (default `0`) gates it: at the default, behavior is byte-for-byte
+  unchanged (never reads `X-Forwarded-For`, exactly the pre-existing
+  behavior every `tests/security/test_rate_limit_header_spoofing.py`
+  regression test already locks in). An operator who sets it to the exact
+  number of trusted reverse-proxy hops in front of this app gets the
+  *real* client IP via the correct "count from the trusted end, not the
+  client-controlled end" algorithm (matching Werkzeug's `ProxyFix`) —
+  reading the leftmost `X-Forwarded-For` entry (the common naive mistake)
+  is directly spoofable by any client that pre-populates the header
+  itself; counting a fixed number of hops from the right end is not, since
+  each trusted proxy appends its own observed peer address rather than
+  forwarding the client's claimed one untouched.
+- **`api/rate_limit.py`'s `enforce_api_action_rate_limit` is now
+  identity-aware**, not IP-only. Every call site that already resolves an
+  `AuthIdentity` (`/execute`, `/schema/refresh`, `/generate/confirm`,
+  `/search/media`, `POST`/`DELETE /documents`, every `/attachments/*`
+  action route) now passes `identity=identity`, keying on
+  `security.oidc.real_caller_subject` when one exists and falling back to
+  `resolve_client_ip` otherwise (`api/voice.py`'s two routes, whose
+  permission check happens at the router level with no bound `identity`
+  parameter, correctly keep the IP-only 3-argument call). This closes a
+  real gap distinct from the "wrong identity mode checked" bug the
+  Scale-out program above already fixed for `/ask` itself: two real,
+  distinct authenticated users sharing one IP (a NAT'd office, a corporate
+  VPN) previously shared one rate-limit bucket on every route in this
+  module, and one user could dodge their own limit by switching IP. Mirrors
+  `api/main.py`'s own `_rate_limit_key` pattern, generalized to the shared
+  limiter every non-`/ask` mutating route uses.
+- **Structured JSON logging, opt-in** (`config/settings.py`'s new
+  `Settings.log_format: Literal["text", "json"] = "text"` +
+  `_JsonLogFormatter`). Default behavior (plain text, matching every
+  existing test/log-reading habit) is unchanged; `LOG_FORMAT=json` emits
+  one JSON object per line (`timestamp`/`level`/`logger`/`correlation_id`/
+  `message`, plus `exception` when present) — what a real log
+  aggregator (the kind a multi-instance deployment needs, per the Scale-out
+  program's own disclosed "no shared store" limitation for rate limiting)
+  actually wants to ingest, instead of parsing free-text log lines.
+  `configure_logging` now also passes `force=True` to `logging.basicConfig`,
+  enabling safe reconfiguration (needed for tests that toggle
+  `log_format` and re-call it) with no behavior change for the single
+  call site that already existed.
+- **Liveness/readiness split**: a new `GET /live` (no dependency checks at
+  all — never touches the DB, Chroma, or Ollama) sits alongside the
+  existing `GET /health` (which does check all three). A container
+  orchestrator's liveness probe should hit `/live` (a slow/degraded
+  dependency must never cause a healthy process to be killed and
+  restarted, which only makes an overload situation worse) while its
+  readiness probe keeps using `/health` (a process that can't reach its
+  DB genuinely shouldn't receive new traffic). Before this, only `/health`
+  existed, conflating both concerns into one endpoint.
+- **Graceful shutdown for the `/ask` thread pool** (`api/main.py`'s
+  `_shutdown_ask_executor`, called at the end of `lifespan`) — the
+  `ThreadPoolExecutor` backing bounded `/ask` concurrency (see the
+  Scale-out program above) is now explicitly drained (`.shutdown(wait=True)`)
+  on process shutdown rather than abandoned, so an in-flight request isn't
+  cut off mid-response during a rolling deploy/restart.
+- **DB-pool-vs-concurrency sizing warning** (`api/main.py`'s
+  `_warn_on_ask_concurrency_pool_mismatch`, called at startup) — logs a
+  warning (never fails startup) when `Settings.max_concurrent_ask_requests`
+  exceeds `db_pool_size + db_max_overflow`, since every concurrent `/ask`
+  can hold a DB connection — a silent, easy-to-hit misconfiguration this
+  codebase had no signal for before, surfaced the same "detectable and
+  startup-visible instead of silently discovered under load" way
+  `_enforce_database_write_privileges` already treats a misconfigured DB
+  role.
+
+**Verified**: 2016 backend tests pass (58 new:
+`tests/test_client_ip.py`, `tests/test_ask_concurrency_pool_warning.py`,
+`tests/test_graceful_shutdown.py`, `tests/test_json_logging.py`, plus new
+classes in `tests/test_api_ask.py`/`test_api_rate_limit.py`/
+`test_api_health.py`), `mypy`/`black`/`ruff` clean on every touched file
+(pre-existing repo-wide drift confirmed unrelated by cross-referencing
+file paths — see "Known, pre-existing CI-hygiene gaps" below), 216
+frontend tests pass, `tsc --noEmit` clean, `npm run build` succeeds — no
+frontend file was touched by this pass, this was a build/regression
+confirmation only.
+
+**A real bug caught and fixed before it shipped, not by a test failure**:
+wiring `identity=identity` into all 11 `enforce_api_action_rate_limit` call
+sites required 5 route-handler parameters to actually be *read* rather than
+ignored — 5 of them were still named with the codebase's own
+underscore-prefix-means-unused convention (`_identity`), which would have
+been a `NameError` at request time with zero test coverage catching it,
+since no existing test exercised the newly-added code path before the
+parameter was ever referenced. Found and fixed by systematic manual
+verification of every call site before running anything, not by a red
+test: `api/generation.py::confirm_generation`,
+`api/media_search.py::search_media_endpoint`, `api/main.py::execute`,
+`api/main.py::schema_refresh`, `api/documents.py::delete_document_route`.
+
+**Explicitly not attempted in this pass, per the assessment's own P2/P3
+prioritization and "do not rewrite the whole application" rule** — these
+remain exactly where `docs/SCALE_OUT_PROMPT.md` already scoped them:
+cross-process rate limiting/concurrency limiting (still per-process
+in-memory, disclosed since the Scale-out program), a message
+queue/background-worker tier for long-running AI work, true async
+request handling, response streaming, and any multi-region/multi-tenant
+architecture change. No million-user (or any specific concurrent-user)
+capacity claim is made anywhere in this pass's own documentation —
+`docs/SCALE_BASELINE.md`'s real k6-measured numbers remain the only actual
+load-test evidence this codebase has, and this pass added no new load
+test of its own.
+
+### AI-guided (generative) image editing (2026-09-27)
+
+Closes a real, previously-disclosed gap named in the "Frontend UI
+redesign" section above and in `docs/image-editing-architecture.md`: the
+Edit-image modal's "AI-guided editing" panel was real UI (preset buttons,
+a free-text prompt field, mask painting) wired to
+`lib/imageEditAdapter.ts`'s `AiGuidedEditAdapter`, which was a deliberate,
+permanent stub — clicking Generate always failed with "it needs a backend
+endpoint that hasn't been built." Traced the click through
+`ImageEditor.tsx` → `AiGuidedEditAdapter.editWithInstruction()` before
+writing any code, confirming that was the whole story (no partial backend
+existed to extend) rather than assuming.
+
+**Provider: IMA Studio, `image_to_image` task category — chosen after
+live verification, not assumed.** A real, read-only, no-cost `GET
+/open/v1/product/list?category=image_to_image` call against this
+project's own configured account confirmed 5 real models (`gpt-image-2`,
+`gemini-3.1-flash-image`/"Nano Banana 2", `gemini-3-pro-image`/"Nano
+Banana Pro", `doubao-seedream-4.5`, `midjourney`) and — critically —
+**that none of them expose a native mask/inpainting parameter**: this is
+instruction-driven whole-image editing only, a real provider constraint
+that shaped the whole mask design below rather than something to work
+around silently. The upload flow this needs (`media_gen/upload.py`) is a
+separate host from IMA's task API (`imapi.liveme.com`, a signed
+GET-for-a-token then a raw `PUT` of the image bytes) — fetched from IMA's
+own public reference implementation
+(`github.com/imastuido/ima-all-ai`) rather than guessed at, since an
+undocumented wire protocol is exactly the kind of thing worth verifying
+before coding against it.
+
+**Mask convention: this app's own canonical mask, converted per-provider,
+never assumed to fit generically.** `attachments/mask.py` defines the one
+internal convention every mask-consuming route shares (a single-channel/
+RGBA PNG, white/opaque = editable, decoded and resized to the source
+image's own native pixel dimensions via `decode_and_validate_mask` — a
+zero-area mask is rejected with an actionable message before any provider
+call, never silently accepted). Since IMA itself has no mask channel,
+`media_gen/image_edit_provider.py::ImaImageEditProvider` converts that
+canonical mask into IMA's actual convention for this one adapter only: a
+translucent red overlay composited onto the source image
+(`_composite_mask_overlay`, alpha scaled by mask intensity) plus an
+explicit prepended prompt instruction to only modify the highlighted
+region. This is disclosed to the user via `ImageEditResult.warnings`
+(shown in the completed-result panel) — never presented as pixel-exact
+masking, since it isn't. A **different** future provider with a real mask
+channel would get its own adapter using the canonical mask directly,
+unconverted — the conversion lives entirely inside the IMA adapter, not in
+the canonical mask model itself.
+
+**Mask/source pixel alignment, actually fixed, not just documented as a
+gap.** The editor already exported a mask before this pass, but — as
+`docs/image-editing-architecture.md` disclosed — it exported the *whole
+flattened canvas*, not an isolated mask render. Fixed via
+`ImageEditor.tsx::flattenMaskOnly`: every Konva layer except the mask
+layer is temporarily hidden, the mask layer is forced to full opacity, one
+`toDataURL({ pixelRatio: 2 })` call captures just it, then everything is
+restored — using the exact same `pixelRatio` `flattenToDataUrl()` itself
+uses is what guarantees the mask and the source line up pixel-for-pixel at
+whatever zoom/rotation/crop state the canvas is currently in, with no
+second offscreen Stage or manual coordinate-transform math needed.
+
+**Backend contract**: `POST /attachments/{id}/ai-edit`
+(`api/attachments.py::ai_edit_route`, new `AiImageEditRequest`/
+`AiImageEditResponse` schemas). The `{id}` is always a **fresh, transient
+attachment holding the editor's current canvas export** — never the
+original file, never a blob URL/local path passed as a model input.
+`lib/imageEditAdapter.ts`'s `AiGuidedEditAdapter` (no longer a stub) does
+the real work: upload the current export via the existing `POST
+/attachments/upload` path, call ai-edit, then delete the transient source
+in a `finally` regardless of outcome — a Generate click never leaves scratch
+attachments behind. `attachments/ai_edit.py::execute_image_edit` is the
+orchestration layer: operation allowlist (`remove_object`/
+`replace_background`/`replace_sky`/`region_edit`/`enhance` — an
+unrecognized operation is a `422` at the schema layer, never reaching this
+far), prompt empty/length validation,
+`media_gen/content_policy.py::basic_prompt_safety_check` (extracted from
+`agent/orchestrator/nodes.py`'s previously-private `_basic_prompt_safety_check`
+so both plain generation and image editing share one policy check, not
+two copies), mask decode/validate, the existing, shared
+`agent.rate_limit.get_media_generation_limiter` (AI image editing is
+exactly as metered as plain generation, same limiter), and a bounded,
+TTL'd in-memory idempotency cache keyed by `(owner_subject,
+idempotency_key)` so a duplicate click/retry never pays for a second
+generation. `ImaImageEditProvider` downloads the result through the
+existing SSRF-hardened `media_gen.download.download_media_bytes` and
+decodes/verifies it via Pillow before it's ever stored — generated bytes
+are untrusted output, exactly like the "SQL is untrusted output" principle
+elsewhere in this file, applied to pixels instead of text. A completed
+edit is stored as a brand-new attachment via the existing, unmodified
+`attachments.pipeline.register_derived_image` (the same function resize/
+remove-text/blur already share) — the original is never mutated, matching
+every other image action in this codebase.
+
+**Frontend result states, one real state machine per flow, not a shared
+generic one.** `ImageEditor.tsx` tracks `idle → uploading → processing →
+completed | failed` for the AI-edit flow specifically (mask preview shown,
+provider/model/warnings surfaced on success, an actionable message on
+failure) and a simpler `idle → processing → completed | failed` for local
+blur and OCR-extract. Every async handler is guarded by `requestEpochRef`
+(bumped on every modal open/close) so a slow response from a request that
+outlived its modal session can never overwrite the UI for whatever is open
+now — verified by an automated test that starts an extract-text call,
+closes the modal, reopens it for a *different* image, then resolves the
+original promise and confirms its (now-stale) text never appears.
+`GET /attachments/capabilities`'s existing `image_ai_editing`/
+`image_ai_editing_provider`/`max_ai_edit_prompt_length` fields (added
+alongside the new `image_blur` field the same pass) gate the AI-edit
+prompt input and its 4 generative preset buttons — fails closed (disabled,
+with an honest "not configured on this server" notice) until the
+capability check genuinely returns `true`, never optimistically enabled
+while the query is still loading or failed.
+
+**Quick-action routing, per this feature's own explicit routing table —
+not one shared handler wired to every button.** Only the 4 genuinely
+generative presets (Remove selected object, Replace background, Replace
+sky, Enhance region — `ImageEditor.tsx`'s `AI_EDIT_PRESET_OPERATIONS` map)
+call the paid `POST /attachments/{id}/ai-edit`. "Blur the selected face"
+(`handleBlurFace`) calls the existing, free `POST
+/attachments/{id}/blur-region` (deterministic Pillow Gaussian blur over
+the painted mask, no model call, works even with AI-guided editing
+disabled — a real gap between what was previously wired to a
+generic prompt-filler and what the task's own routing table requires,
+fixed as part of this pass). "Extract the selected table or chart"
+(`handleExtractTable`) calls the existing OCR/vision analysis route (`POST
+/attachments/{id}/extract-text`) and renders recognized text — analysis,
+never a generated image, per this feature's own "OCR/table extraction
+routes to analysis, never pixel editing" requirement.
+`AI_EDIT_PRESET_OPERATIONS` deliberately excludes both of these two preset
+keys so neither can accidentally reach the AI-edit endpoint.
+
+**No SQL-path leakage, structurally guaranteed, not just conventionally
+avoided.** `attachments/ai_edit.py` imports neither `agent.graph` nor
+`agent.nodes` and is reached only through its own dedicated REST route,
+never through `/ask` — an image-edit-only request cannot retrieve schema,
+generate SQL, or reach "Confirm and Run," because there is no shared code
+path between the two features to guard against in the first place.
+
+**Verified with `FakeImageEditProvider` (a real test double recording
+actual bytes, not filenames) for every automated test, plus one real, live
+call against IMA's actual infrastructure.** The live call (a synthetic
+test image + a real mask, `remove_object`) uploaded successfully against
+IMA's real endpoints, then failed at `POST /open/v1/tasks/create` with
+IMA's own business error `{"code": 4008, "message": "Insufficient
+points"}` — the configured account has no generation credits, a real
+account-balance condition external to this app, not a code defect; no
+credits were spent since the failure happened before any model inference.
+This confirms the upload/request/typed-error-propagation path against
+IMA's real infrastructure but does **not** confirm a successful live
+generation — that still needs an account with a positive credit balance.
+2123 backend tests pass
+(`ruff`/`black`/`mypy` clean on every touched file), including pixel-level
+proof that `_composite_mask_overlay` leaves pixels outside the mask
+byte-identical and red-shifts pixels inside it, and HTTP-level tests
+asserting the mocked provider receives real image/mask bytes (not a
+filename or placeholder) and that a zero-area mask, an unsupported
+operation, and a content-policy violation are all rejected before ever
+reaching the provider. 255 frontend tests pass (13 new — 6 for
+`imageEditAdapter.ts`'s upload→edit→cleanup/error paths, 7 for
+`ImageEditor.tsx`'s capability gating, quick-action routing, and
+stale-response guarding); `tsc`/`oxlint`/`npm run build` all clean. Fixed
+a genuine, disclosed jsdom gap found while writing these tests:
+`HTMLCanvasElement.prototype.toDataURL` is unimplemented in jsdom (silently
+returns `undefined`, no error) — Konva's `Stage.toDataURL()` delegates to
+it, so every canvas-export-dependent flow silently no-opped with no
+exception to catch until a fixed-PNG polyfill was added to
+`frontend/src/test/setup.ts`, the same category as that file's existing
+`getContext`/`ResizeObserver` stubs for other missing jsdom capabilities,
+not a behavior mock of this app's own code.
+
+**Known, disclosed limitations**: IMA's visual-overlay mask convention is
+a best-effort convention, not pixel-exact masking — the model can still
+edit outside the highlighted region (disclosed via `warnings`, not
+hidden). "Extract the selected table or chart" OCRs the whole current
+canvas, not a true selected sub-region (crop first to isolate one
+table/chart). The `"image"` i18n namespace this feature's new strings
+live in exists only in the English locale file — a pre-existing gap that
+predates this feature (the whole editor, crop/rotate/draw included, was
+never localized into es/fr/hi/mr either); `fallbackLng: 'en'` means this
+degrades to English text rather than breaking. See
+`docs/image-editing-architecture.md`'s "AI-guided editing: the real
+implementation" section for the full design and every other disclosed
+limitation.
 
 ## How to run
 

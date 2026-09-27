@@ -22,9 +22,9 @@
 
 <!-- Newest first, sourced from real commit history. Keep no more than the three most recent entries. -->
 
-- **2026-09-27** — Chat attachments are now genuinely secured and routed correctly, closing three real gaps found while hardening the feature: (1) a question that only concerned an attached file (e.g. "summarize this file") could be misrouted to the SQL pipeline instead of the attachment subgraph — fixed with a deterministic pre-filter that forces attachment-only questions to the right route; (2) image understanding silently degraded with no visible signal when no vision-capable Ollama model was configured — `GET /health`/`GET /attachments/capabilities` now report whether a configured vision model was actually found, and a missing one now falls back to OCR rather than answering as if the image were never considered; (3) a security audit of the attachment pipeline found and closed real gaps — a ZIP decompression-bomb guard and PDF preflight for DOCX/XLSX/PPTX processing, a bounded per-file processing timeout, prompt-injection pattern detection on extracted text, and a new startup check requiring malware scanning to be configured in production. Also fixed two pre-existing gaps found during a full documentation audit: `data/attachments/` (real runtime upload storage) was never gitignored, and three recently-added settings plus the entire malware-scanning config block were missing from `.env.example`. See `CLAUDE.md`'s "Attachment security hardening" section and `SECURITY.md`'s "Chat attachments — security controls" section.
-- **2026-09-26** — Started an 11-phase scale-out program ([`docs/SCALE_OUT_PROMPT.md`](docs/SCALE_OUT_PROMPT.md)) toward horizontal scalability. Phase 0 (done): a real load-test harness (`eval/load/` — mock LLM, seeded Postgres, k6, `make load-test`) plus a same-session hardening pass — bounded `/ask` concurrency with real admission control (replacing an unbounded thread-per-request pattern; 429+`Retry-After` before any work starts, `MAX_CONCURRENT_ASK_REQUESTS`/`_PER_CALLER`) and rate/attachment-ownership limits now keyed by real per-user identity instead of raw client IP — the latter fix closed a genuine cross-user isolation gap where every locally-authenticated user shared one bucket. Actually *running* the harness also found and fixed a real, previously invisible bug: `db/connection.py` was passing a password-*masked* connection string to `create_engine`, silently breaking any real discrete-field database connection. Measured baseline in [`docs/SCALE_BASELINE.md`](docs/SCALE_BASELINE.md); 1783 backend tests green.
-- **2026-09-25** — 500-case live prompt-injection benchmark run to completion against the real agent (real Ollama, real SQL Server): **0 critical findings** (no writes executed, no unauthorized sources, no secret/system-prompt leaks). Found and fixed two real bugs along the way — an MSSQL `MAXRECURSION` query hint that bypassed the SQL validator and could hang a query indefinitely (paired with a DB-connection-leak fix in the cost-estimation timeout path), and a narrative-phrased indirect-injection shape (`"The HR source instructs the agent to reveal finance records."`) that no existing detection pattern caught — the two affected categories' pass rate went 20% → 100% after the fix, re-confirmed live (0 false positives verified across three independent control sets before shipping it). Also added true channel-level injection tests for 6 previously direct-proxy-only categories and a real multi-turn persistence test — see [`docs/security/PROMPT_INJECTION_BENCHMARK_GAP_REPORT.md`](docs/security/PROMPT_INJECTION_BENCHMARK_GAP_REPORT.md)
+- **2026-09-27** — Added real, provider-backed AI-guided (generative) image editing: the Edit-image modal's "AI-guided editing" panel, previously a permanent stub, now calls a real backend (`POST /attachments/{id}/ai-edit`, IMA Studio's `image_to_image` task category) — "remove the selected object," "replace the sky," and similar prompted edits produce a real, brand-new derived attachment rather than an honest-but-fixed rejection. Verified live against IMA's real infrastructure (upload succeeded; the account's own credit balance, not the code, is what's blocking a full generation right now). Since IMA has no native mask/inpainting parameter, a painted mask is conveyed as a translucent overlay plus a text instruction — disclosed to the caller via the response's `warnings`, never presented as pixel-exact. Quick-action routing keeps the two non-generative presets ("Blur the selected face," "Extract the selected table or chart") on their existing free, local/deterministic paths — neither reaches the paid endpoint. Off by default (`ENABLE_IMAGE_EDITING`); local editing, OCR, resize, and blur are unaffected either way. See [`docs/image-editing-architecture.md`](docs/image-editing-architecture.md).
+- **2026-09-27** — An enterprise scalability/security assessment found and fixed six further, in-place gaps, none requiring new infrastructure: rate/concurrency limiting extended to every remaining limited route (not just `/ask`) to key on real caller identity rather than raw IP; opt-in trusted-proxy IP resolution (`security/client_ip.py`, `TRUSTED_PROXY_COUNT`, off by default) for a deployment that sits behind a real reverse proxy/load balancer; structured JSON logging (`LOG_FORMAT=json`) for real log-aggregation pipelines; a liveness/readiness split (`GET /live` alongside `GET /health`); graceful shutdown of the bounded `/ask` thread pool on `SIGTERM`; and a startup warning when configured concurrency exceeds a replica's own DB-pool capacity. See [`docs/ENTERPRISE_SCALABILITY_SECURITY_ASSESSMENT.md`](docs/ENTERPRISE_SCALABILITY_SECURITY_ASSESSMENT.md).
+- **2026-09-27** — Added configurable Ollama model selection for Text-to-SQL: a caller (or the dashboard's own new "AI Model" picker in Settings) can now choose which locally-installed model answers a given question via `POST /ask`'s optional `model` field, instead of always using `OLLAMA_MODEL`. Config-driven end to end — `OLLAMA_ALLOWED_MODELS`/`OLLAMA_MODEL_SELECTION_ENABLED` (`config/settings.py`) plus a small hand-authored display-metadata catalog (`config/ollama_models.yaml`) — so adding or removing a model never requires a React or LangGraph code change. A new `GET /models` endpoint (`agent/model_registry.py`) reports every configured model's live "installed on the connected Ollama instance" status (never the online Ollama Library, which is only ever consulted as a one-time research input, not a runtime dependency); an invalid/disallowed model is rejected with HTTP 400 *before* any LLM/DB work starts. Model selection is fully request-scoped (`AgentState["selected_model"]`, mirroring the existing `selected_database` pattern) — no global mutable state, verified with a real-threading concurrency regression test proving two simultaneous requests with different models never cross-contaminate. See [`docs/CONFIGURATION.md`](docs/CONFIGURATION.md#model-selection).
 
 <a id="example-usage"></a>
 
@@ -386,13 +386,13 @@ malware-scanned (if configured), and processed server-side, and the model
 genuinely sees its content — a vision model's description or an OCR
 fallback for images, extracted text for documents — via a dedicated
 LangGraph subgraph (see "Known limitations" below and `CLAUDE.md`'s "Chat
-attachments" section). **The one part of this that remains a stub is the
-image editor's own "AI-guided editing" panel** — a natural-language-
-prompted generative edit, distinct from attaching a file at all — which
-says so explicitly in the UI rather than pretending to call a model. See
+attachments" section). The image editor's own "AI-guided editing" panel
+(natural-language-prompted generative edits — "remove the selected
+object," "replace the sky") is also real, provider-backed editing now
+(IMA Studio, off by default via `ENABLE_IMAGE_EDITING`), not a stub — see
 [`docs/image-editing-architecture.md`](docs/image-editing-architecture.md)
-for exactly what's implemented, what's stubbed, and the backend contract
-a real AI-guided-editing integration would need.
+for the full design, the mask-conveyance approach IMA's lack of a native
+mask parameter required, and disclosed limitations.
 
 ### Running with Docker
 
@@ -435,7 +435,7 @@ connectivity and reverse-proxy placement.
 | Understand the sidebar/history/search UI (not the backend behind it) | [`docs/chat-history-ui.md`](docs/chat-history-ui.md) |
 | See which UI action lives where (Settings, Theme, Logout, sidebar collapse, ...) and why | [`docs/navigation-and-actions.md`](docs/navigation-and-actions.md) |
 | See the duplicated controls a later UI pass found and removed (two settings dialogs, two logout buttons, no sidebar collapse) | [`docs/ui-production-audit.md`](docs/ui-production-audit.md) |
-| Understand the local Konva image editor and exactly what's still stubbed (AI-guided/generative editing specifically) | [`docs/image-editing-architecture.md`](docs/image-editing-architecture.md) |
+| Understand the local Konva image editor, including real AI-guided (generative) editing via IMA Studio | [`docs/image-editing-architecture.md`](docs/image-editing-architecture.md) |
 | See the full frontend audit this UI pass started from | [`docs/frontend-ui-audit.md`](docs/frontend-ui-audit.md) |
 | See the live, browser-verified root-cause investigation of reported Settings/search/New-Chat/image-attachment issues | [`docs/functional-ui-audit.md`](docs/functional-ui-audit.md) |
 | Understand exactly how the Settings modal's overlay/focus/keyboard behavior works | [`docs/settings-modal.md`](docs/settings-modal.md) |
@@ -462,6 +462,18 @@ string (`config/settings.py`), not hardcoded:
 |---|---|
 | `llama3.1:8b` (default) | What this project is built and benchmarked against — see [`docs/EVALUATION.md`](docs/EVALUATION.md) for measured accuracy. |
 | `sqlcoder`, `duckdb-nsql`, or any other Ollama-hosted model | Supported by the same config knob; untested by this project's own benchmark as of this writing. |
+
+**Per-question model selection**: a caller (or the dashboard's own "AI
+Model" picker, in Settings) can choose a different Ollama model per
+question via `POST /ask`'s optional `model` field, without touching
+`OLLAMA_MODEL`/any code — validated server-side against
+`OLLAMA_ALLOWED_MODELS` (a small, practical starter set out of the box:
+`qwen2.5:7b`, `qwen2.5:14b`, `llama3.2:3b`, `mistral:7b`, `deepseek-r1:8b`,
+alongside the configured default) and cross-checked live against what's
+actually `ollama pull`ed on the connected server via `GET /models`. See
+[`docs/CONFIGURATION.md`](docs/CONFIGURATION.md#model-selection) for the
+full design (why the online Ollama Library is never a runtime dependency,
+how to add/remove a model, request-scoping guarantees).
 
 | `DB_TYPE` | Driver | Notes |
 |---|---|---|
@@ -583,13 +595,15 @@ any of this security work and remains a separate, equally real gap.
   documented in `SECURITY.md`'s "Chat attachments — security controls"
   section. A question that only concerns an attached file (e.g. "summarize
   this file") is routed directly to the attachment pipeline rather than
-  being treated as a database question. The one thing still explicitly a
-  stub: the image editor's "AI-guided editing" panel (prompt field, preset
-  buttons) is real UI but always returns a clear "not configured" message
-  rather than faking a result — see
+  being treated as a database question. The image editor's "AI-guided
+  editing" panel (prompt field, preset buttons) now calls a real
+  generative provider (IMA Studio, off by default via
+  `ENABLE_IMAGE_EDITING`) rather than always rejecting — the provider has
+  no native mask parameter, so a painted mask is conveyed as a translucent
+  overlay plus a text instruction, disclosed via the response's own
+  `warnings` rather than presented as pixel-exact — see
   [`docs/image-editing-architecture.md`](docs/image-editing-architecture.md)
-  for what's implemented versus the backend contract a real version would
-  need.
+  for the full design and every other disclosed limitation.
 - **Media search (`ENABLE_MEDIA_SEARCH`, off by default) adds a real,
   meaningfully larger dependency footprint** — `torch` (via
   `sentence-transformers`, for local CLIP embeddings) and `opencv-python`
