@@ -110,3 +110,77 @@ describe('request() -- 401 refresh-and-retry', () => {
     expect(handler).toHaveBeenCalledTimes(1)
   })
 })
+
+describe('request() -- error detail normalization (the "[object Object]" bug)', () => {
+  let fetchMock: ReturnType<typeof vi.fn>
+
+  beforeEach(() => {
+    fetchMock = vi.fn()
+    vi.stubGlobal('fetch', fetchMock)
+    getBearerToken.mockReturnValue(undefined)
+  })
+
+  afterEach(() => {
+    vi.unstubAllGlobals()
+    vi.resetModules()
+    vi.clearAllMocks()
+  })
+
+  it('passes an ordinary string detail through unchanged', async () => {
+    const { request, ApiError } = await import('./api')
+    fetchMock.mockResolvedValue(jsonResponse(400, { detail: 'Only PDF files are supported.' }))
+
+    await expect(request('/documents', { method: 'POST' })).rejects.toMatchObject({
+      message: 'Only PDF files are supported.',
+    } satisfies Partial<InstanceType<typeof ApiError>>)
+  })
+
+  it(
+    'joins a FastAPI 422 validation-error array of objects into readable text -- ' +
+      'this is the real, reported "[object Object]" bug: naively stringifying an ' +
+      'array of Pydantic error objects (or any of its elements) produces exactly that string',
+    async () => {
+      const { request, ApiError } = await import('./api')
+      fetchMock.mockResolvedValue(
+        jsonResponse(422, {
+          detail: [
+            { type: 'missing', loc: ['body', 'sql'], msg: 'Field required', input: {} },
+            { type: 'string_too_short', loc: ['body', 'database'], msg: 'String should have at least 1 character' },
+          ],
+        }),
+      )
+
+      await expect(request('/execute', { method: 'POST' })).rejects.toMatchObject({
+        message: 'Field required String should have at least 1 character',
+      } satisfies Partial<InstanceType<typeof ApiError>>)
+    },
+  )
+
+  it('falls back to the generic status message for a plain object detail with no usable text', async () => {
+    const { request } = await import('./api')
+    fetchMock.mockResolvedValue(jsonResponse(500, { detail: { internal: 'stack trace here' } }))
+
+    await expect(request('/ask', { method: 'POST' })).rejects.toMatchObject({
+      message: 'Request failed with status 500.',
+    })
+  })
+
+  it('falls back to the generic status message for an empty array detail', async () => {
+    const { request } = await import('./api')
+    fetchMock.mockResolvedValue(jsonResponse(422, { detail: [] }))
+
+    await expect(request('/ask', { method: 'POST' })).rejects.toMatchObject({
+      message: 'Request failed with status 422.',
+    })
+  })
+
+  it('never lets the resulting message literally read "[object Object]"', async () => {
+    const { request } = await import('./api')
+    fetchMock.mockResolvedValue(
+      jsonResponse(422, { detail: [{ type: 'value_error', loc: ['body'], msg: null }] }),
+    )
+
+    const error = await request('/ask', { method: 'POST' }).catch((e: unknown) => e)
+    expect(String((error as Error).message)).not.toContain('[object Object]')
+  })
+})

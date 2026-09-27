@@ -25,12 +25,13 @@ type this codebase has always caught, not a raw `pydantic.ValidationError`.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
 from functools import lru_cache
 from pathlib import Path
-from typing import Literal
+from typing import Annotated, Literal
 
 from dotenv import load_dotenv
 from pydantic import (
@@ -42,7 +43,7 @@ from pydantic import (
     field_validator,
     model_validator,
 )
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 # Project root is the parent of this file's parent (config/settings.py -> repo root).
 PROJECT_ROOT: Path = Path(__file__).resolve().parent.parent
@@ -127,6 +128,27 @@ def _resolve_path(raw: str) -> Path:
     """Resolve a possibly-relative path from .env against the project root."""
     path = Path(raw)
     return path if path.is_absolute() else (PROJECT_ROOT / path).resolve()
+
+
+# A small, practical starter set for OLLAMA_ALLOWED_MODELS when it's left
+# unset -- NOT a claim of "every model in the Ollama Library," and
+# deliberately not the full online catalog (see agent/model_registry.py's
+# module docstring for why hard-coding that would be wrong). Evaluated
+# against the live https://ollama.com/library on 2026-09-27 for local
+# Text-to-SQL suitability (instruction-following, structured/JSON output,
+# a spread of sizes from lightweight to more capable) -- see
+# docs/CONFIGURATION.md's "Model selection" section for the full writeup.
+# `ollama_model` (the configured default) is always unioned in on top of
+# this by `_fill_default_ollama_allowed_models` below, regardless of
+# whether it's listed here.
+_DEFAULT_OLLAMA_ALLOWED_MODELS: tuple[str, ...] = (
+    "llama3.1:8b",
+    "qwen2.5:7b",
+    "qwen2.5:14b",
+    "llama3.2:3b",
+    "mistral:7b",
+    "deepseek-r1:8b",
+)
 
 
 def _connection_env_prefix(name: str) -> str:
@@ -278,6 +300,38 @@ class Settings(BaseSettings):
             surfaced as httpx.ReadTimeout/ConnectTimeout errors bubbling up
             as ollama.ResponseError in agent/llm_client.py and rag/llm.py.
             Override via OLLAMA_REQUEST_TIMEOUT_SECONDS in .env.
+        ollama_model_selection_enabled: Whether a caller may override
+            `ollama_model` on a per-question basis (`AskRequest.model`, the
+            dashboard's "AI Model" picker). True by default -- selection is
+            opt-in *per request* (omitting `model` always uses `ollama_model`
+            unchanged, so this defaults on with zero behavior change for any
+            existing caller). Set to `false` to hard-disable the feature
+            entirely (e.g. a locked-down deployment) -- when off,
+            `agent.model_registry.get_allowed_models` collapses to exactly
+            `(ollama_model,)` regardless of `ollama_allowed_models` below, so
+            a caller-supplied `model` other than the configured default is
+            rejected the same way an unconfigured one always is. See
+            `agent/model_registry.py`.
+        ollama_allowed_models: Comma-separated list of additional Ollama
+            model names selectable for Text-to-SQL generation, e.g.
+            `OLLAMA_ALLOWED_MODELS=qwen2.5:7b,llama3.2:3b,mistral:7b`
+            (mirrors `DB_CONNECTIONS`'/`CORS_ALLOWED_ORIGINS`' own
+            comma-separated-string convention -- see `_split_ollama_allowed_models`
+            below). `ollama_model` is always implicitly included even if
+            omitted here, so the configured default is never made
+            unselectable by an operator's own `.env` edit. Leaving this
+            unset does NOT mean "only the default model" -- it falls back to
+            a small, practical starter set (`_DEFAULT_OLLAMA_ALLOWED_MODELS`
+            below, evaluated against the live Ollama Library on 2026-09-27 --
+            see `docs/CONFIGURATION.md`'s "Model selection" section) so a
+            fresh clone shows a useful picker with
+            no `.env` edit required. Every listed model still shows as
+            "not installed" in the UI until it's actually been `ollama
+            pull`ed -- this setting only controls what's *offered*, never
+            what's *installed* (see `agent.model_registry.discover_installed_models`).
+            None of this is a permanent, exhaustive list of "every Ollama
+            model" -- see that module's own docstring for why hard-coding
+            the whole online catalog was deliberately avoided.
         db_type: Target database engine, e.g. "postgresql", "mssql", "mysql",
             "oracle". Interpreted by `db/connection.py` -- see
             `db.connection.SUPPORTED_DB_TYPES` for the full list.
@@ -893,6 +947,21 @@ class Settings(BaseSettings):
             nothing charged) until confirmed. Set `false` only for a
             trusted automation context that has already reviewed this
             tradeoff and wants the previous fully-autonomous behavior.
+        enable_image_editing: Whether the local image editor's "AI-guided
+            editing" panel (`components/image/ImageEditor.tsx`) may call a
+            real, generative image-editing backend at all -- see this
+            field's own inline comment near its declaration for the full
+            design (reuses `ima_api_key`/the `image_to_image` IMA task
+            category, a deliberately separate flag from
+            `enable_media_generation` since this sends a user's own
+            uploaded image externally). False by default.
+        image_edit_timeout_seconds: Hard ceiling on one synchronous AI
+            image-edit request's wall-clock time.
+        image_edit_poll_interval_seconds: How often to poll IMA for a
+            submitted image-edit task's completion.
+        image_edit_max_prompt_length: Max length of the free-text edit
+            instruction a caller may submit to `POST /attachments/{id}
+            /ai-edit`.
         enable_voice_mode: Whether voice input/output (`voice/`, spoken
             questions transcribed via `faster-whisper`, spoken answers
             synthesized via Piper -- both local, no cloud API, same
@@ -1312,6 +1381,19 @@ class Settings(BaseSettings):
     ollama_host: str = "http://localhost:11434"
     ollama_model: str = "llama3.1:8b"
     ollama_request_timeout_seconds: int = Field(default=300, gt=0)
+    ollama_model_selection_enabled: bool = True
+    # `NoDecode` tells pydantic-settings not to attempt its own default
+    # JSON-array decoding of a compound-typed env var -- without it, an env
+    # var actually set via OLLAMA_ALLOWED_MODELS=a,b,c raises
+    # `pydantic_settings.exceptions.SettingsError` before
+    # `_split_ollama_allowed_models` below (a field_validator(mode="before"))
+    # ever runs, since env-source decoding happens in an earlier layer than
+    # field validators. A real, previously-latent bug found while building
+    # this: `cors_allowed_origins` right below uses the identical
+    # comma-separated-string convention and had the exact same gap (no
+    # existing test ever set CORS_ALLOWED_ORIGINS via a real env var to
+    # catch it) -- fixed there too, same annotation.
+    ollama_allowed_models: Annotated[tuple[str, ...], NoDecode] = ()
 
     db_type: str = ""
     db_host: str | None = None
@@ -1349,6 +1431,16 @@ class Settings(BaseSettings):
     cost_high_row_threshold: int = Field(default=1_000_000, gt=0)
     log_level: str = "INFO"
     log_redaction_level: Literal["standard", "strict"] = "standard"
+    # Enterprise scalability/security assessment (2026-09-27): "text" (the
+    # default) is byte-for-byte this codebase's existing terminal-friendly
+    # format -- zero behavior change for local dev or any deployment that
+    # doesn't opt in. "json" emits one JSON object per log line instead
+    # (timestamp/level/logger/correlation_id/message, plus exception info
+    # when present) -- the shape a real log-aggregation pipeline (ELK,
+    # CloudWatch, Datadog, Loki) can actually parse/query/alert on, unlike
+    # the existing pipe-delimited text format. See
+    # `config.settings.configure_logging`/`_JsonLogFormatter`.
+    log_format: Literal["text", "json"] = "text"
     enable_multi_source_router: bool = False
     enable_query_planning: bool = True
     query_plan_max_tokens: int = Field(default=300, gt=0)
@@ -1441,6 +1533,21 @@ class Settings(BaseSettings):
     chat_history_max_page_size: int = Field(default=100, gt=0, le=500)
     chat_search_page_size: int = Field(default=20, gt=0, le=100)
     chat_search_max_page_size: int = Field(default=50, gt=0, le=200)
+    # Universal chat-history persistence (api/chat_persistence.py) -- bounds
+    # on what gets written into `ai_outputs.metadata` for a saved turn, kept
+    # deliberately separate from `max_result_rows` (the *execution* row cap):
+    # this caps what's durably persisted for later replay, not what a live
+    # `/execute` call is allowed to return right now. A saved conversation
+    # showing "first 50 of 500 rows" on reopen is an accepted, disclosed
+    # tradeoff against storing an unbounded result snapshot per turn forever.
+    chat_history_max_result_rows: int = Field(default=50, gt=0, le=1000)
+    # Caps any single free-text field (an answer, a citation excerpt, a
+    # rejection message, ...) persisted into a turn's history snapshot --
+    # independent of this same text's own live-response length, which is
+    # never truncated. Keeps one pathological answer from bloating a
+    # conversation's storage footprint; the persisted field is truncated
+    # with a trailing marker, never silently dropped.
+    chat_history_max_text_chars: int = Field(default=4000, gt=0, le=50_000)
     max_login_attempts: int = Field(default=5, gt=0)
     login_lockout_minutes: int = Field(default=15, gt=0)
     jwt_algorithm: Literal["HS256", "RS256", "ES256"] = "HS256"
@@ -1493,6 +1600,46 @@ class Settings(BaseSettings):
     media_gen_rate_window_seconds: float = Field(default=60.0, gt=0)
     media_gen_video_duration_seconds: int | None = Field(default=None, gt=0, le=60)
     require_generation_approval: bool = True
+    # AI-guided image editing (2026-09-27) -- a real, generative edit of a
+    # user's *own uploaded image* (remove an object, replace a background,
+    # region-transform), distinct from media_gen's own "generate a brand
+    # new image from text" capability. Deliberately its own flag, not
+    # folded into `enable_media_generation`: sending a user's own photo to
+    # a third-party provider is a materially bigger privacy decision than
+    # generating a fresh image from a text prompt, so it needs its own
+    # explicit opt-in even when media generation is already on. Reuses the
+    # exact same IMA Studio account/credential (`ima_api_key`) and the
+    # `image_to_image` task category -- verified live against this
+    # project's real account (a read-only, no-cost `GET /open/v1/product
+    # /list?category=image_to_image` call): 5 real models available
+    # (gpt-image-2, gemini-3.1-flash-image, gemini-3-pro-image,
+    # doubao-seedream-4.5, midjourney), none of which expose a native mask
+    # parameter -- see `media_gen/image_edit_provider.py`'s own docstring
+    # for how a painted mask is conveyed to this provider instead (a
+    # visual overlay baked into the image plus an explicit instruction,
+    # not a pixel-level alpha channel -- a real, disclosed provider
+    # limitation, not an oversight). Both this flag AND `ima_api_key` must
+    # be set for `attachments.capabilities.get_attachment_capabilities` to
+    # report `image_ai_editing=true` -- off by default so a fresh clone
+    # never sends attachment images to a third party without the operator
+    # deliberately opting in.
+    enable_image_editing: bool = False
+    # Hard ceiling on how long one synchronous `POST /attachments/{id}
+    # /ai-edit` call will wait for IMA's own task-poll loop before failing
+    # closed -- deliberately much shorter than `media_gen.client.IMAClient
+    # .poll_task`'s own 600s default (reasonable for a fire-and-forget
+    # generation the orchestrator already handles via its own timeout
+    # machinery) because this is a synchronous HTTP request a real browser
+    # tab is blocked on; real image_to_image edits with the models above
+    # are typically much faster than video generation.
+    image_edit_timeout_seconds: int = Field(default=90, gt=0, le=300)
+    image_edit_poll_interval_seconds: float = Field(default=3.0, gt=0)
+    # Caps the free-text edit instruction a caller may submit -- mirrors
+    # `Settings.max_question_length`'s own "a static limit, not a security
+    # boundary by itself" role; the real prompt-injection defense is the
+    # same "treat all free text as untrusted data" framing this codebase
+    # already applies everywhere else, not a length cap.
+    image_edit_max_prompt_length: int = Field(default=500, gt=0)
     enable_voice_mode: bool = True
     stt_model_size: str = "base"
     stt_device: Literal["cpu", "cuda"] = "cpu"
@@ -1559,7 +1706,15 @@ class Settings(BaseSettings):
     media_image_tile_threshold_px: int = Field(default=2048, gt=0)
     session_expensive_source_limit: int = Field(default=10, gt=0)
     session_expensive_source_window_seconds: float = Field(default=3600.0, gt=0)
-    cors_allowed_origins: tuple[str, ...] = Field(
+    # `NoDecode`: see `ollama_allowed_models`'s own comment above -- without
+    # it, a real `CORS_ALLOWED_ORIGINS=a,b` env var raised
+    # `pydantic_settings.exceptions.SettingsError` before
+    # `_split_cors_origins` below ever ran (only direct
+    # `Settings(cors_allowed_origins=(...))` construction, as every existing
+    # test used, ever worked) -- a real, previously-undiscovered bug found
+    # and fixed while building `ollama_allowed_models` against the identical
+    # pattern.
+    cors_allowed_origins: Annotated[tuple[str, ...], NoDecode] = Field(
         default=(),
         description=(
             "Origins allowed to call this API cross-origin (e.g. a React "
@@ -1569,6 +1724,24 @@ class Settings(BaseSettings):
             ".env, e.g. CORS_ALLOWED_ORIGINS=http://localhost:5173."
         ),
     )
+    # Enterprise scalability/security assessment (2026-09-27): 0 (the
+    # default) preserves this codebase's existing, deliberately-tested
+    # posture of never trusting X-Forwarded-For/X-Real-IP
+    # (tests/security/test_rate_limit_header_spoofing.py) -- correct for
+    # today's single-instance, directly-exposed deployment. Once a real
+    # reverse proxy/load balancer sits in front of this app (the target
+    # architecture's own Phase 2+), `request.client.host` becomes the
+    # proxy's own address for every caller, collapsing every distinct
+    # client into one shared rate-limit bucket/audit-log identity -- a real
+    # availability problem (innocent users rate-limited together), not
+    # merely an inaccuracy. Set to the exact number of trusted reverse
+    # proxies between the internet and this process (usually 1) to read the
+    # correct hop from X-Forwarded-For instead -- see
+    # `security.client_ip.resolve_client_ip`'s own docstring for why this
+    # must be an exact hop *count*, never "trust the header if present",
+    # and why a misconfigured count fails closed to the direct TCP peer
+    # rather than trusting client-supplied data.
+    trusted_proxy_count: int = Field(default=0, ge=0)
     # 2026 Phase 3 security review: on by default -- these headers are
     # cheap, have no functional downside for a normal browser session, and
     # (per this codebase's own "no single control is the final barrier"
@@ -1612,6 +1785,22 @@ class Settings(BaseSettings):
         setting most users will only ever set to zero or one origin."""
         if isinstance(value, str):
             return tuple(origin.strip() for origin in value.split(",") if origin.strip())
+        return value
+
+    @field_validator("ollama_allowed_models", mode="before")
+    @classmethod
+    def _split_ollama_allowed_models(cls, value: object) -> object:
+        """Accepts a comma-separated `.env` string (`OLLAMA_ALLOWED_MODELS`),
+        the same convention `_split_cors_origins` already establishes for
+        `CORS_ALLOWED_ORIGINS` -- a small, human-editable list doesn't need
+        JSON-array syntax. `_fill_default_ollama_allowed_models` below (a
+        `model_validator(mode="after")`, so it runs once every field is in
+        its final form) is what actually fills in the default starter set
+        when this is left unset -- this validator only handles *parsing* a
+        value that was actually provided.
+        """
+        if isinstance(value, str):
+            return tuple(model.strip() for model in value.split(",") if model.strip())
         return value
 
     @field_validator("cors_allowed_origins", mode="after")
@@ -1740,6 +1929,40 @@ class Settings(BaseSettings):
                     ),
                 ),
             )
+        return self
+
+    @model_validator(mode="after")
+    def _fill_default_ollama_allowed_models(self) -> Settings:
+        """Normalizes `ollama_allowed_models` into its final, authoritative form.
+
+        Three cases, in order:
+          1. `ollama_model_selection_enabled` is False -- selection is
+             hard-disabled, so the allowed set collapses to exactly
+             `(ollama_model,)` regardless of whatever `OLLAMA_ALLOWED_MODELS`
+             says. This is the kill switch: `agent.model_registry` never
+             needs its own separate "is selection enabled" branch, since an
+             empty-of-alternatives allowed set already produces the right
+             behavior (only the default is ever valid).
+          2. `ollama_allowed_models` was left unset -- falls back to
+             `_DEFAULT_OLLAMA_ALLOWED_MODELS` above, unioned with
+             `ollama_model` (order-preserving, default first) so a fresh
+             clone gets a useful picker with zero `.env` edits.
+          3. `ollama_allowed_models` was explicitly set -- used as-is, except
+             `ollama_model` is unioned in if the operator's own list omitted
+             it, since the configured default must always remain selectable.
+
+        Same `object.__setattr__` escape hatch as `_fill_default_database`
+        above -- `Settings` is frozen, and a `model_validator(mode="after")`
+        is the one place that's allowed for post-construction normalization.
+        """
+        if not self.ollama_model_selection_enabled:
+            object.__setattr__(self, "ollama_allowed_models", (self.ollama_model,))
+            return self
+
+        base = self.ollama_allowed_models or _DEFAULT_OLLAMA_ALLOWED_MODELS
+        if self.ollama_model not in base:
+            base = (self.ollama_model, *base)
+        object.__setattr__(self, "ollama_allowed_models", base)
         return self
 
     @property
@@ -1974,6 +2197,48 @@ def get_settings() -> Settings:
     return Settings(databases=_parse_named_connections())
 
 
+class _JsonLogFormatter(logging.Formatter):
+    """Renders one JSON object per log line -- `Settings.log_format="json"`.
+
+    Enterprise scalability/security assessment (2026-09-27): the existing
+    default text format (`"%(asctime)s | %(levelname)-8s | ..."`) is fine
+    for a human watching a terminal, but a real log-aggregation pipeline
+    (ELK, CloudWatch, Datadog, Loki) has to regex-parse it back apart --
+    exactly the class of fragility structured logging exists to avoid. This
+    is purely a rendering choice: every existing `logger.info(...)`/
+    `security.audit_log.log_security_event(...)` call site is completely
+    unchanged, and the *default* (`log_format="text"`) still uses the
+    original format string -- this formatter is only ever attached when an
+    operator explicitly opts in.
+
+    Deliberately does not log the raw `%(message)s` args separately, secret
+    values, or anything beyond what the existing text formatter already
+    rendered -- see this codebase's own "never log connection strings,
+    passwords, or full result rows" rule (CLAUDE.md's Coding standards);
+    this formatter changes *shape*, not *content*, so every existing
+    redaction (`security.redaction`) that already ran before a message
+    reached the logger still applies identically.
+    """
+
+    def format(self, record: logging.LogRecord) -> str:
+        # "-" is `CorrelationIdLogFilter`'s own placeholder for "no request
+        # in flight" (chosen there so the *text* format's column stays a
+        # stable width) -- rendered here as a real JSON `null` instead, so
+        # a log-pipeline query for "no correlation id" is a natural `IS
+        # NULL`, not a string-literal match on an internal placeholder.
+        correlation_id = getattr(record, "correlation_id", None)
+        payload: dict[str, object] = {
+            "timestamp": self.formatTime(record, "%Y-%m-%dT%H:%M:%S%z"),
+            "level": record.levelname,
+            "logger": record.name,
+            "correlation_id": None if correlation_id in (None, "-") else correlation_id,
+            "message": record.getMessage(),
+        }
+        if record.exc_info:
+            payload["exception"] = self.formatException(record.exc_info)
+        return json.dumps(payload, default=str)
+
+
 def configure_logging(level: str | None = None) -> None:
     """Configure root logging once, in a format useful for terminal debugging.
 
@@ -1982,20 +2247,38 @@ def configure_logging(level: str | None = None) -> None:
     reconfiguring a caller's logging setup.
 
     Every handler on the root logger gets `security.audit_log
-    .CorrelationIdLogFilter` attached, and the format string includes
+    .CorrelationIdLogFilter` attached, and the format includes
     `correlation_id` -- this is what makes a request's correlation ID show
     up on *every* log line (agent nodes, RAG, DB, external-call modules),
     not just the dedicated `security.audit` event stream. See that filter's
     docstring for the Phase 3 observability gap this closes.
+
+    `Settings.log_format` picks the rendering: "text" (the default) is this
+    codebase's original terminal-friendly pipe-delimited format, unchanged;
+    "json" (enterprise scalability/security assessment, 2026-09-27) renders
+    each line as one JSON object instead (`_JsonLogFormatter`) for a real
+    log pipeline to ingest. Same underlying log records either way -- this
+    only changes how they're rendered.
     """
     from security.audit_log import CorrelationIdLogFilter
 
-    resolved_level = (level or get_settings().log_level).upper()
+    settings = get_settings()
+    resolved_level = (level or settings.log_level).upper()
+    handler = logging.StreamHandler()
+    if settings.log_format == "json":
+        handler.setFormatter(_JsonLogFormatter())
+    else:
+        handler.setFormatter(
+            logging.Formatter(
+                fmt="%(asctime)s | %(levelname)-8s | %(name)s | correlation_id=%(correlation_id)s | %(message)s",
+                datefmt="%H:%M:%S",
+            )
+        )
     logging.basicConfig(
         level=getattr(logging, resolved_level, logging.INFO),
-        format="%(asctime)s | %(levelname)-8s | %(name)s | correlation_id=%(correlation_id)s | %(message)s",
-        datefmt="%H:%M:%S",
+        handlers=[handler],
+        force=True,
     )
     correlation_filter = CorrelationIdLogFilter()
-    for handler in logging.getLogger().handlers:
-        handler.addFilter(correlation_filter)
+    for configured_handler in logging.getLogger().handlers:
+        configured_handler.addFilter(correlation_filter)

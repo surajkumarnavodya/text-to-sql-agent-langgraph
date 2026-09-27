@@ -14,6 +14,7 @@ ever reaches a prompt.
 from __future__ import annotations
 
 import base64
+import binascii
 import io
 
 from PIL import Image, UnidentifiedImageError
@@ -101,6 +102,28 @@ def image_bytes_to_data_url(image_bytes: bytes, media_type: str) -> str:
     """
     encoded = base64.b64encode(image_bytes).decode("ascii")
     return f"data:{media_type};base64,{encoded}"
+
+
+def decode_data_url(data_url: str) -> tuple[bytes, str]:
+    """The inverse of `image_bytes_to_data_url` -- decodes a
+    `data:<media_type>;base64,<...>` string (e.g. the mask/current-canvas
+    export a browser `<canvas>.toDataURL()` call produces) back into raw
+    bytes. Used at request-validation boundaries (`api/attachments.py`'s
+    AI-guided-edit and blur-region routes) that accept an inline data URL
+    rather than a separately-uploaded attachment.
+
+    Raises:
+        ValueError: `data_url` isn't a well-formed `data:...;base64,...`
+            string, or its base64 payload doesn't decode.
+    """
+    if not data_url.startswith("data:") or ";base64," not in data_url:
+        raise ValueError("Expected a data URL of the form 'data:<media type>;base64,<data>'.")
+    header, encoded = data_url.split(",", 1)
+    media_type = header[len("data:") : -len(";base64")]
+    try:
+        return base64.b64decode(encoded, validate=True), media_type
+    except (binascii.Error, ValueError) as exc:
+        raise ValueError(f"Could not decode base64 image data: {exc}") from exc
 
 
 def image_file_to_data_url(path: str, settings: Settings) -> str:

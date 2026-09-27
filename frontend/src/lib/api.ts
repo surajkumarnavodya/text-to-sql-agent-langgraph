@@ -1,9 +1,12 @@
 import { getBearerToken } from '@/store/authStore'
 import type {
+  AiImageEditRequest,
+  AiImageEditResponse,
   AskRequest,
   AskResponse,
   AttachmentCapabilities,
   AttachmentUploadResponse,
+  BlurRegionRequest,
   Collection,
   DetectTextRegionsResponse,
   DocumentListResponse,
@@ -18,12 +21,44 @@ import type {
   MediaGenerationResult,
   MediaSearchResult,
   MessageFeedbackRequest,
+  ModelsResponse,
   OcrExtractResponse,
   SchemaRefreshResponse,
   SensitivityCategory,
   TablesResponse,
   TranscribeResponse,
 } from './types'
+
+/** FastAPI's ordinary error body is `{ detail: string }`, but a 422
+ * validation failure's `detail` is instead an array of Pydantic error
+ * objects (`{ type, loc, msg, ... }`) -- and a proxy/gateway in front of
+ * this app could plausibly return some other non-string shape entirely.
+ * Naively doing `body.detail ?? fallback` and handing the result straight
+ * to `ApiError`/`Error` let a non-string `detail` reach the UI as the
+ * literal text `"[object Object]"` (a real, reported bug): an array's own
+ * `.toString()` calls `.toString()` on each element, and a plain object's
+ * default `.toString()` is always exactly that string, so whichever
+ * component eventually rendered `error.message` as text showed that
+ * instead of anything readable. This normalizes every shape `request()`
+ * might see into a safe, human-readable string -- never a raw object, and
+ * never a stack trace/internal detail beyond what the server already
+ * chose to put in `detail`. */
+function normalizeErrorDetail(detail: unknown, fallback: string): string {
+  if (typeof detail === 'string' && detail.trim()) return detail
+  if (Array.isArray(detail) && detail.length > 0) {
+    const messages = detail
+      .map((item) => {
+        if (typeof item === 'string') return item
+        if (item && typeof item === 'object' && typeof (item as { msg?: unknown }).msg === 'string') {
+          return (item as { msg: string }).msg
+        }
+        return null
+      })
+      .filter((message): message is string => message !== null)
+    if (messages.length > 0) return messages.join(' ')
+  }
+  return fallback
+}
 
 export class ApiError extends Error {
   status: number
@@ -106,10 +141,11 @@ export async function request<T>(
   }
 
   if (!response.ok) {
-    let detail = `Request failed with status ${response.status}.`
+    const fallback = `Request failed with status ${response.status}.`
+    let detail = fallback
     try {
-      const body = (await response.clone().json()) as { detail?: string }
-      detail = body.detail ?? detail
+      const body = (await response.clone().json()) as { detail?: unknown }
+      detail = normalizeErrorDetail(body.detail, fallback)
     } catch {
       // Non-JSON error body (e.g. a 429 from a proxy in front of the app) --
       // the generic message above is still safe to show.
@@ -166,6 +202,15 @@ export function getSchemaTables(database?: string): Promise<TablesResponse> {
 
 export function getHealth(): Promise<HealthResponse> {
   return request<HealthResponse>('/health')
+}
+
+/** The Ollama Text-to-SQL model registry (`GET /models`) -- every
+ * configured/allowed model enriched with live "is it installed right now"
+ * status. See useAvailableModels() (react-query, cached like useHealth) and
+ * HistorySettingsSection.tsx's "AI Model" picker. Never called on every
+ * /ask -- the frontend caches this response instead. */
+export function getAvailableModels(): Promise<ModelsResponse> {
+  return request<ModelsResponse>('/models')
 }
 
 export function listDocuments(collection?: Collection): Promise<DocumentListResponse> {
@@ -249,6 +294,37 @@ export function resizeAttachmentImage(
   body: ImageResizeRequest,
 ): Promise<ImageEditResultResponse> {
   return request<ImageEditResultResponse>(`/attachments/${attachmentId}/resize`, {
+    method: 'POST',
+    body: JSON.stringify(body),
+  })
+}
+
+/** "Blur region" -- deterministic, local Pillow Gaussian blur over a
+ * painted mask, never a model call. Works even when AI-guided editing is
+ * disabled (see api/attachments.py's own route docstring). Always returns
+ * a brand-new attachment, matching resize/remove-text's own contract. */
+export function blurAttachmentRegion(
+  attachmentId: string,
+  body: BlurRegionRequest,
+): Promise<ImageEditResultResponse> {
+  return request<ImageEditResultResponse>(`/attachments/${attachmentId}/blur-region`, {
+    method: 'POST',
+    body: JSON.stringify(body),
+  })
+}
+
+/** Real, generative AI-guided image editing (`POST
+ * /attachments/{id}/ai-edit`) -- the endpoint that used to not exist at
+ * all. `attachmentId` must be a fresh, transient attachment holding the
+ * editor's *current* canvas export (see `lib/imageEditAdapter.ts`'s own
+ * docstring for why). Never throws for an ordinary "the edit didn't work"
+ * outcome -- check `response.status` instead; `request()` only rejects for
+ * a genuine transport/auth/validation failure. */
+export function aiEditAttachmentImage(
+  attachmentId: string,
+  body: AiImageEditRequest,
+): Promise<AiImageEditResponse> {
+  return request<AiImageEditResponse>(`/attachments/${attachmentId}/ai-edit`, {
     method: 'POST',
     body: JSON.stringify(body),
   })

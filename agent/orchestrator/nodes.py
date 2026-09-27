@@ -43,6 +43,7 @@ from agent.rate_limit import (
     get_session_expensive_source_limiter,
 )
 from config.settings import Settings, get_settings
+from media_gen.content_policy import basic_prompt_safety_check as _basic_prompt_safety_check
 from rag.graph import Citation
 from rag.store import RagStoreNotConfiguredError
 from search.web_search import WebSearchNotConfiguredError
@@ -706,6 +707,7 @@ def sql_subgraph_node(state: OrchestratorState) -> dict[str, Any]:
         state.get("conversation_history"),
         state.get("enable_insight", True),
         state.get("caller_roles", ()),
+        state.get("selected_model"),
     )
     result = dict(sql_state)
     result["sources_used"] = ["sql"]
@@ -852,50 +854,11 @@ def web_search_node(state: OrchestratorState) -> dict[str, Any]:
     }
 
 
-# A keyword heuristic, deliberately broadened from the original two-word
-# list -- still NOT a real moderation system, and still trivially bypassed
-# by a synonym, a non-English phrasing, or an indirect description (this
-# is a documented, known limitation, not a claim of completeness -- see
-# docs/RESPONSIBLE_AI.md's media-generation section). Categories:
-# explicit/sexual content, depictions of minors in a sexualized context,
-# graphic violence/gore, and content designed to impersonate a real,
-# identifiable person without consent (deepfake-style requests) -- the
-# categories a real moderation API call should eventually replace this
-# with, not an exhaustive list. Replace with a genuine moderation-API call
-# (many image/video providers, including IMA, expose one) before this
-# feature is exposed to untrusted users at scale.
-_DISALLOWED_PROMPT_SUBSTRINGS = (
-    "nsfw",
-    "explicit",
-    "porn",
-    "pornographic",
-    "hentai",
-    "nude",
-    "naked",
-    "sexual",
-    "erotic",
-    "fetish",
-    "child sexual",
-    "csam",
-    "underage",
-    "loli",
-    "gore",
-    "graphic violence",
-    "beheading",
-    "self-harm",
-    "suicide method",
-    "deepfake",
-)
-
-
-def _basic_prompt_safety_check(text: str) -> str | None:
-    """Returns a rejection reason if `text` fails the (still heuristic, see
-    the constant above) content policy check, else None."""
-    lowered = text.lower()
-    for bad in _DISALLOWED_PROMPT_SUBSTRINGS:
-        if bad in lowered:
-            return "This request was rejected by the content policy check."
-    return None
+# _basic_prompt_safety_check moved to media_gen/content_policy.py
+# (2026-09-27, alongside adding AI-guided image editing,
+# attachments/ai_edit.py -- see this module's own top-of-file import) --
+# that module is now the single shared copy of this keyword list, so
+# every existing call site below keeps working unchanged.
 
 
 # Cheap keyword heuristic, not a second LLM call -- mirrors

@@ -88,6 +88,19 @@ class AskRequest(BaseModel):
             "docstring."
         ),
     )
+    model: str | None = Field(
+        default=None,
+        max_length=128,
+        description=(
+            "Ollama model to use for this question's SQL generation/planning/review/insight "
+            "calls, from a prior GET /models response's `models[].id`. Omit to use the "
+            "server-configured default (Settings.ollama_model) -- every existing caller that "
+            "predates this field keeps working unchanged. Validated server-side against "
+            "Settings.ollama_allowed_models (agent.model_registry.validate_model_selection) "
+            "before this question is ever run -- an unrecognized/disallowed value is rejected "
+            "with HTTP 400, never silently substituted or passed through to Ollama as-is."
+        ),
+    )
 
 
 class AttemptRecordOut(BaseModel):
@@ -237,8 +250,11 @@ class AttachmentCapabilitiesResponse(BaseModel):
     vision_model: str | None = None
     ocr: bool
     image_resize: bool
+    image_blur: bool
     image_text_removal: bool
     image_text_removal_method: str | None = None
+    image_ai_editing: bool
+    image_ai_editing_provider: str | None = None
     native_pdf_input: bool = False
     max_image_bytes: int
     max_document_bytes: int
@@ -246,6 +262,7 @@ class AttachmentCapabilitiesResponse(BaseModel):
     max_total_attachment_bytes: int
     max_resize_dimension_px: int
     max_text_removal_regions: int
+    max_ai_edit_prompt_length: int
     supported_image_extensions: list[str] = Field(default_factory=list)
     supported_document_extensions: list[str] = Field(default_factory=list)
     resize_presets: list[ImageResizePresetOut] = Field(default_factory=list)
@@ -343,6 +360,72 @@ class ImageEditResultResponse(BaseModel):
     warnings: list[str] = Field(default_factory=list)
 
 
+class BlurRegionRequest(BaseModel):
+    """`POST /attachments/{id}/blur-region` -- deterministic, local Pillow
+    Gaussian blur over a painted mask region. `mask_data_url` follows this
+    app's canonical mask convention (`attachments.mask`'s own docstring):
+    the painted/opaque region is blurred, everything else is left
+    byte-identical. Never a model call -- see that route's own docstring
+    for why this stays local/free even when AI-guided editing is enabled."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    mask_data_url: str = Field(..., min_length=1)
+    radius: int = Field(default=18, gt=0, le=100)
+
+
+AiImageEditOperation = Literal[
+    "remove_object", "replace_background", "replace_sky", "region_edit", "enhance"
+]
+
+
+class AiImageEditRequest(BaseModel):
+    """`POST /attachments/{id}/ai-edit` -- a real, generative edit via a
+    configured external provider (see `media_gen.image_edit_provider`'s own
+    docstring for which one and why). `{attachment_id}` in the URL is
+    always a fresh, transient attachment the client uploaded moments
+    earlier via `POST /attachments/upload`, holding the *current* edited
+    canvas state (crop/rotate/local-annotations already baked in) -- never
+    the original file, which could be stale relative to what the editor's
+    preview actually shows (see `ImageEditor.tsx`'s own "always snapshot
+    the current canvas, never the original" contract)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    operation: AiImageEditOperation
+    prompt: str = Field(..., min_length=1)
+    mask_data_url: str | None = None
+    idempotency_key: str | None = Field(default=None, max_length=128)
+
+
+class AiImageEditResponse(BaseModel):
+    """Mirrors `attachments.ai_edit.ImageEditOutcome`. Deliberately never
+    raises an HTTP 5xx for an ordinary provider failure (a timeout, a
+    content-policy rejection, a rate limit) -- `status="failed"` plus a
+    safe `error_code`/`error_message` is the normal shape for "the edit
+    didn't work," matching `MediaGenerationResultOut`'s own
+    always-200-with-a-status-field convention for the sibling media-
+    generation feature."""
+
+    model_config = ConfigDict(frozen=True)
+
+    operation: str
+    status: Literal["completed", "failed"]
+    source_attachment_id: str
+    mask_provided: bool
+    attachment_id: str | None = None
+    image_data_url: str | None = None
+    media_type: str | None = None
+    width: int | None = None
+    height: int | None = None
+    size_bytes: int | None = None
+    provider: str | None = None
+    model: str | None = None
+    warnings: list[str] = Field(default_factory=list)
+    error_code: str | None = None
+    error_message: str | None = None
+
+
 class ImageResizeRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -424,12 +507,30 @@ class AskResponse(BaseModel):
             "conversation."
         ),
     )
+    message_id: str | None = Field(
+        default=None,
+        description=(
+            "The persisted identity.models.AiOutput.id for this turn's answer -- set only "
+            "alongside conversation_id (a locally-authenticated caller whose turn was "
+            "actually persisted). Pass this back as ExecuteRequest.message_id when the "
+            "caller later confirms and runs this turn's SQL, so the confirmed result can be "
+            "attached to this exact saved turn -- see api/chat_persistence.py."
+        ),
+    )
     status: AgentStatus
     database: str | None = Field(
         default=None,
         description=(
             "Which configured database (Settings.databases[i].name) this question "
             "was auto-routed to. 'default' for a plain single-database setup."
+        ),
+    )
+    model: str | None = Field(
+        default=None,
+        description=(
+            "The Ollama model actually used for this question's LLM calls -- either "
+            "AskRequest.model (once validated) or Settings.ollama_model if that field "
+            "was omitted. Always set on a run that reached generation."
         ),
     )
     sql: str | None = None
@@ -507,6 +608,28 @@ class ExecuteRequest(BaseModel):
             "Settings.databases[i].name to execute against. Omit to use the "
             "first configured database (the same fallback used "
             "when no prior selected_database is available)."
+        ),
+    )
+    conversation_id: str | None = Field(
+        default=None,
+        max_length=64,
+        description=(
+            "AskResponse.conversation_id from the /ask call this SQL came from, if any -- "
+            "used only as a defense-in-depth cross-check alongside message_id below (see "
+            "api/chat_persistence.py::persist_execute_result). Never required, never used "
+            "to select which database/rows to execute against."
+        ),
+    )
+    message_id: str | None = Field(
+        default=None,
+        max_length=64,
+        description=(
+            "AskResponse.message_id from the /ask call this SQL came from, if any -- when "
+            "supplied by a locally-authenticated caller, a successful execution's result "
+            "(bounded rows, chart recommendation, the actually-executed SQL) is attached to "
+            "that already-persisted turn, so reopening the conversation later shows it "
+            "immediately without re-running anything. Omitting it changes nothing about "
+            "execution itself -- this only affects what gets remembered for later."
         ),
     )
 
@@ -735,6 +858,46 @@ class HealthResponse(BaseModel):
     vision_model: str | None = None
     vision_model_available: bool | None = None
     ocr_enabled: bool
+
+
+class ModelOut(BaseModel):
+    """One selectable Ollama model, as `GET /models` reports it -- mirrors
+    `agent.model_registry.ModelOption`. `installed`/`available` are a live
+    lookup against the *connected* Ollama instance (never the online Ollama
+    Library, which this application never queries at runtime -- see
+    `agent/model_registry.py`'s module docstring); a model can be
+    `enabled=True` (configured/allowed) but `installed=False` (never
+    `ollama pull`ed on this machine) -- the frontend must disable selecting
+    it in that state rather than assuming `enabled` alone means usable."""
+
+    model_config = ConfigDict(frozen=True)
+
+    id: str
+    display_name: str
+    is_default: bool
+    enabled: bool = True
+    installed: bool
+    available: bool
+    recommended: bool = False
+    parameter_size: str = ""
+    context_length: int | None = None
+    resource_level: str = "unknown"
+    capabilities: tuple[str, ...] = ()
+    description: str = ""
+
+
+class ModelsResponse(BaseModel):
+    """`GET /models` -- the configured/allowed Text-to-SQL model registry,
+    each enriched with live local-installation status. Never includes
+    secrets/connection details/environment variables -- see that route's
+    own docstring in `api/main.py`."""
+
+    model_config = ConfigDict(frozen=True)
+
+    provider: Literal["ollama"] = "ollama"
+    default_model: str
+    selection_enabled: bool
+    models: list[ModelOut]
 
 
 class ColumnOut(BaseModel):

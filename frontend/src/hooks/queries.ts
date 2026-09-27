@@ -2,6 +2,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   deleteDocument,
   getAttachmentCapabilities,
+  getAvailableModels,
   getHealth,
   getSchemaTables,
   listDocuments,
@@ -22,6 +23,19 @@ export function useAttachmentCapabilities() {
   return useQuery({
     queryKey: ['attachment-capabilities'],
     queryFn: getAttachmentCapabilities,
+    staleTime: 30_000,
+  })
+}
+
+/** The Ollama Text-to-SQL model registry (GET /models) -- which models are
+ * configured/allowed and which are actually installed locally right now.
+ * Cached the same 30s as useHealth above: model availability changes only
+ * with server config/local `ollama pull` state, never per-request, and the
+ * backend must not be re-queried on every question. */
+export function useAvailableModels() {
+  return useQuery({
+    queryKey: ['models'],
+    queryFn: getAvailableModels,
     staleTime: 30_000,
   })
 }

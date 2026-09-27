@@ -151,6 +151,7 @@ def run_orchestrated(
     caller_roles: tuple[str, ...] = (),
     caller_subject: str | None = None,
     attachment_ids: list[str] | None = None,
+    model: str | None = None,
 ) -> AgentState | OrchestratorState:
     """Routes a question to one or more sources and returns the combined result.
 
@@ -192,6 +193,13 @@ def run_orchestrated(
             standing multi-source-routing decision, so it must not require
             also opting into the (unrelated) multi-source router feature.
             See `agent.orchestrator.nodes.attachment_node`/`attachments/graph.py`.
+        model: Same shape and meaning as `agent.graph.run_agent`'s parameter
+            of the same name -- already validated by `api/main.py`'s `/ask`
+            handler before this function is ever called. `None` uses
+            `Settings.ollama_model`. Threaded through to `sql_subgraph_node`
+            via `OrchestratorState["selected_model"]` on the multi-source
+            path; passed directly to `run_agent` on the short-circuit path
+            below.
 
     Returns:
         When `Settings.enable_multi_source_router` is off AND no
@@ -205,7 +213,7 @@ def run_orchestrated(
     settings = get_settings()
     has_attachments = bool(attachment_ids)
     if not settings.enable_multi_source_router and not has_attachments:
-        return run_agent(question, conversation_history, enable_insight, caller_roles)
+        return run_agent(question, conversation_history, enable_insight, caller_roles, model)
 
     logger.info(
         "Starting orchestrated run for question=%r (attachment_count=%d)",
@@ -233,6 +241,7 @@ def run_orchestrated(
         "followup_resolved_against": None,
         "clarification_message": None,
         "selected_database": None,
+        "selected_model": model,
         "enable_insight": enable_insight,
         "insight": None,
         "insight_summary": None,

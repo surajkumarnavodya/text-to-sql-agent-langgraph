@@ -7,14 +7,19 @@ a hardcoded dict, since whether vision/OCR/editing are actually usable
 depends entirely on what's configured (a vision model pulled, Tesseract
 installed, chat attachments enabled at all).
 
-Distinguishes the four capabilities this feature is built around (see
-CLAUDE.md's "Chat attachments" section and this package's own module
-docstrings): image understanding (a vision-capable model), OCR (Tesseract,
-independent of any model), deterministic image manipulation (Pillow resize,
-always available once chat attachments are enabled -- no external
-dependency), and image editing / text removal (OpenCV classical inpainting,
-distinguished explicitly from a generative-AI backend, which this
-deployment does not have).
+Distinguishes the five capabilities this feature is built around (see
+CLAUDE.md's "Chat attachments"/"AI-guided image editing" sections and this
+package's own module docstrings): image understanding (a vision-capable
+model), OCR (Tesseract, independent of any model), deterministic image
+manipulation (Pillow resize/blur, always available once chat attachments
+are enabled -- no external dependency), classical (non-generative) text
+removal (OpenCV inpainting), and -- 2026-09-27, new -- real generative
+AI-guided editing (`image_ai_editing`, `attachments.ai_edit` +
+`media_gen.image_edit_provider`), off unless both `Settings
+.enable_image_editing` and a real `IMA_API_KEY` are configured. The first
+four never depend on any external provider; only the fifth does, and its
+own capability flag is the one place that distinction is surfaced to the
+frontend honestly rather than assumed.
 """
 
 from __future__ import annotations
@@ -45,8 +50,11 @@ class AttachmentCapabilitiesOut(BaseModel):
     vision_model: str | None = None
     ocr: bool
     image_resize: bool
+    image_blur: bool
     image_text_removal: bool
     image_text_removal_method: str | None = None
+    image_ai_editing: bool
+    image_ai_editing_provider: str | None = None
     native_pdf_input: bool = False
     max_image_bytes: int
     max_document_bytes: int
@@ -54,6 +62,7 @@ class AttachmentCapabilitiesOut(BaseModel):
     max_total_attachment_bytes: int
     max_resize_dimension_px: int
     max_text_removal_regions: int
+    max_ai_edit_prompt_length: int
     supported_image_extensions: list[str] = Field(default_factory=list)
     supported_document_extensions: list[str] = Field(default_factory=list)
     resize_presets: list[ImageResizePresetOut] = Field(default_factory=list)
@@ -75,14 +84,25 @@ def get_attachment_capabilities(settings: Settings) -> AttachmentCapabilitiesOut
         ocr_importable = False
 
     vision_model = settings.media_vision_model or None
+    # Reflects real backend readiness, never a frontend-hardcoded value
+    # (per this feature's own "capability flags must reflect real backend
+    # readiness" requirement): both the feature flag AND a real configured
+    # credential must be present, mirroring `enable_media_generation`/
+    # `ima_api_key`'s own pair -- see `Settings.enable_image_editing`'s
+    # docstring for why AI-guided editing is a separate flag from plain
+    # media generation.
+    image_ai_editing = bool(settings.enable_image_editing and settings.ima_api_key)
     return AttachmentCapabilitiesOut(
         enabled=settings.enable_chat_attachments,
         vision_input=bool(vision_model),
         vision_model=vision_model,
         ocr=ocr_importable,
         image_resize=settings.enable_chat_attachments,
+        image_blur=settings.enable_chat_attachments,
         image_text_removal=ocr_importable,
         image_text_removal_method="opencv_telea_inpaint" if ocr_importable else None,
+        image_ai_editing=image_ai_editing,
+        image_ai_editing_provider="ima_studio" if image_ai_editing else None,
         native_pdf_input=False,
         max_image_bytes=settings.max_attachment_image_bytes,
         max_document_bytes=settings.max_attachment_document_bytes,
@@ -90,6 +110,7 @@ def get_attachment_capabilities(settings: Settings) -> AttachmentCapabilitiesOut
         max_total_attachment_bytes=settings.max_total_attachment_bytes,
         max_resize_dimension_px=settings.max_attachment_resize_dimension_px,
         max_text_removal_regions=settings.max_text_removal_regions,
+        max_ai_edit_prompt_length=settings.image_edit_max_prompt_length,
         supported_image_extensions=sorted(
             ext
             for ext, media_type in EXTENSION_TO_MEDIA_TYPE.items()

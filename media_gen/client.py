@@ -395,19 +395,32 @@ def _extract_model_params(node: dict) -> dict:
     }
 
 
-def build_create_payload(task_type: str, model_params: dict, prompt: str) -> dict:
+def build_create_payload(
+    task_type: str, model_params: dict, prompt: str, image_urls: list[str] | None = None
+) -> dict:
     """Builds the exact `POST /open/v1/tasks/create` payload shape,
-    verified against `ima_runtime.shared.task_creation.build_create_payload`."""
+    verified against `ima_runtime.shared.task_creation.build_create_payload`.
+
+    `image_urls` is new (2026-09-27, added for `image_to_image`/image-edit
+    support -- every pre-existing caller here is text-only and passes
+    `None`): verified against the real reference source
+    (`references/models/product-list-and-create-params.md`'s "local/remote
+    inputs | top-level `src_img_url` and inner `input_images`") that a
+    source image URL must be set in *both* places, not just one -- see
+    `media_gen/upload.py`'s own docstring for how a local image gets turned
+    into a URL in the first place (IMA's create endpoint takes a URL, never
+    raw bytes/base64)."""
+    urls = image_urls or []
     inner = dict(model_params["form_params"])
     inner["prompt"] = prompt
     inner["n"] = 1
-    inner["input_images"] = []
+    inner["input_images"] = urls
     inner["cast"] = {"points": model_params["credit"], "attribute_id": model_params["attribute_id"]}
 
     return {
         "task_type": task_type,
         "enable_multi_model": False,
-        "src_img_url": [],
+        "src_img_url": urls,
         "parameters": [
             {
                 "attribute_id": model_params["attribute_id"],
@@ -431,9 +444,16 @@ def create_and_poll(
     poll_interval_seconds: float = 5.0,
     poll_timeout_seconds: float = 600.0,
     form_overrides: dict | None = None,
+    image_urls: list[str] | None = None,
 ) -> tuple[dict, str]:
     """High-level helper: discover a model for `task_type`, create the
     task, poll to completion. Returns `(media, model_name)`.
+
+    `image_urls` (new, 2026-09-27) -- one or more already-uploaded source
+    image URLs for an `image_to_image` task (see `media_gen/upload.py` for
+    how a local image becomes a URL, and `build_create_payload`'s own
+    docstring for exactly where this lands in the request). `None`/empty
+    for every pre-existing text-only caller here.
 
     `form_overrides` replaces specific `form_config` field values on top of
     the model's own defaults (e.g. `{"duration": 10}` for a video model
@@ -463,7 +483,7 @@ def create_and_poll(
     model_params = _extract_model_params(leaf)
     if form_overrides:
         model_params["form_params"].update(form_overrides)
-    payload = build_create_payload(task_type, model_params, prompt)
+    payload = build_create_payload(task_type, model_params, prompt, image_urls=image_urls)
     task_id = client.create_task(payload)
     media = client.poll_task(
         task_id, interval_seconds=poll_interval_seconds, timeout_seconds=poll_timeout_seconds

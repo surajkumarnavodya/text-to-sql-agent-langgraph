@@ -91,6 +91,16 @@ def _clear_process_singleton_caches() -> None:
     fixture that failure mode is silent and order-dependent -- it only
     shows up as a flaky, hard-to-explain failure depending on which tests
     ran first, not as a clear assertion mismatch.
+
+    `_get_ask_executor` (added by the enterprise scalability assessment's
+    graceful-shutdown work, `api/main.py`) is the same category of hazard
+    with a sharper failure mode: a test that exercises real shutdown
+    (`_shutdown_ask_executor`) leaves the cached `ThreadPoolExecutor`
+    permanently unusable (`.shutdown()` is irreversible) -- without clearing
+    it here, every *later* test in the process that happens to request the
+    same `max_workers` key would get handed that already-shut-down instance
+    and fail with `RuntimeError: cannot schedule new futures after
+    shutdown`, not a clear assertion mismatch.
     """
     from identity.db import _cached_identity_engine, _cached_session_factory
     from moderation.store import _cached_moderation_engine
@@ -98,6 +108,7 @@ def _clear_process_singleton_caches() -> None:
     from agent.graph import build_graph
     from agent.llm_client import _get_ollama_client
     from agent.orchestrator.graph import build_orchestrator_graph
+    from api.main import _get_ask_executor
     from embeddings.schema_indexer import _cached_chroma_client
 
     build_graph.cache_clear()
@@ -107,3 +118,4 @@ def _clear_process_singleton_caches() -> None:
     _cached_moderation_engine.cache_clear()
     _cached_identity_engine.cache_clear()
     _cached_session_factory.cache_clear()
+    _get_ask_executor.cache_clear()

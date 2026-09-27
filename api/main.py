@@ -47,6 +47,12 @@ from agent.authz import Permission
 from agent.exceptions import AgentError
 from agent.graph import build_graph
 from agent.llm_client import get_ollama_client
+from agent.model_registry import (
+    InvalidModelSelectionError,
+    build_model_options,
+    installed_model_names,
+    validate_model_selection,
+)
 from agent.orchestrator.graph import build_orchestrator_graph, run_orchestrated
 from agent.rate_limit import (
     ASK_CONCURRENCY_LIMIT_MESSAGE,
@@ -63,7 +69,7 @@ from agent.state import ConversationExchange
 from api.attachments import router as attachments_router
 from api.authz import require_permission
 from api.chat_history import router as chat_history_router
-from api.chat_persistence import persist_ask_turn
+from api.chat_persistence import persist_ask_turn, persist_execute_result
 from api.documents import router as documents_router
 from api.generation import router as generation_router
 from api.identity_auth import router as identity_auth_router
@@ -92,6 +98,8 @@ from api.schemas import (
     MediaSearchResultOut,
     MessageFeedbackRequest,
     MessageFeedbackResponse,
+    ModelOut,
+    ModelsResponse,
     PerformanceMetricsResponse,
     RequestMetricOut,
     SchemaRefreshResponse,
@@ -103,7 +111,7 @@ from api.schemas import (
     TablesResponse,
 )
 from api.voice import router as voice_router
-from config.settings import ConfigurationError, configure_logging, get_settings
+from config.settings import ConfigurationError, Settings, configure_logging, get_settings
 from db.connection import (
     check_write_privileges,
     get_connection,
@@ -123,6 +131,7 @@ from security.audit_log import (
     reset_correlation_id,
     set_correlation_id,
 )
+from security.client_ip import resolve_client_ip
 from security.oidc import AuthIdentity, real_caller_subject
 from security.redaction import redact_configured_secrets, redact_secrets
 
@@ -209,6 +218,75 @@ def _enforce_database_write_privileges(db_engines: Mapping[str, Any], settings) 
     )
 
 
+def _warn_on_ask_concurrency_pool_mismatch(settings) -> None:
+    """Enterprise scalability assessment (2026-09-27): warns at startup when
+    this process could admit more concurrent `/ask` requests
+    (`Settings.max_concurrent_ask_requests`) than its own SQLAlchemy
+    connection pool can serve for a configured database
+    (`Settings.db_pool_size + db_max_overflow`, applied uniformly to every
+    `Settings.databases` entry -- there is no per-database pool override).
+
+    Never blocks startup (unlike `_enforce_database_write_privileges`) --
+    this is a latency/throughput tuning signal, not a safety boundary: an
+    admitted request that can't immediately check out a pooled connection
+    simply queues behind one that's still using it (SQLAlchemy's own
+    `pool_timeout`, then a clear error if that's also exceeded), which is
+    correct, bounded behavior, not data loss or a crash. Left uncorrected it
+    just means some fraction of "concurrently admitted" requests are
+    actually waiting on a connection rather than truly running in parallel
+    -- worth knowing at startup rather than discovering it as an unexplained
+    latency plateau under load.
+
+    A separate, plain function (mirroring `_enforce_database_write_privileges`'s
+    own reasoning) so it's unit-testable without spinning up the whole app.
+    """
+    pool_capacity = settings.db_pool_size + settings.db_max_overflow
+    if settings.max_concurrent_ask_requests <= pool_capacity:
+        return
+    logger.warning(
+        "[startup] MAX_CONCURRENT_ASK_REQUESTS=%d exceeds this process's own "
+        "per-database connection pool capacity (DB_POOL_SIZE=%d + "
+        "DB_MAX_OVERFLOW=%d = %d), for %d configured database(s). Requests "
+        "beyond %d will queue for a pooled connection rather than running "
+        "truly in parallel -- correct, bounded behavior (not an error), but "
+        "worth raising DB_POOL_SIZE/DB_MAX_OVERFLOW (subject to your "
+        "database server's own max_connections, across every replica of "
+        "this API process) or lowering MAX_CONCURRENT_ASK_REQUESTS if this "
+        "wasn't intentional.",
+        settings.max_concurrent_ask_requests,
+        settings.db_pool_size,
+        settings.db_max_overflow,
+        pool_capacity,
+        len(settings.databases),
+        pool_capacity,
+    )
+
+
+def _shutdown_ask_executor(settings) -> None:
+    """Drains `_get_ask_executor`'s bounded `/ask` thread pool on shutdown.
+
+    Enterprise scalability assessment (2026-09-27): without this, a SIGTERM
+    (a rolling-deployment/orchestrator-initiated restart, or `docker compose
+    stop`) tears down the process while the pool may still have in-flight
+    `/ask` work running -- a graph mid-generation/mid-execution, holding a
+    live DB connection and an in-flight Ollama call. `ThreadPoolExecutor
+    .shutdown(wait=True)` blocks exactly until every already-submitted task
+    finishes (never accepting new ones -- but nothing new arrives here
+    anyway, since ASGI servers stop routing new requests to a shutting-down
+    app before calling this) rather than abandoning them mid-flight.
+    `_get_ask_executor(...)` retrieves the *same* `@cache`d instance every
+    request already shares -- calling it again here does not create a
+    second pool. Bounded by however long the slowest in-flight request
+    takes (ultimately `Settings.request_timeout_seconds`); an operator's own
+    orchestrator graceful-termination grace period should be set with that
+    in mind (see docs/DEPLOYMENT.md).
+
+    A separate, plain function (mirroring `_enforce_database_write_privileges`'s
+    own reasoning) so it's unit-testable without spinning up the whole app.
+    """
+    _get_ask_executor(settings.max_concurrent_ask_requests).shutdown(wait=True)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """Builds every expensive, process-lifetime resource once at startup
@@ -250,6 +328,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             )
     app.state.db_engines = db_engines
     _enforce_database_write_privileges(db_engines, settings)
+    _warn_on_ask_concurrency_pool_mismatch(settings)
 
     app.state.ollama_client = get_ollama_client(settings)
     app.state.compiled_graph = build_graph()
@@ -262,6 +341,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         len(settings.databases),
     )
     yield
+
+    _shutdown_ask_executor(settings)
 
 
 app = FastAPI(
@@ -472,7 +553,7 @@ def _limiter_for(key: str) -> SlidingWindowRateLimiter:
     )
 
 
-def _rate_limit_key(identity: AuthIdentity, request: Request) -> str:
+def _rate_limit_key(identity: AuthIdentity, request: Request, settings: Settings) -> str:
     """The key every `/ask`-scoped rate/concurrency limiter uses for one
     caller -- scale-out hardening pass (`docs/SCALE_OUT_PROMPT.md`
     bottleneck #3): raw client IP is meaningless behind a load balancer
@@ -482,12 +563,18 @@ def _rate_limit_key(identity: AuthIdentity, request: Request) -> str:
     when `security.oidc.real_caller_subject` reports there isn't one
     (`none`/`static_token` modes, where every caller shares one fixed
     sentinel) -- see that function's own docstring.
+
+    The IP fallback itself goes through `security.client_ip.resolve_client_ip`
+    (enterprise scalability assessment, 2026-09-27) rather than reading
+    `request.client.host` directly, so a deployment that puts a trusted
+    reverse proxy in front of this app can opt into correct per-client
+    keying via `Settings.trusted_proxy_count` instead of every "none"/
+    "static_token"-mode caller silently sharing the proxy's own bucket.
     """
     subject = real_caller_subject(identity)
     if subject is not None:
         return f"user:{subject}"
-    client_ip = request.client.host if request.client else "unknown"
-    return f"ip:{client_ip}"
+    return f"ip:{resolve_client_ip(request, settings)}"
 
 
 @app.middleware("http")
@@ -674,6 +761,7 @@ def _ask_response_from_state(
         conversation_id=conversation_id,
         status=state.get("status", "failed"),
         database=state.get("selected_database"),
+        model=state.get("selected_model"),
         sql=state.get("sql"),
         result_columns=state.get("result_columns"),
         result_rows=_rows_to_json(result_rows),
@@ -718,28 +806,26 @@ def _ask_response_from_state(
     )
 
 
-def _pulled_ollama_model_names(list_response: object) -> set[str]:
-    """Extracts pulled model names from an `ollama.Client().list()` result --
-    tolerant of both the real client's `ListResponse` (a `.models` attribute
-    of `Model` objects, each with its own `.model` attribute) and a plain
-    `{"models": [...]}` dict (this project's own existing `/health` test
-    doubles, and what the raw `/api/tags` HTTP response itself looks like),
-    where each entry may be a dict with a `"model"` and/or `"name"` key.
-    Never raises -- an unrecognized shape just yields an empty set, which
-    `HealthResponse.vision_model_available` then correctly reports as
-    "not found" rather than crashing the whole health check.
+@app.get("/live", include_in_schema=False)
+def live() -> dict[str, str]:
+    """Liveness probe: "is this process alive and able to answer HTTP at
+    all" -- nothing more. Enterprise scalability assessment (2026-09-27):
+    `GET /health` right below is a real, non-cached *readiness* check (a
+    live DB `SELECT 1` + Chroma collection count per configured database,
+    plus an Ollama `.list()` call) -- correct for readiness, but the wrong
+    thing to poll frequently as a liveness probe once this runs as N
+    replicas behind an orchestrator: a liveness check firing every few
+    seconds per replica would otherwise multiply into constant DB/Chroma/
+    Ollama load purely from health-checking, not real traffic. This
+    endpoint does none of that -- it never touches a database, Chroma, or
+    Ollama, so its cost/latency is independent of how many of those are
+    configured or how they're behaving. A process that can return this
+    response is, by definition, able to accept and complete an HTTP
+    request; whether its *dependencies* are healthy is `/health`'s job,
+    meant to be polled far less frequently (an orchestrator's own
+    *readiness* probe, or a human/dashboard check), not this one's.
     """
-    models = getattr(list_response, "models", None)
-    if models is None and isinstance(list_response, dict):
-        models = list_response.get("models")
-    names: set[str] = set()
-    for model in models or []:
-        name = getattr(model, "model", None)
-        if name is None and isinstance(model, dict):
-            name = model.get("model") or model.get("name")
-        if name:
-            names.add(name)
-    return names
+    return {"status": "alive"}
 
 
 @app.get("/health", response_model=HealthResponse)
@@ -797,9 +883,11 @@ def health(response: Response) -> HealthResponse:
     # own docstring for why this specific check exists (a real, reported bug:
     # no way to tell "vision never configured" from "configured but the
     # model was never actually pulled" until a user's image question failed).
+    # installed_model_names is shared with GET /models (agent/model_registry.py)
+    # rather than kept as a private copy here.
     pulled_model_names: set[str] = set()
     try:
-        pulled_model_names = _pulled_ollama_model_names(get_ollama_client(settings).list())
+        pulled_model_names = installed_model_names(get_ollama_client(settings).list())
         ollama_health = ComponentHealth(ok=True, detail=f"Reachable at {settings.ollama_host}.")
     except Exception as exc:  # noqa: BLE001 - health check must never crash the endpoint
         ollama_health = ComponentHealth(ok=False, detail=f"Unreachable: {redact_secrets(str(exc))}")
@@ -878,6 +966,7 @@ def _run_orchestrated_with_timeout(
     max_workers: int,
     on_done: Callable[[], None],
     attachment_ids: list[str] | None = None,
+    model: str | None = None,
 ) -> Mapping[str, Any]:
     """Runs `run_orchestrated` on `_get_ask_executor`'s bounded pool and
     gives up *waiting* past `timeout_seconds`, raising `_AskRequestTimedOut`
@@ -914,6 +1003,7 @@ def _run_orchestrated_with_timeout(
                 caller_roles=caller_roles,
                 caller_subject=caller_subject,
                 attachment_ids=attachment_ids,
+                model=model,
             )
         except BaseException as exc:  # noqa: BLE001 - re-raised on the caller's thread below
             error["error"] = exc
@@ -962,7 +1052,8 @@ def ask(
     session key).
     """
     session_id = payload.session_id or str(uuid.uuid4())
-    caller_key = _rate_limit_key(identity, request)
+    settings = get_settings()
+    caller_key = _rate_limit_key(identity, request, settings)
 
     rate_limit_result = _limiter_for(caller_key).check()
     if not rate_limit_result.allowed:
@@ -979,7 +1070,31 @@ def ask(
         for turn in payload.conversation_history
     ]
 
-    settings = get_settings()
+    # Validated before any admission-control slot is acquired or any LLM/DB
+    # work starts -- an invalid/disallowed AskRequest.model is a malformed
+    # request (HTTP 400), not a reason to spend a concurrency slot or a
+    # graceful "failed" AgentState the way a genuinely-uninstalled-but-
+    # allowed model does (that failure surfaces naturally from the real
+    # Ollama call instead -- see agent/model_registry.py's module docstring
+    # for why this is a deliberate, cheap, allowlist-only check with no
+    # extra Ollama round trip). Never allows an arbitrary string through to
+    # `ollama.Client.chat(model=...)` unchecked.
+    try:
+        selected_model = validate_model_selection(payload.model, settings)
+    except InvalidModelSelectionError as exc:
+        # Same audit-trail convention as api.authz.require_permission's
+        # "authz_denied" event -- a caller-supplied model name is not a
+        # secret, so logging it plainly is what makes this investigable
+        # after the fact (e.g. a client integration bug, or someone probing
+        # for an unlisted model).
+        log_security_event(
+            "invalid_model_selection",
+            "info",
+            "A request specified an Ollama model outside the configured allowlist.",
+            subject=identity.subject,
+            requested_model=payload.model,
+        )
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
 
     # Admission control (scale-out hardening pass, docs/SCALE_OUT_PROMPT.md
     # bottleneck #1/#4): reject fast, before any LLM/DB work starts, once
@@ -1031,6 +1146,7 @@ def ask(
             max_workers=settings.max_concurrent_ask_requests,
             on_done=_release_ask_slots,
             attachment_ids=payload.attachment_ids,
+            model=selected_model,
         )
     except _AskRequestTimedOut:
         # See Settings.request_timeout_seconds's docstring: this is "stop
@@ -1072,13 +1188,22 @@ def ask(
         )
         final_state = {"status": "failed", "error_history": [exc.safe_message]}
 
+    # Built once, with conversation_id/message_id still unset, so
+    # `persist_ask_turn` can persist exactly what this response already
+    # contains (redacted, bounded) -- see api/chat_persistence.py's own
+    # docstring for why persistence is built from this already-computed
+    # response rather than re-deriving anything from raw `final_state`.
+    ask_response = _ask_response_from_state(final_state, session_id)
+
     persisted_conversation_id: str | None = None
+    persisted_message_id: str | None = None
     try:
-        persisted_conversation_id = persist_ask_turn(
+        persisted_conversation_id, persisted_message_id = persist_ask_turn(
             identity=identity,
             conversation_id=payload.conversation_id,
             question=payload.question,
-            final_state=final_state,
+            ask_response=ask_response,
+            attachment_ids=payload.attachment_ids,
             settings=settings,
         )
     except Exception as exc:  # noqa: BLE001 - see api/chat_persistence.py's own docstring
@@ -1088,14 +1213,16 @@ def ask(
             exc,
         )
 
-    return _ask_response_from_state(final_state, session_id, persisted_conversation_id)
+    return ask_response.model_copy(
+        update={"conversation_id": persisted_conversation_id, "message_id": persisted_message_id}
+    )
 
 
 @app.post("/execute", response_model=ExecuteResponse)
 def execute(
     payload: ExecuteRequest,
     request: Request,
-    _identity: AuthIdentity = Depends(require_permission(Permission.EXECUTE_SQL)),
+    identity: AuthIdentity = Depends(require_permission(Permission.EXECUTE_SQL)),
 ) -> ExecuteResponse:
     """Validates and executes a specific SQL string read-only -- the exact
     `validate_sql` -> `enforce_row_limit` -> `qualify_table_schema` ->
@@ -1109,7 +1236,7 @@ def execute(
     `/ask`, this route previously had no rate limit of its own at all.
     """
     settings = get_settings()
-    enforce_api_action_rate_limit(request, "execute", settings)
+    enforce_api_action_rate_limit(request, "execute", settings, identity=identity)
     if not settings.databases:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="No database configured."
@@ -1167,7 +1294,7 @@ def execute(
     column_types: dict[str, str] = dict(classify_columns(result_df)) if not result_df.empty else {}
     recommendation = recommend_chart(result_df, column_types)
 
-    return ExecuteResponse(
+    execute_response = ExecuteResponse(
         status="succeeded",
         database=database_name,
         normalized_sql=safe_sql,
@@ -1184,6 +1311,30 @@ def execute(
         # runs a separate COUNT(*) query to know the true total.
         truncated=len(rows) >= settings.max_result_rows,
     )
+
+    if payload.message_id:
+        # Best-effort: attaches this confirmed result to the turn it came
+        # from (see api/chat_persistence.py::persist_execute_result) so
+        # reopening the conversation later shows it without re-running
+        # anything -- never a reason a successful "Confirm and Run" fails.
+        try:
+            persist_execute_result(
+                identity=identity,
+                conversation_id=payload.conversation_id,
+                message_id=payload.message_id,
+                sql=payload.sql,
+                execute_response=execute_response,
+                settings=settings,
+            )
+        except Exception as exc:  # noqa: BLE001 - see api/chat_persistence.py's own docstring
+            logger.warning(
+                "[api] /execute: chat-history result persistence failed unexpectedly "
+                "(message_id=%s): %s",
+                payload.message_id,
+                exc,
+            )
+
+    return execute_response
 
 
 @app.post(
@@ -1242,7 +1393,7 @@ def feedback_message(
 @app.post("/schema/refresh", response_model=SchemaRefreshResponse)
 def schema_refresh(
     request: Request,
-    _identity: AuthIdentity = Depends(require_permission(Permission.SCHEMA_REFRESH)),
+    identity: AuthIdentity = Depends(require_permission(Permission.SCHEMA_REFRESH)),
 ) -> SchemaRefreshResponse:
     """Re-introspects and re-embeds every configured database's schema --
     the same `refresh_all_schema_indexes` call the React dashboard's
@@ -1256,7 +1407,7 @@ def schema_refresh(
     work.
     """
     settings = get_settings()
-    enforce_api_action_rate_limit(request, "schema_refresh", settings)
+    enforce_api_action_rate_limit(request, "schema_refresh", settings, identity=identity)
     results = refresh_all_schema_indexes(settings)
     return SchemaRefreshResponse(
         databases=[
@@ -1342,6 +1493,55 @@ def schema_tables(
                 )
             )
     return TablesResponse(tables=tables_out)
+
+
+@app.get("/models", response_model=ModelsResponse)
+def models(
+    _identity: AuthIdentity = Depends(require_permission(Permission.ASK)),
+) -> ModelsResponse:
+    """The Ollama Text-to-SQL model registry -- every model
+    `Settings.ollama_allowed_models` configures, enriched with a live
+    "is it actually installed right now" lookup against the connected
+    Ollama instance (see `agent.model_registry.build_model_options`).
+
+    Same `Permission.ASK` gate as `/schema/tables` above -- seeing which
+    models exist is the same capability level as asking a question, not a
+    separate admin concern. Never exposes `OLLAMA_HOST`, secrets, or any
+    other environment/connection detail -- only model ids and this
+    application's own hand-authored display metadata
+    (`config/ollama_models.yaml`).
+
+    Deliberately the only place this application calls Ollama's `list()`
+    API for model-*selection* purposes (`GET /health` also calls it, but
+    only for its own, narrower vision-model-availability check) -- the
+    frontend is expected to cache this response (`useAvailableModels`,
+    `staleTime` matching `useHealth`'s own 30s) rather than the backend
+    re-querying Ollama on every `/ask`. See `agent/model_registry.py`'s
+    module docstring for the full online-catalog/configured/installed/
+    selectable distinction this response embodies.
+    """
+    settings = get_settings()
+    options = build_model_options(settings)
+    return ModelsResponse(
+        default_model=settings.ollama_model,
+        selection_enabled=settings.ollama_model_selection_enabled,
+        models=[
+            ModelOut(
+                id=option.id,
+                display_name=option.display_name,
+                is_default=option.is_default,
+                installed=option.installed,
+                available=option.available,
+                recommended=option.recommended,
+                parameter_size=option.parameter_size,
+                context_length=option.context_length,
+                resource_level=option.resource_level,
+                capabilities=option.capabilities,
+                description=option.description,
+            )
+            for option in options
+        ],
+    )
 
 
 # Serves the built React frontend (frontend/dist, `npm run build`) from this

@@ -9,18 +9,23 @@ implementation of validation/storage/processing. Mounted onto
 
 from __future__ import annotations
 
+import io
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile, status
+from PIL import Image, UnidentifiedImageError
 
 from agent.authz import Permission
 from api.authz import require_permission
 from api.rate_limit import enforce_api_action_rate_limit
 from api.schemas import (
+    AiImageEditRequest,
+    AiImageEditResponse,
     AttachmentCapabilitiesResponse,
     AttachmentErrorOut,
     AttachmentOut,
     AttachmentUploadResponse,
+    BlurRegionRequest,
     DetectTextRegionsResponse,
     ImageEditResultResponse,
     ImageResizePresetOut,
@@ -30,10 +35,13 @@ from api.schemas import (
     TextLineRegionOut,
     TextRegionOut,
 )
+from attachments.ai_edit import execute_image_edit
+from attachments.blur import blur_region
 from attachments.capabilities import get_attachment_capabilities
 from attachments.image_ops import resize_image
-from attachments.image_processing import ImageDecodeError
+from attachments.image_processing import ImageDecodeError, decode_data_url
 from attachments.inpaint import InpaintRegion, detect_text_line_regions, remove_text
+from attachments.mask import MaskValidationError
 from attachments.ocr_extract import extract_text_with_regions
 from attachments.pipeline import (
     delete_attachment,
@@ -83,7 +91,7 @@ async def upload_attachments(
     still go through.
     """
     settings = get_settings()
-    enforce_api_action_rate_limit(request, "attachment_upload", settings)
+    enforce_api_action_rate_limit(request, "attachment_upload", settings, identity=identity)
 
     if not settings.enable_chat_attachments:
         raise HTTPException(
@@ -170,8 +178,11 @@ def get_capabilities(
         vision_model=capabilities.vision_model,
         ocr=capabilities.ocr,
         image_resize=capabilities.image_resize,
+        image_blur=capabilities.image_blur,
         image_text_removal=capabilities.image_text_removal,
         image_text_removal_method=capabilities.image_text_removal_method,
+        image_ai_editing=capabilities.image_ai_editing,
+        image_ai_editing_provider=capabilities.image_ai_editing_provider,
         native_pdf_input=capabilities.native_pdf_input,
         max_image_bytes=capabilities.max_image_bytes,
         max_document_bytes=capabilities.max_document_bytes,
@@ -179,6 +190,7 @@ def get_capabilities(
         max_total_attachment_bytes=capabilities.max_total_attachment_bytes,
         max_resize_dimension_px=capabilities.max_resize_dimension_px,
         max_text_removal_regions=capabilities.max_text_removal_regions,
+        max_ai_edit_prompt_length=capabilities.max_ai_edit_prompt_length,
         supported_image_extensions=capabilities.supported_image_extensions,
         supported_document_extensions=capabilities.supported_document_extensions,
         resize_presets=[
@@ -219,7 +231,7 @@ def extract_text_route(
     what it recognized, never an LLM's paraphrase of the image (see
     `attachments.ocr_extract`'s own docstring)."""
     settings = get_settings()
-    enforce_api_action_rate_limit(request, "attachment_extract_text", settings)
+    enforce_api_action_rate_limit(request, "attachment_extract_text", settings, identity=identity)
     owner_subject = _owner_subject(identity)
     attachment, file_bytes = _load_owned_image_bytes(attachment_id, owner_subject)
 
@@ -278,7 +290,9 @@ def detect_text_regions_route(
     user confirmation, or manual selection" requirement) -- OCR only, no
     pixels are edited by this route."""
     settings = get_settings()
-    enforce_api_action_rate_limit(request, "attachment_detect_text_regions", settings)
+    enforce_api_action_rate_limit(
+        request, "attachment_detect_text_regions", settings, identity=identity
+    )
     owner_subject = _owner_subject(identity)
     _attachment, file_bytes = _load_owned_image_bytes(attachment_id, owner_subject)
 
@@ -320,7 +334,7 @@ def remove_text_route(
     manually -- either way, in source-image pixel coordinates. The original
     attachment is untouched; this always produces and stores a new one."""
     settings = get_settings()
-    enforce_api_action_rate_limit(request, "attachment_remove_text", settings)
+    enforce_api_action_rate_limit(request, "attachment_remove_text", settings, identity=identity)
     owner_subject = _owner_subject(identity)
     source, file_bytes = _load_owned_image_bytes(attachment_id, owner_subject)
 
@@ -375,7 +389,7 @@ def resize_route(
     question, it's the *resized* bytes that reach the model, never the
     original (per this feature's own requirement)."""
     settings = get_settings()
-    enforce_api_action_rate_limit(request, "attachment_resize", settings)
+    enforce_api_action_rate_limit(request, "attachment_resize", settings, identity=identity)
     owner_subject = _owner_subject(identity)
     source, file_bytes = _load_owned_image_bytes(attachment_id, owner_subject)
 
@@ -418,6 +432,178 @@ def resize_route(
         size_bytes=result.size_bytes,
         warnings=[],
     )
+
+
+@router.post("/attachments/{attachment_id}/blur-region", response_model=ImageEditResultResponse)
+def blur_region_route(
+    attachment_id: str,
+    body: BlurRegionRequest,
+    request: Request,
+    identity: AuthIdentity = Depends(require_permission(Permission.ASK)),
+) -> ImageEditResultResponse:
+    """ "Blur region" -- a deterministic, local Pillow Gaussian blur over a
+    painted mask, never a model call. Exists specifically so the image
+    editor's "Blur the selected face" quick action defaults to this free,
+    always-available path instead of the metered AI-guided-edit endpoint
+    below, per this feature's own "deterministic filter by default" quick-
+    action mapping -- see `attachments.blur`'s own module docstring."""
+    settings = get_settings()
+    enforce_api_action_rate_limit(request, "attachment_blur_region", settings, identity=identity)
+    owner_subject = _owner_subject(identity)
+    source, file_bytes = _load_owned_image_bytes(attachment_id, owner_subject)
+
+    try:
+        mask_bytes, _mask_media_type = decode_data_url(body.mask_data_url)
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+
+    try:
+        result = blur_region(file_bytes, mask_bytes, radius=body.radius)
+    except ImageDecodeError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)
+        ) from exc
+    except MaskValidationError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+
+    store = get_default_attachment_store()
+    derived = register_derived_image(
+        source,
+        result.image_bytes,
+        result.media_type,
+        suffix="blurred",
+        settings=settings,
+        store=store,
+    )
+    return ImageEditResultResponse(
+        attachment_id=derived.attachment_id,
+        source_attachment_id=attachment_id,
+        operation="blur_region",
+        image_data_url=derived.image_data_url or "",
+        media_type=result.media_type,
+        width=result.width,
+        height=result.height,
+        size_bytes=result.size_bytes,
+        warnings=[],
+    )
+
+
+@router.post("/attachments/{attachment_id}/ai-edit", response_model=AiImageEditResponse)
+def ai_edit_route(
+    attachment_id: str,
+    body: AiImageEditRequest,
+    request: Request,
+    identity: AuthIdentity = Depends(require_permission(Permission.ASK)),
+) -> AiImageEditResponse:
+    """Real, generative AI-guided image editing -- the endpoint that used
+    to not exist at all (`frontend/src/lib/imageEditAdapter.ts`'s
+    `AiGuidedEditAdapter` stub always rejected with
+    `AiEditNotConfiguredError` before this route existed). See
+    `attachments.ai_edit`/`media_gen.image_edit_provider`'s own docstrings
+    for the full design, the live-verified provider (IMA Studio's
+    `image_to_image` task category), and the honest mask-conveyance
+    limitation (no native mask channel on this provider).
+
+    `{attachment_id}` is always a *fresh, transient* attachment the client
+    uploaded moments earlier via `POST /attachments/upload`, holding the
+    editor's current canvas export (crop/rotate/local annotations already
+    baked in) -- never the original file, which could be stale relative to
+    what the editor's preview shows. This route does not itself need to
+    know or care whether that's true; it always treats whatever attachment
+    the id resolves to as the source, exactly like resize/remove-text
+    already do.
+
+    Never returns an HTTP 5xx for an ordinary provider failure (a timeout,
+    a content-policy rejection, a rate limit, an unconfigured provider) --
+    `status="failed"` plus a safe `error_code`/`error_message` is the
+    normal response shape, matching `POST /generate/confirm`'s own
+    always-200-with-a-status-field convention for the sibling media-
+    generation feature.
+    """
+    settings = get_settings()
+    enforce_api_action_rate_limit(request, "attachment_ai_edit", settings, identity=identity)
+    owner_subject = _owner_subject(identity)
+    source, file_bytes = _load_owned_image_bytes(attachment_id, owner_subject)
+
+    mask_bytes: bytes | None = None
+    if body.mask_data_url:
+        try:
+            mask_bytes, _mask_media_type = decode_data_url(body.mask_data_url)
+        except ValueError as exc:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+
+    try:
+        width, height = _image_dimensions(file_bytes)
+    except ImageDecodeError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)
+        ) from exc
+
+    outcome = execute_image_edit(
+        source_bytes=file_bytes,
+        source_content_type=source.media_type,
+        source_width=width,
+        source_height=height,
+        operation=body.operation,
+        prompt=body.prompt,
+        mask_bytes=mask_bytes,
+        settings=settings,
+        owner_subject=owner_subject,
+        idempotency_key=body.idempotency_key,
+    )
+
+    if outcome.status != "completed" or not outcome.image_bytes or not outcome.media_type:
+        return AiImageEditResponse(
+            operation=outcome.operation,
+            status="failed",
+            source_attachment_id=attachment_id,
+            mask_provided=outcome.mask_provided,
+            warnings=list(outcome.warnings),
+            error_code=outcome.error_code,
+            error_message=outcome.error_message,
+        )
+
+    store = get_default_attachment_store()
+    derived = register_derived_image(
+        source,
+        outcome.image_bytes,
+        outcome.media_type,
+        suffix="ai-edited",
+        settings=settings,
+        store=store,
+    )
+    try:
+        output_width, output_height = _image_dimensions(outcome.image_bytes)
+    except ImageDecodeError:
+        output_width, output_height = None, None
+
+    return AiImageEditResponse(
+        operation=outcome.operation,
+        status="completed",
+        source_attachment_id=attachment_id,
+        mask_provided=outcome.mask_provided,
+        attachment_id=derived.attachment_id,
+        image_data_url=derived.image_data_url or "",
+        media_type=outcome.media_type,
+        width=output_width,
+        height=output_height,
+        size_bytes=len(outcome.image_bytes),
+        provider=outcome.provider,
+        model=outcome.model,
+        warnings=list(outcome.warnings),
+    )
+
+
+def _image_dimensions(file_bytes: bytes) -> tuple[int, int]:
+    """Real pixel dimensions, decoded fresh (never trusted from a client-
+    supplied field) -- used by `ai_edit_route` both to align a submitted
+    mask to the actual source image and to report the real output
+    dimensions in the response."""
+    try:
+        with Image.open(io.BytesIO(file_bytes)) as opened:
+            return opened.size
+    except (UnidentifiedImageError, OSError) as exc:
+        raise ImageDecodeError(f"Could not decode image: {exc}") from exc
 
 
 @router.delete("/attachments/{attachment_id}", status_code=status.HTTP_204_NO_CONTENT)

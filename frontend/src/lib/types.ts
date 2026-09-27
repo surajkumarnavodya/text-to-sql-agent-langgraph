@@ -124,8 +124,17 @@ export interface AttachmentCapabilities {
   vision_model: string | null
   ocr: boolean
   image_resize: boolean
+  image_blur: boolean
   image_text_removal: boolean
   image_text_removal_method: string | null
+  // Real, generative AI-guided editing (2026-09-27) -- true only when the
+  // server has both the feature flag and a real provider credential
+  // configured (see Settings.enable_image_editing's own docstring for why
+  // this is a separate flag from plain media generation). The editor's
+  // "AI-guided editing" panel must key every enabled/disabled state off
+  // this, never assume it's always available.
+  image_ai_editing: boolean
+  image_ai_editing_provider: string | null
   native_pdf_input: boolean
   max_image_bytes: number
   max_document_bytes: number
@@ -133,6 +142,7 @@ export interface AttachmentCapabilities {
   max_total_attachment_bytes: number
   max_resize_dimension_px: number
   max_text_removal_regions: number
+  max_ai_edit_prompt_length: number
   supported_image_extensions: string[]
   supported_document_extensions: string[]
   resize_presets: ImageResizePresetOut[]
@@ -205,6 +215,59 @@ export interface ImageEditResultResponse {
   warnings: string[]
 }
 
+/** Mirrors api.schemas.BlurRegionRequest -- deterministic, local Pillow
+ * Gaussian blur over a painted mask region. Never a model call, and works
+ * even when AI-guided editing is disabled. */
+export interface BlurRegionRequest {
+  mask_data_url: string
+  radius?: number
+}
+
+/** Mirrors api.schemas.AiImageEditOperation -- the fixed allowlist of
+ * generative operations this app actually offers. Deliberately excludes
+ * anything resembling "remove watermark" -- see
+ * media_gen.image_edit_provider's own module docstring for why. */
+export type AiImageEditOperation =
+  | 'remove_object'
+  | 'replace_background'
+  | 'replace_sky'
+  | 'region_edit'
+  | 'enhance'
+
+/** Mirrors api.schemas.AiImageEditRequest -- `POST
+ * /attachments/{id}/ai-edit`. `{attachment_id}` in the URL is always a
+ * fresh, transient attachment holding the editor's *current* canvas export
+ * (crop/rotate/local annotations already baked in), never the original
+ * file -- see ImageEditor.tsx's own "always snapshot the current canvas"
+ * contract. */
+export interface AiImageEditRequest {
+  operation: AiImageEditOperation
+  prompt: string
+  mask_data_url?: string | null
+  idempotency_key?: string | null
+}
+
+/** Mirrors api.schemas.AiImageEditResponse. Deliberately never an HTTP
+ * error for an ordinary provider failure -- `status: 'failed'` plus a safe
+ * `error_message` is the normal "the edit didn't work" shape. */
+export interface AiImageEditResponse {
+  operation: string
+  status: 'completed' | 'failed'
+  source_attachment_id: string
+  mask_provided: boolean
+  attachment_id: string | null
+  image_data_url: string | null
+  media_type: string | null
+  width: number | null
+  height: number | null
+  size_bytes: number | null
+  provider: string | null
+  model: string | null
+  warnings: string[]
+  error_code: string | null
+  error_message: string | null
+}
+
 export type ImageResizeFit = 'contain' | 'cover' | 'stretch'
 export type ImageResizeOutputFormat = 'png' | 'jpeg' | 'webp'
 
@@ -234,6 +297,11 @@ export interface AskRequest {
   // Ids of files attached to this question, from a prior
   // POST /attachments/upload response -- see useChatAttachments.ts.
   attachment_ids?: string[]
+  // Ollama model id (from a prior GET /models response's models[].id) to
+  // use for this question's generation/planning/review/insight calls.
+  // Omit to use the server-configured default -- see settingsStore.ts's
+  // selectedModel and HistorySettingsSection.tsx's "AI Model" picker.
+  model?: string | null
 }
 
 export interface AskResponse {
@@ -243,8 +311,16 @@ export interface AskResponse {
   // caller, or a persistence failure, which never affects the rest of this
   // response). See docs/chat-history-architecture.md.
   conversation_id: string | null
+  // The persisted identity.models.AiOutput.id for this turn, set alongside
+  // conversation_id above. Pass this back as ExecuteRequest.message_id when
+  // confirming this turn's SQL, so the confirmed result gets attached to
+  // this exact saved turn (see api/chat_persistence.py::persist_execute_result).
+  message_id: string | null
   status: AgentStatus
   database: string | null
+  // The Ollama model actually used for this question -- either
+  // AskRequest.model (once validated) or the server default.
+  model: string | null
   sql: string | null
   result_columns: string[] | null
   result_rows: unknown[][] | null
@@ -282,6 +358,13 @@ export interface AskResponse {
 export interface ExecuteRequest {
   sql: string
   database?: string | null
+  // AskResponse.conversation_id/message_id from the /ask call this SQL came
+  // from, if any -- when supplied (a locally-authenticated caller), a
+  // successful execution's result is attached to that already-persisted
+  // turn so reopening the conversation later shows it immediately, without
+  // re-running anything. See api/chat_persistence.py::persist_execute_result.
+  conversation_id?: string | null
+  message_id?: string | null
 }
 
 /** Mirrors api.schemas.ChartRecommendationOut -- a suggested starting chart
@@ -368,6 +451,34 @@ export interface HealthResponse {
   vision_model: string | null
   vision_model_available: boolean | null
   ocr_enabled: boolean
+}
+
+/** One selectable Ollama model, as GET /models reports it -- mirrors
+ * api.schemas.ModelOut / agent.model_registry.ModelOption. `installed`/
+ * `available` are a live lookup against the *connected* Ollama instance
+ * (never the online Ollama Library) -- a model can be `enabled` (configured)
+ * but not `installed` (never pulled on this machine); the picker must
+ * disable selecting it in that state. */
+export interface ModelOut {
+  id: string
+  display_name: string
+  is_default: boolean
+  enabled: boolean
+  installed: boolean
+  available: boolean
+  recommended: boolean
+  parameter_size: string
+  context_length: number | null
+  resource_level: string
+  capabilities: string[]
+  description: string
+}
+
+export interface ModelsResponse {
+  provider: 'ollama'
+  default_model: string
+  selection_enabled: boolean
+  models: ModelOut[]
 }
 
 export interface ColumnOut {
@@ -491,6 +602,77 @@ export interface ConversationListResponse {
 
 export type MessageRole = 'user' | 'assistant'
 
+/** One persisted attachment reference, taken from the process-lifetime
+ * `AttachmentStore` at save time -- see api/chat_persistence.py's
+ * `_attachment_refs_snapshot`. If the attachment has since been evicted
+ * from that in-memory store, `filename` falls back to the bare id and
+ * `media_type` to a generic value -- there is no bytes/preview to restore
+ * either way, by design (attachments are ephemeral, never persisted to
+ * disk-plus-database forever). */
+export interface PersistedAttachmentRef {
+  attachment_id: string
+  filename: string
+  media_type: string
+}
+
+/** The bounded, confirmed-execution snapshot persisted once a "Confirm and
+ * Run" succeeds for a turn whose message_id was known (see
+ * api/chat_persistence.py::persist_execute_result) -- lets a reopened
+ * conversation show a previously confirmed result immediately, without
+ * re-running the SQL. `rows`/`returned_rows` may be fewer than `row_count`
+ * if the live result exceeded Settings.chat_history_max_result_rows --
+ * `truncated` covers both that and the live execution's own truncation. */
+export interface PersistedResultSnapshot {
+  columns: string[]
+  rows: unknown[][]
+  row_count: number | null
+  returned_rows: number
+  truncated: boolean
+  column_types: Record<string, string>
+  chart_recommendation: ChartRecommendation | null
+  normalized_sql: string | null
+  duration_ms: number | null
+  captured_at: string
+}
+
+/** Mirrors `api.chat_persistence._build_history_metadata`'s output --
+ * the full, versioned snapshot stored in `ai_outputs.metadata` for one
+ * assistant turn. Every field is optional/nullable: a record created
+ * before `schema_version` existed (the old `{ sql: "..." }`-or-nothing
+ * shape) has none of the richer fields, which
+ * `frontend/src/lib/history.ts::serverMessagesToQueryHistory` must degrade
+ * gracefully against rather than assume. */
+export interface ServerMessageMetadata {
+  schema_version?: number
+  status?: AgentStatus
+  sources_used?: string[]
+  database?: string | null
+  model?: string | null
+  sql?: string | null
+  row_count?: number | null
+  retry_count?: number
+  query_plan?: string[] | null
+  schema_tables?: { table_name: string; similarity_score: number }[]
+  insight?: string | null
+  synthesized_answer?: string | null
+  cost_notice?: string | null
+  low_confidence_notice?: string | null
+  rejection_reason?: string | null
+  rejection_message?: string | null
+  rate_limit_message?: string | null
+  clarification_message?: string | null
+  failure_explanation?: string | null
+  permission_denied_notice?: string | null
+  document_result?: SourceAnswer | null
+  policy_result?: SourceAnswer | null
+  web_result?: SourceAnswer | null
+  generation_result?: MediaGenerationResult | null
+  media_search_result?: MediaSearchResult | null
+  attachment_result?: AttachmentResult | null
+  attachment_refs?: PersistedAttachmentRef[]
+  result_snapshot?: PersistedResultSnapshot | null
+}
+
 export interface ServerMessage {
   id: string
   conversation_id: string
@@ -501,10 +683,9 @@ export interface ServerMessage {
   status: string | null
   model_name: string | null
   error_code: string | null
-  // An assistant row's own metadata (e.g. { sql: "..." }, set when the turn
-  // produced SQL) -- lets a reloaded past turn show its SQL again, not just
-  // the plain answer text. Always null for a user row.
-  metadata: { sql?: string | null } | null
+  // An assistant row's own persisted metadata -- see ServerMessageMetadata's
+  // own docstring. Always null for a user row.
+  metadata: ServerMessageMetadata | null
 }
 
 export interface MessageListResponse {
