@@ -264,6 +264,7 @@ def run_agent(
     conversation_history: list[ConversationExchange] | None = None,
     enable_insight: bool = True,
     caller_roles: tuple[str, ...] = (),
+    model: str | None = None,
 ) -> AgentState:
     """Runs the full agent graph for a single natural-language question.
 
@@ -290,14 +291,24 @@ def run_agent(
             Read by `validate_sql_node`'s restricted-column gate (2026
             Phase 2 security review) via `agent.authz.has_permission` --
             see `docs/AUTHORIZATION.md`.
-
-    Returns:
-        The final `AgentState` after the graph reaches `END` -- check
-        `state["status"]` ("succeeded", "failed", "needs_clarification",
-        "rejected", or "rate_limited") and `state["error_history"]` for the
-        outcome.
+        model: The Ollama model to use for every LLM call this run makes
+            (generation, planning, review, insight) -- `AskRequest.model`,
+            already validated against `Settings.ollama_allowed_models` by
+            `api/main.py`'s `/ask` handler (via `agent.model_registry
+            .validate_model_selection`) *before* this function is ever
+            called, so an invalid/disallowed model never reaches the graph.
+            `None` (the default -- every caller before this feature existed,
+            and any current caller that omits `AskRequest.model`) uses
+            `Settings.ollama_model` unchanged; `eval/runner.py` and
+            `scripts/integration_test.py` both get this default too, since
+            neither passes anything for this parameter. Resolved once here,
+            stored in `state["selected_model"]`, and never re-resolved
+            per-retry -- see that field's own docstring in `agent/state.py`
+            for why a question's model choice, like its `selected_database`,
+            must stay fixed for the life of one run.
     """
     settings = get_settings()
+    effective_model = model or settings.ollama_model
     # Computed once, up front -- not re-evaluated per retry -- so a
     # question's budget is fixed for the life of this run regardless of how
     # the question text might read differently in combination with a later
@@ -310,13 +321,14 @@ def run_agent(
     )
     logger.info(
         "Starting agent run for question=%r conversation_history_len=%d enable_insight=%s "
-        "max_retries=%d (base=%d) complexity_signals=%s",
+        "max_retries=%d (base=%d) complexity_signals=%s model=%s",
         question,
         len(conversation_history or []),
         enable_insight,
         effective_max_retries,
         settings.max_retries,
         complexity_signals,
+        effective_model,
     )
     compiled_graph = build_graph()
     initial_state: AgentState = {
@@ -330,6 +342,7 @@ def run_agent(
         "followup_resolved_against": None,
         "clarification_message": None,
         "selected_database": None,
+        "selected_model": effective_model,
         "retrieved_context": [],
         "retrieval_query": None,
         "retrieval_sources": [],

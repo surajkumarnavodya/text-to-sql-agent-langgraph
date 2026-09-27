@@ -730,7 +730,9 @@ def plan_query_node(state: AgentState) -> dict[str, Any]:
     question = state["question"]
     schema_context = state.get("schema_context_text", "")
     try:
-        plan = generate_query_plan_from_llm(question, schema_context, settings)
+        plan = generate_query_plan_from_llm(
+            question, schema_context, settings, model=state.get("selected_model")
+        )
     except OllamaUnavailableError as exc:
         logger.warning("[plan_query] LLM call failed, proceeding without a plan: %s", exc)
         return {"query_plan": None, "status": "generating"}
@@ -820,6 +822,7 @@ def generate_sql_node(state: AgentState) -> dict[str, Any]:
             query_plan=state.get("query_plan"),
             golden_examples=state.get("golden_examples"),
             retrieved_context=state.get("retrieved_context"),
+            model=state.get("selected_model"),
         )
     except OffTopicQuestionError as exc:
         # Defense-in-depth backstop, not the normal path: agent.input_guard's
@@ -901,7 +904,9 @@ def review_sql_node(state: AgentState) -> dict[str, Any]:
         return {"plan_review_passed": None, "plan_review_feedback": None, "status": "validating"}
 
     try:
-        passed, feedback = review_sql_against_plan_from_llm(query_plan, sql, settings)
+        passed, feedback = review_sql_against_plan_from_llm(
+            query_plan, sql, settings, model=state.get("selected_model")
+        )
     except OllamaUnavailableError as exc:
         logger.warning(
             "[review_sql] attempt %d: LLM call failed, treating as a pass: %s", attempt_number, exc
@@ -1506,7 +1511,11 @@ def generate_insight_node(state: AgentState) -> dict[str, Any]:
 
     try:
         insight_text = generate_insight_from_llm(
-            question=question, sql=sql, summary=summary, settings=settings
+            question=question,
+            sql=sql,
+            summary=summary,
+            settings=settings,
+            model=state.get("selected_model"),
         )
     except OllamaUnavailableError as exc:
         logger.warning("[generate_insight] LLM call failed, omitting insight: %s", exc)

@@ -377,3 +377,52 @@ class TestMultiDatabaseConfig:
                 get_settings()
         finally:
             get_settings.cache_clear()
+
+
+class TestOllamaModelSelectionConfig:
+    """`Settings.ollama_allowed_models`/`ollama_model_selection_enabled` --
+    see `config.settings._fill_default_ollama_allowed_models` and
+    `_split_ollama_allowed_models`."""
+
+    def test_unset_falls_back_to_the_default_starter_set_including_the_configured_model(self):
+        settings = _settings(ollama_model="llama3.1:8b")
+        assert "llama3.1:8b" in settings.ollama_allowed_models
+        # The starter set has more than just the default -- a fresh clone
+        # gets a useful picker with zero .env edits.
+        assert len(settings.ollama_allowed_models) > 1
+
+    def test_env_value_is_parsed_as_a_comma_separated_list(self, monkeypatch):
+        monkeypatch.setenv("OLLAMA_ALLOWED_MODELS", "qwen2.5:7b, mistral:7b ,llama3.2:3b")
+        get_settings.cache_clear()
+        try:
+            settings = get_settings()
+            assert "qwen2.5:7b" in settings.ollama_allowed_models
+            assert "mistral:7b" in settings.ollama_allowed_models
+            assert "llama3.2:3b" in settings.ollama_allowed_models
+        finally:
+            get_settings.cache_clear()
+
+    def test_configured_default_model_is_unioned_in_even_if_operator_omitted_it(self):
+        settings = _settings(
+            ollama_model="llama3.1:8b", ollama_allowed_models=("qwen2.5:7b", "mistral:7b")
+        )
+        assert "llama3.1:8b" in settings.ollama_allowed_models
+        assert "qwen2.5:7b" in settings.ollama_allowed_models
+        assert "mistral:7b" in settings.ollama_allowed_models
+
+    def test_explicit_list_already_containing_the_default_is_not_duplicated(self):
+        settings = _settings(
+            ollama_model="llama3.1:8b", ollama_allowed_models=("llama3.1:8b", "qwen2.5:7b")
+        )
+        assert settings.ollama_allowed_models.count("llama3.1:8b") == 1
+
+    def test_selection_disabled_collapses_to_only_the_default_model(self):
+        settings = _settings(
+            ollama_model="llama3.1:8b",
+            ollama_model_selection_enabled=False,
+            ollama_allowed_models=("qwen2.5:7b", "mistral:7b"),
+        )
+        assert settings.ollama_allowed_models == ("llama3.1:8b",)
+
+    def test_selection_enabled_by_default(self):
+        assert _settings().ollama_model_selection_enabled is True

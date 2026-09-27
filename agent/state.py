@@ -208,6 +208,33 @@ class AgentState(TypedDict, total=False):
     # execute_sql all resolve their dialect/engine from this via
     # db.connection.get_connection(settings, state["selected_database"]).
     selected_database: str | None
+
+    # Input, set once by the caller (`agent.graph.run_agent`) via
+    # `agent.model_registry.validate_model_selection` -- the Ollama model
+    # name to use for every LLM call this run makes (generation, planning,
+    # review, insight). Always a validated, allowed model name by the time
+    # it lands here (an invalid caller-supplied model never reaches the
+    # graph at all -- see `api/main.py`'s `/ask` handler, which validates
+    # before ever calling `run_agent`), never a raw, unchecked string.
+    # Deliberately request-scoped, exactly like `selected_database` above --
+    # never a process-global -- so one caller's model choice can never leak
+    # into a concurrent request for a different one. `agent.nodes` reads
+    # this (never re-selects it) and passes it straight through to
+    # `agent.llm_client`'s `model=` parameter on every call; `None` there
+    # means "use `Settings.ollama_model`," the pre-existing default
+    # behavior, so a caller that never sets this field (every caller before
+    # this feature existed, and any current caller that omits
+    # `AskRequest.model`) sees zero change. Deliberately never changes
+    # per-attempt: a retry keeps using the same model the first attempt did,
+    # for the same reason a retry keeps targeting the same
+    # `selected_database` -- switching models mid-question would make the
+    # error-feedback retry loop's "learn from the last mistake" premise
+    # incoherent. Every LLM call for one question -- generation, the
+    # up-front plan, the plan-conformance review, and the post-execution
+    # insight -- intentionally uses this same one model, never a mix; see
+    # `agent.llm_client.generate_insight_from_llm`'s own docstring for why.
+    selected_model: str | None
+
     # Set by retrieve_schema
     schema_tables: list[TableSchema]
     schema_context_text: str

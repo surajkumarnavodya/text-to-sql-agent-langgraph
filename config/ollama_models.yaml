@@ -1,0 +1,100 @@
+# Hand-authored display metadata for Ollama models this application knows
+# about -- NOT the list of models actually offered for selection (that's
+# `Settings.ollama_allowed_models`, config/settings.py) and NOT a claim that
+# every Ollama model is listed here. A model id in `OLLAMA_ALLOWED_MODELS`
+# with no entry below still works -- it just gets a generic fallback display
+# name and default capabilities (see config/ollama_models.py::describe_model)
+# rather than the curated description here. Purpose is purely cosmetic/
+# informational (what the UI shows next to a model), never a gate on whether
+# a model may be selected or used.
+#
+# Evaluated against the live https://ollama.com/library on 2026-09-27 for
+# local Text-to-SQL suitability -- see docs/CONFIGURATION.md's "Model
+# selection" section for the full assessment this was drawn from. Sizes/
+# context lengths are the vendor's own published figures at that date, not
+# independently benchmarked by this project.
+
+models:
+  - id: llama3.1:8b
+    display_name: Llama 3.1 8B
+    parameter_size: 8B
+    context_length: 128000
+    resource_level: medium
+    capabilities: [text, sql, reasoning, tools]
+    recommended: true
+    description: >
+      This application's own default model. Strong general instruction
+      following and tool use; a solid, well-tested baseline for SQL
+      generation on modest local hardware.
+
+  - id: qwen2.5:7b
+    display_name: Qwen 2.5 7B
+    parameter_size: 7B
+    context_length: 32000
+    resource_level: medium
+    capabilities: [text, sql, reasoning, tools]
+    recommended: true
+    description: >
+      Explicitly documents strong structured/JSON output and coding/math
+      ability -- a strong alternative to the default for SQL generation at
+      a similar hardware footprint.
+
+  - id: qwen2.5:14b
+    display_name: Qwen 2.5 14B
+    parameter_size: 14B
+    context_length: 32000
+    resource_level: high
+    capabilities: [text, sql, reasoning, tools]
+    recommended: false
+    description: >
+      Same family as Qwen 2.5 7B with more capacity -- for users with more
+      VRAM/RAM who want higher accuracy on harder multi-step questions.
+
+  - id: llama3.2:3b
+    display_name: Llama 3.2 3B
+    parameter_size: 3B
+    context_length: 128000
+    resource_level: low
+    capabilities: [text, sql]
+    recommended: false
+    description: >
+      Lightweight option for limited hardware -- the vendor reports it
+      outperforming similarly-sized models on instruction-following and
+      tool use, though accuracy on complex SQL will trail larger models.
+
+  - id: mistral:7b
+    display_name: Mistral 7B
+    parameter_size: 7B
+    context_length: 32000
+    resource_level: medium
+    capabilities: [text, sql, tools]
+    recommended: false
+    description: >
+      Supports function calling (v0.3+) and structured responses; a solid
+      mid-size alternative to Llama/Qwen at a similar hardware footprint.
+
+  - id: deepseek-r1:8b
+    display_name: DeepSeek-R1 8B
+    parameter_size: 8B
+    context_length: 128000
+    resource_level: medium
+    capabilities: [text, sql, reasoning]
+    recommended: false
+    description: >
+      A distilled reasoning-focused model -- worth trying for questions
+      needing multi-step logic (e.g. top-N-per-group, period-over-period
+      comparisons), at the cost of slower responses than a plain
+      instruction-tuned model of similar size.
+
+  - id: sqlcoder:7b
+    display_name: SQLCoder 7B
+    parameter_size: 7B
+    context_length: 32000
+    resource_level: medium
+    capabilities: [sql]
+    recommended: false
+    description: >
+      Purpose-built for SQL generation, but its Ollama Library page was
+      last updated several years ago -- listed here for completeness, not
+      as a recommended default, since more recently updated general models
+      now match or exceed it on most real questions.

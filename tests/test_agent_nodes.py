@@ -400,7 +400,7 @@ class TestPlanQueryNode:
     def test_calls_llm_and_stores_plan_for_a_complex_question(self, monkeypatch):
         captured = {}
 
-        def _capture(question, schema_context, settings):
+        def _capture(question, schema_context, settings, model=None):
             captured["question"] = question
             captured["schema_context"] = schema_context
             return ["Group by region and year", "Use ROW_NUMBER() partitioned by region"]

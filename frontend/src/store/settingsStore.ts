@@ -26,11 +26,23 @@ interface SettingsState {
    * theme/accent/font (`sidebarCollapsed=true`/`false` in localStorage) --
    * a non-sensitive UI preference only, never chat content. */
   sidebarCollapsed: boolean
+  /** The user's own Ollama model choice, from the "AI Model" picker in
+   * Settings (HistorySettingsSection.tsx) -- a model id from the most
+   * recent GET /models response, or null to use the server-configured
+   * default. Persisted like theme/accent/font (a device preference). Unlike
+   * that flag, this is validated server-side on every /ask (see
+   * agent.model_registry.validate_model_selection) -- if a model an earlier
+   * session picked is no longer in the server's allowed set (a config
+   * change since then), HistorySettingsSection.tsx resets this back to
+   * null the next time GET /models loads, rather than leaving every /ask
+   * failing with a 400 until the user notices and re-picks manually. */
+  selectedModel: string | null
   setThemeMode: (mode: ThemeMode) => void
   setAccent: (accentId: string) => void
   setFont: (fontId: string) => void
   setLanguage: (language: string) => void
   setVoiceModeEnabled: (enabled: boolean) => void
+  setSelectedModel: (modelId: string | null) => void
   toggleSection: (sectionId: string) => void
   isSectionCollapsed: (sectionId: string) => boolean
   toggleSidebarCollapsed: () => void
@@ -55,7 +67,9 @@ export const useSettingsStore = create<SettingsState>()(
       collapsedSections: {},
       voiceModeEnabled: true,
       sidebarCollapsed: false,
+      selectedModel: null,
       setVoiceModeEnabled: (enabled) => set({ voiceModeEnabled: enabled }),
+      setSelectedModel: (modelId) => set({ selectedModel: modelId }),
       toggleSidebarCollapsed: () => set((state) => ({ sidebarCollapsed: !state.sidebarCollapsed })),
       setThemeMode: (mode) => {
         applyThemeMode(mode)

@@ -496,7 +496,7 @@ def _build_insight_prompt(question: str, sql: str, summary: ResultSummary) -> st
 
 
 def generate_insight_from_llm(
-    question: str, sql: str, summary: ResultSummary, settings: Settings
+    question: str, sql: str, summary: ResultSummary, settings: Settings, model: str | None = None
 ) -> str | None:
     """Calls Ollama to write a 1-2 sentence plain-English insight for a result.
 
@@ -508,6 +508,13 @@ def generate_insight_from_llm(
         summary: The small aggregate-only summary of the result (see
             `agent.insight.summarize_result`) -- never the raw rows.
         settings: Application settings (model name, host, insight token cap).
+        model: The Ollama model name to use for this call. `None` (the
+            default) uses `settings.ollama_model`, preserving every existing
+            call site unchanged. When set, it's always the exact same model
+            `generate_sql_from_llm` used for this question -- see
+            `agent.state.AgentState.selected_model`'s docstring for why
+            insight/plan/review intentionally never use a *different* model
+            than generation for the same request.
 
     Returns:
         The insight text, or None if the model declined (responded "NONE")
@@ -522,13 +529,14 @@ def generate_insight_from_llm(
     Raises:
         OllamaUnavailableError: if the Ollama server can't be reached.
     """
+    effective_model = model or settings.ollama_model
     user_prompt = _build_insight_prompt(question, sql, summary)
     client = _get_ollama_client(settings.ollama_host, settings.ollama_request_timeout_seconds)
 
-    logger.debug("Calling Ollama (insight) model=%s prompt=%r", settings.ollama_model, user_prompt)
+    logger.debug("Calling Ollama (insight) model=%s prompt=%r", effective_model, user_prompt)
     try:
         response = client.chat(
-            model=settings.ollama_model,
+            model=effective_model,
             messages=[
                 {"role": "system", "content": _INSIGHT_SYSTEM_PROMPT},
                 {"role": "user", "content": user_prompt},
@@ -548,7 +556,7 @@ def generate_insight_from_llm(
         # graph run instead of degrading to the intended "failed" status.
         raise OllamaUnavailableError(
             f"Could not reach Ollama at {settings.ollama_host} with model "
-            f"'{settings.ollama_model}': {exc}."
+            f"'{effective_model}': {exc}."
         ) from exc
 
     _log_ollama_timing(response)
@@ -599,6 +607,7 @@ def generate_sql_from_llm(
     query_plan: list[str] | None = None,
     golden_examples: list[GoldenExample] | None = None,
     retrieved_context: list[dict] | None = None,
+    model: str | None = None,
 ) -> str:
     """Calls Ollama to generate a candidate SQL statement.
 
@@ -638,6 +647,12 @@ def generate_sql_from_llm(
             failed (fails open -- see that function's docstring). Injected
             as a clearly labeled, verify-against-schema reference block --
             see `_build_business_context_block`.
+        model: The Ollama model name to use for this call. `None` (the
+            default) uses `settings.ollama_model` -- every existing call
+            site is unaffected. Set by `agent.nodes.generate_sql_node` from
+            `state["selected_model"]`, which `agent.graph.run_agent` resolves
+            and validates exactly once per question -- never a global, never
+            re-resolved per retry.
 
     Returns:
         Extracted SQL text (not yet validated -- caller must run it through
@@ -672,12 +687,13 @@ def generate_sql_from_llm(
         len(user_prompt),
     )
 
+    effective_model = model or settings.ollama_model
     client = _get_ollama_client(settings.ollama_host, settings.ollama_request_timeout_seconds)
 
-    logger.debug("Calling Ollama model=%s prompt=%r", settings.ollama_model, user_prompt)
+    logger.debug("Calling Ollama model=%s prompt=%r", effective_model, user_prompt)
     try:
         response = client.chat(
-            model=settings.ollama_model,
+            model=effective_model,
             messages=[
                 {"role": "system", "content": _system_prompt(settings.db_type)},
                 {"role": "user", "content": user_prompt},
@@ -694,8 +710,8 @@ def generate_sql_from_llm(
         # broken) Ollama response would otherwise crash the whole graph run.
         raise OllamaUnavailableError(
             f"Could not reach Ollama at {settings.ollama_host} with model "
-            f"'{settings.ollama_model}': {exc}. Is `ollama serve` running and "
-            f"has the model been pulled (`ollama pull {settings.ollama_model}`)?"
+            f"'{effective_model}': {exc}. Is `ollama serve` running and "
+            f"has the model been pulled (`ollama pull {effective_model}`)?"
         ) from exc
 
     _log_ollama_timing(response)
@@ -826,7 +842,7 @@ def _parse_plan_response(raw_response: str) -> list[str] | None:
 
 
 def generate_query_plan_from_llm(
-    question: str, schema_context: str, settings: Settings
+    question: str, schema_context: str, settings: Settings, model: str | None = None
 ) -> list[str] | None:
     """Calls Ollama to break `question` into a short ordered plan before any SQL is written.
 
@@ -836,6 +852,9 @@ def generate_query_plan_from_llm(
             same context `generate_sql_from_llm` will see, so the plan is
             grounded in the same tables/columns.
         settings: Application settings (model name, host, `query_plan_max_tokens`).
+        model: The Ollama model name to use for this call -- always the same
+            model selected for `generate_sql_from_llm` on this question (see
+            `agent.nodes.plan_query_node`). `None` uses `settings.ollama_model`.
 
     Returns:
         The plan (a list of step strings, possibly empty), or None if the
@@ -848,15 +867,14 @@ def generate_query_plan_from_llm(
             caller fails open on this (proceeds with no plan) -- planning
             is an accuracy aid, never a reason a question can't be answered.
     """
+    effective_model = model or settings.ollama_model
     user_prompt = _build_plan_user_prompt(question, schema_context)
     client = _get_ollama_client(settings.ollama_host, settings.ollama_request_timeout_seconds)
 
-    logger.debug(
-        "Calling Ollama (query_plan) model=%s prompt=%r", settings.ollama_model, user_prompt
-    )
+    logger.debug("Calling Ollama (query_plan) model=%s prompt=%r", effective_model, user_prompt)
     try:
         response = client.chat(
-            model=settings.ollama_model,
+            model=effective_model,
             messages=[
                 {"role": "system", "content": _PLAN_SYSTEM_PROMPT},
                 {"role": "user", "content": user_prompt},
@@ -869,7 +887,7 @@ def generate_query_plan_from_llm(
     except (ollama.ResponseError, ConnectionError, TimeoutError, OSError, httpx.HTTPError) as exc:
         raise OllamaUnavailableError(
             f"Could not reach Ollama at {settings.ollama_host} with model "
-            f"'{settings.ollama_model}': {exc}."
+            f"'{effective_model}': {exc}."
         ) from exc
 
     _log_ollama_timing(response)
@@ -946,7 +964,7 @@ def _parse_review_response(raw_response: str) -> tuple[bool, str | None]:
 
 
 def review_sql_against_plan_from_llm(
-    query_plan: list[str], sql: str, settings: Settings
+    query_plan: list[str], sql: str, settings: Settings, model: str | None = None
 ) -> tuple[bool, str | None]:
     """Calls Ollama to check whether `sql` implements every step of `query_plan`.
 
@@ -956,6 +974,9 @@ def review_sql_against_plan_from_llm(
             when there's an actual plan to check against).
         sql: The just-generated candidate SQL (not yet validated).
         settings: Application settings (model name, host, `sql_review_max_tokens`).
+        model: The Ollama model name to use for this call -- always the same
+            model selected for `generate_sql_from_llm` on this question (see
+            `agent.nodes.review_sql_node`). `None` uses `settings.ollama_model`.
 
     Returns:
         `(passed, feedback)` -- see `_parse_review_response`.
@@ -966,15 +987,14 @@ def review_sql_against_plan_from_llm(
             step is an extra accuracy check, never a reason a validated,
             executable query can't run.
     """
+    effective_model = model or settings.ollama_model
     user_prompt = _build_review_user_prompt(query_plan, sql)
     client = _get_ollama_client(settings.ollama_host, settings.ollama_request_timeout_seconds)
 
-    logger.debug(
-        "Calling Ollama (sql_review) model=%s prompt=%r", settings.ollama_model, user_prompt
-    )
+    logger.debug("Calling Ollama (sql_review) model=%s prompt=%r", effective_model, user_prompt)
     try:
         response = client.chat(
-            model=settings.ollama_model,
+            model=effective_model,
             messages=[
                 {"role": "system", "content": _REVIEW_SYSTEM_PROMPT},
                 {"role": "user", "content": user_prompt},
@@ -987,7 +1007,7 @@ def review_sql_against_plan_from_llm(
     except (ollama.ResponseError, ConnectionError, TimeoutError, OSError, httpx.HTTPError) as exc:
         raise OllamaUnavailableError(
             f"Could not reach Ollama at {settings.ollama_host} with model "
-            f"'{settings.ollama_model}': {exc}."
+            f"'{effective_model}': {exc}."
         ) from exc
 
     _log_ollama_timing(response)

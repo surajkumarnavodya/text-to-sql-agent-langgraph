@@ -19,6 +19,7 @@ import pytest
 from fastapi import Request
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, text
+from starlette.datastructures import Headers
 
 import agent.rate_limit as rate_limit_module
 import api.main as api_main
@@ -183,6 +184,7 @@ class TestAsk:
             caller_roles=(),
             caller_subject=None,
             attachment_ids=None,
+            model=None,
         ):
             captured["question"] = question
             captured["conversation_history"] = conversation_history
@@ -191,6 +193,7 @@ class TestAsk:
             captured["caller_roles"] = caller_roles
             captured["caller_subject"] = caller_subject
             captured["attachment_ids"] = attachment_ids
+            captured["model"] = model
             return {"status": "succeeded", "error_history": []}
 
         monkeypatch.setattr("api.main.run_orchestrated", _capture)
@@ -274,7 +277,9 @@ class TestAsk:
                 max_concurrent_ask_requests=10, max_concurrent_ask_requests_per_caller=1
             ),
         )
-        monkeypatch.setattr("api.main._rate_limit_key", lambda identity, request: "test-caller")
+        monkeypatch.setattr(
+            "api.main._rate_limit_key", lambda identity, request, settings: "test-caller"
+        )
         rate_limit_module.get_per_caller_ask_concurrency_limiter("test-caller", 1).try_acquire()
 
         def _fail_if_called(*a, **k):
@@ -336,7 +341,9 @@ class TestAsk:
                 max_concurrent_ask_requests_per_caller=1,
             ),
         )
-        monkeypatch.setattr("api.main._rate_limit_key", lambda identity, request: "slow-caller")
+        monkeypatch.setattr(
+            "api.main._rate_limit_key", lambda identity, request, settings: "slow-caller"
+        )
 
         def _slow(*a, **k):
             time_module.sleep(2)
@@ -511,12 +518,15 @@ class TestAsk:
         assert right_token.status_code == 200
 
 
-def _fake_request(host: str | None) -> Request:
+def _fake_request(host: str | None, headers: list[tuple[bytes, bytes]] | None = None) -> Request:
     """A minimal duck-typed stand-in for `fastapi.Request` -- `_rate_limit_key`
-    only ever reads `request.client.host`, so a real `Request` (which needs
-    a full ASGI scope) would be pure ceremony here."""
+    only ever reads `request.client.host` (and, since the trusted-proxy
+    assessment pass, `request.headers` via `security.client_ip
+    .resolve_client_ip`), so a real `Request` (which needs a full ASGI
+    scope) would be pure ceremony here for the common (no proxy) case.
+    `headers` is only exercised by `TestRateLimitKeyTrustedProxy` below."""
     client = SimpleNamespace(host=host) if host is not None else None
-    return cast(Request, SimpleNamespace(client=client))
+    return cast(Request, SimpleNamespace(client=client, headers=Headers(raw=headers or [])))
 
 
 class TestRateLimitKey:
@@ -527,12 +537,18 @@ class TestRateLimitKey:
     def test_local_auth_mode_keys_by_subject_not_ip(self):
         identity = AuthIdentity(subject="user-123", roles=("user",), mode="local")
 
-        assert api_main._rate_limit_key(identity, _fake_request("10.0.0.5")) == "user:user-123"
+        assert (
+            api_main._rate_limit_key(identity, _fake_request("10.0.0.5"), _BASE_SETTINGS)
+            == "user:user-123"
+        )
 
     def test_oidc_auth_mode_keys_by_subject_not_ip(self):
         identity = AuthIdentity(subject="oidc-sub-456", roles=("user",), mode="oidc")
 
-        assert api_main._rate_limit_key(identity, _fake_request("10.0.0.5")) == "user:oidc-sub-456"
+        assert (
+            api_main._rate_limit_key(identity, _fake_request("10.0.0.5"), _BASE_SETTINGS)
+            == "user:oidc-sub-456"
+        )
 
     def test_none_auth_mode_falls_back_to_client_ip(self):
         """`AuthIdentity.subject` is a fixed shared sentinel in "none" mode
@@ -540,24 +556,84 @@ class TestRateLimitKey:
         caller in one bucket, so this mode must fall back to IP."""
         identity = AuthIdentity(subject="dev-mode", roles=("admin",), mode="none")
 
-        assert api_main._rate_limit_key(identity, _fake_request("203.0.113.7")) == "ip:203.0.113.7"
+        assert (
+            api_main._rate_limit_key(identity, _fake_request("203.0.113.7"), _BASE_SETTINGS)
+            == "ip:203.0.113.7"
+        )
 
     def test_static_token_auth_mode_falls_back_to_client_ip(self):
         identity = AuthIdentity(subject="static-token", roles=("admin",), mode="static_token")
 
-        assert api_main._rate_limit_key(identity, _fake_request("203.0.113.7")) == "ip:203.0.113.7"
+        assert (
+            api_main._rate_limit_key(identity, _fake_request("203.0.113.7"), _BASE_SETTINGS)
+            == "ip:203.0.113.7"
+        )
 
     def test_missing_client_falls_back_to_unknown(self):
         identity = AuthIdentity(subject="static-token", roles=("admin",), mode="static_token")
 
-        assert api_main._rate_limit_key(identity, _fake_request(None)) == "ip:unknown"
+        assert (
+            api_main._rate_limit_key(identity, _fake_request(None), _BASE_SETTINGS) == "ip:unknown"
+        )
 
     def test_two_different_subjects_get_different_keys(self):
         request = _fake_request("10.0.0.5")
         a = AuthIdentity(subject="user-a", roles=("user",), mode="local")
         b = AuthIdentity(subject="user-b", roles=("user",), mode="local")
 
-        assert api_main._rate_limit_key(a, request) != api_main._rate_limit_key(b, request)
+        assert api_main._rate_limit_key(a, request, _BASE_SETTINGS) != api_main._rate_limit_key(
+            b, request, _BASE_SETTINGS
+        )
+
+
+class TestRateLimitKeyTrustedProxy:
+    """`Settings.trusted_proxy_count` -- the enterprise scalability
+    assessment's opt-in fix for bottleneck #3's IP-fallback half: behind a
+    real load balancer, every "none"/"static_token"-mode caller must not
+    collapse into the LB's own single IP bucket."""
+
+    def test_default_ignores_x_forwarded_for_even_when_present(self):
+        """trusted_proxy_count=0 (the default): the header must never be
+        consulted, matching tests/security/test_rate_limit_header_spoofing.py's
+        existing guarantee -- a request from the LB (peer 10.0.0.1) with an
+        attacker-supplied X-Forwarded-For must still key on the peer."""
+        identity = AuthIdentity(subject="dev-mode", roles=("admin",), mode="none")
+        request = _fake_request("10.0.0.1", [(b"x-forwarded-for", b"203.0.113.9")])
+
+        assert api_main._rate_limit_key(identity, request, _BASE_SETTINGS) == "ip:10.0.0.1"
+
+    def test_one_trusted_proxy_reads_the_real_client_from_the_header(self):
+        identity = AuthIdentity(subject="dev-mode", roles=("admin",), mode="none")
+        settings = _settings(trusted_proxy_count=1)
+        request = _fake_request("10.0.0.1", [(b"x-forwarded-for", b"203.0.113.9")])
+
+        assert api_main._rate_limit_key(identity, request, settings) == "ip:203.0.113.9"
+
+    def test_two_distinct_real_clients_behind_one_lb_get_different_keys(self):
+        """The actual bug this fixes: without trusted-proxy support, both
+        of these would collapse to the LB's own single IP."""
+        identity = AuthIdentity(subject="dev-mode", roles=("admin",), mode="none")
+        settings = _settings(trusted_proxy_count=1)
+        request_a = _fake_request("10.0.0.1", [(b"x-forwarded-for", b"203.0.113.9")])
+        request_b = _fake_request("10.0.0.1", [(b"x-forwarded-for", b"198.51.100.4")])
+
+        assert api_main._rate_limit_key(identity, request_a, settings) != api_main._rate_limit_key(
+            identity, request_b, settings
+        )
+
+    def test_client_prepended_spoofed_hops_beyond_the_trusted_count_are_ignored(self):
+        """The core XFF-spoofing defense: only the Nth entry from the
+        *right* is ever trusted -- entries the client could have prepended
+        before ever reaching the (one, trusted) proxy must not be read."""
+        identity = AuthIdentity(subject="dev-mode", roles=("admin",), mode="none")
+        settings = _settings(trusted_proxy_count=1)
+        request = _fake_request(
+            "10.0.0.1", [(b"x-forwarded-for", b"9.9.9.9, 8.8.8.8, 203.0.113.9")]
+        )
+
+        # Only one hop is trusted -> only the rightmost entry is used, never
+        # the attacker-controlled entries further left.
+        assert api_main._rate_limit_key(identity, request, settings) == "ip:203.0.113.9"
 
 
 class TestSchemaTables:
@@ -599,3 +675,120 @@ class TestSchemaTables:
         response = client.get("/schema/tables")
 
         assert response.status_code == 401
+
+
+class TestAskModelSelection:
+    """`AskRequest.model` / `AskResponse.model` -- configurable Ollama model
+    selection. `_BASE_SETTINGS` has no explicit `OLLAMA_ALLOWED_MODELS`, so
+    it falls back to the default starter set (config/settings.py's
+    `_DEFAULT_OLLAMA_ALLOWED_MODELS`), which includes both `llama3.1:8b`
+    (the configured default) and `qwen2.5:7b` -- used below as "the
+    default" and "a valid, non-default alternative" respectively."""
+
+    def test_omitting_model_preserves_existing_behavior(self, monkeypatch, client):
+        """The critical backward-compatibility guarantee: an existing
+        caller's request body (no `model` field at all) must keep working
+        exactly as before this feature existed."""
+        captured = {}
+
+        def _capture(question, conversation_history=None, **kwargs):
+            captured.update(kwargs)
+            return {"status": "succeeded", "error_history": [], "selected_model": "llama3.1:8b"}
+
+        monkeypatch.setattr("api.main.run_orchestrated", _capture)
+
+        response = client.post("/ask", json={"question": "How many rows are there?"})
+
+        assert response.status_code == 200
+        assert captured["model"] == "llama3.1:8b"  # resolved to Settings.ollama_model
+        assert response.json()["model"] == "llama3.1:8b"
+
+    def test_valid_alternate_model_is_forwarded_and_validated(self, monkeypatch, client):
+        captured = {}
+
+        def _capture(question, conversation_history=None, **kwargs):
+            captured.update(kwargs)
+            return {"status": "succeeded", "error_history": [], "selected_model": "qwen2.5:7b"}
+
+        monkeypatch.setattr("api.main.run_orchestrated", _capture)
+
+        response = client.post(
+            "/ask", json={"question": "How many rows are there?", "model": "qwen2.5:7b"}
+        )
+
+        assert response.status_code == 200
+        assert captured["model"] == "qwen2.5:7b"
+        assert response.json()["model"] == "qwen2.5:7b"
+
+    def test_disallowed_model_returns_400_and_never_calls_run_orchestrated(
+        self, monkeypatch, client
+    ):
+        def _fail_if_called(*args, **kwargs):
+            raise AssertionError("run_orchestrated must not be called for a disallowed model")
+
+        monkeypatch.setattr("api.main.run_orchestrated", _fail_if_called)
+
+        response = client.post(
+            "/ask",
+            json={"question": "How many rows are there?", "model": "not-a-real-model:1b"},
+        )
+
+        assert response.status_code == 400
+        assert "not-a-real-model:1b" in response.json()["detail"]
+
+    def test_disallowed_model_does_not_consume_a_concurrency_slot(self, monkeypatch, client):
+        """A malformed/disallowed model request must be rejected before any
+        admission-control slot is acquired -- proven by a concurrency limit
+        of 1 still allowing a second, valid request through immediately
+        after the rejected one."""
+        monkeypatch.setattr(
+            "api.main.get_settings",
+            lambda: _settings(
+                max_concurrent_ask_requests=1, max_concurrent_ask_requests_per_caller=1
+            ),
+        )
+        monkeypatch.setattr(
+            "api.main.run_orchestrated",
+            lambda *a, **k: {"status": "succeeded", "error_history": []},
+        )
+
+        rejected = client.post("/ask", json={"question": "q1", "model": "not-allowed:1b"})
+        assert rejected.status_code == 400
+
+        accepted = client.post("/ask", json={"question": "q2"})
+        assert accepted.status_code == 200
+
+    def test_selection_disabled_rejects_any_non_default_model(self, monkeypatch, client):
+        disabled_settings = _settings(
+            ollama_model="llama3.1:8b", ollama_model_selection_enabled=False
+        )
+        monkeypatch.setattr("api.main.get_settings", lambda: disabled_settings)
+
+        def _fail_if_called(*args, **kwargs):
+            raise AssertionError("must not be called when the model is rejected")
+
+        monkeypatch.setattr("api.main.run_orchestrated", _fail_if_called)
+
+        response = client.post("/ask", json={"question": "How many rows?", "model": "qwen2.5:7b"})
+
+        assert response.status_code == 400
+
+    def test_extra_long_model_string_is_rejected_by_request_validation(self, client):
+        response = client.post("/ask", json={"question": "How many rows?", "model": "x" * 200})
+        assert response.status_code == 422
+
+    def test_disallowed_model_is_audit_logged(self, monkeypatch, client):
+        events = []
+        monkeypatch.setattr(
+            "api.main.log_security_event",
+            lambda event_type, severity, message, **kwargs: events.append(
+                (event_type, severity, kwargs)
+            ),
+        )
+
+        response = client.post("/ask", json={"question": "q", "model": "not-allowed:1b"})
+
+        assert response.status_code == 400
+        assert any(e[0] == "invalid_model_selection" for e in events)
+        logged_kwargs = next(e[2] for e in events if e[0] == "invalid_model_selection")
+        assert logged_kwargs["requested_model"] == "not-allowed:1b"

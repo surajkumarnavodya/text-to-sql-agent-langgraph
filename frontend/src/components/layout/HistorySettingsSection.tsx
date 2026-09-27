@@ -3,6 +3,7 @@ import { useTranslation } from 'react-i18next'
 import { AccentColorPicker } from '@/components/settings/AccentColorPicker'
 import { FontPicker } from '@/components/settings/FontPicker'
 import { LanguageSelector } from '@/components/settings/LanguageSelector'
+import { ModelSelector } from '@/components/settings/ModelSelector'
 import { ThemeToggle } from '@/components/settings/ThemeToggle'
 import { Button } from '@/components/ui/button'
 import { Switch } from '@/components/ui/switch'
@@ -124,6 +125,13 @@ export function HistorySettingsSection() {
               </ul>
             </div>
           ))}
+        </SectionBody>
+      </section>
+
+      <section>
+        <SectionHeader id="ai-model" title={t('sidebar.aiModel')} />
+        <SectionBody id="ai-model">
+          <ModelSelector />
         </SectionBody>
       </section>
 

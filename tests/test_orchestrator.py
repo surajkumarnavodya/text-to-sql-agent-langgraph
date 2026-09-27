@@ -797,8 +797,10 @@ class TestSqlSubgraphNode:
         captured: dict[str, object] = {}
         fake_result: AgentState = {"status": "succeeded", "sql": "SELECT 1", "row_count": 1}
 
-        def fake_run_agent(question, conversation_history, enable_insight, caller_roles):
-            captured["args"] = (question, conversation_history, enable_insight, caller_roles)
+        def fake_run_agent(
+            question, conversation_history, enable_insight, caller_roles, model=None
+        ):
+            captured["args"] = (question, conversation_history, enable_insight, caller_roles, model)
             return fake_result
 
         monkeypatch.setattr(orchestrator_nodes, "run_agent", fake_run_agent)
@@ -810,7 +812,7 @@ class TestSqlSubgraphNode:
         }
         result = sql_subgraph_node(state)
 
-        assert captured["args"] == ("how many orders?", [], True, ())
+        assert captured["args"] == ("how many orders?", [], True, (), None)
         assert result["status"] == "succeeded"
         assert result["sql"] == "SELECT 1"
         assert result["sources_used"] == ["sql"]
@@ -818,7 +820,9 @@ class TestSqlSubgraphNode:
     def test_defaults_enable_insight_to_true_when_absent(self, monkeypatch):
         captured: dict[str, object] = {}
 
-        def fake_run_agent(question, conversation_history, enable_insight, caller_roles):
+        def fake_run_agent(
+            question, conversation_history, enable_insight, caller_roles, model=None
+        ):
             captured["enable_insight"] = enable_insight
             return {"status": "succeeded"}
 
@@ -1678,8 +1682,10 @@ class TestRunOrchestrated:
         fake_result: AgentState = {"status": "succeeded", "sql": "SELECT 1"}
         captured: dict[str, object] = {}
 
-        def fake_run_agent(question, conversation_history, enable_insight, caller_roles):
-            captured["args"] = (question, conversation_history, enable_insight, caller_roles)
+        def fake_run_agent(
+            question, conversation_history, enable_insight, caller_roles, model=None
+        ):
+            captured["args"] = (question, conversation_history, enable_insight, caller_roles, model)
             return fake_result
 
         monkeypatch.setattr(orchestrator_graph, "run_agent", fake_run_agent)
@@ -1694,7 +1700,7 @@ class TestRunOrchestrated:
         result = orchestrator_graph.run_orchestrated("how many orders?", None, True)
 
         assert result is fake_result
-        assert captured["args"] == ("how many orders?", None, True, ())
+        assert captured["args"] == ("how many orders?", None, True, (), None)
 
     def test_flag_on_routes_through_the_graph_to_sql(self, monkeypatch):
         settings = _settings(enable_multi_source_router=True)
@@ -1703,7 +1709,7 @@ class TestRunOrchestrated:
         monkeypatch.setattr(
             orchestrator_nodes,
             "run_agent",
-            lambda question, conversation_history, enable_insight, caller_roles: {
+            lambda question, conversation_history, enable_insight, caller_roles, model=None: {
                 "status": "succeeded",
                 "sql": "SELECT 1",
                 "row_count": 3,
@@ -1735,7 +1741,7 @@ class TestRunOrchestrated:
         monkeypatch.setattr(
             orchestrator_nodes,
             "run_agent",
-            lambda question, conversation_history, enable_insight, caller_roles: {
+            lambda question, conversation_history, enable_insight, caller_roles, model=None: {
                 "status": "succeeded",
                 "sql": "SELECT 1",
                 "row_count": 5,
@@ -1807,7 +1813,7 @@ class TestRunOrchestrated:
         monkeypatch.setattr(
             orchestrator_graph,
             "run_agent",
-            lambda question, conversation_history, enable_insight, caller_roles: fake_result,
+            lambda question, conversation_history, enable_insight, caller_roles, model=None: fake_result,
         )
         result = orchestrator_graph.run_orchestrated("how many orders?", attachment_ids=None)
         assert result is fake_result
