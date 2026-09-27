@@ -8,7 +8,7 @@ import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Expander } from '@/components/ui/expander'
 import { Markdown } from '@/components/ui/markdown'
-import { buildAnswerMarkdown, type QueryHistoryEntry } from '@/lib/history'
+import { buildAnswerMarkdown, isSqlResult, type QueryHistoryEntry } from '@/lib/history'
 import { useChatStore } from '@/store/chatStore'
 import { ChatMessage } from './ChatMessage'
 import { CopyAnswerButton } from './CopyAnswerButton'
@@ -33,11 +33,18 @@ const ChartSection = lazy(() =>
   import('@/components/sql/ChartSection').then((m) => ({ default: m.ChartSection })),
 )
 
-function isSqlResult(sourcesUsed: string[]): boolean {
-  return sourcesUsed.length === 0 || sourcesUsed.includes('sql')
-}
-
-const BLOCKED_STATUSES = new Set(['failed', 'needs_clarification', 'rejected', 'rate_limited'])
+const BLOCKED_STATUSES = new Set([
+  'failed',
+  'needs_clarification',
+  'rejected',
+  'rate_limited',
+  // A reconstructed history entry with no matching assistant row at all
+  // (see history.ts::serverMessagesToQueryHistory's own doc comment on a
+  // truncated/failed persistence) -- there is genuinely nothing to show,
+  // and showing the SQL editor + "Confirm and Run" here would offer to run
+  // a query that was never actually generated.
+  'pending',
+])
 
 /** One full question+answer turn -- always fully rendered (never replaced
  * by a later turn), so the whole conversation stays visible and each
@@ -54,6 +61,16 @@ export function TurnCard({ entry, isMultiDb }: { entry: QueryHistoryEntry; isMul
 
   const state = entry.finalState
   const showSqlPanel = isSqlResult(state.sources_used) && !BLOCKED_STATUSES.has(entry.agentStatus)
+  // The editor + "Confirm and Run" specifically (as opposed to the
+  // read-only schema/plan context above it) require actual SQL text to
+  // edit or a result already confirmed -- `showSqlPanel` alone used to be
+  // treated as "safe to show an editor," but a reconstructed history entry
+  // (or, in principle, any SQL-path turn that produced no candidate SQL at
+  // all) has neither, and showing an empty box with a working "Confirm and
+  // Run" button next to it offered to run nothing. See CLAUDE.md's chat-
+  // history section for the reload-specific case this was found from.
+  const hasEditableSql = entry.editableSql.trim().length > 0
+  const showSqlEditor = showSqlPanel && (hasEditableSql || entry.confirmedColumns !== null)
   const isConfirming = confirmingEntryId === entry.entryId
   const answerMarkdown = buildAnswerMarkdown(entry)
 
@@ -112,6 +129,11 @@ export function TurnCard({ entry, isMultiDb }: { entry: QueryHistoryEntry; isMul
         {state.permission_denied_notice && (
           <p className="text-sm text-[var(--warning)]">{state.permission_denied_notice}</p>
         )}
+        {entry.agentStatus === 'pending' && (
+          <p className="text-sm text-[var(--muted-foreground)]">
+            {t('chat.noRecordedAnswer')}
+          </p>
+        )}
         {entry.agentStatus === 'failed' && (
           <div className="flex flex-col gap-2">
             <p className="text-sm text-[var(--danger)]">
@@ -134,11 +156,18 @@ export function TurnCard({ entry, isMultiDb }: { entry: QueryHistoryEntry; isMul
 
         {state.attempt_history.length > 0 && <RetryTimeline attempts={state.attempt_history} />}
         <SourcesUsedPanel state={state} entryId={entry.entryId} />
-        {isMultiDb && showSqlPanel && state.database && (
+        {showSqlPanel && ((isMultiDb && state.database) || state.model) && (
           <Expander title={t('details.title')}>
-            <p className="text-xs text-[var(--muted-foreground)]">
-              {t('details.database')}: <strong>{state.database}</strong>
-            </p>
+            {isMultiDb && state.database && (
+              <p className="text-xs text-[var(--muted-foreground)]">
+                {t('details.database')}: <strong>{state.database}</strong>
+              </p>
+            )}
+            {state.model && (
+              <p className="text-xs text-[var(--muted-foreground)]">
+                {t('details.model')}: <strong>{state.model}</strong>
+              </p>
+            )}
           </Expander>
         )}
 
@@ -147,29 +176,31 @@ export function TurnCard({ entry, isMultiDb }: { entry: QueryHistoryEntry; isMul
             <SchemaContextPanel tables={state.schema_tables} />
             <QueryPlanPanel plan={state.query_plan} />
 
-            <Expander title={t('sql.title')} defaultOpen>
-              <div className="flex flex-col gap-2">
-                <p className="text-xs text-[var(--muted-foreground)]">{t('sql.hint')}</p>
-                <SqlEditor value={entry.editableSql} onChange={(sql) => setEditableSql(entry.entryId, sql)} />
-                {state.cost_notice && entry.editableSql === state.sql && (
-                  <p className="text-xs text-[var(--warning)]">{state.cost_notice}</p>
-                )}
-                <div>
-                  <Button
-                    variant="primary"
-                    onClick={() => void confirmAndRun(entry.entryId)}
-                    disabled={isConfirming}
-                  >
-                    {isConfirming ? (
-                      <Loader2 className="h-4 w-4 animate-spin" />
-                    ) : (
-                      <Play className="h-4 w-4" />
-                    )}
-                    {t('sql.confirmAndRun')}
-                  </Button>
+            {showSqlEditor && (
+              <Expander title={t('sql.title')} defaultOpen>
+                <div className="flex flex-col gap-2">
+                  <p className="text-xs text-[var(--muted-foreground)]">{t('sql.hint')}</p>
+                  <SqlEditor value={entry.editableSql} onChange={(sql) => setEditableSql(entry.entryId, sql)} />
+                  {state.cost_notice && entry.editableSql === state.sql && (
+                    <p className="text-xs text-[var(--warning)]">{state.cost_notice}</p>
+                  )}
+                  <div>
+                    <Button
+                      variant="primary"
+                      onClick={() => void confirmAndRun(entry.entryId)}
+                      disabled={isConfirming}
+                    >
+                      {isConfirming ? (
+                        <Loader2 className="h-4 w-4 animate-spin" />
+                      ) : (
+                        <Play className="h-4 w-4" />
+                      )}
+                      {t('sql.confirmAndRun')}
+                    </Button>
+                  </div>
                 </div>
-              </div>
-            </Expander>
+              </Expander>
+            )}
 
             {entry.confirmedError && (
               <p className="rounded-md border border-[var(--danger)]/30 bg-[var(--danger)]/10 p-3 text-sm text-[var(--danger)]">

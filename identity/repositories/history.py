@@ -253,6 +253,37 @@ def append_turn(
     return prompt, ai_output
 
 
+def get_ai_output(
+    session: Session, *, ai_output_id: uuid.UUID, user_id: uuid.UUID
+) -> AiOutput | None:
+    """Ownership-scoped lookup of one assistant message row, by its own
+    `user_id` column (set once, at `append_turn` time, to the same caller
+    that owns the conversation) -- same "the row simply doesn't match a
+    forged/wrong id" shape as `get_conversation`'s own docstring describes,
+    applied one level down. Used by `api.chat_persistence
+    .persist_execute_result` to attach a confirmed "Confirm and Run" result
+    to the exact turn it belongs to, without ever trusting a client-supplied
+    id past this check."""
+    return session.scalar(
+        select(AiOutput).where(AiOutput.id == ai_output_id, AiOutput.user_id == user_id)
+    )
+
+
+def update_ai_output_metadata(session: Session, *, ai_output: AiOutput, metadata: dict) -> AiOutput:
+    """Replaces an assistant message's stored `metadata_json` wholesale --
+    the caller (`api.chat_persistence.persist_execute_result`) is expected
+    to have already merged in whatever it wants to keep from the existing
+    value, since this does not itself merge. Only ever called after
+    `get_ai_output`'s own ownership check has already succeeded -- like
+    `soft_delete_conversation`, this does not re-check ownership itself, by
+    design (a private, already-loaded-and-verified `AiOutput` row, not a
+    raw id)."""
+    ai_output.metadata_json = metadata
+    session.commit()
+    session.refresh(ai_output)
+    return ai_output
+
+
 def append_single_message(
     session: Session, *, conversation: Conversation, user_id: uuid.UUID, role: str, content: str
 ) -> Prompt | AiOutput:

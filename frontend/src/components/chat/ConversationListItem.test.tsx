@@ -9,8 +9,10 @@ function makeConversation(overrides: Partial<ConversationSummary> = {}): Convers
   const finalState: AskResponse = {
     session_id: 's1',
     conversation_id: 'c1',
+    message_id: null,
     status: 'succeeded',
     database: 'default',
+    model: 'llama3.1:8b',
     sql: 'SELECT 1',
     result_columns: ['n'],
     result_rows: [[1]],

@@ -43,6 +43,7 @@ import {
 } from '@/lib/identityApi'
 import type { AskResponse } from '@/lib/types'
 import { useLocalAuthStore } from './localAuthStore'
+import { useSettingsStore } from './settingsStore'
 
 /** The question currently in flight -- rendered by
  * `components/chat/PendingTurn.tsx` as the next item in the normal
@@ -219,8 +220,10 @@ function emptyAskResponse(message: string): AskResponse {
   return {
     session_id: '',
     conversation_id: null,
+    message_id: null,
     status: 'failed',
     database: null,
+    model: null,
     sql: null,
     result_columns: null,
     result_rows: null,
@@ -384,6 +387,12 @@ export const useChatStore = create<ChatState>((set, get) => ({
             enable_insight: enableInsight,
             conversation_id: knownServerConversationId,
             attachment_ids: attachmentIds,
+            // A cross-store read (not a hook, since this runs outside React
+            // render) -- see useSettingsStore.selectedModel's own docstring.
+            // null/undefined both mean "use the server default," so this is
+            // always safe to include even when the user never opened the
+            // model picker.
+            model: useSettingsStore.getState().selectedModel,
           },
           controller.signal,
         ))
@@ -472,7 +481,18 @@ export const useChatStore = create<ChatState>((set, get) => ({
     set({ confirmingEntryId: entryId })
     const startedAt = performance.now()
     try {
-      const response = await executeSql({ sql: entry.editableSql, database: entry.finalState.database })
+      const response = await executeSql({
+        sql: entry.editableSql,
+        database: entry.finalState.database,
+        // When set (a locally-authenticated caller whose /ask turn was
+        // persisted), lets the server attach this confirmed result to the
+        // exact saved turn it belongs to -- see
+        // api/chat_persistence.py::persist_execute_result. Omitted (both
+        // null) for every other auth mode, or a turn that was never
+        // persisted; execution itself is completely unaffected either way.
+        conversation_id: entry.finalState.conversation_id,
+        message_id: entry.finalState.message_id,
+      })
       const durationMs = performance.now() - startedAt
       const updated =
         response.status === 'succeeded'

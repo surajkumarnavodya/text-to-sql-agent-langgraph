@@ -15,6 +15,11 @@ const SOURCE_CHIP_LABELS: Record<string, string> = {
   generation: 'Generated Media',
   media_search: 'Media Library',
   attachments: 'Attached Files',
+  // A conversation turn saved before per-source metadata existed (see
+  // frontend/src/lib/history.ts::askResponseFromPersistedMessage's own
+  // "legacy record without recoverable structure" case) -- the answer text
+  // itself was always preserved, only which source(s) produced it wasn't.
+  legacy: 'Saved answer',
 }
 
 /** Shows which source(s) contributed, and either the synthesized combined

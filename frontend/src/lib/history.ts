@@ -6,8 +6,26 @@ import type {
   ConversationExchange,
   MediaGenerationResult,
   ServerMessage,
+  ServerMessageMetadata,
 } from './types'
 import type { ChartOptions } from './chartEngine'
+
+/** Whether a turn's `sources_used` reads as the plain SQL pipeline (the
+ * multi-source router off, or a real SQL-path answer even when the router
+ * is on) -- `TurnCard.tsx`'s single gate for showing schema/plan/SQL-editor
+ * UI at all. An **empty** array is this app's own established "router off"
+ * convention (`AskResponse.sources_used`'s own docstring), not "unknown" --
+ * it must never be conflated with a reconstructed history entry that simply
+ * failed to record its real sources; see
+ * `askResponseFromPersistedMessage` below for why that distinction is what
+ * the reload bug (an empty SQL editor showing for a non-SQL saved answer)
+ * actually traced back to. Kept in this module (not `TurnCard.tsx`) so it's
+ * plain, non-component logic -- both for direct unit testing and so
+ * exporting it doesn't trip the "a component file should only export
+ * components" Fast Refresh lint rule. */
+export function isSqlResult(sourcesUsed: string[]): boolean {
+  return sourcesUsed.length === 0 || sourcesUsed.includes('sql')
+}
 
 /** A read-only snapshot of one file attached to a sent question, taken at
  * submit time (`ChatInput.tsx`'s `submit()`) so the question's own chat
@@ -113,16 +131,133 @@ export interface ConversationSummary {
   messagesLoaded?: boolean
 }
 
+/** Reconstructs the reloaded turn's `AskResponse` from a persisted
+ * assistant row's metadata (see `api.chat_persistence._build_history_metadata`)
+ * -- the one place a saved conversation's fields are mapped back into the
+ * exact shape every live-rendering component (`TurnCard.tsx`,
+ * `SourcesUsedPanel.tsx`, `ChartSection.tsx`, ...) already knows how to
+ * render, so there is no second, reload-only rendering path to keep in
+ * sync with the live one.
+ *
+ * Three cases, most-informative first:
+ * 1. **Rich record** (`metadata.schema_version` present, every turn saved
+ *    since this reconstruction was fixed): every field below is read
+ *    straight from `metadata` -- `sources_used` is the *real* value the
+ *    turn actually produced, which is what makes `TurnCard.tsx`'s
+ *    `isSqlResult` check behave identically for a reloaded turn as it did
+ *    live (a web/document/policy/attachment-only turn correctly never
+ *    shows the SQL editor; a genuine SQL-path turn does).
+ * 2. **Legacy record with SQL** (`metadata` exists, no `schema_version`,
+ *    but `metadata.sql` is set -- every row persisted before this feature
+ *    shipped, for a turn that produced SQL): `sources_used` stays `[]`
+ *    (this app's own "empty means SQL path" convention), preserving the
+ *    one part of the old behavior that already worked -- the SQL text
+ *    itself shows, pre-filled, ready to confirm.
+ * 3. **Legacy record without recoverable structure** (`metadata` missing
+ *    entirely, or present with no `schema_version` and no `sql`): the
+ *    per-source shape genuinely cannot be recovered, so this never
+ *    guesses one. `assistantRow.content` -- always saved, regardless of
+ *    route, even before this fix -- is instead surfaced via a synthetic
+ *    `'legacy'` source marker, which `SourcesUsedPanel.tsx` renders like
+ *    any other synthesized answer. This is strictly better than the
+ *    pre-fix behavior (no answer shown at all) and never worse -- see
+ *    `docs/chat-history-architecture.md`'s "Known limitations" for the
+ *    honest disclosure that a legacy record's true source/citations/chart
+ *    are not recoverable.
+ */
+function askResponseFromPersistedMessage(
+  userRow: ServerMessage,
+  assistantRow: ServerMessage | undefined,
+): { response: AskResponse; sql: string | null; resultSnapshot: ServerMessageMetadata['result_snapshot'] } {
+  const metadata: ServerMessageMetadata | null = assistantRow?.metadata ?? null
+  const isRich = metadata?.schema_version != null
+  const succeeded = assistantRow ? assistantRow.status !== 'failed' : false
+  const status: AgentStatus = assistantRow
+    ? (metadata?.status ?? (succeeded ? 'succeeded' : 'failed'))
+    : 'pending'
+
+  const legacySql = !isRich ? (metadata?.sql ?? null) : null
+  // True for a genuinely legacy assistant row (created before this
+  // metadata shape existed) with no SQL to fall back to either -- whether
+  // that row has `metadata: null` (no metadata was ever stored, e.g. a
+  // plain "chat_answer" output) or a metadata object simply missing
+  // `schema_version`/`sql` makes no practical difference here: neither
+  // case has a recoverable per-source structure.
+  const isLegacyWithoutStructure = assistantRow != null && !isRich && !legacySql
+
+  let sourcesUsed: string[]
+  let synthesizedAnswer: string | null
+  if (isRich) {
+    sourcesUsed = metadata?.sources_used ?? []
+    synthesizedAnswer = metadata?.synthesized_answer ?? (succeeded ? (assistantRow?.content ?? null) : null)
+  } else if (isLegacyWithoutStructure && succeeded) {
+    // See this function's own doc comment, case 3.
+    sourcesUsed = ['legacy']
+    synthesizedAnswer = assistantRow?.content ?? null
+  } else {
+    sourcesUsed = []
+    synthesizedAnswer = null
+  }
+
+  const sql = isRich ? (metadata?.sql ?? null) : legacySql
+  const resultSnapshot = isRich ? (metadata?.result_snapshot ?? null) : null
+
+  const response: AskResponse = {
+    session_id: '',
+    conversation_id: userRow.conversation_id,
+    message_id: assistantRow?.id ?? null,
+    status,
+    database: metadata?.database ?? null,
+    model: metadata?.model ?? null,
+    sql,
+    result_columns: null,
+    result_rows: null,
+    row_count: metadata?.row_count ?? null,
+    retry_count: metadata?.retry_count ?? 0,
+    attempt_history: [],
+    insight: metadata?.insight ?? null,
+    cost_notice: metadata?.cost_notice ?? null,
+    low_confidence_notice: metadata?.low_confidence_notice ?? null,
+    rejection_reason: metadata?.rejection_reason ?? null,
+    rejection_message: metadata?.rejection_message ?? null,
+    rate_limit_message: metadata?.rate_limit_message ?? null,
+    clarification_message: metadata?.clarification_message ?? null,
+    failure_explanation:
+      metadata?.failure_explanation ?? (succeeded ? null : (assistantRow?.content ?? null)),
+    error_history: [],
+    sources_used: sourcesUsed,
+    synthesized_answer: synthesizedAnswer,
+    document_result: metadata?.document_result ?? null,
+    policy_result: metadata?.policy_result ?? null,
+    web_result: metadata?.web_result ?? null,
+    generation_result: metadata?.generation_result ?? null,
+    media_search_result: metadata?.media_search_result ?? null,
+    attachment_result: metadata?.attachment_result ?? null,
+    query_plan: metadata?.query_plan ?? null,
+    schema_tables: (metadata?.schema_tables ?? []).map((table) => ({
+      table_name: table.table_name,
+      // DDL is deliberately not persisted (see _build_history_metadata's
+      // own docstring) -- an empty string here, never fabricated content.
+      ddl: '',
+      similarity_score: table.similarity_score,
+    })),
+    followup_classification: null,
+    followup_resolved_against: null,
+    permission_denied_notice: metadata?.permission_denied_notice ?? null,
+  }
+  return { response, sql, resultSnapshot }
+}
+
 /** Turns a server-backed conversation's raw message rows
  * (`GET /conversations/{id}/messages`) into the same `QueryHistoryEntry`
  * shape a live, in-session turn produces -- so `TurnCard.tsx` and friends
  * render a reloaded-from-another-device conversation identically to one
- * asked in the current tab, with one honest exception: a reloaded turn
- * only has whatever this app chose to persist (the answer text, and the
- * SQL if the turn produced one, via `metadata.sql`) -- not the full
- * `AskResponse` (charts, per-source citations, schema DDL shown, ...),
- * since that was never durably stored. See `docs/chat-history-architecture.md`'s
- * "Known limitations" for the full disclosure.
+ * asked in the current tab. Never executes SQL, calls a model, fetches a
+ * URL, or performs OCR -- every field below comes from what was already
+ * persisted (see `askResponseFromPersistedMessage` above); a turn whose SQL
+ * was confirmed-and-run in its original session shows those exact rows/
+ * chart again immediately, via `metadata.result_snapshot`, without the user
+ * needing to click "Confirm and Run" a second time.
  *
  * Pairs consecutive `user`/`assistant` rows by `sequence_number` (assigned
  * server-side by `identity.repositories.history.append_turn`, always
@@ -141,71 +276,45 @@ export function serverMessagesToQueryHistory(rows: ServerMessage[]): QueryHistor
       continue
     }
     const assistantRow = sorted[index + 1]?.role === 'assistant' ? sorted[index + 1] : undefined
-    const sql = assistantRow?.metadata?.sql ?? null
-    const succeeded = assistantRow ? assistantRow.status !== 'failed' : false
-    const finalState: AskResponse = {
-      session_id: '',
-      conversation_id: userRow.conversation_id,
-      status: assistantRow ? (succeeded ? 'succeeded' : 'failed') : 'pending',
-      database: null,
-      sql,
-      result_columns: null,
-      result_rows: null,
-      row_count: null,
-      retry_count: 0,
-      attempt_history: [],
-      insight: null,
-      cost_notice: null,
-      low_confidence_notice: null,
-      rejection_reason: null,
-      rejection_message: null,
-      rate_limit_message: null,
-      clarification_message: null,
-      failure_explanation: succeeded ? null : (assistantRow?.content ?? null),
-      error_history: [],
-      sources_used: [],
-      synthesized_answer: succeeded ? (assistantRow?.content ?? null) : null,
-      document_result: null,
-      policy_result: null,
-      web_result: null,
-      generation_result: null,
-      media_search_result: null,
-      attachment_result: null,
-      query_plan: null,
-      schema_tables: [],
-      followup_classification: null,
-      followup_resolved_against: null,
-      permission_denied_notice: null,
-    }
+    const { response: finalState, sql, resultSnapshot } = askResponseFromPersistedMessage(
+      userRow,
+      assistantRow,
+    )
+    const attachmentRefs = assistantRow?.metadata?.attachment_refs ?? []
     entries.push({
       entryId: userRow.id,
       question: userRow.content,
       sql,
       agentStatus: finalState.status,
-      retryCount: 0,
-      rowCount: null,
-      tables: [],
+      retryCount: finalState.retry_count,
+      rowCount: finalState.row_count,
+      tables: finalState.schema_tables.map((table) => table.table_name),
       timestamp: userRow.created_at,
       finalState,
       answerDurationMs: 0,
-      editableSql: sql ?? '',
-      confirmedColumns: null,
-      confirmedRows: null,
+      editableSql: resultSnapshot?.normalized_sql ?? sql ?? '',
+      confirmedColumns: resultSnapshot?.columns ?? null,
+      confirmedRows: resultSnapshot?.rows ?? null,
       confirmedError: null,
-      confirmedSql: null,
-      confirmedColumnTypes: null,
-      confirmedChartRecommendation: null,
-      confirmedTruncated: false,
-      confirmedDurationMs: null,
+      confirmedSql: resultSnapshot ? (resultSnapshot.normalized_sql ?? sql) : null,
+      confirmedColumnTypes: resultSnapshot?.column_types ?? null,
+      confirmedChartRecommendation: resultSnapshot?.chart_recommendation ?? null,
+      confirmedTruncated: resultSnapshot?.truncated ?? false,
+      confirmedDurationMs: resultSnapshot?.duration_ms ?? null,
       chartOptions: null,
       originatedFromVoice: false,
       spokenAudioUrl: null,
-      // A reloaded past turn isn't a byte-for-byte reconstruction of a live
-      // one -- charts/citations/schema DDL aren't restored either (see
-      // docs/chat-history-architecture.md's own "Known limitations").
-      // Nothing server-side stores which files a past question was sent
-      // with, so this stays empty rather than guessing.
-      sentAttachments: [],
+      // Restores which files this question was sent with, from the
+      // filename/media-type snapshot taken at persist time (see
+      // api/chat_persistence.py::_attachment_refs_snapshot) -- never a
+      // preview image or document bytes, since the original attachment may
+      // since have been evicted from the ephemeral, process-lifetime
+      // attachment store; the chip still shows honestly (filename only).
+      sentAttachments: attachmentRefs.map((ref) => ({
+        filename: ref.filename,
+        kind: ref.media_type.startsWith('image/') ? 'image' : 'document',
+        previewUrl: null,
+      })),
     })
     index += assistantRow ? 2 : 1
   }

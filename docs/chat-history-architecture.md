@@ -52,7 +52,7 @@ just duplicate their shape.
 | `status` | `AiOutput.status` (`"completed"`/`"failed"`/...); always `"completed"` for a user row | |
 | `model_name` | `AiOutput.model_name` | |
 | `error_code` | `AiOutput.error_code` | |
-| `metadata` | `AiOutput.metadata_json` (e.g. `{"sql": "..."}"`) | Lets a reloaded turn show its SQL again |
+| `metadata` | `AiOutput.metadata_json` — see "Universal conversation history" below | The full, bounded, versioned per-turn snapshot a reload is reconstructed from |
 
 **Deterministic ordering**: `sequence_number` (new column on both
 `prompts` and `ai_outputs`) is assigned once, inside
@@ -190,19 +190,77 @@ isn't configured at all.
   `deleted_at`/`created_at` against a configured TTL) rather than assumed
   to exist.
 
+## 6.5. Universal conversation history (2026-09-27)
+
+Closes the limitation this section used to describe (reproduced below,
+struck through, for anyone who read the earlier version): reopening a
+saved conversation could show no assistant answer, an empty SQL editor
+with "Confirm and Run", or `[object Object]` — traced to `api/
+chat_persistence.py` only ever persisting `{"sql": "..."}"` (or nothing)
+regardless of which source(s) actually answered, and the frontend
+reconstruction (`frontend/src/lib/history.ts::serverMessagesToQueryHistory`)
+fabricating a hardcoded `sources_used: []` for every reloaded turn, which
+`TurnCard.tsx`'s own "empty means the SQL path" convention then
+misinterpreted for every non-SQL saved answer.
+
+`api/chat_persistence.py::_build_history_metadata` now snapshots a bounded,
+redacted superset of the already-computed `AskResponse` into the exact same
+`AiOutput.metadata_json` column — **no migration was needed**: it was
+already an arbitrary-shape JSONB (JSON on SQLite) column with no fixed
+schema (see `identity/models.py`'s own docstring), so a richer payload is a
+pure application-layer change. A `schema_version` field (currently `2`)
+lets the frontend tell a rich record from a pre-this-feature `{"sql": ...}`
+-or-nothing legacy one and degrade gracefully rather than guess:
+
+- **Real `sources_used`, `database`, `model`, `query_plan`, and a bounded
+  `schema_tables` list** (table name + similarity score; DDL is dropped to
+  keep stored size down) are persisted, so a reloaded document/policy/web/
+  attachment/generation/media-search/mixed-source turn renders through the
+  exact same `SourcesUsedPanel.tsx` a live turn uses — never the SQL panel.
+- **`document_result`/`policy_result`/`web_result`/`generation_result`/
+  `media_search_result`/`attachment_result`** are persisted verbatim
+  (answer text bounded to `Settings.chat_history_max_text_chars`,
+  citations kept as-is) — a reloaded multi-source answer shows every
+  source that actually contributed, correctly labeled, not just plain text.
+- **`persist_execute_result`** (new) updates an already-persisted turn's
+  metadata with a bounded `result_snapshot` (rows capped at `Settings
+  .chat_history_max_result_rows`, plus column types/chart recommendation/
+  the actually-executed SQL/duration) once `POST /execute` succeeds for a
+  turn whose `message_id` (a new `AskResponse` field, the persisted
+  `AiOutput.id`) is known. Reopening a conversation whose SQL was already
+  confirmed-and-run shows those exact rows and chart immediately — **the
+  SQL is never re-executed just because a conversation was reopened**;
+  `POST /execute` is the only thing that ever runs it, exactly as before.
+- **Attachment references** (`attachment_refs`: id/filename/media-type,
+  best-effort — see below) let a reloaded turn show which files were sent,
+  without ever fabricating a preview for one that's since been evicted
+  from the ephemeral, process-lifetime `AttachmentStore`.
+- **Legacy records degrade gracefully, never inventing an answer**: a
+  pre-this-feature row with `metadata: {"sql": "..."}"` still shows that
+  SQL (the one part of the old behavior that already worked); a row with
+  no recoverable structure at all falls back to its always-preserved
+  `content` text, surfaced via a synthetic `'legacy'` source marker rather
+  than showing nothing or an empty SQL editor.
+- A separate, unrelated frontend bug (`frontend/src/lib/api.ts`'s
+  `request()`) was fixed alongside this: a FastAPI 422 validation error's
+  `detail` is an *array* of Pydantic error objects, not a string — naively
+  assigning it as an `Error`'s message rendered as the literal text
+  `[object Object]` wherever it was later displayed. `normalizeErrorDetail`
+  now handles a string, an array of `{msg: ...}` objects, or any other
+  shape safely.
+
+~~**A reloaded past turn is not a byte-for-byte reconstruction of a live
+one.** Only the answer text and, if the turn produced SQL, that SQL
+(`AiOutput.metadata_json`) are persisted — not the full `AskResponse`
+(charts, per-source citations for a multi-source answer, the exact
+retrieved schema DDL, the query plan).~~ — superseded above. One honest
+remaining gap: the retrieved schema's *DDL* itself (not just table names)
+and a chart's own free-text customization (title/axis labels, entered
+client-side, never sent to the backend) are still not restored on reload —
+disclosed, not silently dropped.
+
 ## 7. Known limitations
 
-- **A reloaded past turn is not a byte-for-byte reconstruction of a live
-  one.** Only the answer text and, if the turn produced SQL, that SQL
-  (`AiOutput.metadata_json`) are persisted — not the full `AskResponse`
-  (charts, per-source citations for a multi-source answer, the exact
-  retrieved schema DDL, the query plan). A conversation reopened from
-  another device shows the right questions and answers, with SQL where
-  applicable, but not the original rich result table/chart. Persisting
-  the complete `AskResponse` JSON per turn is a reasonable follow-up,
-  deliberately not attempted in this pass to keep the stored schema
-  close to what `identity/models.py` already defined rather than
-  widening it further.
 - **Only local accounts get server-side history** — see
   `docs/chat-history-authentication-audit.md` §7.
 - **No conversation-restore or permanent-purge UI** — soft-delete only,

@@ -30,8 +30,10 @@ function makeFinalState(): AskResponse {
   return {
     session_id: 's1',
     conversation_id: 'c1',
+    message_id: null,
     status: 'succeeded',
     database: 'default',
+    model: 'llama3.1:8b',
     sql: 'SELECT 1',
     result_columns: null,
     result_rows: null,

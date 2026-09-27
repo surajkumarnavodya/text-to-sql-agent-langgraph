@@ -28,8 +28,10 @@ function makeAskResponse(overrides: Partial<AskResponse> = {}): AskResponse {
   return {
     session_id: 's1',
     conversation_id: null,
+    message_id: null,
     status: 'succeeded',
     database: 'default',
+    model: 'llama3.1:8b',
     sql: null,
     result_columns: null,
     result_rows: null,

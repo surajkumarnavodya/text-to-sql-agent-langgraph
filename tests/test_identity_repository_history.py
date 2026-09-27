@@ -13,11 +13,13 @@ from identity.repositories.history import (
     append_single_message,
     append_turn,
     create_conversation,
+    get_ai_output,
     get_conversation,
     list_conversations,
     list_messages,
     search_history,
     soft_delete_conversation,
+    update_ai_output_metadata,
     update_conversation,
 )
 from sqlalchemy import create_engine
@@ -241,6 +243,62 @@ class TestAppendTurnAndMessageOrdering:
             db_session, conversation=conversation, user_id=user.id, role="user", content="Q2 manual"
         )
         assert extra.sequence_number == 3  # after prompt(1)/ai_output(2) from the first turn
+
+
+class TestGetAndUpdateAiOutput:
+    """Universal conversation history (2026-09-27): `get_ai_output`/
+    `update_ai_output_metadata` back `api.chat_persistence
+    .persist_execute_result` -- the "attach a confirmed Confirm-and-Run
+    result to the exact turn it belongs to" write path."""
+
+    def test_get_returns_the_owned_output(self, db_session: Session):
+        user = _make_user(db_session)
+        conversation = create_conversation(db_session, user_id=user.id)
+        _, ai_output = append_turn(
+            db_session, conversation=conversation, user_id=user.id, question="Q", answer_text="A"
+        )
+        fetched = get_ai_output(db_session, ai_output_id=ai_output.id, user_id=user.id)
+        assert fetched is not None
+        assert fetched.id == ai_output.id
+
+    def test_get_returns_none_for_wrong_user(self, db_session: Session):
+        owner = _make_user(db_session, "owner@example.com")
+        stranger = _make_user(db_session, "stranger@example.com")
+        conversation = create_conversation(db_session, user_id=owner.id)
+        _, ai_output = append_turn(
+            db_session, conversation=conversation, user_id=owner.id, question="Q", answer_text="A"
+        )
+        assert get_ai_output(db_session, ai_output_id=ai_output.id, user_id=stranger.id) is None
+
+    def test_get_returns_none_for_unknown_id(self, db_session: Session):
+        user = _make_user(db_session)
+        assert get_ai_output(db_session, ai_output_id=uuid.uuid4(), user_id=user.id) is None
+
+    def test_update_replaces_metadata_and_persists(self, db_session: Session):
+        user = _make_user(db_session)
+        conversation = create_conversation(db_session, user_id=user.id)
+        _, ai_output = append_turn(
+            db_session,
+            conversation=conversation,
+            user_id=user.id,
+            question="Q",
+            answer_text="A",
+            output_metadata={"schema_version": 2, "sql": "SELECT 1"},
+        )
+        updated = update_ai_output_metadata(
+            db_session,
+            ai_output=ai_output,
+            metadata={
+                "schema_version": 2,
+                "sql": "SELECT 1",
+                "result_snapshot": {"columns": ["x"]},
+            },
+        )
+        assert updated.metadata_json["result_snapshot"] == {"columns": ["x"]}
+
+        refetched = get_ai_output(db_session, ai_output_id=ai_output.id, user_id=user.id)
+        assert refetched is not None
+        assert refetched.metadata_json["result_snapshot"] == {"columns": ["x"]}
 
 
 class TestSearchHistory:
