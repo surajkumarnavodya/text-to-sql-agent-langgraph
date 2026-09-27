@@ -24,7 +24,7 @@ router = APIRouter()
 def search_media_endpoint(
     payload: MediaSearchRequest,
     request: Request,
-    _identity=Depends(require_permission(Permission.MEDIA_SEARCH)),
+    identity=Depends(require_permission(Permission.MEDIA_SEARCH)),
 ) -> MediaSearchResultOut:
     """Searches the media library directly for `payload.query`, restricted
     to `payload.media_type` if given. 404 when `Settings.enable_media_search`
@@ -35,7 +35,7 @@ def search_media_endpoint(
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail="Media search is not enabled."
         )
-    enforce_api_action_rate_limit(request, "media_search", settings)
+    enforce_api_action_rate_limit(request, "media_search", settings, identity=identity)
 
     hits = search_media(payload.query, settings, media_type=payload.media_type)
     return MediaSearchResultOut(

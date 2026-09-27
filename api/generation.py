@@ -29,7 +29,7 @@ router = APIRouter()
 def confirm_generation(
     payload: GenerateConfirmRequest,
     request: Request,
-    _identity=Depends(require_permission(Permission.MEDIA_GENERATE)),
+    identity=Depends(require_permission(Permission.MEDIA_GENERATE)),
 ) -> MediaGenerationResultOut:
     """The human-approval confirmation step for media generation.
 
@@ -45,7 +45,7 @@ def confirm_generation(
     this one bounds how often *this caller* can even attempt a confirm.
     """
     settings = get_settings()
-    enforce_api_action_rate_limit(request, "generate_confirm", settings)
+    enforce_api_action_rate_limit(request, "generate_confirm", settings, identity=identity)
     kind = infer_media_kind(payload.question)
     result = execute_generation(payload.question, kind, settings)
     return MediaGenerationResultOut(

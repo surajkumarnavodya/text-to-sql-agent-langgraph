@@ -116,7 +116,7 @@ async def upload_document(
     non-PDF content after the fact.
     """
     settings = get_settings()
-    enforce_api_action_rate_limit(request, "document_upload", settings)
+    enforce_api_action_rate_limit(request, "document_upload", settings, identity=identity)
     _require_collection_configured(collection)
 
     max_bytes = settings.max_document_upload_mb * 1024 * 1024
@@ -169,7 +169,7 @@ async def upload_document(
 def delete_document_route(
     document_id: str,
     request: Request,
-    _identity=Depends(require_permission(Permission.DOCUMENTS_DELETE)),
+    identity=Depends(require_permission(Permission.DOCUMENTS_DELETE)),
 ) -> None:
     """Deletes a document and its chunks -- mirrors the management page's
     unconditional delete button (this page's admin surface is already
@@ -178,7 +178,7 @@ def delete_document_route(
     (`enforce_api_action_rate_limit`) -- an irreversible, previously-
     unrated action."""
     settings = get_settings()
-    enforce_api_action_rate_limit(request, "document_delete", settings)
+    enforce_api_action_rate_limit(request, "document_delete", settings, identity=identity)
     try:
         engine = get_rag_engine(settings)
     except RagStoreNotConfiguredError as exc:

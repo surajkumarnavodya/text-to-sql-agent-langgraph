@@ -71,6 +71,35 @@ def client() -> TestClient:
     return TestClient(api_main.app)
 
 
+class TestLive:
+    """`GET /live` -- enterprise scalability assessment (2026-09-27): a
+    liveness probe distinct from `/health`'s real dependency checks, so a
+    frequent orchestrator liveness poll never touches the database/Chroma/
+    Ollama at all. (The app-wide `_add_security_headers` middleware does
+    call the cheap, `lru_cache`d `get_settings()` for every response
+    including this one, same as it does for every other route -- that's an
+    intentional, negligible-cost exception, not something this endpoint's
+    own handler does.)"""
+
+    def test_returns_200_with_no_dependency_mocks_at_all(self, client):
+        """No monkeypatching of test_connection/Ollama/Chroma anywhere in
+        this test -- if /live touched either, this would fail or hang
+        against whatever real (or absent) config the test process happens
+        to have, which is exactly what this test is designed to catch."""
+        response = client.get("/live")
+        assert response.status_code == 200
+        assert response.json() == {"status": "alive"}
+
+    def test_never_calls_test_connection_or_ollama(self, monkeypatch, client):
+        def _fail_if_called(*args, **kwargs):
+            raise AssertionError("/live must never touch the database or Ollama")
+
+        monkeypatch.setattr("api.main.test_connection", _fail_if_called)
+        monkeypatch.setattr("api.main.get_ollama_client", _fail_if_called)
+        response = client.get("/live")
+        assert response.status_code == 200
+
+
 class TestHealth:
     def test_all_components_reachable_returns_200_ok(self, monkeypatch, client):
         monkeypatch.setattr(
@@ -186,7 +215,7 @@ class TestHealthVisionDiagnostics:
     """A real, reported bug this closes: there was previously no way to
     tell "vision was never configured" from "configured but the model was
     never actually pulled" until a user's image question failed at answer
-    time. See api.main._pulled_ollama_model_names's own docstring."""
+    time. See agent.model_registry.installed_model_names's own docstring."""
 
     def _mock_db_and_chroma(self, monkeypatch):
         monkeypatch.setattr(

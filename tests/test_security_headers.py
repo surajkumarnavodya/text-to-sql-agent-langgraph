@@ -87,14 +87,18 @@ class TestSecurityHeadersPresentByDefault:
 
 class TestSecurityHeadersConfigurable:
     def test_disabled_via_settings_omits_all_headers(self, client):
-        with patch("api.main.get_settings", return_value=_settings_with(enable_security_headers=False)):
+        with patch(
+            "api.main.get_settings", return_value=_settings_with(enable_security_headers=False)
+        ):
             response = client.get("/health")
         assert "Content-Security-Policy" not in response.headers
         assert "X-Frame-Options" not in response.headers
         assert "Strict-Transport-Security" not in response.headers
 
     def test_empty_csp_override_omits_only_csp(self, client):
-        with patch("api.main.get_settings", return_value=_settings_with(content_security_policy="")):
+        with patch(
+            "api.main.get_settings", return_value=_settings_with(content_security_policy="")
+        ):
             response = client.get("/health")
         assert "Content-Security-Policy" not in response.headers
         # The other headers are independent of the CSP override.
@@ -102,7 +106,9 @@ class TestSecurityHeadersConfigurable:
 
     def test_custom_csp_override_is_used_verbatim(self, client):
         custom = "default-src 'none'"
-        with patch("api.main.get_settings", return_value=_settings_with(content_security_policy=custom)):
+        with patch(
+            "api.main.get_settings", return_value=_settings_with(content_security_policy=custom)
+        ):
             response = client.get("/health")
         assert response.headers.get("Content-Security-Policy") == custom
 
@@ -151,3 +157,26 @@ class TestCorsWildcardRejected:
     def test_empty_origins_is_accepted(self):
         settings = _settings_with(cors_allowed_origins=())
         assert settings.cors_allowed_origins == ()
+
+    def test_real_env_var_is_parsed_as_a_comma_separated_list(self, monkeypatch):
+        """Regression test: a real `CORS_ALLOWED_ORIGINS` environment
+        variable (not a direct `Settings(cors_allowed_origins=(...))`
+        kwarg, which every other test in this class uses) used to raise
+        `pydantic_settings.exceptions.SettingsError` before
+        `_split_cors_origins` ever ran, since pydantic-settings' own
+        env-source decoding for a tuple-typed field happens before field
+        validators -- found and fixed (via the `NoDecode` annotation)
+        while building `Settings.ollama_allowed_models` against this exact
+        same comma-separated-string convention."""
+        from config.settings import get_settings
+
+        monkeypatch.setenv("CORS_ALLOWED_ORIGINS", "http://localhost:5173,http://localhost:3000")
+        get_settings.cache_clear()
+        try:
+            settings = get_settings()
+            assert settings.cors_allowed_origins == (
+                "http://localhost:5173",
+                "http://localhost:3000",
+            )
+        finally:
+            get_settings.cache_clear()

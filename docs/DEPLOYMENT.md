@@ -153,6 +153,16 @@ bare-metal install:
 Set `ENABLE_VOICE_MODE=false` if you'd rather not carry either dependency
 in a deployment that has no use for spoken input/output.
 
+## AI-guided image editing (optional, off by default)
+
+`ENABLE_IMAGE_EDITING` shares the exact same outbound-network/secret
+consideration as `ENABLE_MEDIA_GENERATION` just below — real, metered
+HTTPS calls to IMA Studio, gated behind the same `IMA_API_KEY`. No
+separate Docker/volume concern beyond that: a generated edit is stored as
+a normal attachment (`ATTACHMENT_STORAGE_DIR` — see
+[`docs/CONFIGURATION.md`](CONFIGURATION.md)'s "Chat attachments" section),
+not a separate cache.
+
 ## Media generation (optional, off by default)
 
 Turning on `ENABLE_MEDIA_GENERATION` means the container makes outbound
@@ -215,6 +225,23 @@ Ollama running on the host" above already covers, just an additional
   ([`docs/API.md`](API.md)), which actually verifies the database, Ollama,
   and the Chroma index are all reachable — a real dependency check, not
   just "the process is running."
+- **`GET /live`** (enterprise scalability assessment, 2026-09-27) is a
+  separate, near-zero-cost liveness probe that never touches the database,
+  Chroma, or Ollama — just "is this process able to answer HTTP at all."
+  If you move to an orchestrator that distinguishes liveness from readiness
+  (Kubernetes, ECS, Nomad), point the frequently-polled *liveness* probe at
+  `/live` and the less-frequent *readiness*/startup probe at `/health` —
+  polling `/health` at liveness-probe frequency across many replicas would
+  otherwise turn health-checking itself into real, avoidable DB/Chroma/
+  Ollama load. `docker-compose.yml`'s own healthcheck stays on `/health`
+  (Compose has no separate liveness/readiness concept, and its 30s interval
+  is infrequent enough not to matter).
+- **Graceful shutdown**: on `SIGTERM`, the API drains its bounded `/ask`
+  thread pool (waits for in-flight requests to finish rather than
+  abandoning them) before the process exits. Set your orchestrator's
+  termination grace period comfortably above `REQUEST_TIMEOUT_SECONDS`
+  (default 600s) so a slow in-flight request isn't killed mid-shutdown
+  anyway — a grace period shorter than that defeats the point of draining.
 
 ## Reverse proxy and auth
 
@@ -228,6 +255,17 @@ The service needs no code to know this exists; point the proxy at
 `API_AUTH_TOKEN` shared-secret check can layer underneath this (defense in
 depth) but should never be the *only* layer for anything but a single
 trusted caller.
+
+**Once you put a reverse proxy/load balancer in front of this app, also
+set `TRUSTED_PROXY_COUNT`** (default `0`) to the exact number of proxy
+hops between the internet and this process — usually `1`. Without this,
+every rate limiter and audit-log entry keyed by client IP
+(`security/client_ip.py`) sees only the proxy's own address for every
+caller, collapsing every distinct user into one shared rate-limit bucket —
+a real availability problem (innocent users rate-limited together), not
+just an inaccuracy. This is deliberately opt-in and an *exact hop count*,
+never "trust the header if present" — a misconfigured count fails closed
+to the direct TCP peer rather than trusting a client-suppliable header.
 
 `docker-compose.yml`'s port mapping is bound to `127.0.0.1` by default
 (`${API_BIND_HOST:-127.0.0.1}:8000:8000`) — an unqualified `"8000:8000"`
@@ -246,12 +284,31 @@ bypassed.
   running multiple replicas behind a load balancer is safe for the request
   path itself.
 - **Rate limiting is per-process, not distributed.** `agent/rate_limit.py`'s
-  LLM-call limiter and `api/main.py`'s per-IP question limiter are
+  LLM-call limiter and `api/main.py`'s per-caller question limiter are
   in-memory (`SlidingWindowRateLimiter`) — multiple replicas each enforce
-  their own independent limit, not a shared one. Fine for one replica;
-  revisit (a shared store like Redis) before running several replicas
-  behind a load balancer if the rate limits need to mean what their
-  numbers say across the whole deployment, not per-replica.
+  their own independent limit, not a shared one (so N replicas effectively
+  give N× the configured budget). Fine for one replica; revisit (a shared
+  store like Redis) before running several replicas behind a load balancer
+  if the rate limits need to mean what their numbers say across the whole
+  deployment, not per-replica. What *is* fixed as of the enterprise
+  scalability assessment (2026-09-27): every limiter now keys on real
+  caller identity when one exists, and falls back to a correctly-resolved
+  client IP (honoring `TRUSTED_PROXY_COUNT`, see "Reverse proxy and auth"
+  above) rather than the load balancer's own address — without that fix,
+  *every* caller behind one LB would previously have shared one bucket
+  regardless of which user they were, a strictly worse problem than the
+  still-open per-process-budget one described here.
+- **Each replica's own DB connection pool bounds its real parallelism.**
+  `DB_POOL_SIZE` + `DB_MAX_OVERFLOW` (default 10 + 20 = 30 connections per
+  configured database, per replica) is independent of
+  `MAX_CONCURRENT_ASK_REQUESTS` (default 50) — a replica can *admit* more
+  concurrent `/ask` requests than it can actually run against the database
+  in parallel; the excess simply queues for a pooled connection rather than
+  failing (a startup warning now flags this mismatch, see
+  `api/main.py::_warn_on_ask_concurrency_pool_mismatch`). When sizing
+  multiple replicas, remember the real constraint is `replicas × pool
+  capacity ≤ your database server's own max_connections`, not just each
+  replica's own numbers in isolation.
 - **The Chroma index is the one piece of real shared state.** All replicas
   must mount the same `chroma_index` volume (or, for true multi-host
   scaling, move to Chroma's client-server mode or a hosted vector DB

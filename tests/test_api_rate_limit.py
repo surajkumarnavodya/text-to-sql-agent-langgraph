@@ -105,3 +105,69 @@ class TestEnforceApiActionRateLimit:
         enforce_api_action_rate_limit(_fake_request(None), "execute", settings)
         with pytest.raises(HTTPException):
             enforce_api_action_rate_limit(_fake_request(None), "execute", settings)
+
+
+class TestEnforceApiActionRateLimitIdentityAware:
+    """Enterprise scalability assessment (2026-09-27): `identity` is a new
+    optional parameter -- every route that already resolves an
+    `AuthIdentity` (`/execute`, `/schema/refresh`, `/generate/confirm`,
+    `/search/media`, `POST`/`DELETE /documents`, every `/attachments/*`
+    action route) now passes it through, closing a gap where this limiter
+    rate-limited purely by IP even for an authenticated caller."""
+
+    def test_two_authenticated_users_behind_the_same_ip_get_independent_budgets(self):
+        """The actual bug this fixes: two real, distinct authenticated
+        users sharing one IP (a NAT'd office, a corporate VPN) must not
+        share one rate-limit bucket just because IP was all that was ever
+        consulted."""
+        from security.oidc import AuthIdentity
+
+        settings = Settings(**{**_BASE_SETTINGS.__dict__, "api_action_rate_limit_per_minute": 1})
+        request = _fake_request("10.0.0.5")  # same IP for both callers
+        alice = AuthIdentity(subject="alice", roles=("user",), mode="local")
+        bob = AuthIdentity(subject="bob", roles=("user",), mode="local")
+
+        enforce_api_action_rate_limit(request, "execute", settings, identity=alice)
+        enforce_api_action_rate_limit(request, "execute", settings, identity=bob)  # must not raise
+
+    def test_same_authenticated_user_is_still_limited_across_different_ips(self):
+        """The inverse property: identity, not IP, is authoritative once an
+        identity exists -- one real user can't dodge their own limit by
+        changing IP (a mobile network handoff, a VPN)."""
+        from security.oidc import AuthIdentity
+
+        settings = Settings(**{**_BASE_SETTINGS.__dict__, "api_action_rate_limit_per_minute": 1})
+        alice = AuthIdentity(subject="alice", roles=("user",), mode="local")
+
+        enforce_api_action_rate_limit(
+            _fake_request("10.0.0.5"), "execute", settings, identity=alice
+        )
+        with pytest.raises(HTTPException):
+            enforce_api_action_rate_limit(
+                _fake_request("10.0.0.9"), "execute", settings, identity=alice
+            )
+
+    def test_no_real_identity_still_falls_back_to_ip(self):
+        """'none'/'static_token' auth modes have no real per-caller
+        identity (see `security.oidc.real_caller_subject`) -- must still
+        fall back to IP-based keying exactly as before this parameter
+        existed, not silently pool every such caller together."""
+        from security.oidc import AuthIdentity
+
+        settings = Settings(**{**_BASE_SETTINGS.__dict__, "api_action_rate_limit_per_minute": 1})
+        shared_identity = AuthIdentity(subject="dev-mode", roles=("admin",), mode="none")
+
+        enforce_api_action_rate_limit(
+            _fake_request("1.1.1.1"), "execute", settings, identity=shared_identity
+        )
+        enforce_api_action_rate_limit(
+            _fake_request("2.2.2.2"), "execute", settings, identity=shared_identity
+        )  # must not raise -- different IPs, same fallback-only "identity"
+
+    def test_identity_none_is_the_original_ip_only_behavior(self):
+        """The default (`identity=None`, every pre-existing call site
+        before this parameter existed) is unaffected."""
+        settings = Settings(**{**_BASE_SETTINGS.__dict__, "api_action_rate_limit_per_minute": 1})
+        enforce_api_action_rate_limit(_fake_request("1.1.1.1"), "execute", settings)
+        with pytest.raises(HTTPException):
+            enforce_api_action_rate_limit(_fake_request("1.1.1.1"), "execute", settings)

@@ -83,6 +83,7 @@ from agent.rate_limit import BoundedLimiterCache
 from api.identity_authz import get_identity_db, require_local_auth_enabled, require_local_user
 from config.settings import Settings, get_settings
 from security.audit_log import log_security_event
+from security.client_ip import resolve_client_ip
 
 router = APIRouter()
 
@@ -130,7 +131,22 @@ def _enforce_rate_limit(
 
 
 def _client_ip(request: Request) -> str:
-    return request.client.host if request.client else "unknown"
+    """The IP every login/register/refresh/password-reset rate limiter and
+    `signin_events` audit row keys on -- brute-force/credential-stuffing
+    defenses that, unlike an authenticated route, have no caller identity
+    to key on instead (this endpoint's whole job is establishing one).
+
+    Enterprise scalability assessment (2026-09-27): routes through
+    `security.client_ip.resolve_client_ip` (`Settings.trusted_proxy_count`,
+    default 0 -- byte-for-byte the previous `request.client.host` behavior)
+    rather than reading `request.client.host` directly, so this becomes
+    correct behind a real reverse proxy/load balancer with a single `.env`
+    change instead of every distinct client silently sharing the proxy's
+    own IP bucket. `get_settings()` here (rather than threading `settings`
+    through all dozen call sites in this module) mirrors this module's own
+    existing per-call `get_settings()` convention.
+    """
+    return resolve_client_ip(request, get_settings())
 
 
 def _user_out(user: User, roles: tuple[str, ...]) -> UserOut:
