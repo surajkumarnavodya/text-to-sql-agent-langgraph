@@ -1,15 +1,19 @@
 import {
+  AlertTriangle,
   Circle as CircleIcon,
   Crop as CropIcon,
   Download,
+  Droplet,
   Eraser,
   FlipHorizontal,
   FlipVertical,
+  Loader2,
   MousePointer2,
   Pencil,
   Redo2,
   RotateCcw,
   RotateCw,
+  ScanText,
   Sparkles,
   Square as SquareIcon,
   Type as TypeIcon,
@@ -23,9 +27,22 @@ import Konva from 'konva'
 import { Ellipse, Image as KonvaImage, Layer, Line, Rect, Stage, Text, Transformer } from 'react-konva'
 import { Button } from '@/components/ui/button'
 import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog'
-import { useToast } from '@/components/ui/toast'
+import { useAttachmentCapabilities } from '@/hooks/queries'
 import { useHistory } from '@/hooks/useHistory'
-import { AiEditNotConfiguredError, AiGuidedEditAdapter } from '@/lib/imageEditAdapter'
+import {
+  ApiError,
+  blurAttachmentRegion,
+  deleteAttachment,
+  extractAttachmentText,
+  uploadAttachments,
+} from '@/lib/api'
+import {
+  AiEditFailedError,
+  AiEditNotConfiguredError,
+  AiGuidedEditAdapter,
+  type AiGuidedEditResult,
+} from '@/lib/imageEditAdapter'
+import type { AiImageEditOperation } from '@/lib/types'
 import { cn } from '@/lib/utils'
 import {
   EMPTY_DOCUMENT,
@@ -62,7 +79,35 @@ function randomId(prefix: string): string {
   return `${prefix}-${Math.random().toString(36).slice(2, 10)}`
 }
 
+function dataUrlToFile(dataUrl: string, filename: string): File {
+  const [header, base64Data] = dataUrl.split(',')
+  const mimeMatch = /data:([^;]+)/.exec(header)
+  const mime = mimeMatch?.[1] ?? 'image/png'
+  const binary = atob(base64Data)
+  const bytes = new Uint8Array(binary.length)
+  for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i)
+  return new File([bytes], filename, { type: mime })
+}
+
 const aiEditAdapter = new AiGuidedEditAdapter()
+
+/** Real, generative operations only -- one quick-action preset button per
+ * entry, each setting both a prefilled (editable) prompt and this fixed,
+ * server-validated operation. "Blur the selected face" and "Extract the
+ * selected table or chart" are deliberately NOT in this map: per this
+ * feature's own quick-action routing table, blur must default to a local
+ * deterministic filter (see `handleBlurFace` below) and table/chart
+ * extraction is analysis, not pixel editing (see `handleExtractTable`
+ * below) -- neither should ever reach the paid AI-edit endpoint. */
+const AI_EDIT_PRESET_OPERATIONS: Partial<Record<string, AiImageEditOperation>> = {
+  aiPresetRemoveObject: 'remove_object',
+  aiPresetBlueBackground: 'region_edit',
+  aiPresetReplaceSky: 'replace_sky',
+  aiPresetEnhance: 'enhance',
+}
+
+type AiEditPhase = 'idle' | 'uploading' | 'processing' | 'completed' | 'failed'
+type LocalActionPhase = 'idle' | 'processing' | 'completed' | 'failed'
 
 export function ImageEditor({
   open,
@@ -81,7 +126,13 @@ export function ImageEditor({
   onSave: (dataUrl: string) => void
 }) {
   const { t } = useTranslation()
-  const { toast } = useToast()
+  const capabilitiesQuery = useAttachmentCapabilities()
+  // Off (fails closed, never open) until the capability check actually
+  // returns `true` -- per this feature's own "capability flags must
+  // reflect real backend readiness" requirement; a still-loading or
+  // failed capability fetch must never optimistically enable a metered
+  // provider call.
+  const aiEditingAvailable = capabilitiesQuery.data?.image_ai_editing === true
   // `workingSrc` overrides `imageSrc` once a crop has been applied --
   // Apply Crop flattens the whole current canvas (rotation/flip/
   // annotations included) into a brand-new base image, so everything
@@ -129,7 +180,21 @@ export function ImageEditor({
   const [selectedId, setSelectedId] = useState<string | null>(null)
   const [showOriginal, setShowOriginal] = useState(false)
   const [aiPrompt, setAiPrompt] = useState('')
-  const [isAiEditing, setIsAiEditing] = useState(false)
+  const [aiOperation, setAiOperation] = useState<AiImageEditOperation>('remove_object')
+  const [aiPhase, setAiPhase] = useState<AiEditPhase>('idle')
+  const [aiResult, setAiResult] = useState<AiGuidedEditResult | null>(null)
+  const [aiError, setAiError] = useState<string | null>(null)
+  const [aiMaskPreviewUrl, setAiMaskPreviewUrl] = useState<string | null>(null)
+  // Deterministic, local Pillow blur (never a model call) -- see
+  // `handleBlurFace` below for why this is a separate, non-AI action.
+  const [blurPhase, setBlurPhase] = useState<LocalActionPhase>('idle')
+  const [blurResultUrl, setBlurResultUrl] = useState<string | null>(null)
+  const [blurError, setBlurError] = useState<string | null>(null)
+  // OCR/vision analysis -- "Extract the selected table or chart" produces
+  // structured recognized text, never a generated image.
+  const [extractPhase, setExtractPhase] = useState<LocalActionPhase>('idle')
+  const [extractedText, setExtractedText] = useState<string | null>(null)
+  const [extractError, setExtractError] = useState<string | null>(null)
   const [cropRect, setCropRect] = useState<{ x: number; y: number; width: number; height: number } | null>(null)
 
   const doc = useHistory<EditorDocument>(EMPTY_DOCUMENT)
@@ -145,14 +210,24 @@ export function ImageEditor({
   // rect/ellipse existed (a real bug caught and fixed before this shipped).
   const drawingShapeIdRef = useRef<string | null>(null)
   const stageRef = useRef<Konva.Stage>(null)
+  const maskLayerRef = useRef<Konva.Layer>(null)
   const selectedNodeRef = useRef<Konva.Node | null>(null)
   const transformerRef = useRef<Konva.Transformer>(null)
+  // Guards every async image action (AI edit, blur, extract) against a
+  // stale response overwriting the UI after the modal was closed or
+  // reopened for a different image -- incremented on every open/close and
+  // checked before any state-setting call in an async handler resolves.
+  const requestEpochRef = useRef(0)
 
   // Reset all editor state back to a pristine view of `imageSrc` whenever
   // the dialog opens for a (possibly different) image -- reopening the
   // same attachment later starts a fresh session rather than replaying
-  // stale in-memory edits from last time.
+  // stale in-memory edits from last time. Also bumps `requestEpochRef` --
+  // closing the modal (or reopening it for a different image) while an
+  // AI-edit/blur/extract request is still in flight must never let that
+  // request's eventual response overwrite the UI for whatever is open now.
   useEffect(() => {
+    requestEpochRef.current += 1
     if (!open) return
     doc.reset(EMPTY_DOCUMENT)
     setTool('select')
@@ -163,6 +238,17 @@ export function ImageEditor({
     setSelectedId(null)
     setShowOriginal(false)
     setAiPrompt('')
+    setAiOperation('remove_object')
+    setAiPhase('idle')
+    setAiResult(null)
+    setAiError(null)
+    setAiMaskPreviewUrl(null)
+    setBlurPhase('idle')
+    setBlurResultUrl(null)
+    setBlurError(null)
+    setExtractPhase('idle')
+    setExtractedText(null)
+    setExtractError(null)
     setWorkingSrc(null)
     setCropRect(null)
     // eslint-disable-next-line react-hooks/exhaustive-deps -- deliberately only re-runs on open/imageSrc, not on every doc identity change
@@ -389,34 +475,172 @@ export function ImageEditor({
     setSelectedId(null)
   }
 
+  /** A real, isolated render of *only* the mask layer, at the exact same
+   * pixel dimensions `flattenToDataUrl()` itself produces -- both come
+   * from the same Stage geometry (same `pixelRatio: 2`), which is what
+   * guarantees the mask and the source image line up pixel-for-pixel
+   * regardless of the current zoom/rotation/crop state, without needing a
+   * second offscreen Stage or any manual coordinate-transform math. Fixes
+   * the "the mask sent is currently the whole flattened canvas" known
+   * simplification docs/image-editing-architecture.md used to disclose.
+   *
+   * Every other layer is temporarily hidden and the mask layer is forced
+   * to full opacity (the visible 0.45 preview opacity would otherwise
+   * wash out the exported alpha values) for the duration of one
+   * `toDataURL()` call, then immediately restored -- the on-screen editor
+   * is never visibly affected. Returns `null` when there's nothing painted
+   * (an empty mask should mean "no mask," not a real-but-blank PNG). */
+  const flattenMaskOnly = (): string | null => {
+    const stage = stageRef.current
+    const maskLayer = maskLayerRef.current
+    if (!stage || !maskLayer || doc.state.maskElements.length === 0) return null
+
+    const otherLayers = stage.getLayers().filter((layer) => layer !== maskLayer)
+    const previousVisibility = otherLayers.map((layer) => layer.visible())
+    const previousMaskOpacity = maskLayer.opacity()
+    otherLayers.forEach((layer) => layer.hide())
+    maskLayer.opacity(1)
+    stage.batchDraw()
+
+    const dataUrl = stage.toDataURL({ pixelRatio: 2 })
+
+    otherLayers.forEach((layer, index) => layer.visible(previousVisibility[index]))
+    maskLayer.opacity(previousMaskOpacity)
+    stage.batchDraw()
+
+    return dataUrl
+  }
+
+  /** Replaces the working canvas with `dataUrl` and clears every layer on
+   * top of it -- the same "bake everything into a new base image" pattern
+   * `applyCrop` already established, reused here so accepting an AI-edit
+   * or blur result behaves identically: the result becomes the new
+   * starting point for further local edits, and nothing from before it
+   * (rotation/flip/annotations/mask) is incorrectly re-applied on top. */
+  const applyResultToCanvas = (dataUrl: string) => {
+    setWorkingSrc(dataUrl)
+    doc.reset(EMPTY_DOCUMENT)
+    setRotation(0)
+    setFlipX(false)
+    setFlipY(false)
+    setCropRect(null)
+    setTool('select')
+  }
+
   const handleAiGenerate = async () => {
     if (!aiPrompt.trim()) return
-    setIsAiEditing(true)
+    const epoch = requestEpochRef.current
+    const sourceDataUrl = flattenToDataUrl()
+    if (!sourceDataUrl) return
+    const maskDataUrl = flattenMaskOnly()
+
+    setAiPhase('uploading')
+    setAiError(null)
+    setAiResult(null)
+    setAiMaskPreviewUrl(maskDataUrl)
     try {
-      const maskDataUrl = doc.state.maskElements.length > 0 ? flattenMaskOnly() : null
-      await aiEditAdapter.editWithInstruction({
-        imageDataUrl: flattenToDataUrl() ?? '',
+      setAiPhase('processing')
+      const result = await aiEditAdapter.editWithInstruction({
+        imageDataUrl: sourceDataUrl,
         maskDataUrl,
         instruction: aiPrompt.trim(),
+        operation: aiOperation,
       })
+      if (requestEpochRef.current !== epoch) return // modal closed/reopened while this was in flight
+      setAiResult(result)
+      setAiPhase('completed')
     } catch (error) {
+      if (requestEpochRef.current !== epoch) return
       if (error instanceof AiEditNotConfiguredError) {
-        toast({ title: t('image.aiNotConfigured'), variant: 'info', durationMs: 8000 })
+        setAiError(t('image.aiNotConfigured'))
+      } else if (error instanceof AiEditFailedError) {
+        setAiError(error.message)
+      } else if (error instanceof ApiError) {
+        setAiError(error.message)
       } else {
-        toast({ title: 'AI-guided edit failed.', variant: 'error' })
+        setAiError(t('image.aiGenericError'))
       }
-    } finally {
-      setIsAiEditing(false)
+      setAiPhase('failed')
     }
   }
 
-  const flattenMaskOnly = (): string | null => {
-    // A real, separate render of just the mask layer would need a second
-    // offscreen Stage -- out of scope for this pass; the combined
-    // flattened image is passed as a best-effort stand-in so the (always-
-    // rejecting, see AiGuidedEditAdapter) stub call still receives
-    // *something* mask-shaped. Documented as a known simplification.
-    return flattenToDataUrl()
+  const handleAiPresetClick = (key: string) => {
+    setAiPrompt(t(`image.${key}`))
+    const operation = AI_EDIT_PRESET_OPERATIONS[key]
+    if (operation) setAiOperation(operation)
+  }
+
+  /** "Blur the selected face" -- capability (C)-adjacent local,
+   * deterministic Pillow work (`attachments.blur.blur_region`), never the
+   * paid AI-edit endpoint, per this feature's own "deterministic filter by
+   * default" quick-action requirement. Requires a painted mask (the region
+   * to blur); still works even when AI-guided editing itself is disabled. */
+  const handleBlurFace = async () => {
+    const epoch = requestEpochRef.current
+    const sourceDataUrl = flattenToDataUrl()
+    const maskDataUrl = flattenMaskOnly()
+    if (!sourceDataUrl) return
+    if (!maskDataUrl) {
+      setBlurError(t('image.aiMaskRequired'))
+      setBlurPhase('failed')
+      return
+    }
+
+    setBlurPhase('processing')
+    setBlurError(null)
+    setBlurResultUrl(null)
+    let sourceAttachmentId: string | null = null
+    try {
+      const uploadResult = await uploadAttachments([dataUrlToFile(sourceDataUrl, 'source.png')])
+      if (uploadResult.attachments.length === 0) {
+        throw new Error(uploadResult.errors[0]?.message ?? t('image.aiGenericError'))
+      }
+      sourceAttachmentId = uploadResult.attachments[0].attachment_id
+      const result = await blurAttachmentRegion(sourceAttachmentId, { mask_data_url: maskDataUrl })
+      if (requestEpochRef.current !== epoch) return
+      setBlurResultUrl(result.image_data_url)
+      setBlurPhase('completed')
+    } catch (error) {
+      if (requestEpochRef.current !== epoch) return
+      setBlurError(error instanceof ApiError ? error.message : t('image.aiGenericError'))
+      setBlurPhase('failed')
+    } finally {
+      if (sourceAttachmentId) void deleteAttachment(sourceAttachmentId).catch(() => {})
+    }
+  }
+
+  /** "Extract the selected table or chart" -- capability (B), OCR/vision
+   * *analysis*, never pixel editing: this must never produce or claim to
+   * produce a generated image, per this feature's own routing requirement.
+   * Runs on the whole current canvas as shown (crop first with the Crop
+   * tool to isolate a specific table/chart, if the photo has more than
+   * one). */
+  const handleExtractTable = async () => {
+    const epoch = requestEpochRef.current
+    const sourceDataUrl = flattenToDataUrl()
+    if (!sourceDataUrl) return
+
+    setExtractPhase('processing')
+    setExtractError(null)
+    setExtractedText(null)
+    let sourceAttachmentId: string | null = null
+    try {
+      const uploadResult = await uploadAttachments([dataUrlToFile(sourceDataUrl, 'source.png')])
+      if (uploadResult.attachments.length === 0) {
+        throw new Error(uploadResult.errors[0]?.message ?? t('image.aiGenericError'))
+      }
+      sourceAttachmentId = uploadResult.attachments[0].attachment_id
+      const result = await extractAttachmentText(sourceAttachmentId)
+      if (requestEpochRef.current !== epoch) return
+      setExtractedText(result.raw_text)
+      setExtractPhase('completed')
+    } catch (error) {
+      if (requestEpochRef.current !== epoch) return
+      setExtractError(error instanceof ApiError ? error.message : t('image.aiGenericError'))
+      setExtractPhase('failed')
+    } finally {
+      if (sourceAttachmentId) void deleteAttachment(sourceAttachmentId).catch(() => {})
+    }
   }
 
   const cursorClass =
@@ -629,7 +853,7 @@ export function ImageEditor({
             )}
 
             {!showOriginal && doc.state.maskElements.length > 0 && (
-              <Layer opacity={0.45} listening={false}>
+              <Layer ref={maskLayerRef} opacity={0.45} listening={false}>
                 {doc.state.maskElements.map((element) => (
                   <Line
                     key={element.id}
@@ -696,26 +920,28 @@ export function ImageEditor({
           <p className="mb-1.5 flex items-center gap-1.5 text-sm font-medium">
             <Sparkles className="h-3.5 w-3.5" /> {t('image.aiSectionTitle')}
           </p>
+
+          {!capabilitiesQuery.isLoading && !aiEditingAvailable && (
+            <p className="mb-2 flex items-start gap-1.5 rounded-md border border-[var(--border)] bg-[var(--muted)] p-2 text-xs text-[var(--muted-foreground)]">
+              <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+              {t('image.aiNotConfigured')}
+            </p>
+          )}
+
           <div className="flex flex-wrap gap-1.5">
-            {(
-              [
-                'aiPresetRemoveObject',
-                'aiPresetBlueBackground',
-                'aiPresetReplaceSky',
-                'aiPresetEnhance',
-                'aiPresetBlurFace',
-                'aiPresetExtractTable',
-              ] as const
-            ).map((key) => (
-              <button
-                key={key}
-                type="button"
-                onClick={() => setAiPrompt(t(`image.${key}`))}
-                className="rounded-full border border-[var(--border)] px-2.5 py-1 text-xs hover:bg-[var(--muted)]"
-              >
-                {t(`image.${key}`)}
-              </button>
-            ))}
+            {(['aiPresetRemoveObject', 'aiPresetBlueBackground', 'aiPresetReplaceSky', 'aiPresetEnhance'] as const).map(
+              (key) => (
+                <button
+                  key={key}
+                  type="button"
+                  onClick={() => handleAiPresetClick(key)}
+                  disabled={!aiEditingAvailable}
+                  className="rounded-full border border-[var(--border)] px-2.5 py-1 text-xs hover:bg-[var(--muted)] disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  {t(`image.${key}`)}
+                </button>
+              ),
+            )}
           </div>
           <div className="mt-2 flex gap-2">
             <input
@@ -723,15 +949,146 @@ export function ImageEditor({
               onChange={(event) => setAiPrompt(event.target.value)}
               placeholder={t('image.aiPromptPlaceholder')}
               aria-label={t('image.aiPromptLabel')}
-              className="h-9 flex-1 rounded-md border border-[var(--border)] bg-[var(--input)] px-2 text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--focus-ring)]"
+              disabled={!aiEditingAvailable}
+              className="h-9 flex-1 rounded-md border border-[var(--border)] bg-[var(--input)] px-2 text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--focus-ring)] disabled:opacity-50"
             />
             <Button
               variant="secondary"
               onClick={() => void handleAiGenerate()}
-              disabled={!aiPrompt.trim() || isAiEditing}
+              disabled={
+                !aiEditingAvailable ||
+                !aiPrompt.trim() ||
+                aiPhase === 'uploading' ||
+                aiPhase === 'processing'
+              }
             >
-              {t('image.aiGenerate')}
+              {aiPhase === 'uploading' || aiPhase === 'processing' ? (
+                <Loader2 className="h-4 w-4 animate-spin" />
+              ) : (
+                t('image.aiGenerate')
+              )}
             </Button>
+          </div>
+
+          {(aiPhase === 'uploading' || aiPhase === 'processing') && (
+            <p className="mt-2 flex items-center gap-1.5 text-xs text-[var(--muted-foreground)]">
+              <Loader2 className="h-3.5 w-3.5 animate-spin" />
+              {aiPhase === 'uploading' ? t('image.aiPhaseUploading') : t('image.aiPhaseProcessing')}
+            </p>
+          )}
+
+          {aiMaskPreviewUrl && (aiPhase === 'processing' || aiPhase === 'completed' || aiPhase === 'failed') && (
+            <div className="mt-2 flex items-center gap-2">
+              <img
+                src={aiMaskPreviewUrl}
+                alt={t('image.aiMaskPreview')}
+                className="h-12 w-12 rounded border border-[var(--border)] bg-[var(--muted)] object-contain"
+              />
+              <span className="text-xs text-[var(--muted-foreground)]">{t('image.aiMaskPreview')}</span>
+            </div>
+          )}
+
+          {aiPhase === 'failed' && aiError && (
+            <p className="mt-2 flex items-start gap-1.5 rounded-md border border-[var(--danger)]/30 bg-[var(--danger)]/10 p-2 text-xs text-[var(--danger)]">
+              <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+              {aiError}
+            </p>
+          )}
+
+          {aiPhase === 'completed' && aiResult && (
+            <div className="mt-2 flex flex-col gap-2 rounded-md border border-[var(--border)] p-2">
+              <img
+                src={aiResult.imageDataUrl}
+                alt={t('image.aiResultTitle')}
+                className="mx-auto max-h-56 rounded border border-[var(--border)] object-contain"
+              />
+              {aiResult.warnings.map((warning) => (
+                <p key={warning} className="flex items-start gap-1.5 text-xs text-[var(--warning)]">
+                  <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+                  {warning}
+                </p>
+              ))}
+              <div className="flex justify-center gap-2">
+                <Button size="sm" variant="ghost" onClick={() => setAiPhase('idle')}>
+                  {t('image.aiDiscardResult')}
+                </Button>
+                <Button size="sm" variant="primary" onClick={() => applyResultToCanvas(aiResult.imageDataUrl)}>
+                  {t('image.aiApplyResult')}
+                </Button>
+              </div>
+            </div>
+          )}
+        </div>
+
+        <div className="mt-3 flex flex-col gap-3 rounded-md border border-[var(--border)] p-3 sm:flex-row">
+          <div className="flex-1">
+            <p className="mb-1.5 flex items-center gap-1.5 text-sm font-medium">
+              <Droplet className="h-3.5 w-3.5" /> {t('image.aiPresetBlurFace')}
+            </p>
+            <p className="mb-2 text-xs text-[var(--muted-foreground)]">{t('image.blurHint')}</p>
+            <Button size="sm" variant="secondary" onClick={() => void handleBlurFace()} disabled={blurPhase === 'processing'}>
+              {blurPhase === 'processing' ? <Loader2 className="h-4 w-4 animate-spin" /> : <Droplet className="h-4 w-4" />}
+              {t('image.aiPresetBlurFace')}
+            </Button>
+            {blurPhase === 'failed' && blurError && (
+              <p className="mt-2 flex items-start gap-1.5 rounded-md border border-[var(--danger)]/30 bg-[var(--danger)]/10 p-2 text-xs text-[var(--danger)]">
+                <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+                {blurError}
+              </p>
+            )}
+            {blurPhase === 'completed' && blurResultUrl && (
+              <div className="mt-2 flex flex-col gap-2 rounded-md border border-[var(--border)] p-2">
+                <img
+                  src={blurResultUrl}
+                  alt={t('image.blurResultTitle')}
+                  className="mx-auto max-h-40 rounded border border-[var(--border)] object-contain"
+                />
+                <div className="flex justify-center gap-2">
+                  <Button size="sm" variant="ghost" onClick={() => setBlurPhase('idle')}>
+                    {t('image.aiDiscardResult')}
+                  </Button>
+                  <Button size="sm" variant="primary" onClick={() => applyResultToCanvas(blurResultUrl)}>
+                    {t('image.aiApplyResult')}
+                  </Button>
+                </div>
+              </div>
+            )}
+          </div>
+
+          <div className="flex-1">
+            <p className="mb-1.5 flex items-center gap-1.5 text-sm font-medium">
+              <ScanText className="h-3.5 w-3.5" /> {t('image.aiPresetExtractTable')}
+            </p>
+            <p className="mb-2 text-xs text-[var(--muted-foreground)]">{t('image.extractHint')}</p>
+            <Button
+              size="sm"
+              variant="secondary"
+              onClick={() => void handleExtractTable()}
+              disabled={extractPhase === 'processing'}
+            >
+              {extractPhase === 'processing' ? (
+                <Loader2 className="h-4 w-4 animate-spin" />
+              ) : (
+                <ScanText className="h-4 w-4" />
+              )}
+              {t('image.aiPresetExtractTable')}
+            </Button>
+            {extractPhase === 'failed' && extractError && (
+              <p className="mt-2 flex items-start gap-1.5 rounded-md border border-[var(--danger)]/30 bg-[var(--danger)]/10 p-2 text-xs text-[var(--danger)]">
+                <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+                {extractError}
+              </p>
+            )}
+            {extractPhase === 'completed' && (
+              <div className="mt-2 rounded-md border border-[var(--border)] p-2">
+                <p className="mb-1 text-xs font-medium text-[var(--muted-foreground)]">
+                  {t('image.extractedTextTitle')}
+                </p>
+                <pre className="max-h-32 overflow-auto whitespace-pre-wrap break-words text-xs">
+                  {extractedText && extractedText.trim() ? extractedText : t('image.extractedTextEmpty')}
+                </pre>
+              </div>
+            )}
           </div>
         </div>
 

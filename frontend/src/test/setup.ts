@@ -96,6 +96,21 @@ if (typeof HTMLCanvasElement !== 'undefined') {
   ) {
     return contextId === '2d' ? fakeContext2d(this) : null
   } as typeof HTMLCanvasElement.prototype.getContext
+
+  // jsdom's `HTMLCanvasElement.toDataURL()` is also unimplemented -- unlike
+  // `getContext` above (which jsdom at least calls out via a console
+  // warning), this one silently returns `undefined` with no error at all.
+  // `ImageEditor.tsx`'s Konva `Stage.toDataURL()` (used to export the
+  // current canvas/mask for every AI-edit/blur/extract-text/download flow)
+  // delegates to this native method at the end of its own rendering
+  // pipeline, so without a stub every one of those flows silently no-ops
+  // (`flattenToDataUrl()`/`flattenMaskOnly()` return `undefined`) with no
+  // exception to catch -- a real capability gap, not a behavior mock. A
+  // fixed, valid 1x1 transparent PNG data URL is enough for every test here,
+  // since nothing in this test suite asserts on actual exported pixel data.
+  HTMLCanvasElement.prototype.toDataURL = function fakeToDataUrl(): string {
+    return 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII='
+  }
 }
 
 // matchMedia is used by useTheme/usePwaInstall-style hooks that check

@@ -197,6 +197,25 @@ class TestBuildCreatePayload:
         assert inner["parameters"]["cast"] == {"points": 4, "attribute_id": 101}
         assert inner["parameters"]["size"] == "2K"
 
+    def test_no_image_urls_produces_empty_lists_backward_compatibly(self):
+        """Every pre-existing (text-only) caller must see byte-identical
+        behavior after the 2026-09-27 image_to_image extension."""
+        model_params = _extract_model_params(_SAMPLE_LEAF)
+        payload = build_create_payload("text_to_image", model_params, "a red fox")
+        assert payload["src_img_url"] == []
+        assert payload["parameters"][0]["parameters"]["input_images"] == []
+
+    def test_image_urls_populate_both_top_level_and_inner_fields(self):
+        """Verified against the real reference doc (`references/models/
+        product-list-and-create-params.md`): "top-level src_img_url and
+        inner input_images" -- both must carry the URL, not just one."""
+        model_params = _extract_model_params(_SAMPLE_LEAF)
+        payload = build_create_payload(
+            "image_to_image", model_params, "remove the object", image_urls=["https://cdn/src.png"]
+        )
+        assert payload["src_img_url"] == ["https://cdn/src.png"]
+        assert payload["parameters"][0]["parameters"]["input_images"] == ["https://cdn/src.png"]
+
 
 class TestCreateAndPoll:
     def test_full_flow_success(self, client):
@@ -225,6 +244,37 @@ class TestCreateAndPoll:
             pytest.raises(MediaGenerationError, match="No IMA model available"),
         ):
             create_and_poll(client, task_type="text_to_image", prompt="a red fox")
+
+    def test_image_urls_reach_create_task_in_both_required_fields(self, client):
+        """image_to_image/AI-guided-editing support (2026-09-27) --
+        `image_urls` must flow all the way through to the real
+        `create_task` payload, not just `build_create_payload` in
+        isolation (see `TestBuildCreatePayload` above for that)."""
+        captured_payload = {}
+
+        def _capture_create_task(payload):
+            captured_payload.update(payload)
+            return "task_456"
+
+        with (
+            patch.object(client, "get_product_list", return_value=[_SAMPLE_LEAF]),
+            patch.object(client, "create_task", side_effect=_capture_create_task),
+            patch.object(
+                client,
+                "poll_task",
+                return_value={"resource_status": 1, "url": "https://cdn.example/edited.png"},
+            ),
+        ):
+            create_and_poll(
+                client,
+                task_type="image_to_image",
+                prompt="remove the object",
+                image_urls=["https://cdn.example/source.png"],
+            )
+        assert captured_payload["src_img_url"] == ["https://cdn.example/source.png"]
+        assert captured_payload["parameters"][0]["parameters"]["input_images"] == [
+            "https://cdn.example/source.png"
+        ]
 
 
 class TestIMAClientPollTask:
@@ -605,7 +655,9 @@ class TestDownloadMediaBytesRedirectHandling:
     def test_redirect_to_public_address_is_followed(self):
         from media_gen.download import download_media_bytes
 
-        redirect_response = _MockStreamResponse(302, {"Location": "https://cdn2.example/img.png"}, b"")
+        redirect_response = _MockStreamResponse(
+            302, {"Location": "https://cdn2.example/img.png"}, b""
+        )
         final_response = _MockStreamResponse(200, {"Content-Type": "image/png"}, b"abc")
         with (
             patch("socket.getaddrinfo", return_value=_PUBLIC_ADDRINFO),
@@ -637,7 +689,9 @@ class TestDownloadMediaBytesRedirectHandling:
     def test_redirect_to_non_https_is_rejected(self):
         from media_gen.download import download_media_bytes
 
-        redirect_response = _MockStreamResponse(302, {"Location": "http://cdn2.example/img.png"}, b"")
+        redirect_response = _MockStreamResponse(
+            302, {"Location": "http://cdn2.example/img.png"}, b""
+        )
         with (
             patch("socket.getaddrinfo", return_value=_PUBLIC_ADDRINFO),
             patch("requests.get", return_value=redirect_response),

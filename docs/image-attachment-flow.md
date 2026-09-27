@@ -13,11 +13,12 @@
 > attachment pipeline** — see `CLAUDE.md`'s "Chat attachments" and
 > "Explicit image actions" sections, `docs/API.md`'s "Attachments" section,
 > and `SECURITY.md`'s "Chat attachments — security controls" section
-> instead. The one thing this document says is still accurate: the image
-> **editor**'s own "AI-guided editing" panel (a natural-language-prompted
-> generative edit, distinct from the real "Resize"/"Remove text" actions
-> above) remains a deliberate, permanent stub — see
-> `docs/image-editing-architecture.md`.
+> instead. **Update, 2026-09-27**: the image **editor**'s own "AI-guided
+> editing" panel (a natural-language-prompted generative edit, distinct
+> from the real "Resize"/"Remove text" actions above) is also no longer a
+> stub — it now calls a real provider (IMA Studio) via `POST
+> /attachments/{id}/ai-edit` — see `docs/image-editing-architecture.md`
+> for the current, accurate design.
 
 Companion to `docs/functional-ui-audit.md` §4 (the full investigation) and
 `docs/image-editing-architecture.md` (the editor itself). This document is

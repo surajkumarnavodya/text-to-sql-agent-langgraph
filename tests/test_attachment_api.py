@@ -67,6 +67,48 @@ def _reset_ip_limiters():
     api_main._ip_limiters.clear()
 
 
+@pytest.fixture(autouse=True)
+def _reset_api_action_limiters():
+    """`api.rate_limit._limiters` is a process-wide singleton dict (the
+    `enforce_api_action_rate_limit` budget every attachment route --
+    upload, resize, blur-region, ai-edit, ... -- shares) -- reset before/
+    after every test so the cumulative call count across this whole file's
+    many upload-heavy tests can never trip another test's own limit purely
+    by test order/count (same reasoning as `_reset_ip_limiters` above)."""
+    import api.rate_limit as api_rate_limit
+
+    api_rate_limit._limiters.clear()
+    yield
+    api_rate_limit._limiters.clear()
+
+
+@pytest.fixture(autouse=True)
+def _reset_ai_edit_idempotency_cache():
+    """`attachments.ai_edit._idempotency_cache` is a process-wide dict --
+    reset before/after every test in this whole pytest session (this
+    fixture runs for every test in this file, but the cache itself is a
+    module-level global other test files could in principle also touch)
+    so a fixed literal key like `"retry-key-1"` can never leak between
+    test runs."""
+    from attachments import ai_edit
+
+    ai_edit._idempotency_cache.clear()
+    yield
+    ai_edit._idempotency_cache.clear()
+
+
+@pytest.fixture(autouse=True)
+def _reset_media_generation_limiter():
+    """Shared with plain media generation (`agent.orchestrator.nodes
+    .execute_generation`) -- reset for the same reason as the other
+    process-wide limiters reset above."""
+    import agent.rate_limit as rate_limit_module
+
+    rate_limit_module._media_generation_limiter = None
+    yield
+    rate_limit_module._media_generation_limiter = None
+
+
 @pytest.fixture
 def client() -> TestClient:
     return TestClient(api_main.app)
@@ -171,10 +213,34 @@ class TestAttachmentCapabilities:
         assert body["vision_input"] is True
         assert body["vision_model"] == "llava"
         assert body["image_resize"] is True
+        assert body["image_blur"] is True
         assert body["native_pdf_input"] is False
         assert any(preset["name"] == "medium_800" for preset in body["resize_presets"])
         assert ".png" in body["supported_image_extensions"]
         assert ".pdf" in body["supported_document_extensions"]
+        # Off by default (see Settings.enable_image_editing's own docstring)
+        # -- must reflect real backend readiness, never a hardcoded true.
+        assert body["image_ai_editing"] is False
+        assert body["image_ai_editing_provider"] is None
+
+    def test_reports_ai_editing_available_only_when_flag_and_key_are_both_set(
+        self, monkeypatch, client, tmp_path
+    ):
+        monkeypatch.setattr(
+            "api.attachments.get_settings",
+            lambda: _settings(tmp_path, enable_image_editing=True, ima_api_key=None),
+        )
+        response = client.get("/attachments/capabilities")
+        assert response.json()["image_ai_editing"] is False
+
+        monkeypatch.setattr(
+            "api.attachments.get_settings",
+            lambda: _settings(tmp_path, enable_image_editing=True, ima_api_key=SecretStr("k")),
+        )
+        response = client.get("/attachments/capabilities")
+        body = response.json()
+        assert body["image_ai_editing"] is True
+        assert body["image_ai_editing_provider"] == "ima_studio"
 
 
 class TestResizeAttachment:
@@ -343,6 +409,312 @@ class TestRemoveText:
         response = client.post(
             "/attachments/does-not-exist/remove-text",
             json={"regions": [{"left": 0, "top": 0, "width": 10, "height": 10}]},
+        )
+        assert response.status_code == 404
+
+
+def _mask_data_url(width: int, height: int, *, box=None) -> str:
+    """A real single-channel PNG mask, base64-encoded as a data URL --
+    `box` (left, top, right, bottom) is painted white (editable); the rest
+    is left black (preserved). No `box` means an all-black (zero-area)
+    mask, for testing the "empty mask" rejection path."""
+    mask = Image.new("L", (width, height), 0)
+    if box is not None:
+        for y in range(box[1], box[3]):
+            for x in range(box[0], box[2]):
+                mask.putpixel((x, y), 255)
+    buffer = io.BytesIO()
+    mask.save(buffer, format="PNG")
+    import base64
+
+    encoded = base64.b64encode(buffer.getvalue()).decode("ascii")
+    return f"data:image/png;base64,{encoded}"
+
+
+class TestBlurRegion:
+    """Deterministic, local Pillow blur -- never a model call, and must
+    work regardless of whether AI-guided editing is configured (per this
+    feature's own "keep local tools independent" / "local blur should work
+    even if AI editing is off" requirement)."""
+
+    def test_blurs_the_masked_region_and_returns_a_new_attachment(
+        self, monkeypatch, client, tmp_path
+    ):
+        attachment_id = _upload_image(client, monkeypatch, tmp_path, width=200, height=150)
+        mask = _mask_data_url(200, 150, box=(50, 50, 100, 100))
+
+        response = client.post(
+            f"/attachments/{attachment_id}/blur-region",
+            json={"mask_data_url": mask, "radius": 10},
+        )
+        assert response.status_code == 200
+        body = response.json()
+        assert body["operation"] == "blur_region"
+        assert body["source_attachment_id"] == attachment_id
+        assert body["attachment_id"] != attachment_id
+        assert body["width"] == 200
+        assert body["height"] == 150
+        assert body["image_data_url"].startswith("data:image/")
+
+    def test_works_even_when_ai_editing_is_disabled(self, monkeypatch, client, tmp_path):
+        monkeypatch.setattr(
+            "api.attachments.get_settings",
+            lambda: _settings(tmp_path, enable_image_editing=False, ima_api_key=None),
+        )
+        attachment_id = _upload_image(client, monkeypatch, tmp_path, width=100, height=100)
+        mask = _mask_data_url(100, 100, box=(10, 10, 40, 40))
+        response = client.post(
+            f"/attachments/{attachment_id}/blur-region", json={"mask_data_url": mask}
+        )
+        assert response.status_code == 200
+
+    def test_rejects_a_zero_area_mask_with_an_actionable_message(
+        self, monkeypatch, client, tmp_path
+    ):
+        attachment_id = _upload_image(client, monkeypatch, tmp_path, width=100, height=100)
+        empty_mask = _mask_data_url(100, 100, box=None)
+        response = client.post(
+            f"/attachments/{attachment_id}/blur-region", json={"mask_data_url": empty_mask}
+        )
+        assert response.status_code == 400
+        assert "too small" in response.json()["detail"].lower()
+
+    def test_rejects_a_malformed_mask_data_url(self, monkeypatch, client, tmp_path):
+        attachment_id = _upload_image(client, monkeypatch, tmp_path)
+        response = client.post(
+            f"/attachments/{attachment_id}/blur-region", json={"mask_data_url": "not-a-data-url"}
+        )
+        assert response.status_code == 400
+
+    def test_404_for_unknown_attachment(self, client):
+        mask = _mask_data_url(10, 10, box=(0, 0, 5, 5))
+        response = client.post(
+            "/attachments/does-not-exist/blur-region", json={"mask_data_url": mask}
+        )
+        assert response.status_code == 404
+
+
+class TestAiEdit:
+    """Real, generative AI-guided image editing -- the endpoint the
+    frontend's "AI-guided editing" panel used to have no backend for at
+    all. `attachments.ai_edit.get_image_edit_provider` is monkeypatched to
+    a `FakeImageEditProvider` for every test here except the explicit
+    "not configured" ones -- no real network/IMA call is ever made."""
+
+    def _install_fake_provider(self, monkeypatch, **kwargs):
+        from media_gen.image_edit_provider import FakeImageEditProvider
+
+        fake = FakeImageEditProvider(**kwargs)
+        monkeypatch.setattr("attachments.ai_edit.get_image_edit_provider", lambda settings: fake)
+        return fake
+
+    def _settings_with_editing_enabled(self, tmp_path, **overrides):
+        return _settings(
+            tmp_path, enable_image_editing=True, ima_api_key=SecretStr("fake-key"), **overrides
+        )
+
+    def test_not_configured_returns_a_clean_failed_status_not_a_500(
+        self, monkeypatch, client, tmp_path
+    ):
+        monkeypatch.setattr(
+            "api.attachments.get_settings",
+            lambda: _settings(tmp_path, enable_image_editing=False),
+        )
+        attachment_id = _upload_image(client, monkeypatch, tmp_path)
+        response = client.post(
+            f"/attachments/{attachment_id}/ai-edit",
+            json={"operation": "remove_object", "prompt": "remove the person"},
+        )
+        assert response.status_code == 200
+        body = response.json()
+        assert body["status"] == "failed"
+        assert body["error_code"] == "not_configured"
+
+    def test_successful_edit_returns_a_new_attachment_and_never_mutates_the_source(
+        self, monkeypatch, client, tmp_path
+    ):
+        monkeypatch.setattr(
+            "api.attachments.get_settings", lambda: self._settings_with_editing_enabled(tmp_path)
+        )
+        fake = self._install_fake_provider(monkeypatch)
+        attachment_id = _upload_image(client, monkeypatch, tmp_path, width=64, height=64)
+
+        response = client.post(
+            f"/attachments/{attachment_id}/ai-edit",
+            json={"operation": "remove_object", "prompt": "remove the selected object"},
+        )
+        assert response.status_code == 200
+        body = response.json()
+        assert body["status"] == "completed"
+        assert body["source_attachment_id"] == attachment_id
+        assert body["attachment_id"] != attachment_id
+        assert body["image_data_url"].startswith("data:image/")
+        assert body["provider"] == "fake"
+        assert body["mask_provided"] is False
+        # The fake provider actually received real image bytes, not a
+        # filename/placeholder -- see FakeImageEditProvider's own docstring
+        # for why this is exactly what this feature's own test requirement
+        # asks for.
+        assert len(fake.requests) == 1
+        assert fake.requests[0].image_bytes.startswith(b"\x89PNG")
+        assert fake.requests[0].prompt == "remove the selected object"
+
+    def test_mask_bytes_are_passed_to_the_provider_not_just_a_flag(
+        self, monkeypatch, client, tmp_path
+    ):
+        monkeypatch.setattr(
+            "api.attachments.get_settings", lambda: self._settings_with_editing_enabled(tmp_path)
+        )
+        fake = self._install_fake_provider(monkeypatch)
+        attachment_id = _upload_image(client, monkeypatch, tmp_path, width=100, height=100)
+        mask = _mask_data_url(100, 100, box=(20, 20, 60, 60))
+
+        response = client.post(
+            f"/attachments/{attachment_id}/ai-edit",
+            json={
+                "operation": "replace_background",
+                "prompt": "make the background blue",
+                "mask_data_url": mask,
+            },
+        )
+        assert response.status_code == 200
+        assert response.json()["mask_provided"] is True
+        assert fake.requests[0].mask_bytes is not None
+        assert len(fake.requests[0].mask_bytes) > 0
+
+    def test_rejects_a_zero_area_mask_before_ever_calling_the_provider(
+        self, monkeypatch, client, tmp_path
+    ):
+        monkeypatch.setattr(
+            "api.attachments.get_settings", lambda: self._settings_with_editing_enabled(tmp_path)
+        )
+        fake = self._install_fake_provider(monkeypatch)
+        attachment_id = _upload_image(client, monkeypatch, tmp_path, width=50, height=50)
+        empty_mask = _mask_data_url(50, 50, box=None)
+
+        response = client.post(
+            f"/attachments/{attachment_id}/ai-edit",
+            json={
+                "operation": "remove_object",
+                "prompt": "remove it",
+                "mask_data_url": empty_mask,
+            },
+        )
+        assert response.status_code == 200
+        body = response.json()
+        assert body["status"] == "failed"
+        assert body["error_code"] == "empty_mask"
+        assert fake.requests == []  # never reached the (paid) provider call
+
+    def test_rejects_unsupported_operation_at_the_schema_layer(self, monkeypatch, client, tmp_path):
+        monkeypatch.setattr(
+            "api.attachments.get_settings", lambda: self._settings_with_editing_enabled(tmp_path)
+        )
+        attachment_id = _upload_image(client, monkeypatch, tmp_path)
+        response = client.post(
+            f"/attachments/{attachment_id}/ai-edit",
+            json={"operation": "remove_watermark", "prompt": "take out the watermark"},
+        )
+        # Not in the Literal allowlist at all -- a 422 from Pydantic, before
+        # this ever reaches attachments.ai_edit's own allowlist check. See
+        # media_gen.image_edit_provider's own module docstring for why
+        # "remove watermark" is deliberately never offered as an operation.
+        assert response.status_code == 422
+
+    def test_content_policy_rejection_never_reaches_the_provider(
+        self, monkeypatch, client, tmp_path
+    ):
+        monkeypatch.setattr(
+            "api.attachments.get_settings", lambda: self._settings_with_editing_enabled(tmp_path)
+        )
+        fake = self._install_fake_provider(monkeypatch)
+        attachment_id = _upload_image(client, monkeypatch, tmp_path)
+        response = client.post(
+            f"/attachments/{attachment_id}/ai-edit",
+            json={"operation": "remove_object", "prompt": "make it nsfw"},
+        )
+        body = response.json()
+        assert body["status"] == "failed"
+        assert body["error_code"] == "content_policy_rejected"
+        assert fake.requests == []
+
+    def test_provider_failure_surfaces_as_a_clean_failed_status(
+        self, monkeypatch, client, tmp_path
+    ):
+        from media_gen.image_edit_provider import ImageEditProviderError
+
+        monkeypatch.setattr(
+            "api.attachments.get_settings", lambda: self._settings_with_editing_enabled(tmp_path)
+        )
+        self._install_fake_provider(
+            monkeypatch,
+            error=ImageEditProviderError("raw provider detail", safe_message="Try again later."),
+        )
+        attachment_id = _upload_image(client, monkeypatch, tmp_path)
+        response = client.post(
+            f"/attachments/{attachment_id}/ai-edit",
+            json={"operation": "remove_object", "prompt": "remove it"},
+        )
+        assert response.status_code == 200
+        body = response.json()
+        assert body["status"] == "failed"
+        assert body["error_message"] == "Try again later."
+        assert "raw provider detail" not in body["error_message"]
+
+    def test_idempotency_key_prevents_a_second_provider_call(self, monkeypatch, client, tmp_path):
+        monkeypatch.setattr(
+            "api.attachments.get_settings", lambda: self._settings_with_editing_enabled(tmp_path)
+        )
+        fake = self._install_fake_provider(monkeypatch)
+        attachment_id = _upload_image(client, monkeypatch, tmp_path)
+        payload = {
+            "operation": "remove_object",
+            "prompt": "remove it",
+            "idempotency_key": "retry-key-1",
+        }
+        first = client.post(f"/attachments/{attachment_id}/ai-edit", json=payload)
+        second = client.post(f"/attachments/{attachment_id}/ai-edit", json=payload)
+        assert first.status_code == 200 and second.status_code == 200
+        assert len(fake.requests) == 1  # the second call reused the cached outcome
+
+    def test_cannot_edit_another_owners_attachment(
+        self, monkeypatch, client, tmp_path, _fresh_attachment_store
+    ):
+        from attachments.models import Attachment
+
+        monkeypatch.setattr(
+            "api.attachments.get_settings", lambda: self._settings_with_editing_enabled(tmp_path)
+        )
+        self._install_fake_provider(monkeypatch)
+        image_bytes = _make_png_bytes()
+        path = tmp_path / "other_owner.png"
+        path.write_bytes(image_bytes)
+        attachment = Attachment(
+            original_filename="secret.png",
+            safe_filename="secret.png",
+            media_type="image/png",
+            extension=".png",
+            size_bytes=len(image_bytes),
+            sha256="deadbeef2",
+            local_path=str(path),
+            owner_subject="someone-else",
+            processing_status="succeeded",
+        )
+        _fresh_attachment_store.put(attachment)
+
+        response = client.post(
+            f"/attachments/{attachment.attachment_id}/ai-edit",
+            json={"operation": "remove_object", "prompt": "remove it"},
+        )
+        assert response.status_code == 404
+
+    def test_404_for_unknown_attachment(self, monkeypatch, client, tmp_path):
+        monkeypatch.setattr(
+            "api.attachments.get_settings", lambda: self._settings_with_editing_enabled(tmp_path)
+        )
+        response = client.post(
+            "/attachments/does-not-exist/ai-edit",
+            json={"operation": "remove_object", "prompt": "remove it"},
         )
         assert response.status_code == 404
 

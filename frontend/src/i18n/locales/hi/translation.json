@@ -74,7 +74,8 @@
   },
   "details": {
     "title": "क्वेरी जानकारी",
-    "database": "डेटाबेस"
+    "database": "डेटाबेस",
+    "model": "मॉडल"
   },
   "voice": {
     "settingsLabel": "वॉइस मोड",
@@ -100,7 +101,14 @@
     "language": "भाषा",
     "installApp": "ऐप इंस्टॉल करें",
     "updateAvailable": "एक नया संस्करण उपलब्ध है।",
-    "reload": "रीलोड करें"
+    "reload": "रीलोड करें",
+    "aiModel": "एआई मॉडल",
+    "modelRefresh": "मॉडल रीफ़्रेश करें",
+    "modelAvailable": "उपलब्ध",
+    "modelNotInstalled": "इंस्टॉल नहीं है",
+    "modelDefault": "डिफ़ॉल्ट",
+    "modelSelectionUnavailable": "मॉडल सूची अनुपलब्ध है -- सर्वर डिफ़ॉल्ट का उपयोग किया जा रहा है।",
+    "modelPullHint": "इस मॉडल को इंस्टॉल करने के लिए \"ollama pull {{model}}\" चलाएँ।"
   },
   "theme": {
     "light": "हल्का",
@@ -114,7 +122,8 @@
     "sources": "इनकी मदद से उत्तर दिया गया",
     "followingUpOn": "इसका अनुवर्ती",
     "sourcesLabel": "स्रोत",
-    "words": "शब्द"
+    "words": "शब्द",
+    "noRecordedAnswer": "इस संदेश का कोई सहेजा हुआ उत्तर नहीं है।"
   },
   "sql": {
     "title": "जनरेट किया गया SQL",

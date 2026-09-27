@@ -78,7 +78,8 @@
   },
   "details": {
     "title": "Query information",
-    "database": "Database"
+    "database": "Database",
+    "model": "Model"
   },
   "voice": {
     "settingsLabel": "Voice mode",
@@ -107,7 +108,14 @@
     "reload": "Reload",
     "settingsTitle": "Settings",
     "collapseSidebar": "Collapse sidebar",
-    "expandSidebar": "Expand sidebar"
+    "expandSidebar": "Expand sidebar",
+    "aiModel": "AI Model",
+    "modelRefresh": "Refresh models",
+    "modelAvailable": "Available",
+    "modelNotInstalled": "Not installed",
+    "modelDefault": "Default",
+    "modelSelectionUnavailable": "Model list unavailable -- using the server default.",
+    "modelPullHint": "Run \"ollama pull {{model}}\" to install this model."
   },
   "userMenu": {
     "trigger": "Account menu",
@@ -130,7 +138,8 @@
     "sources": "Answered using",
     "followingUpOn": "Following up on",
     "sourcesLabel": "Sources",
-    "words": "words"
+    "words": "words",
+    "noRecordedAnswer": "This message has no recorded answer."
   },
   "sql": {
     "title": "Generated SQL",
@@ -277,7 +286,20 @@
     "aiPresetBlurFace": "Blur the selected face",
     "aiPresetExtractTable": "Extract the selected table or chart",
     "aiGenerate": "Generate",
-    "aiNotConfigured": "AI-guided editing isn't available in this deployment yet — it needs a backend endpoint that hasn't been built. Your local edits above are unaffected.",
+    "aiNotConfigured": "AI-guided editing is not configured on this server. Your local edits above are unaffected.",
+    "aiPhaseUploading": "Uploading your edited image…",
+    "aiPhaseProcessing": "Generating the edit…",
+    "aiMaskPreview": "Mask sent with this request",
+    "aiDiscardResult": "Discard",
+    "aiApplyResult": "Apply to canvas",
+    "aiResultTitle": "AI edit result",
+    "aiGenericError": "Something went wrong while processing this image. Please try again.",
+    "aiMaskRequired": "Paint over the region to blur with the Mask tool first.",
+    "blurHint": "Deterministic, local blur — no AI model call, works even when AI-guided editing is unavailable. Requires a painted mask.",
+    "blurResultTitle": "Blurred result",
+    "extractHint": "Recognizes on-screen text via OCR — analysis only, never a generated image. Crop first to isolate one table or chart.",
+    "extractedTextTitle": "Recognized text",
+    "extractedTextEmpty": "No text was recognized in this image.",
     "viewerTitle": "Image viewer",
     "edited": "Edited",
     "original": "Original"

@@ -74,7 +74,8 @@
   },
   "details": {
     "title": "Información de la consulta",
-    "database": "Base de datos"
+    "database": "Base de datos",
+    "model": "Modelo"
   },
   "voice": {
     "settingsLabel": "Modo de voz",
@@ -100,7 +101,14 @@
     "language": "Idioma",
     "installApp": "Instalar aplicación",
     "updateAvailable": "Hay una nueva versión disponible.",
-    "reload": "Recargar"
+    "reload": "Recargar",
+    "aiModel": "Modelo de IA",
+    "modelRefresh": "Actualizar modelos",
+    "modelAvailable": "Disponible",
+    "modelNotInstalled": "No instalado",
+    "modelDefault": "Predeterminado",
+    "modelSelectionUnavailable": "Lista de modelos no disponible; se usará el valor predeterminado del servidor.",
+    "modelPullHint": "Ejecute \"ollama pull {{model}}\" para instalar este modelo."
   },
   "theme": {
     "light": "Claro",
@@ -114,7 +122,8 @@
     "sources": "Respondido usando",
     "followingUpOn": "Continuando con",
     "sourcesLabel": "Fuentes",
-    "words": "palabras"
+    "words": "palabras",
+    "noRecordedAnswer": "Este mensaje no tiene una respuesta registrada."
   },
   "sql": {
     "title": "SQL generado",
