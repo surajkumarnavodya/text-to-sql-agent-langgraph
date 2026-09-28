@@ -843,6 +843,16 @@ class HealthResponse(BaseModel):
     # "configured, not necessarily healthy" contract those two fields
     # already have.
     local_auth_enabled: bool
+    # Google sign-in capability discovery (2026-09-28) -- same "sanitized
+    # capability endpoint" contract as the rest of this response:
+    # `google_client_id` is a PUBLIC OAuth client ID, never a secret (see
+    # `security/google_oidc.py`'s own module docstring for why this flow
+    # never holds a client secret at all), and is only ever populated
+    # alongside `google_signin_enabled=True` -- the frontend's "Continue
+    # with Google" button reads both together and never assumes a client
+    # ID implies availability or the reverse.
+    google_signin_enabled: bool = False
+    google_client_id: str | None = None
     # Startup/operator diagnostic for chat-image vision support -- a real,
     # reported bug (an attached image silently answering "vision not
     # configured" with no way to tell whether that meant "never set up" or

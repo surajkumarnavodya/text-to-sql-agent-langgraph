@@ -35,7 +35,14 @@
     "hidePassword": "Hide password",
     "completeProfileTitle": "Add your display name to finish setting up your account.",
     "completeProfileSave": "Save",
-    "completeProfileDismiss": "Dismiss"
+    "completeProfileDismiss": "Dismiss",
+    "orDivider": "or",
+    "continueWithGoogle": "Continue with Google",
+    "googleSigningIn": "Signing in with Google…",
+    "googleUnavailable": "Google sign-in isn't available right now. Please use email and password instead.",
+    "googleLinked": "Google account linked",
+    "unlink": "Unlink",
+    "unlinkBlockedNoPassword": "Set a password before unlinking your only sign-in method."
   },
   "nav": {
     "chat": "Chat",
@@ -110,6 +117,7 @@
     "collapseSidebar": "Collapse sidebar",
     "expandSidebar": "Expand sidebar",
     "aiModel": "AI Model",
+    "connectedAccounts": "Connected accounts",
     "modelRefresh": "Refresh models",
     "modelAvailable": "Available",
     "modelNotInstalled": "Not installed",
@@ -392,6 +400,62 @@
     "close": "Close",
     "closeDialog": "Close dialog",
     "stop": "Stop",
-    "copy": "Copy"
+    "copy": "Copy",
+    "confirm": "Confirm"
+  },
+  "share": {
+    "menuItem": "Share",
+    "title": "Share conversation",
+    "loadError": "Couldn't load sharing settings.",
+    "actionError": "Something went wrong. Please try again.",
+    "notSharedDescription": "This conversation isn't shared yet.",
+    "enableSharing": "Enable sharing",
+    "snapshotNotice": "Viewers see a snapshot captured on {{date}}.",
+    "snapshotNoticeUnknown": "Viewers see a snapshot of this conversation.",
+    "generalAccess": "General access",
+    "accessInviteOnly": "Only invited people",
+    "accessAnyoneWithLink": "Anyone with the link",
+    "widenAccessWarning": "Anyone who has this link will be able to view this conversation.",
+    "regenerateLink": "Regenerate link",
+    "copyLink": "Copy link",
+    "oneTimeLinkNotice": "Save this link now -- it won't be shown again.",
+    "expiresLabel": "Expires",
+    "noExpiry": "Never",
+    "inviteLabel": "Invite people",
+    "invitePlaceholder": "Email address",
+    "inviteAction": "Invite",
+    "inviteError": "Couldn't send that invite.",
+    "copyInvite": "Copy invite link",
+    "peopleWithAccess": "People with access",
+    "unknownMember": "Pending invite",
+    "removeMember": "Remove",
+    "memberStatus": {
+      "pending": "Pending",
+      "active": "Active",
+      "revoked": "Removed",
+      "expired": "Expired"
+    },
+    "sharingActive": "Sharing",
+    "turnOff": "Turn off",
+    "turnOn": "Turn on",
+    "refreshSnapshot": "Update shared snapshot",
+    "revoke": "Revoke share",
+    "revokeWarning": "This permanently revokes this share and its link. This cannot be undone."
+  },
+  "sharedView": {
+    "badge": "Shared conversation",
+    "untitled": "Untitled conversation",
+    "snapshotOf": "Snapshot captured {{date}}",
+    "rateLimited": "Too many requests. Please try again in a moment.",
+    "unavailable": "This shared conversation is unavailable. It may have been removed, expired, or revoked.",
+    "turnFailed": "This response could not be completed.",
+    "resultTruncated": "Showing a partial result.",
+    "attachmentUnavailable": "unavailable"
+  },
+  "acceptInvitation": {
+    "working": "Accepting invitation...",
+    "success": "You now have access to this conversation.",
+    "openConversation": "Open conversation",
+    "genericError": "This invitation could not be accepted."
   }
 }

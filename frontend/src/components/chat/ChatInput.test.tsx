@@ -16,6 +16,8 @@ function makeHealth(): HealthResponse {
     voice_enabled: false,
     media_search_enabled: false,
     local_auth_enabled: false,
+    google_signin_enabled: false,
+    google_client_id: null,
     vision_enabled: false,
     vision_provider: null,
     vision_model: null,

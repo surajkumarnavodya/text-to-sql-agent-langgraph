@@ -184,6 +184,19 @@ jobs:
       - name: Build
         run: npm run build
 
+      # 2026-09-28 addition (Google sign-in / frontend credential-safety
+      # review): the two scanners above (gitleaks/detect-secrets) only ever
+      # scan Git-tracked *source* files -- neither has ever looked at what
+      # Vite actually bundled into frontend/dist, the one artifact a real
+      # browser downloads. Pattern-only here (no backend Python
+      # dependencies installed in this job) -- see
+      # scripts/scan_frontend_build_for_secrets.py's own module docstring
+      # for the deeper `--check-configured-secrets` mode a real deployment
+      # can run locally against its own actual secrets before shipping.
+      - name: Scan production build for leaked credentials
+        working-directory: .
+        run: python3 scripts/scan_frontend_build_for_secrets.py --dist-dir frontend/dist
+
   # 2026 Phase 2 security review: builds the actual image this project
   # ships (Dockerfile) and scans it for OS-package and known-vulnerable-
   # dependency CVEs -- `pip-audit` above only covers this project's own

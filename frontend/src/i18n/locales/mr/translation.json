@@ -35,7 +35,14 @@
     "hidePassword": "पासवर्ड लपवा",
     "completeProfileTitle": "तुमचे खाते पूर्ण करण्यासाठी तुमचे प्रदर्शित नाव जोडा.",
     "completeProfileSave": "जतन करा",
-    "completeProfileDismiss": "रद्द करा"
+    "completeProfileDismiss": "रद्द करा",
+    "orDivider": "किंवा",
+    "continueWithGoogle": "Google सह सुरू ठेवा",
+    "googleSigningIn": "Google सह साइन इन होत आहे…",
+    "googleUnavailable": "Google साइन-इन सध्या उपलब्ध नाही. कृपया ईमेल आणि पासवर्ड वापरा.",
+    "googleLinked": "Google खाते जोडलेले आहे",
+    "unlink": "अनलिंक करा",
+    "unlinkBlockedNoPassword": "तुमची एकमेव साइन-इन पद्धत अनलिंक करण्यापूर्वी पासवर्ड सेट करा."
   },
   "nav": {
     "chat": "चॅट",
@@ -103,6 +110,7 @@
     "updateAvailable": "नवीन आवृत्ती उपलब्ध आहे.",
     "reload": "पुन्हा लोड करा",
     "aiModel": "एआय मॉडेल",
+    "connectedAccounts": "जोडलेली खाती",
     "modelRefresh": "मॉडेल रिफ्रेश करा",
     "modelAvailable": "उपलब्ध",
     "modelNotInstalled": "इंस्टॉल केलेले नाही",
@@ -190,6 +198,62 @@
     "noResults": "जुळणारी कोणतीही ओळ नाही.",
     "showMore": "अधिक पाहा",
     "showLess": "कमी पाहा",
-    "of": "पैकी"
+    "of": "पैकी",
+    "confirm": "पुष्टी करा"
+  },
+  "share": {
+    "menuItem": "शेअर करा",
+    "title": "संभाषण शेअर करा",
+    "loadError": "शेअरिंग सेटिंग्ज लोड करता आल्या नाहीत.",
+    "actionError": "काहीतरी चूक झाली. कृपया पुन्हा प्रयत्न करा.",
+    "notSharedDescription": "हे संभाषण अद्याप शेअर केलेले नाही.",
+    "enableSharing": "शेअरिंग सक्षम करा",
+    "snapshotNotice": "दर्शकांना {{date}} रोजी घेतलेला स्नॅपशॉट दिसतो.",
+    "snapshotNoticeUnknown": "दर्शकांना या संभाषणाचा स्नॅपशॉट दिसतो.",
+    "generalAccess": "सामान्य प्रवेश",
+    "accessInviteOnly": "फक्त आमंत्रित लोक",
+    "accessAnyoneWithLink": "लिंक असलेली कोणतीही व्यक्ती",
+    "widenAccessWarning": "ही लिंक असलेली कोणतीही व्यक्ती हे संभाषण पाहू शकेल.",
+    "regenerateLink": "लिंक पुन्हा तयार करा",
+    "copyLink": "लिंक कॉपी करा",
+    "oneTimeLinkNotice": "ही लिंक आत्ताच जतन करा -- ती पुन्हा दाखवली जाणार नाही.",
+    "expiresLabel": "कालबाह्य",
+    "noExpiry": "कधीही नाही",
+    "inviteLabel": "लोकांना आमंत्रित करा",
+    "invitePlaceholder": "ईमेल पत्ता",
+    "inviteAction": "आमंत्रित करा",
+    "inviteError": "ते आमंत्रण पाठवता आले नाही.",
+    "copyInvite": "आमंत्रण लिंक कॉपी करा",
+    "peopleWithAccess": "प्रवेश असलेले लोक",
+    "unknownMember": "प्रलंबित आमंत्रण",
+    "removeMember": "काढा",
+    "memberStatus": {
+      "pending": "प्रलंबित",
+      "active": "सक्रिय",
+      "revoked": "काढले",
+      "expired": "कालबाह्य"
+    },
+    "sharingActive": "शेअरिंग",
+    "turnOff": "बंद करा",
+    "turnOn": "सुरू करा",
+    "refreshSnapshot": "शेअर केलेला स्नॅपशॉट अद्ययावत करा",
+    "revoke": "शेअर रद्द करा",
+    "revokeWarning": "हे शेअरिंग आणि त्याची लिंक कायमची रद्द करेल. हे पूर्ववत करता येणार नाही."
+  },
+  "sharedView": {
+    "badge": "शेअर केलेले संभाषण",
+    "untitled": "शीर्षकहीन संभाषण",
+    "snapshotOf": "{{date}} रोजी घेतलेला स्नॅपशॉट",
+    "rateLimited": "खूप विनंत्या. कृपया थोड्या वेळाने पुन्हा प्रयत्न करा.",
+    "unavailable": "हे शेअर केलेले संभाषण उपलब्ध नाही. ते काढले, कालबाह्य किंवा रद्द केले गेले असावे.",
+    "turnFailed": "हा प्रतिसाद पूर्ण करता आला नाही.",
+    "resultTruncated": "आंशिक निकाल दाखवत आहे.",
+    "attachmentUnavailable": "अनुपलब्ध"
+  },
+  "acceptInvitation": {
+    "working": "आमंत्रण स्वीकारत आहे...",
+    "success": "आता तुम्हाला या संभाषणात प्रवेश आहे.",
+    "openConversation": "संभाषण उघडा",
+    "genericError": "हे आमंत्रण स्वीकारता आले नाही."
   }
 }

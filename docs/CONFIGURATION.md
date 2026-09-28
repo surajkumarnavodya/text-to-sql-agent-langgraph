@@ -254,6 +254,49 @@ feature existed.
 | `VITE_OIDC_POST_LOGOUT_REDIRECT_URI` | `<origin>` | Where the IdP sends the user after sign-out. |
 | `VITE_API_AUTH_TOKEN` | *(unset)* | A build-time copy of `API_AUTH_TOKEN` above, used as a fallback when OIDC isn't configured (or as the sole credential for a trusted-network/single-operator deployment). |
 
+### Local self-hosted accounts, Google sign-in & conversation sharing
+
+`LOCAL_AUTH_ENABLED=true` (plus `AUTH_DATABASE_URL` — a dedicated
+PostgreSQL database — and `JWT_SECRET_KEY`) turns on this app's own
+accounts (`identity/`): real login/registration, per-user chat history,
+and (once set up) Google sign-in and secure conversation sharing on top.
+See `.env.example`'s own "Local self-hosted accounts" block for the full
+set (password/session/lockout tuning), and `docs/AUTHENTICATION.md` for
+the complete design — the two tables below cover only what's new.
+
+**Google sign-in** ("Continue with Google" — requires `LOCAL_AUTH_ENABLED=true`;
+refuses to start otherwise). See `docs/AUTHENTICATION.md`'s "Google
+sign-in" section for the chosen flow, every server-side token check, and
+the Google Cloud Console setup steps.
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `GOOGLE_OAUTH_CLIENT_ID` | *(unset)* | Setting this turns Google sign-in on. Unlike every other credential in this table, this value is **public by design** (it ships in the Google Identity Services JS the browser runs) — served live to the frontend via `GET /health`, never baked into a `VITE_*` build-time variable, so it can be rotated with a process restart alone. |
+| `GOOGLE_OAUTH_ALLOWED_HOSTED_DOMAINS` | *(unset = any account)* | Comma-separated Google Workspace domain(s) to restrict sign-in to. Enforced from the token's own signed `hd` claim — never inferred from the email's `@domain` suffix. |
+| `GOOGLE_OAUTH_CLOCK_SKEW_SECONDS` | `60` | Leeway for the Google ID token's `iat`/`exp` validation — same purpose as `OIDC_CLOCK_SKEW_SECONDS` above, kept separate since this feature doesn't share `security/oidc.py`'s validation path. |
+| `GOOGLE_OAUTH_NONCE_TTL_SECONDS` | `300` | How long a server-issued sign-in nonce (`GET /auth/google/nonce`) stays claimable before it expires unused. |
+
+**Secure conversation sharing** ("Share conversation" — requires
+`LOCAL_AUTH_ENABLED=true`). See `docs/SHARING_SECURITY.md` for the full
+RBAC/ABAC model, token lifecycle, and snapshot/projection rules.
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `ENABLE_CONVERSATION_SHARING` | `true` | Master switch for the whole feature. |
+| `SHARE_PUBLIC_LINKS_ENABLED` | `false` | A deliberately separate, deny-by-default switch: even with sharing on, an owner can only create an "anyone with the link" share once an operator explicitly opts in here. Invite-only sharing works with this left off. |
+| `SHARE_DEFAULT_EXPIRY_DAYS` | `30` | Default expiry for a new share (and for a re-share after revocation) — always finite, shown in the owner UI. |
+| `SHARE_INVITATION_EXPIRY_DAYS` | `14` | How long an invited member's own accept link stays valid. |
+| `SHARE_MAX_MEMBERS_PER_CONVERSATION` | `50` | Anti-abuse cap on invited members per share. |
+| `SHARE_LINK_ACCESS_RATE_LIMIT_PER_MINUTE` | `30` | Per-IP rate limit on the anonymous-reachable `GET /share-view/{ref}` (and its attachment sibling) — the only sharing routes with no authenticated caller identity to key a limiter on. |
+| `SHARE_INVITE_RATE_LIMIT_PER_HOUR` | `20` | Per-caller rate limit on inviting members, regenerating a link, and accepting an invitation. |
+
+**Operator note**: after deploying either feature to an already-provisioned
+database, run `python scripts/bootstrap_admin.py` once (idempotent, safe to
+re-run) — this codebase has no automatic "re-seed RBAC permissions on
+startup" hook, so a newly-added permission (like the ones sharing needs)
+is invisible to existing roles until this is run. See
+`docs/SHARING_SECURITY.md`'s "External configuration / staging steps".
+
 ## Multi-source router (optional, off by default)
 
 See [`docs/MULTI_SOURCE_GUIDE.md`](MULTI_SOURCE_GUIDE.md) for a walkthrough

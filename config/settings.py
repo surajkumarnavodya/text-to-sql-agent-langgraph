@@ -565,6 +565,36 @@ class Settings(BaseSettings):
             standard claim for this; Auth0/Keycloak/Azure AD each use their
             own custom-claim convention) -- configure this to match
             whatever the identity provider actually issues.
+        google_oauth_client_id: This app's Google Cloud OAuth 2.0 Web
+            Client ID -- a **public** identifier (safe to ship in a
+            frontend response, unlike an OAuth client *secret*, which this
+            app never needs -- see `security/google_oidc.py`'s own module
+            docstring for why the ID-token-credential flow was chosen
+            specifically to avoid ever holding a Google client secret).
+            None (default) means Google sign-in is off; `GET /health`
+            reports it as `google_signin_enabled: false` and the frontend
+            never renders the button. Every verified ID token's `aud`
+            claim must exactly equal this value -- see
+            `security/google_oidc.py::verify_google_id_token`.
+        google_oauth_allowed_hosted_domains: Optional Google Workspace
+            domain allowlist (comma-separated, e.g. "example.com") for the
+            verified `hd` claim. Empty (default) means no Workspace
+            restriction -- any verified Google account may sign in.
+            Deliberately never inferred from an `@domain` email suffix
+            (a `hd` claim is validated server-side against Google's signed
+            token; an email suffix is just string content the token's
+            actual sender doesn't have to match).
+        google_oauth_clock_skew_seconds: Leeway applied to the Google ID
+            token's `iat`/`exp` validation -- the same purpose as
+            `oidc_clock_skew_seconds` above, kept as its own separate field
+            since Google sign-in doesn't share `security/oidc.py`'s
+            validation path at all.
+        google_oauth_nonce_ttl_seconds: How long a server-issued sign-in
+            nonce (`GET /auth/google/nonce`) stays valid and claimable
+            before it expires unused. Short and bounded deliberately -- a
+            nonce is single-use and tied to one page load, not a session
+            (none exists yet pre-authentication), so this is the only
+            lifetime control on it.
         local_auth_enabled: Whether this app's own self-hosted user
             accounts (`identity/`) are active at all -- register/login/
             refresh/logout/password-reset/admin-user-management. False by
@@ -1513,6 +1543,14 @@ class Settings(BaseSettings):
     oidc_clock_skew_seconds: int = Field(default=60, ge=0)
     oidc_role_claim: str = "roles"
 
+    # --- Google sign-in (identity/, security/google_oidc.py -- a specific
+    # provider integrated into this app's own local accounts, distinct from
+    # the generic third-party-issued-JWT relying party above) ---
+    google_oauth_client_id: str | None = None
+    google_oauth_allowed_hosted_domains: Annotated[tuple[str, ...], NoDecode] = ()
+    google_oauth_clock_skew_seconds: int = Field(default=60, ge=0)
+    google_oauth_nonce_ttl_seconds: int = Field(default=300, gt=0)
+
     # --- Local user accounts / identity database (identity/, see that
     # package's own module docstrings; docs/AUTH_USER_MANAGEMENT.md has the
     # full picture) ---
@@ -1548,6 +1586,27 @@ class Settings(BaseSettings):
     # conversation's storage footprint; the persisted field is truncated
     # with a trailing marker, never silently dropped.
     chat_history_max_text_chars: int = Field(default=4000, gt=0, le=50_000)
+    # --- Secure conversation sharing (identity/share_policy.py,
+    # identity/repositories/shares.py, api/shares.py) ---
+    enable_conversation_sharing: bool = True
+    # Deny-by-default deployment policy: an "anyone with the link" share is
+    # only ever creatable when an operator has explicitly turned this on --
+    # per this feature's own spec ("Anonymous link viewer: only if
+    # explicitly enabled by deployment policy"). Off by default, unlike
+    # `enable_conversation_sharing` itself, since a bearer link is a
+    # materially larger exposure surface than an invite-only share.
+    share_public_links_enabled: bool = False
+    share_default_expiry_days: int = Field(default=30, gt=0, le=365)
+    share_invitation_expiry_days: int = Field(default=14, gt=0, le=90)
+    share_max_members_per_conversation: int = Field(default=50, gt=0, le=500)
+    # Rate limits for the anonymous-reachable surface (`GET /shared/{ref}`,
+    # attachment downloads, invitation acceptance) -- deliberately its own
+    # settings block, not reused from `question_rate_limit_per_minute`,
+    # since these routes have no authenticated caller identity to key a
+    # per-user limiter on for an anonymous link visitor (see
+    # `api/rate_limit.py`'s own per-IP fallback convention).
+    share_link_access_rate_limit_per_minute: int = Field(default=30, gt=0)
+    share_invite_rate_limit_per_hour: int = Field(default=20, gt=0)
     max_login_attempts: int = Field(default=5, gt=0)
     login_lockout_minutes: int = Field(default=15, gt=0)
     jwt_algorithm: Literal["HS256", "RS256", "ES256"] = "HS256"
@@ -1801,6 +1860,15 @@ class Settings(BaseSettings):
         """
         if isinstance(value, str):
             return tuple(model.strip() for model in value.split(",") if model.strip())
+        return value
+
+    @field_validator("google_oauth_allowed_hosted_domains", mode="before")
+    @classmethod
+    def _split_google_oauth_allowed_hosted_domains(cls, value: object) -> object:
+        """Same comma-separated `.env` convention as `_split_cors_origins`/
+        `_split_ollama_allowed_models` above."""
+        if isinstance(value, str):
+            return tuple(domain.strip() for domain in value.split(",") if domain.strip())
         return value
 
     @field_validator("cors_allowed_origins", mode="after")
@@ -2112,6 +2180,27 @@ class Settings(BaseSettings):
                 "self-hosted user accounts need a dedicated identity database to "
                 "store users/sessions/history in. Set AUTH_DATABASE_URL in .env, or "
                 "leave LOCAL_AUTH_ENABLED unset/false."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_google_signin_requires_local_auth(self) -> Settings:
+        """`GOOGLE_OAUTH_CLIENT_ID` is meaningless without `LOCAL_AUTH_ENABLED`
+        -- a Google-authenticated user is provisioned as a real row in
+        `identity.users` (see `identity/repositories/external_identities.py`),
+        so there is nowhere to create or look up that user without the
+        identity database this app's own local accounts already require.
+        Caught here at startup, the same way `_validate_local_auth_requires_database`
+        catches its own analogous gap, rather than letting the first real
+        Google sign-in attempt fail with a confusing error.
+        """
+        if self.google_oauth_client_id is not None and not self.local_auth_enabled:
+            raise ConfigurationError(
+                "GOOGLE_OAUTH_CLIENT_ID is set but LOCAL_AUTH_ENABLED is not -- "
+                "refusing to start. Google sign-in creates/links a row in this "
+                "app's own identity database, which requires LOCAL_AUTH_ENABLED=true "
+                "and AUTH_DATABASE_URL to be set. Enable local auth first, or leave "
+                "GOOGLE_OAUTH_CLIENT_ID unset."
             )
         return self
 

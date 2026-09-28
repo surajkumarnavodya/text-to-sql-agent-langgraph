@@ -10,6 +10,7 @@ code.
 from __future__ import annotations
 
 import uuid
+from typing import Any
 
 from sqlalchemy.orm import Session
 
@@ -27,6 +28,7 @@ def record_signin_event(
     ip_address: str | None = None,
     user_agent: str | None = None,
     session_id: uuid.UUID | None = None,
+    metadata: dict[str, Any] | None = None,
 ) -> None:
     """Appends one `signin_events` row. Never raises on a logging-shaped
     failure path -- callers (`api/identity_auth.py`) call this *after* the
@@ -35,6 +37,13 @@ def record_signin_event(
     the call site if you need that guarantee, same posture
     `security.audit_log.log_security_event` already has for its own event
     stream.
+
+    `metadata` (2026-09-28, Google sign-in) -- small, non-sensitive extra
+    context that doesn't fit an existing column (e.g. `{"provider":
+    "google", "new_user": true}`) -- **never** a credential/token/claim
+    dump; every call site is responsible for only ever passing plain,
+    already-safe-to-store values here, the same trust boundary this
+    module's other fields already have.
     """
     session.add(
         SigninEvent(
@@ -46,6 +55,7 @@ def record_signin_event(
             ip_address=ip_address,
             user_agent=user_agent,
             session_id=session_id,
+            metadata_json=metadata,
         )
     )
     session.commit()

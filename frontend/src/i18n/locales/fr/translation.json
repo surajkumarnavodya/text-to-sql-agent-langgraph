@@ -35,7 +35,14 @@
     "hidePassword": "Masquer le mot de passe",
     "completeProfileTitle": "Ajoutez votre nom affiché pour terminer la configuration de votre compte.",
     "completeProfileSave": "Enregistrer",
-    "completeProfileDismiss": "Ignorer"
+    "completeProfileDismiss": "Ignorer",
+    "orDivider": "ou",
+    "continueWithGoogle": "Continuer avec Google",
+    "googleSigningIn": "Connexion avec Google…",
+    "googleUnavailable": "La connexion avec Google n'est pas disponible pour le moment. Utilisez votre e-mail et votre mot de passe.",
+    "googleLinked": "Compte Google lié",
+    "unlink": "Dissocier",
+    "unlinkBlockedNoPassword": "Définissez un mot de passe avant de dissocier votre seule méthode de connexion."
   },
   "nav": {
     "chat": "Chat",
@@ -103,6 +110,7 @@
     "updateAvailable": "Une nouvelle version est disponible.",
     "reload": "Recharger",
     "aiModel": "Modèle IA",
+    "connectedAccounts": "Comptes connectés",
     "modelRefresh": "Actualiser les modèles",
     "modelAvailable": "Disponible",
     "modelNotInstalled": "Non installé",
@@ -190,6 +198,62 @@
     "noResults": "Aucune ligne correspondante.",
     "showMore": "Afficher plus",
     "showLess": "Afficher moins",
-    "of": "sur"
+    "of": "sur",
+    "confirm": "Confirmer"
+  },
+  "share": {
+    "menuItem": "Partager",
+    "title": "Partager la conversation",
+    "loadError": "Impossible de charger les paramètres de partage.",
+    "actionError": "Une erreur s'est produite. Veuillez réessayer.",
+    "notSharedDescription": "Cette conversation n'est pas encore partagée.",
+    "enableSharing": "Activer le partage",
+    "snapshotNotice": "Les visiteurs voient un instantané capturé le {{date}}.",
+    "snapshotNoticeUnknown": "Les visiteurs voient un instantané de cette conversation.",
+    "generalAccess": "Accès général",
+    "accessInviteOnly": "Personnes invitées uniquement",
+    "accessAnyoneWithLink": "Toute personne disposant du lien",
+    "widenAccessWarning": "Toute personne disposant de ce lien pourra voir cette conversation.",
+    "regenerateLink": "Régénérer le lien",
+    "copyLink": "Copier le lien",
+    "oneTimeLinkNotice": "Enregistrez ce lien maintenant, il ne sera plus affiché.",
+    "expiresLabel": "Expire",
+    "noExpiry": "Jamais",
+    "inviteLabel": "Inviter des personnes",
+    "invitePlaceholder": "Adresse e-mail",
+    "inviteAction": "Inviter",
+    "inviteError": "Impossible d'envoyer cette invitation.",
+    "copyInvite": "Copier le lien d'invitation",
+    "peopleWithAccess": "Personnes ayant accès",
+    "unknownMember": "Invitation en attente",
+    "removeMember": "Retirer",
+    "memberStatus": {
+      "pending": "En attente",
+      "active": "Actif",
+      "revoked": "Retiré",
+      "expired": "Expiré"
+    },
+    "sharingActive": "Partage",
+    "turnOff": "Désactiver",
+    "turnOn": "Activer",
+    "refreshSnapshot": "Mettre à jour l'instantané partagé",
+    "revoke": "Révoquer le partage",
+    "revokeWarning": "Cela révoque définitivement ce partage et son lien. Cette action est irréversible."
+  },
+  "sharedView": {
+    "badge": "Conversation partagée",
+    "untitled": "Conversation sans titre",
+    "snapshotOf": "Instantané capturé le {{date}}",
+    "rateLimited": "Trop de requêtes. Veuillez réessayer dans un instant.",
+    "unavailable": "Cette conversation partagée n'est pas disponible. Elle a peut-être été supprimée, expirée ou révoquée.",
+    "turnFailed": "Cette réponse n'a pas pu être terminée.",
+    "resultTruncated": "Affichage d'un résultat partiel.",
+    "attachmentUnavailable": "indisponible"
+  },
+  "acceptInvitation": {
+    "working": "Acceptation de l'invitation...",
+    "success": "Vous avez maintenant accès à cette conversation.",
+    "openConversation": "Ouvrir la conversation",
+    "genericError": "Cette invitation n'a pas pu être acceptée."
   }
 }

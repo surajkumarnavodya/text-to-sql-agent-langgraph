@@ -35,7 +35,14 @@
     "hidePassword": "पासवर्ड छिपाएं",
     "completeProfileTitle": "अपना खाता पूरा करने के लिए अपना प्रदर्शित नाम जोड़ें।",
     "completeProfileSave": "सहेजें",
-    "completeProfileDismiss": "खारिज करें"
+    "completeProfileDismiss": "खारिज करें",
+    "orDivider": "या",
+    "continueWithGoogle": "Google से जारी रखें",
+    "googleSigningIn": "Google से साइन इन हो रहा है…",
+    "googleUnavailable": "Google साइन-इन अभी उपलब्ध नहीं है। कृपया ईमेल और पासवर्ड का उपयोग करें।",
+    "googleLinked": "Google खाता जुड़ा हुआ है",
+    "unlink": "अनलिंक करें",
+    "unlinkBlockedNoPassword": "अपनी एकमात्र साइन-इन विधि को अनलिंक करने से पहले एक पासवर्ड सेट करें।"
   },
   "nav": {
     "chat": "चैट",
@@ -103,6 +110,7 @@
     "updateAvailable": "एक नया संस्करण उपलब्ध है।",
     "reload": "रीलोड करें",
     "aiModel": "एआई मॉडल",
+    "connectedAccounts": "जुड़े हुए खाते",
     "modelRefresh": "मॉडल रीफ़्रेश करें",
     "modelAvailable": "उपलब्ध",
     "modelNotInstalled": "इंस्टॉल नहीं है",
@@ -190,6 +198,62 @@
     "noResults": "कोई मेल खाती पंक्ति नहीं।",
     "showMore": "और देखें",
     "showLess": "कम देखें",
-    "of": "में से"
+    "of": "में से",
+    "confirm": "पुष्टि करें"
+  },
+  "share": {
+    "menuItem": "साझा करें",
+    "title": "बातचीत साझा करें",
+    "loadError": "साझाकरण सेटिंग्स लोड नहीं हो सकीं।",
+    "actionError": "कुछ गलत हो गया। कृपया पुनः प्रयास करें।",
+    "notSharedDescription": "यह बातचीत अभी तक साझा नहीं की गई है।",
+    "enableSharing": "साझाकरण सक्षम करें",
+    "snapshotNotice": "दर्शक {{date}} को लिया गया स्नैपशॉट देखते हैं।",
+    "snapshotNoticeUnknown": "दर्शक इस बातचीत का एक स्नैपशॉट देखते हैं।",
+    "generalAccess": "सामान्य पहुंच",
+    "accessInviteOnly": "केवल आमंत्रित लोग",
+    "accessAnyoneWithLink": "लिंक वाला कोई भी व्यक्ति",
+    "widenAccessWarning": "इस लिंक वाला कोई भी व्यक्ति इस बातचीत को देख सकेगा।",
+    "regenerateLink": "लिंक पुनः बनाएं",
+    "copyLink": "लिंक कॉपी करें",
+    "oneTimeLinkNotice": "इस लिंक को अभी सहेज लें -- यह दोबारा नहीं दिखाया जाएगा।",
+    "expiresLabel": "समाप्ति",
+    "noExpiry": "कभी नहीं",
+    "inviteLabel": "लोगों को आमंत्रित करें",
+    "invitePlaceholder": "ईमेल पता",
+    "inviteAction": "आमंत्रित करें",
+    "inviteError": "वह निमंत्रण नहीं भेजा जा सका।",
+    "copyInvite": "आमंत्रण लिंक कॉपी करें",
+    "peopleWithAccess": "पहुंच वाले लोग",
+    "unknownMember": "लंबित निमंत्रण",
+    "removeMember": "हटाएं",
+    "memberStatus": {
+      "pending": "लंबित",
+      "active": "सक्रिय",
+      "revoked": "हटाया गया",
+      "expired": "समाप्त"
+    },
+    "sharingActive": "साझाकरण",
+    "turnOff": "बंद करें",
+    "turnOn": "चालू करें",
+    "refreshSnapshot": "साझा स्नैपशॉट अपडेट करें",
+    "revoke": "साझाकरण रद्द करें",
+    "revokeWarning": "यह इस साझाकरण और उसके लिंक को स्थायी रूप से रद्द कर देगा। इसे पूर्ववत नहीं किया जा सकता।"
+  },
+  "sharedView": {
+    "badge": "साझा की गई बातचीत",
+    "untitled": "शीर्षकहीन बातचीत",
+    "snapshotOf": "{{date}} को लिया गया स्नैपशॉट",
+    "rateLimited": "बहुत अधिक अनुरोध। कृपया थोड़ी देर बाद पुनः प्रयास करें।",
+    "unavailable": "यह साझा की गई बातचीत उपलब्ध नहीं है। इसे हटाया, समाप्त या रद्द किया जा सकता है।",
+    "turnFailed": "यह प्रतिक्रिया पूरी नहीं की जा सकी।",
+    "resultTruncated": "आंशिक परिणाम दिखाया जा रहा है।",
+    "attachmentUnavailable": "अनुपलब्ध"
+  },
+  "acceptInvitation": {
+    "working": "निमंत्रण स्वीकार किया जा रहा है...",
+    "success": "अब आपके पास इस बातचीत तक पहुंच है।",
+    "openConversation": "बातचीत खोलें",
+    "genericError": "यह निमंत्रण स्वीकार नहीं किया जा सका।"
   }
 }

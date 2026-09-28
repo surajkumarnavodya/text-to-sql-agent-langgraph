@@ -1,8 +1,10 @@
 import { Eye, EyeOff, Loader2 } from 'lucide-react'
 import { type FormEvent, useState } from 'react'
 import { useTranslation } from 'react-i18next'
+import { GoogleSignInButton } from '@/components/auth/GoogleSignInButton'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
+import { useHealth } from '@/hooks/queries'
 import { ApiError } from '@/lib/api'
 import { isTokenResponse } from '@/lib/identityApi'
 import { validatePasswordStrength } from '@/lib/passwordPolicy'
@@ -26,6 +28,9 @@ import { useLocalAuthStore } from '@/store/localAuthStore'
 export function Register({ onSwitchToSignIn }: { onSwitchToSignIn: () => void }) {
   const { t } = useTranslation()
   const register = useLocalAuthStore((state) => state.register)
+  const loginWithGoogle = useLocalAuthStore((state) => state.loginWithGoogle)
+  const health = useHealth()
+  const [googleSubmitting, setGoogleSubmitting] = useState(false)
   const [email, setEmail] = useState('')
   const [displayName, setDisplayName] = useState('')
   const [password, setPassword] = useState('')
@@ -67,6 +72,18 @@ export function Register({ onSwitchToSignIn }: { onSwitchToSignIn: () => void })
       setError(err instanceof ApiError ? err.message : t('auth.localGenericError'))
     } finally {
       setSubmitting(false)
+    }
+  }
+
+  const handleGoogleCredential = async (credential: string) => {
+    setError(null)
+    setGoogleSubmitting(true)
+    try {
+      await loginWithGoogle(credential)
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : t('auth.localGenericError'))
+    } finally {
+      setGoogleSubmitting(false)
     }
   }
 
@@ -188,6 +205,27 @@ export function Register({ onSwitchToSignIn }: { onSwitchToSignIn: () => void })
             {t('auth.localSwitchToSignIn')}
           </button>
         </form>
+
+        {health.data?.google_signin_enabled && health.data.google_client_id && (
+          <div className="mt-4 flex flex-col items-center gap-3">
+            <div className="flex w-full items-center gap-2 text-xs text-[var(--muted-foreground)]">
+              <span className="h-px flex-1 bg-[var(--border)]" />
+              {t('auth.orDivider')}
+              <span className="h-px flex-1 bg-[var(--border)]" />
+            </div>
+            {googleSubmitting ? (
+              <div className="flex h-10 items-center gap-2 text-xs text-[var(--muted-foreground)]">
+                <Loader2 className="h-4 w-4 animate-spin" />
+                {t('auth.googleSigningIn')}
+              </div>
+            ) : (
+              <GoogleSignInButton
+                clientId={health.data.google_client_id}
+                onCredential={handleGoogleCredential}
+              />
+            )}
+          </div>
+        )}
       </CardContent>
     </Card>
   )

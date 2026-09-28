@@ -23,6 +23,7 @@ export interface ConversationListProps {
   onCommitRename: (id: string) => void
   onCancelRename: () => void
   onDelete: (id: string, title: string) => void
+  onShare: (id: string, title: string) => void
 }
 
 /** Recency-grouped conversation list -- extracted from the old
@@ -43,6 +44,7 @@ export function ConversationList({
   onCommitRename,
   onCancelRename,
   onDelete,
+  onShare,
 }: ConversationListProps) {
   const { t } = useTranslation()
   const groups = groupConversationsByRecency(conversations)
@@ -86,6 +88,7 @@ export function ConversationList({
                 onCommitRename={() => onCommitRename(conversation.id)}
                 onCancelRename={onCancelRename}
                 onDelete={() => onDelete(conversation.id, conversation.title)}
+                onShare={() => onShare(conversation.id, conversation.title)}
               />
             ))}
           </div>

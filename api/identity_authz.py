@@ -13,12 +13,14 @@ from collections.abc import Iterator
 from fastapi import Depends, HTTPException, Request, status
 from identity.db import get_identity_session
 from identity.models import User
-from identity.repositories.users import get_user_by_id
+from identity.rbac import Permission as IdentityPermission
+from identity.repositories.users import get_user_by_id, get_user_permissions
 from sqlalchemy.orm import Session
 
 from api.auth import verify_api_key
 from api.authz import get_auth_identity
 from config.settings import Settings, get_settings
+from security.audit_log import log_security_event
 
 
 def require_local_auth_enabled(settings: Settings | None = None) -> Settings:
@@ -95,3 +97,50 @@ def require_local_user(
             status_code=status.HTTP_401_UNAUTHORIZED, detail="Account no longer exists."
         )
     return user, session
+
+
+def require_identity_permission(permission: IdentityPermission):
+    """FastAPI dependency factory: 403s unless the local caller's DB-backed
+    `identity.rbac.Permission` grants include `permission`.
+
+    `identity.rbac`'s granular permission codes (`SEED_ROLES`/
+    `SEED_PERMISSIONS`, seeded by `identity.bootstrap.seed_rbac`) existed
+    in this codebase's schema and repository layer
+    (`identity.repositories.users.get_user_permissions`) before this
+    function did, but nothing had actually wired them into a route yet --
+    every existing `identity/`-backed endpoint (`api/chat_history.py`) only
+    ever checked "is this a valid local account," relying on per-resource
+    `user_id` ownership scoping alone, never this table. This is the first
+    call site, added for conversation sharing's own explicit RBAC
+    requirement -- it does not change behavior for any pre-existing route,
+    and every default seeded role already grants every `shares.*`
+    permission (see `identity/rbac.py`'s own `_VIEWER`/`_OWN_RESOURCE_PERMISSIONS`
+    sets), so this is additive enforcement, not a new restriction for an
+    existing user.
+
+    Mirrors `api.authz.require_permission`'s exact shape (same denial
+    logging, same self-sufficient `Depends(require_local_user)` composition)
+    for the sibling, more-granular permission system.
+    """
+
+    def _dependency(
+        request: Request, user_and_session: tuple[User, Session] = Depends(require_local_user)
+    ) -> tuple[User, Session]:
+        user, session = user_and_session
+        granted = get_user_permissions(session, user.id)
+        if permission.value not in granted:
+            log_security_event(
+                "identity_authz_denied",
+                "warning",
+                "A request was denied at the identity-permission gate.",
+                user_id=str(user.id),
+                required_permission=permission.value,
+                path=request.url.path,
+            )
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="You do not have permission to perform this action.",
+            )
+        return user, session
+
+    return _dependency

@@ -2,6 +2,8 @@ import { request } from './api'
 import type {
   AuthSessionOut,
   ConversationListResponse,
+  GoogleNonceResponse,
+  LinkedIdentityListResponse,
   LocalUser,
   MessageListResponse,
   MessageResponse,
@@ -33,6 +35,49 @@ export function loginUser(email: string, password: string): Promise<TokenRespons
     method: 'POST',
     body: JSON.stringify({ email, password }),
   })
+}
+
+// --- Google sign-in (2026-09-28, security/google_oidc.py) -- the ID token
+// (`credential`) comes from Google Identity Services' JS callback, never
+// decoded/trusted client-side; the backend does all real verification. ---
+
+/** A short-lived, single-use nonce to pass into `google.accounts.id
+ * .initialize({nonce, ...})` before rendering the Sign In With Google
+ * button -- see `security/google_oidc.py`'s own module docstring for
+ * exactly what this does and does not protect against. */
+export function fetchGoogleSigninNonce(): Promise<GoogleNonceResponse> {
+  return request<GoogleNonceResponse>('/auth/google/nonce')
+}
+
+/** Sign in, or sign up on first use of a given Google identity -- one
+ * backend flow decides which, the caller never has to say. */
+export function googleSignIn(credential: string): Promise<TokenResponse> {
+  return request<TokenResponse>('/auth/google', {
+    method: 'POST',
+    body: JSON.stringify({ credential }),
+  })
+}
+
+/** The authenticated caller's own linked external identities, for an
+ * account-settings "connected accounts" view. */
+export function listLinkedIdentities(): Promise<LinkedIdentityListResponse> {
+  return request<LinkedIdentityListResponse>('/auth/google/link')
+}
+
+/** Links a verified Google identity to the *currently signed-in* local
+ * account -- the safe, explicit alternative to auto-merging by email (see
+ * `api/identity_auth.py::google_signin`'s own docstring). */
+export function linkGoogleAccount(credential: string): Promise<LinkedIdentityListResponse> {
+  return request<LinkedIdentityListResponse>('/auth/google/link', {
+    method: 'POST',
+    body: JSON.stringify({ credential }),
+  })
+}
+
+/** Removes the caller's own Google link -- rejected server-side (409) if
+ * this is the account's only usable sign-in method. */
+export function unlinkGoogleAccount(): Promise<LinkedIdentityListResponse> {
+  return request<LinkedIdentityListResponse>('/auth/google/link', { method: 'DELETE' })
 }
 
 /** Reads the refresh-token cookie automatically (same-origin request) --

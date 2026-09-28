@@ -110,6 +110,7 @@ from api.schemas import (
     TableOut,
     TablesResponse,
 )
+from api.shares import router as shares_router
 from api.voice import router as voice_router
 from config.settings import ConfigurationError, Settings, configure_logging, get_settings
 from db.connection import (
@@ -360,6 +361,7 @@ app.include_router(media_search_router)
 app.include_router(media_library_router)
 app.include_router(identity_auth_router)
 app.include_router(chat_history_router)
+app.include_router(shares_router)
 
 # No-op when Settings.cors_allowed_origins is empty (the default) -- a
 # same-origin deployment (the built React app served by this same FastAPI
@@ -414,14 +416,28 @@ def _default_csp(settings) -> str:
         issuer_origin = urlparse(settings.oidc_issuer)
         if issuer_origin.scheme and issuer_origin.netloc:
             frame_src = f"'self' {issuer_origin.scheme}://{issuer_origin.netloc}"
+
+    # 2026-09-28, Google sign-in: Google Identity Services'
+    # `https://accounts.google.com/gsi/client` script renders the
+    # "Continue with Google" button and, on click, opens a Google-hosted
+    # popup/iframe to obtain the credential -- conditional on
+    # `google_oauth_client_id` actually being configured, never granted
+    # for a deployment not using this feature at all.
+    script_src = "'self'"
+    connect_src = "'self'"
+    if settings.google_oauth_client_id is not None:
+        script_src += " https://accounts.google.com"
+        connect_src += " https://accounts.google.com"
+        frame_src += " https://accounts.google.com"
+
     return (
         "default-src 'self'; "
-        "script-src 'self'; "
+        f"script-src {script_src}; "
         "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "
         "font-src 'self' https://fonts.gstatic.com data:; "
         "img-src 'self' data: blob:; "
         "media-src 'self' blob:; "
-        "connect-src 'self'; "
+        f"connect-src {connect_src}; "
         f"frame-src {frame_src}; "
         "object-src 'none'; "
         "base-uri 'self'; "
@@ -911,6 +927,20 @@ def health(response: Response) -> HealthResponse:
         voice_enabled=settings.enable_voice_mode,
         media_search_enabled=settings.enable_media_search,
         local_auth_enabled=settings.local_auth_enabled,
+        # `google_client_id` is a PUBLIC identifier, never a secret (see
+        # `security/google_oidc.py`'s own module docstring for why this
+        # flow never holds a client secret at all) -- safe to serve from
+        # this unauthenticated endpoint by design, the same "sanitized
+        # capability endpoint" pattern this field itself follows: a
+        # boolean availability flag plus the one public value the
+        # frontend actually needs, never the rest of `Settings`.
+        google_signin_enabled=settings.google_oauth_client_id is not None
+        and settings.local_auth_enabled,
+        google_client_id=(
+            settings.google_oauth_client_id
+            if settings.google_oauth_client_id is not None and settings.local_auth_enabled
+            else None
+        ),
         vision_enabled=vision_enabled,
         vision_provider="ollama" if vision_enabled else None,
         vision_model=settings.media_vision_model or None,

@@ -1,8 +1,10 @@
 import { Eye, EyeOff, Loader2 } from 'lucide-react'
 import { type FormEvent, useState } from 'react'
 import { useTranslation } from 'react-i18next'
+import { GoogleSignInButton } from '@/components/auth/GoogleSignInButton'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
+import { useHealth } from '@/hooks/queries'
 import { ApiError } from '@/lib/api'
 import { useLocalAuthStore } from '@/store/localAuthStore'
 
@@ -15,10 +17,13 @@ import { useLocalAuthStore } from '@/store/localAuthStore'
 export function SignIn({ onSwitchToRegister }: { onSwitchToRegister: () => void }) {
   const { t } = useTranslation()
   const login = useLocalAuthStore((state) => state.login)
+  const loginWithGoogle = useLocalAuthStore((state) => state.loginWithGoogle)
+  const health = useHealth()
   const [email, setEmail] = useState('')
   const [password, setPassword] = useState('')
   const [showPassword, setShowPassword] = useState(false)
   const [submitting, setSubmitting] = useState(false)
+  const [googleSubmitting, setGoogleSubmitting] = useState(false)
   const [error, setError] = useState<string | null>(null)
 
   const handleSubmit = async (event: FormEvent) => {
@@ -31,6 +36,23 @@ export function SignIn({ onSwitchToRegister }: { onSwitchToRegister: () => void 
       setError(err instanceof ApiError ? err.message : t('auth.localGenericError'))
     } finally {
       setSubmitting(false)
+    }
+  }
+
+  const handleGoogleCredential = async (credential: string) => {
+    setError(null)
+    setGoogleSubmitting(true)
+    try {
+      await loginWithGoogle(credential)
+    } catch (err) {
+      // A 409 here means an existing local account already owns this
+      // email (see api/identity_auth.py::google_signin's own docstring) --
+      // the server's own message already tells the user what to do next
+      // (sign in with a password, then link Google from settings), so it's
+      // shown as-is rather than papered over with a generic string.
+      setError(err instanceof ApiError ? err.message : t('auth.localGenericError'))
+    } finally {
+      setGoogleSubmitting(false)
     }
   }
 
@@ -89,6 +111,27 @@ export function SignIn({ onSwitchToRegister }: { onSwitchToRegister: () => void 
             {t('auth.localSwitchToRegister')}
           </button>
         </form>
+
+        {health.data?.google_signin_enabled && health.data.google_client_id && (
+          <div className="mt-4 flex flex-col items-center gap-3">
+            <div className="flex w-full items-center gap-2 text-xs text-[var(--muted-foreground)]">
+              <span className="h-px flex-1 bg-[var(--border)]" />
+              {t('auth.orDivider')}
+              <span className="h-px flex-1 bg-[var(--border)]" />
+            </div>
+            {googleSubmitting ? (
+              <div className="flex h-10 items-center gap-2 text-xs text-[var(--muted-foreground)]">
+                <Loader2 className="h-4 w-4 animate-spin" />
+                {t('auth.googleSigningIn')}
+              </div>
+            ) : (
+              <GoogleSignInButton
+                clientId={health.data.google_client_id}
+                onCredential={handleGoogleCredential}
+              />
+            )}
+          </div>
+        )}
       </CardContent>
     </Card>
   )

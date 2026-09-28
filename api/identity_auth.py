@@ -23,11 +23,16 @@ from __future__ import annotations
 import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
+from identity.display_name import validate_display_name
 from identity.email import send_password_reset_email, send_verification_email
 from identity.exceptions import (
     AccountLockedError,
     AccountNotActiveError,
+    CannotUnlinkLastSignInMethodError,
     DuplicateUserError,
+    ExternalAccountEmailConflictError,
+    ExternalIdentityAlreadyLinkedError,
+    GoogleSignInProvisioningError,
     IdentityError,
     InvalidCredentialsError,
     RefreshTokenInvalidError,
@@ -35,6 +40,12 @@ from identity.exceptions import (
 )
 from identity.models import User
 from identity.password_policy import validate_password_strength
+from identity.repositories.external_identities import (
+    find_or_create_user_for_google_identity,
+    link_external_identity,
+    list_external_identities,
+    unlink_external_identity,
+)
 from identity.repositories.sessions import (
     create_session,
     get_session_by_refresh_token,
@@ -64,6 +75,10 @@ from identity.repositories.users import (
 from identity.schemas import (
     ChangePasswordRequest,
     ForgotPasswordRequest,
+    GoogleNonceResponse,
+    GoogleSignInRequest,
+    LinkedIdentityListResponse,
+    LinkedIdentityOut,
     LoginRequest,
     MessageResponse,
     RegisterRequest,
@@ -84,6 +99,11 @@ from api.identity_authz import get_identity_db, require_local_auth_enabled, requ
 from config.settings import Settings, get_settings
 from security.audit_log import log_security_event
 from security.client_ip import resolve_client_ip
+from security.google_oidc import (
+    GoogleTokenValidationError,
+    issue_signin_nonce,
+    verify_google_id_token,
+)
 
 router = APIRouter()
 
@@ -101,6 +121,8 @@ _login_limiters = BoundedLimiterCache()
 _register_limiters = BoundedLimiterCache()
 _refresh_limiters = BoundedLimiterCache()
 _password_reset_limiters = BoundedLimiterCache()
+_google_signin_limiters = BoundedLimiterCache()
+_google_nonce_limiters = BoundedLimiterCache()
 
 _RATE_LIMIT_MESSAGE = "Too many attempts -- please wait a moment and try again."
 
@@ -366,7 +388,21 @@ def login(
             status_code=status.HTTP_401_UNAUTHORIZED, detail=InvalidCredentialsError().safe_message
         ) from None
 
-    if not verify_password(payload.password, user.password_hash):
+    # A Google-only account (`password_hash IS NULL`, see `identity/models
+    # .py::User`'s own docstring) has no password to check at all --
+    # `verify_password` is never meant to be called with a `None` hash
+    # (argon2-cffi raises a bare, uncaught `AttributeError` for one, which
+    # would otherwise surface as a 500 instead of the same 401 every other
+    # login failure gets here, itself a real account-enumeration side
+    # channel: a caller could tell "this email has a local password" from
+    # "this email is Google-only" purely by the HTTP status code). Treated
+    # identically to a wrong password -- same generic response, same
+    # signin-event shape -- so this case is indistinguishable from any
+    # other login failure to the caller.
+    password_ok = user.password_hash is not None and verify_password(
+        payload.password, user.password_hash
+    )
+    if not password_ok:
         just_locked = record_login_failure(
             session,
             user,
@@ -420,6 +456,293 @@ def login(
         user_agent=request.headers.get("user-agent"),
     )
     return _issue_tokens(session, user, request=request, response=response, settings=settings)
+
+
+def _require_google_signin_configured(settings: Settings) -> None:
+    """404, not a different error shape, when Google sign-in isn't
+    configured -- mirrors `require_local_auth_enabled`'s own "the feature
+    genuinely doesn't exist" posture for the parent feature."""
+    if settings.google_oauth_client_id is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found.")
+
+
+@router.get("/auth/google/nonce", response_model=GoogleNonceResponse)
+def google_nonce(request: Request) -> GoogleNonceResponse:
+    """Issues a short-lived, single-use nonce for the frontend to pass into
+    `google.accounts.id.initialize({nonce, ...})` before rendering the
+    Sign In With Google button -- see `security/google_oidc.py`'s own
+    module docstring for exactly what this does and does not protect
+    against. A cheap call (no DB write, no external request) -- rate
+    limited anyway since it's reachable pre-authentication.
+    """
+    settings = get_settings()
+    require_local_auth_enabled(settings)
+    _require_google_signin_configured(settings)
+    _enforce_rate_limit(
+        _google_nonce_limiters,
+        request,
+        action="google_nonce",
+        max_events=settings.login_rate_limit_per_minute,
+        window_seconds=60.0,
+    )
+    return GoogleNonceResponse(nonce=issue_signin_nonce(settings))
+
+
+@router.post("/auth/google", response_model=TokenResponse)
+def google_signin(
+    payload: GoogleSignInRequest,
+    request: Request,
+    response: Response,
+    session: Session = Depends(get_identity_db),
+) -> TokenResponse:
+    """Sign in, or sign up on first use of a given Google identity, via a
+    server-verified Google ID token -- one backend flow decides new-signup
+    vs. returning-login, the caller never has to say which it intends (see
+    `identity.repositories.external_identities
+    .find_or_create_user_for_google_identity`'s own docstring for exactly
+    how that decision is made, including why a matching email on an
+    existing *local* account is never auto-merged).
+
+    Every rejection path here returns a generic-enough message to avoid
+    reflecting token-internal detail back to the caller (`security.google_oidc
+    .GoogleTokenValidationError`'s own messages are already written to be
+    response-safe) -- this mirrors `login()` above's own "specific reason
+    logged server-side, generic message returned" contract, just for a
+    different credential type.
+    """
+    settings = get_settings()
+    require_local_auth_enabled(settings)
+    _require_google_signin_configured(settings)
+    _enforce_rate_limit(
+        _google_signin_limiters,
+        request,
+        action="google_signin",
+        max_events=settings.login_rate_limit_per_minute,
+        window_seconds=60.0,
+    )
+
+    try:
+        claims = verify_google_id_token(payload.credential, settings)
+    except GoogleTokenValidationError as exc:
+        record_signin_event(
+            session,
+            event_type="login_failed",
+            success=False,
+            failure_reason_code="google_token_invalid",
+            ip_address=_client_ip(request),
+            user_agent=request.headers.get("user-agent"),
+        )
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=str(exc)) from exc
+
+    display_name: str | None = None
+    if claims.name:
+        try:
+            display_name = validate_display_name(claims.name)
+        except ValueError:
+            # Falls through to this app's existing "needs profile
+            # completion" state (`UserOut.needs_profile_completion`) --
+            # never blocks sign-in over a Google-supplied name this app's
+            # own stricter display-name rules happen to reject.
+            display_name = None
+
+    try:
+        user, is_new_user = find_or_create_user_for_google_identity(
+            session,
+            provider_subject=claims.sub,
+            email=claims.email,
+            email_verified=claims.email_verified,
+            display_name=display_name,
+        )
+    except ExternalAccountEmailConflictError as exc:
+        record_signin_event(
+            session,
+            identifier_attempted=claims.email,
+            event_type="login_failed",
+            success=False,
+            failure_reason_code="google_email_conflict",
+            ip_address=_client_ip(request),
+            user_agent=request.headers.get("user-agent"),
+        )
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=exc.safe_message) from exc
+    except GoogleSignInProvisioningError as exc:
+        # Deliberately a generic 401, not the 409 above -- this path must
+        # never confirm that an account with this email exists (see that
+        # exception's own docstring for why: reaching it only required an
+        # *unverified* email claim, weaker proof than the 409 case above).
+        record_signin_event(
+            session,
+            event_type="login_failed",
+            success=False,
+            failure_reason_code="google_email_collision_unverified",
+            ip_address=_client_ip(request),
+            user_agent=request.headers.get("user-agent"),
+        )
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED, detail=exc.safe_message
+        ) from exc
+
+    if user.status != "active":
+        record_signin_event(
+            session,
+            user_id=user.id,
+            identifier_attempted=claims.email,
+            event_type="login_failed",
+            success=False,
+            failure_reason_code=f"status_{user.status}",
+            ip_address=_client_ip(request),
+            user_agent=request.headers.get("user-agent"),
+        )
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED, detail=AccountNotActiveError().safe_message
+        )
+
+    record_login_success(session, user)
+    record_signin_event(
+        session,
+        user_id=user.id,
+        identifier_attempted=user.email,
+        event_type="login_success",
+        success=True,
+        ip_address=_client_ip(request),
+        user_agent=request.headers.get("user-agent"),
+        metadata={"provider": "google", "new_user": is_new_user},
+    )
+    log_security_event(
+        "google_signin_succeeded",
+        "info",
+        (
+            "A new account was created via Google sign-in."
+            if is_new_user
+            else "A user signed in via Google."
+        ),
+        user_id=str(user.id),
+    )
+    return _issue_tokens(session, user, request=request, response=response, settings=settings)
+
+
+@router.get("/auth/google/link", response_model=LinkedIdentityListResponse)
+def list_google_links(
+    user_and_session: tuple[User, Session] = Depends(require_local_user),
+) -> LinkedIdentityListResponse:
+    """The authenticated caller's own linked external identities, for an
+    account-settings "connected accounts" view. Ownership is implicit --
+    `require_local_user` resolves `user_id` from the caller's own verified
+    session, never from a request parameter."""
+    user, session = user_and_session
+    identities = list_external_identities(session, user.id)
+    return LinkedIdentityListResponse(
+        identities=[
+            LinkedIdentityOut(
+                provider=row.provider,
+                email_at_link=row.email_at_link,
+                created_at=row.created_at,
+                last_used_at=row.last_used_at,
+            )
+            for row in identities
+        ],
+        has_password=user.password_hash is not None,
+    )
+
+
+@router.post("/auth/google/link", response_model=LinkedIdentityListResponse)
+def link_google_account(
+    payload: GoogleSignInRequest,
+    request: Request,
+    user_and_session: tuple[User, Session] = Depends(require_local_user),
+) -> LinkedIdentityListResponse:
+    """Links a verified Google identity to the *currently authenticated*
+    account -- the safe, explicit alternative to auto-merging by email
+    (see `POST /auth/google`'s own docstring). `user_id` always comes from
+    the caller's own verified session (`require_local_user`), never from
+    the request body -- this is what makes "link my own account" and
+    "hijack someone else's" structurally different requests, not just a
+    permission check that could be forgotten.
+
+    Per the task's own "require a currently authenticated local session ...
+    before linking" requirement -- this endpoint itself *is* that
+    requirement (`require_local_user` demands a live, valid access token);
+    a step-up/recent-reauthentication check beyond that is not implemented
+    in this pass (this app has no MFA system to step up to at all) --
+    disclosed here rather than silently assumed equivalent.
+    """
+    user, session = user_and_session
+    settings = get_settings()
+    _require_google_signin_configured(settings)
+    _enforce_rate_limit(
+        _google_signin_limiters,
+        request,
+        action="google_signin",
+        max_events=settings.login_rate_limit_per_minute,
+        window_seconds=60.0,
+    )
+
+    try:
+        claims = verify_google_id_token(payload.credential, settings)
+    except GoogleTokenValidationError as exc:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=str(exc)) from exc
+
+    try:
+        link_external_identity(
+            session,
+            user_id=user.id,
+            provider="google",
+            provider_subject=claims.sub,
+            email_at_link=claims.email,
+            email_verified_at_link=claims.email_verified,
+        )
+    except ExternalIdentityAlreadyLinkedError as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=exc.safe_message) from exc
+
+    log_security_event(
+        "google_account_linked", "info", "A user linked a Google identity.", user_id=str(user.id)
+    )
+    identities = list_external_identities(session, user.id)
+    return LinkedIdentityListResponse(
+        identities=[
+            LinkedIdentityOut(
+                provider=row.provider,
+                email_at_link=row.email_at_link,
+                created_at=row.created_at,
+                last_used_at=row.last_used_at,
+            )
+            for row in identities
+        ],
+        has_password=user.password_hash is not None,
+    )
+
+
+@router.delete("/auth/google/link", response_model=LinkedIdentityListResponse)
+def unlink_google_account(
+    user_and_session: tuple[User, Session] = Depends(require_local_user),
+) -> LinkedIdentityListResponse:
+    """Removes the caller's own Google link. Refuses (409) if this is the
+    account's only usable sign-in method -- see `identity.repositories
+    .external_identities.unlink_external_identity`'s own docstring."""
+    user, session = user_and_session
+    try:
+        unlink_external_identity(session, user_id=user.id, provider="google")
+    except CannotUnlinkLastSignInMethodError as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=exc.safe_message) from exc
+
+    log_security_event(
+        "google_account_unlinked",
+        "info",
+        "A user unlinked a Google identity.",
+        user_id=str(user.id),
+    )
+    identities = list_external_identities(session, user.id)
+    return LinkedIdentityListResponse(
+        identities=[
+            LinkedIdentityOut(
+                provider=row.provider,
+                email_at_link=row.email_at_link,
+                created_at=row.created_at,
+                last_used_at=row.last_used_at,
+            )
+            for row in identities
+        ],
+        has_password=user.password_hash is not None,
+    )
 
 
 @router.post("/auth/refresh", response_model=TokenResponse)
@@ -595,11 +918,21 @@ def change_password_route(
 ) -> MessageResponse:
     """Requires the caller's *current* password, not just a valid access
     token -- a stolen-but-not-yet-expired access token alone must not be
-    enough to lock the real owner out by changing their password."""
+    enough to lock the real owner out by changing their password.
+
+    A Google-only account (`user.password_hash is None`, see
+    `identity/models.py::User`'s own docstring) has no current password to
+    verify -- this doubles as that account's "set a local password" flow,
+    gated only by the same authenticated-session requirement every other
+    call here already has (`require_local_user`), never by proving
+    knowledge of a password that was never set.
+    """
     user, session = user_and_session
     settings = get_settings()
 
-    if not verify_password(payload.current_password, user.password_hash):
+    if user.password_hash is not None and not verify_password(
+        payload.current_password, user.password_hash
+    ):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED, detail="Current password is incorrect."
         )

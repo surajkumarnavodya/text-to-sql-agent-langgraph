@@ -56,7 +56,7 @@ def create_user(
     session: Session,
     *,
     email: str,
-    password: str,
+    password: str | None = None,
     display_name: str | None = None,
     username: str | None = None,
     status: str = "active",
@@ -69,6 +69,16 @@ def create_user(
     on, `"active"` otherwise; `api/identity_admin.py`'s admin-create route
     can pass either directly).
 
+    `password=None` (2026-09-28, Google sign-in) creates an account with
+    `password_hash=None` -- no local password at all, not a blank/empty
+    one. Every *local* login path (`api/identity_auth.py::login`) must
+    check for this explicitly before calling `identity.security
+    .verify_password`, since that function is never meant to be called
+    with a `None` hash. Callers creating a Google-only account should use
+    `identity.repositories.external_identities.create_user_from_external_identity`
+    rather than calling this directly, so the identity-link row is created
+    in the same transaction.
+
     Raises:
         DuplicateUserError: `email` (normalized) already exists.
     """
@@ -80,9 +90,9 @@ def create_user(
         email=normalized_email,
         username=username,
         display_name=display_name,
-        password_hash=hash_password(password),
+        password_hash=hash_password(password) if password is not None else None,
         status=status,
-        password_changed_at=datetime.now(UTC),
+        password_changed_at=datetime.now(UTC) if password is not None else None,
     )
     session.add(user)
     session.flush()  # assigns user.id before the role-assignment insert below

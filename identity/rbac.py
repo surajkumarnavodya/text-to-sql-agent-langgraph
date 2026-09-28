@@ -57,6 +57,9 @@ class Permission(str, Enum):
     OUTPUTS_READ_ANY = "outputs.read_any"
     CONVERSATIONS_READ_OWN = "conversations.read_own"
     CONVERSATIONS_DELETE_OWN = "conversations.delete_own"
+    SHARES_CREATE_OWN = "shares.create_own"
+    SHARES_MANAGE_OWN = "shares.manage_own"
+    SHARES_VIEW = "shares.view"
     AI_USE = "ai.use"
     RAG_QUERY = "rag.query"
     TEXT_TO_SQL_QUERY = "text_to_sql.query"
@@ -82,6 +85,16 @@ SEED_PERMISSIONS: tuple[tuple[Permission, str], ...] = (
     (Permission.OUTPUTS_READ_ANY, "View any user's AI output history."),
     (Permission.CONVERSATIONS_READ_OWN, "View the caller's own conversations."),
     (Permission.CONVERSATIONS_DELETE_OWN, "Delete (soft-delete) the caller's own conversations."),
+    (Permission.SHARES_CREATE_OWN, "Create a share for one of the caller's own conversations."),
+    (
+        Permission.SHARES_MANAGE_OWN,
+        "Update settings, invite/remove members, regenerate the link, or revoke one of the "
+        "caller's own shares.",
+    ),
+    (
+        Permission.SHARES_VIEW,
+        "View a conversation the caller has been given access to via sharing.",
+    ),
     (Permission.AI_USE, "Use the AI assistant at all (chat/typed questions)."),
     (Permission.RAG_QUERY, "Query document/policy RAG sources."),
     (Permission.TEXT_TO_SQL_QUERY, "Use the text-to-SQL feature."),
@@ -98,6 +111,8 @@ _OWN_RESOURCE_PERMISSIONS: frozenset[Permission] = frozenset(
         Permission.OUTPUTS_READ_OWN,
         Permission.CONVERSATIONS_READ_OWN,
         Permission.CONVERSATIONS_DELETE_OWN,
+        Permission.SHARES_CREATE_OWN,
+        Permission.SHARES_MANAGE_OWN,
     }
 )
 
@@ -111,7 +126,18 @@ _OWN_RESOURCE_PERMISSIONS: frozenset[Permission] = frozenset(
 # feature's own admin dashboard/audit trail can report "what can this user
 # do" from one consistent vocabulary, not as a second enforcement point for
 # the same capability.
-_VIEWER: frozenset[Permission] = _OWN_RESOURCE_PERMISSIONS | {Permission.AI_USE}
+_VIEWER: frozenset[Permission] = _OWN_RESOURCE_PERMISSIONS | {
+    Permission.AI_USE,
+    # Granted broadly, not tied to a resource-ownership tier: whether a
+    # caller may *view* a conversation shared with them depends entirely on
+    # `identity.share_policy.authorize_share_action`'s own RBAC/ABAC checks
+    # (share status, membership, expiry, tenant) -- this permission only
+    # gates "is this account allowed to use the sharing feature's viewer
+    # surface at all," the same way `AI_USE` gates the chat feature itself
+    # without saying anything about which conversations a given call may
+    # reach.
+    Permission.SHARES_VIEW,
+}
 _USER: frozenset[Permission] = _VIEWER | {Permission.TEXT_TO_SQL_QUERY}
 _ANALYST: frozenset[Permission] = _USER | {Permission.RAG_QUERY}
 _ADMIN: frozenset[Permission] = _ANALYST | {

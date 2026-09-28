@@ -4,6 +4,7 @@ import { useTranslation } from 'react-i18next'
 import { ConversationList } from '@/components/chat/ConversationList'
 import { ConversationSearch } from '@/components/chat/ConversationSearch'
 import { ConversationSearchResults } from '@/components/chat/ConversationSearchResults'
+import { ShareModal } from '@/components/chat/ShareModal'
 import { Button } from '@/components/ui/button'
 import { useChatSearch } from '@/hooks/useChatSearch'
 import type { SearchHit } from '@/lib/types'
@@ -41,6 +42,9 @@ export function Sidebar({ onNavigate, collapsed = false }: SidebarProps) {
   const search = useChatSearch()
   const [renamingId, setRenamingId] = useState<string | null>(null)
   const [renameValue, setRenameValue] = useState('')
+  const [sharingConversation, setSharingConversation] = useState<{ id: string; title: string } | null>(
+    null,
+  )
   const searchInputRef = useRef<HTMLInputElement>(null)
 
   const conversations = useChatStore((state) => state.conversations)
@@ -149,9 +153,17 @@ export function Sidebar({ onNavigate, collapsed = false }: SidebarProps) {
             }}
             onCancelRename={() => setRenamingId(null)}
             onDelete={handleDelete}
+            onShare={(id, title) => setSharingConversation({ id, title })}
           />
         )}
       </div>
+      {sharingConversation && (
+        <ShareModal
+          conversationId={sharingConversation.id}
+          conversationTitle={sharingConversation.title}
+          onClose={() => setSharingConversation(null)}
+        />
+      )}
     </div>
   )
 }

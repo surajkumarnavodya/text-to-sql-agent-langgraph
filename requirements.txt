@@ -114,6 +114,18 @@ email-validator==2.2.0
 # mechanism) is part of the base package, not the extra.
 pyjwt[crypto]==2.14.0
 
+# --- Google sign-in (optional, see security/google_oidc.py, docs/AUTHENTICATION.md) ---
+# google.oauth2.id_token.verify_oauth2_token is Google's own maintained ID-
+# token verifier (signature check against Google's rotating public certs,
+# fetched/cached internally, issuer/expiry validation) -- deliberately used
+# instead of hand-rolling a second JWKS client alongside pyjwt's above, since
+# this is exactly the "do not implement cryptography from scratch" case.
+# pyasn1/pyasn1-modules are its own transitive deps, pinned explicitly so a
+# future `pip install` doesn't silently drift them.
+google-auth==2.58.1
+pyasn1==0.6.4
+pyasn1-modules==0.4.2
+
 # --- Voice mode (optional, on by default -- see voice/, ENABLE_VOICE_MODE) ---
 # Both are local/offline inference, no cloud API, matching this project's
 # "Ollama not a hosted LLM" posture. Neither pulls in torch (confirmed

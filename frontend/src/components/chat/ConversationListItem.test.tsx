@@ -70,6 +70,7 @@ describe('ConversationListItem', () => {
         onCommitRename={noop}
         onCancelRename={noop}
         onDelete={noop}
+        onShare={noop}
       />,
     )
     await userEvent.click(screen.getByText('Revenue last quarter'))
@@ -90,6 +91,7 @@ describe('ConversationListItem', () => {
         onCommitRename={noop}
         onCancelRename={noop}
         onDelete={noop}
+        onShare={noop}
       />,
     )
     expect(screen.getByText('Loading…')).toBeInTheDocument()
@@ -111,6 +113,7 @@ describe('ConversationListItem', () => {
         onCommitRename={onCommitRename}
         onCancelRename={noop}
         onDelete={noop}
+        onShare={noop}
       />,
     )
     const input = screen.getByDisplayValue('New title')
@@ -133,6 +136,7 @@ describe('ConversationListItem', () => {
         onCommitRename={noop}
         onCancelRename={onCancelRename}
         onDelete={noop}
+        onShare={noop}
       />,
     )
     await userEvent.type(screen.getByDisplayValue('New title'), '{Escape}')

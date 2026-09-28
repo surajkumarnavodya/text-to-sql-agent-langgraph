@@ -86,6 +86,51 @@ class ResendVerificationRequest(BaseModel):
     email: EmailStr
 
 
+class GoogleNonceResponse(BaseModel):
+    """`GET /auth/google/nonce` -- see `security/google_oidc.py`'s own
+    module docstring for exactly what this nonce does and does not
+    protect against."""
+
+    model_config = ConfigDict(frozen=True)
+
+    nonce: str
+
+
+class GoogleSignInRequest(BaseModel):
+    """`POST /auth/google`/`POST /auth/google/link` -- `credential` is the
+    raw ID token string from Google Identity Services' JS callback
+    (`{credential}` in its own response shape), never decoded/trusted
+    client-side (see `security/google_oidc.py`). The length bound here is
+    a first, cheap rejection of an obviously-malformed request before the
+    real verification call -- `security.google_oidc.verify_google_id_token`
+    enforces the authoritative bound independently."""
+
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    credential: str = Field(..., min_length=1, max_length=8192)
+
+
+class LinkedIdentityOut(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    provider: str
+    email_at_link: str | None
+    created_at: datetime
+    last_used_at: datetime
+
+
+class LinkedIdentityListResponse(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    identities: list[LinkedIdentityOut]
+    # Whether removing a linked identity is even possible right now for
+    # this account -- the frontend uses this to disable the "unlink"
+    # action instead of letting the caller find out via a failed request
+    # (see `identity.repositories.external_identities
+    # .unlink_external_identity`'s own "last sign-in method" guard).
+    has_password: bool
+
+
 class UserOut(BaseModel):
     model_config = ConfigDict(frozen=True)
 

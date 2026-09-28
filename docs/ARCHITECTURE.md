@@ -839,3 +839,57 @@ conversion, pixel-alignment fix, backend contract, and disclosed
 limitations): [`docs/image-editing-architecture.md`](image-editing-architecture.md).
 Configuration reference: `docs/CONFIGURATION.md`'s "AI-guided (generative)
 image editing" section.
+
+## 9. Google sign-in
+
+A second way to reach this app's own self-hosted accounts (`identity/`),
+layered entirely on top of the pre-existing local-account system — it
+never touches OIDC mode, the static-token mode, or `agent/authz.py`'s
+RBAC, and a successful Google sign-in produces the exact same session a
+password login does (`api/identity_auth.py`'s existing `_issue_tokens`
+helper). The flow is Google Identity Services' ID-token flow, not the
+OAuth authorization-code flow — chosen specifically because Google
+sign-in here is authentication only, never authorization to any Google
+API, so no `client_secret` is ever needed at all.
+
+`security/google_oidc.py::verify_google_id_token` does the real work via
+Google's own `google-auth` library (signature against Google's live,
+rotating keys; issuer/audience/`azp` checks; a server-issued single-use
+nonce; `sub` as the only durable identity key). `identity/repositories
+/external_identities.py::find_or_create_user_for_google_identity` owns
+identity linking — the same `(provider, provider_subject)` always resolves
+to the same local user, and a new sign-in is never silently merged into an
+existing local account by email alone.
+
+Full design, every server-side check, and the honest "what's live-verified
+vs. not" breakdown: [`docs/AUTHENTICATION.md`](AUTHENTICATION.md#google-sign-in-2026-09-28).
+Configuration reference: `docs/CONFIGURATION.md`'s "Local self-hosted
+accounts, Google sign-in & conversation sharing" section.
+
+## 10. Secure conversation sharing
+
+Turns a conversation into a controlled, read-only snapshot other people
+may view — never a live query channel, an authentication session, or a way
+to reach this app's SQL/RAG/web/model/image pipelines from a shared view.
+`identity/share_policy.py::authorize_share_action` is the single RBAC/ABAC
+decision point every route and resolver calls before acting (mirroring
+`agent/authz.py`'s own "pure policy, no web-framework import" split) —
+three roles (owner / invited viewer / anonymous link viewer, no "Editor"),
+deny-by-default on anything unrecognized. `identity/repositories/shares.py`
+owns the snapshot boundary (a message sent after sharing is invisible
+until the owner explicitly refreshes it) and `build_share_projection`, a
+hard **allowlist** (not a blocklist) of which persisted-turn metadata
+fields a viewer may ever see.
+
+This app has no real multi-tenant model (single-tenant by design, see
+`agent/rate_limit.py`'s own existing disclosure) — only the new sharing
+tables carry a scoped `tenant_id` (`security/tenancy.py`), a deliberate,
+narrower decision than a full multi-tenant retrofit. Share-link and
+invitation tokens reuse `identity/security.py`'s existing CSPRNG-token/
+SHA-256-hash primitive directly rather than reinventing one.
+
+Full design (data model, token lifecycle, cache/referrer protections, the
+API surface, and two real bugs found and fixed by live-testing the running
+app rather than unit tests alone): [`docs/SHARING_SECURITY.md`](SHARING_SECURITY.md).
+Configuration reference: `docs/CONFIGURATION.md`'s "Local self-hosted
+accounts, Google sign-in & conversation sharing" section.

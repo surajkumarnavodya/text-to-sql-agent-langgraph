@@ -46,28 +46,39 @@ if TYPE_CHECKING:
 
 _REDACTED = "***REDACTED***"
 
-# Generic fallback for connection-string-/API-key-shaped secrets:
-# `password=`/`pwd=` followed by a run of non-whitespace/non-`;`/non-`&`
+# Generic fallback for connection-string-/API-key-/token-shaped secrets:
+# `password=`/`pwd=`/`client_secret=`/`access_token=`/`id_token=`/
+# `refresh_token=` followed by a run of non-whitespace/non-`;`/non-`&`
 # characters (covers both `key=value;key=value` DSN style and
-# `key=value&key=value` URL-query style), the `://user:password@host`
-# URL-credentials shape (username preserved in the redacted output -- only
-# the password itself is sensitive), an AWS-style access key ID, and a
-# bearer token. Applied regardless of whether the exact configured value
-# was matched first -- a driver (or an LLM paraphrasing/re-rendering
-# something it saw) can render the same secret differently than `Settings`
-# stores it (URL-encoded, re-cased, ...). The AKIA/Bearer alternatives
-# exist primarily for `redact_configured_secrets`'s LLM-response-text use
-# case (see that function) -- a driver error is unlikely to contain either
-# shape, but including them here rather than a second, parallel regex
-# costs nothing and keeps one canonical pattern.
+# `key=value&key=value` URL-query style -- e.g. an OAuth callback URL
+# accidentally logged whole, or a Set-Cookie header dumped raw), the
+# `://user:password@host` URL-credentials shape (username preserved in the
+# redacted output -- only the password itself is sensitive), an AWS-style
+# access key ID, a bearer token, and a **bare JWT** (three dot-separated
+# base64url segments -- Google ID tokens, this app's own locally-issued
+# access tokens, and any other JWT alike, whether or not it's preceded by
+# "Bearer " -- e.g. one sitting in a query string, a cookie value, or a
+# raw claims-dump in an error message). Applied regardless of whether the
+# exact configured value was matched first -- a driver (or an LLM
+# paraphrasing/re-rendering something it saw) can render the same secret
+# differently than `Settings` stores it (URL-encoded, re-cased, ...). The
+# AKIA/Bearer/JWT alternatives exist primarily for
+# `redact_configured_secrets`'s LLM-response-text use case (see that
+# function) and for Google-sign-in-adjacent logging -- a driver error is
+# unlikely to contain any of these shapes, but including them here rather
+# than a second, parallel regex costs nothing and keeps one canonical
+# pattern every caller shares.
 _CONNECTION_STRING_SECRET_RE = re.compile(
-    r"(?P<key>password|pwd)\s*=\s*(?P<value>[^;&\s]+)"
+    r"(?P<key>password|pwd|client_secret|access_token|id_token|refresh_token)"
+    r"\s*=\s*(?P<value>[^;&\s]+)"
     r"|"
     r"://(?P<user>[^\s:/@]+):(?P<pass>[^\s@]+)@"
     r"|"
     r"\bAKIA[0-9A-Z]{16}\b"
     r"|"
-    r"\bBearer\s+[A-Za-z0-9\-_.]{20,}\b",
+    r"\bBearer\s+[A-Za-z0-9\-_.]{20,}\b"
+    r"|"
+    r"\bey[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}\b",
     re.IGNORECASE,
 )
 

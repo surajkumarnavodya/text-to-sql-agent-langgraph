@@ -1,4 +1,4 @@
-import { Check, MoreHorizontal, Pencil, Trash2, X } from 'lucide-react'
+import { Check, MoreHorizontal, Pencil, Share2, Trash2, X } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
 import { Button } from '@/components/ui/button'
 import {
@@ -39,6 +39,7 @@ export interface ConversationListItemProps {
   onCommitRename: () => void
   onCancelRename: () => void
   onDelete: () => void
+  onShare: () => void
 }
 
 /** One row in the conversation list -- extracted from the old
@@ -56,6 +57,7 @@ export function ConversationListItem({
   onCommitRename,
   onCancelRename,
   onDelete,
+  onShare,
 }: ConversationListItemProps) {
   const { t } = useTranslation()
   const lastEntry = conversation.entries.at(-1)
@@ -112,7 +114,7 @@ export function ConversationListItem({
                 size="icon"
                 variant="ghost"
                 className="shrink-0 opacity-0 focus-visible:opacity-100 group-hover:opacity-100"
-                aria-label={`${t('history.rename')} / ${t('history.delete')}`}
+                aria-label={`${t('history.rename')} / ${t('share.menuItem')} / ${t('history.delete')}`}
               >
                 <MoreHorizontal className="h-3.5 w-3.5" />
               </Button>
@@ -121,6 +123,10 @@ export function ConversationListItem({
               <DropdownMenuItem onSelect={onStartRename}>
                 <Pencil className="h-3.5 w-3.5" />
                 {t('history.rename')}
+              </DropdownMenuItem>
+              <DropdownMenuItem onSelect={onShare}>
+                <Share2 className="h-3.5 w-3.5" />
+                {t('share.menuItem')}
               </DropdownMenuItem>
               <DropdownMenuItem className="text-[var(--danger)]" onSelect={onDelete}>
                 <Trash2 className="h-3.5 w-3.5" />

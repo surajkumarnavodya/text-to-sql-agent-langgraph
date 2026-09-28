@@ -138,6 +138,92 @@ class InvalidTokenError(IdentityError):
     safe_message = "This link is invalid or has expired."
 
 
+class ExternalIdentityAlreadyLinkedError(IdentityError):
+    """The `(provider, provider_subject)` pair is already linked to a
+    *different* local user than the one this call is trying to link it to
+    -- e.g. two people racing to be first to sign in with the same Google
+    account (vanishingly unlikely, since only the real account owner can
+    ever produce a validly-signed token for it), or an authenticated user
+    trying to link a Google identity someone else already claimed. Backed
+    by a real, database-enforced unique constraint
+    (`identity.models.ExternalIdentity`'s own `UniqueConstraint`), not just
+    an application-level check a race condition could slip past.
+    """
+
+    safe_message = "This Google account is already linked to a different account."
+
+
+class ExternalAccountEmailConflictError(IdentityError):
+    """A Google sign-in attempt's verified email matches an *existing*
+    local (password) account that has no Google identity linked yet.
+
+    Deliberately never auto-linked -- see `identity/repositories
+    /external_identities.py::find_or_create_user_for_google_identity`'s own
+    docstring for why matching email alone is not sufficient proof of
+    account ownership. Safe to disclose that *an* account exists here
+    (unlike an ordinary login attempt): reaching this path already requires
+    a Google-verified, `email_verified=true` token for this exact address,
+    which is strictly stronger proof of address ownership than a login
+    form's own unauthenticated "email exists" oracle.
+    """
+
+    safe_message = (
+        "An account with this email already exists. Sign in with your password, "
+        "then link Google from your account settings."
+    )
+
+
+class GoogleSignInProvisioningError(IdentityError):
+    """A Google sign-in attempt's email matches an existing account, but
+    the token's own `email_verified` claim is false -- `users.email` has a
+    real, database-level unique constraint, so a second account with the
+    same email genuinely cannot be created (this is not a policy choice,
+    it's a schema fact), but *unlike* `ExternalAccountEmailConflictError`
+    above, this case must not confirm that an account with this email
+    exists: the caller has not proven they control this exact address the
+    way a Google-verified `email_verified=true` claim would. Deliberately
+    the same generic, non-confirming shape as `InvalidCredentialsError`'s
+    own account-enumeration defense, applied to this different trigger.
+    """
+
+    safe_message = (
+        "Google sign-in could not be completed. Please try again, or use a "
+        "different sign-in method."
+    )
+
+
+class CannotUnlinkLastSignInMethodError(IdentityError):
+    """Unlinking this external identity would leave the account with no way
+    to sign in at all -- no password set, and no other linked identity.
+    `identity/repositories/external_identities.py::unlink_external_identity`
+    checks this before ever deleting the row."""
+
+    safe_message = "Set a password or link another sign-in method before removing this one."
+
+
+class ShareVersionConflictError(IdentityError):
+    """`PATCH .../share` supplied a `version` that no longer matches the
+    row's current one -- a concurrent settings change (another browser tab,
+    a second owner session) landed first. The optimistic-concurrency
+    control this feature's own spec requires; the caller must re-fetch and
+    retry, never silently overwrite what the other writer just set."""
+
+    safe_message = "This share was updated elsewhere. Please refresh and try again."
+
+
+class ShareInvitationEmailMismatchError(IdentityError):
+    """The presented invitation token is real, unexpired, and unused, but
+    the accepting caller's own account email does not match the address it
+    was issued to -- someone other than the intended invitee obtained the
+    raw token (a forwarded link, a scraped URL) and tried to redeem it
+    under their own account. Deliberately generic and non-confirming, the
+    same shape as `InvalidCredentialsError`, so a probing caller cannot use
+    the response to learn whether a mismatch or a genuinely invalid token
+    was the cause."""
+
+    safe_message = "This invitation is not valid for your account."
+
+
 class LocalTokenValidationError(IdentityError):
     """A locally-issued access JWT failed validation (expired, wrong
     signature, wrong issuer/audience, malformed, ...). Mirrors

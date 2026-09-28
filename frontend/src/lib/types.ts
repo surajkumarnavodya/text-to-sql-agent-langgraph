@@ -442,6 +442,12 @@ export interface HealthResponse {
   voice_enabled: boolean
   media_search_enabled: boolean
   local_auth_enabled: boolean
+  // Google sign-in capability discovery (2026-09-28) -- google_client_id is
+  // a PUBLIC OAuth client ID, never a secret (see security/google_oidc.py's
+  // own module docstring for why this flow never holds a client secret at
+  // all), and is only ever non-null alongside google_signin_enabled=true.
+  google_signin_enabled: boolean
+  google_client_id: string | null
   // Startup/operator diagnostic for chat-image vision support --
   // vision_model_available is null whenever vision_enabled is false
   // (nothing to check); when true, it's a real, live lookup against
@@ -563,6 +569,27 @@ export interface TokenResponse {
 
 export interface MessageResponse {
   message: string
+}
+
+// --- Google sign-in (2026-09-28, security/google_oidc.py, api/identity_auth.py) ---
+
+export interface GoogleNonceResponse {
+  nonce: string
+}
+
+export interface LinkedIdentityOut {
+  provider: string
+  email_at_link: string | null
+  created_at: string
+  last_used_at: string
+}
+
+export interface LinkedIdentityListResponse {
+  identities: LinkedIdentityOut[]
+  /** Whether removing a linked identity is even possible right now --
+   * the settings page disables "unlink" instead of letting the user find
+   * out via a failed request when this is false. */
+  has_password: boolean
 }
 
 export interface AuthSessionOut {
@@ -710,4 +737,116 @@ export interface SearchResponse {
   limit: number
   offset: number
   query: string
+}
+
+// --- Secure conversation sharing (api/shares.py) --------------------------
+// See identity/share_schemas.py's own docstring: no response shape here
+// ever carries a raw share-link token except ShareLinkOut, and only from
+// the two owner actions explicitly authorized to mint one.
+
+export type ShareAccessMode = 'invite_only' | 'anyone_with_link'
+export type ShareStatus = 'active' | 'disabled'
+export type ShareMemberStatus = 'pending' | 'active' | 'revoked' | 'expired'
+
+export interface ShareMember {
+  id: string
+  user_id: string | null
+  invited_email: string | null
+  display_name: string | null
+  role: 'viewer'
+  status: ShareMemberStatus
+  expires_at: string | null
+  accepted_at: string | null
+  revoked_at: string | null
+  created_at: string
+}
+
+export interface Share {
+  id: string
+  conversation_id: string
+  access_mode: ShareAccessMode
+  default_permission: 'viewer'
+  status: ShareStatus
+  snapshot_message_sequence: number
+  snapshot_captured_at: string | null
+  expires_at: string | null
+  revoked_at: string | null
+  /** Optimistic-concurrency token -- every PATCH/revoke must echo back
+   * whatever this was on the copy the caller most recently read. */
+  version: number
+  created_at: string
+  updated_at: string
+  members: ShareMember[]
+  link_available: boolean
+  member_view_path: string
+}
+
+export interface ShareLink {
+  /** A relative path (e.g. "/shared/<raw-token>") -- the caller prepends
+   * `window.location.origin` itself; this server never constructs an
+   * absolute URL (see ShareLinkOut's own docstring for why). */
+  view_path: string
+  expires_at: string | null
+}
+
+export interface ShareResponse {
+  share: Share
+  link: ShareLink | null
+}
+
+export interface CreateShareRequest {
+  access_mode?: ShareAccessMode
+  expiry_days?: number | null
+}
+
+export interface UpdateShareRequest {
+  version: number
+  access_mode?: ShareAccessMode | null
+  expiry_days?: number | null
+  status?: ShareStatus | null
+  refresh_snapshot?: boolean
+}
+
+export interface InviteMemberRequest {
+  email: string
+  expiry_days?: number | null
+}
+
+export interface InviteMemberResponse {
+  member: ShareMember
+  invitation_path: string | null
+}
+
+export interface AcceptInvitationResponse {
+  conversation_id: string
+  member_view_path: string
+}
+
+export interface ProjectedTurn {
+  sequence_number: number
+  role: 'user' | 'assistant'
+  content: string
+  created_at: string
+  sources_used: string[]
+  database: string | null
+  model: string | null
+  sql: string | null
+  row_count: number | null
+  insight: string | null
+  synthesized_answer: string | null
+  document_result: Record<string, unknown> | null
+  policy_result: Record<string, unknown> | null
+  web_result: Record<string, unknown> | null
+  generation_result: Record<string, unknown> | null
+  media_search_result: Record<string, unknown> | null
+  attachment_refs: { attachment_id: string; filename: string; media_type: string }[]
+  result_snapshot: Record<string, unknown> | null
+}
+
+export interface SharedConversation {
+  conversation_title: string | null
+  feature_type: string
+  snapshot_captured_at: string | null
+  viewer_role: 'owner' | 'member' | 'public_link'
+  turns: ProjectedTurn[]
 }

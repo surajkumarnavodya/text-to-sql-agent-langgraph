@@ -245,16 +245,51 @@ Ollama running on the host" above already covers, just an additional
 
 ## Reverse proxy and auth
 
-Neither the dashboard nor the API has real authentication (see
-[`docs/RISK_REGISTER.md`](RISK_REGISTER.md)'s R-001,
-[`docs/API.md`](API.md)'s "Auth" section). For anything beyond
-local/trusted-network use, put an authenticating reverse proxy in front of
-it — e.g. `oauth2-proxy`, or your platform's managed auth/ingress layer.
-The service needs no code to know this exists; point the proxy at
-`api:8000` and terminate TLS + auth there. The API's optional
-`API_AUTH_TOKEN` shared-secret check can layer underneath this (defense in
+By default (nothing configured), neither the dashboard nor the API has
+real authentication (see [`docs/RISK_REGISTER.md`](RISK_REGISTER.md)'s
+R-001, [`docs/API.md`](API.md)'s "Auth" section) — suitable only for
+local/trusted-network use. **Two of `Settings.auth_mode`'s four values do
+provide real, per-user identity**: `local` (`LOCAL_AUTH_ENABLED=true`,
+this app's own self-hosted accounts, optionally including Google sign-in —
+see below) and `oidc` (`OIDC_ISSUER` set, any standard external identity
+provider) — configure one of these for a genuinely multi-user deployment,
+rather than relying on the reverse-proxy pattern below as the only
+boundary. For anything still short of that (or as defense-in-depth on top
+of it), put an authenticating reverse proxy in front of the service — e.g.
+`oauth2-proxy`, or your platform's managed auth/ingress layer. The service
+needs no code to know this exists; point the proxy at `api:8000` and
+terminate TLS + auth there. The API's optional `API_AUTH_TOKEN`
+shared-secret check can also layer underneath either mode (defense in
 depth) but should never be the *only* layer for anything but a single
 trusted caller.
+
+### Local accounts, Google sign-in, and conversation sharing
+
+If you set `LOCAL_AUTH_ENABLED=true`, run the identity database's
+migrations **before** first use (and after pulling any update that
+touches `identity/models.py` — including this project's own Google
+sign-in and conversation-sharing tables):
+
+```bash
+alembic -c identity/alembic.ini upgrade head
+```
+
+Then seed the RBAC roles/permissions tables (idempotent — safe, and
+necessary, to re-run after *any* update that adds a new permission code,
+including this one, since this codebase has no automatic "re-seed on
+startup" hook):
+
+```bash
+python scripts/bootstrap_admin.py
+```
+
+To also enable **Google sign-in**, set `GOOGLE_OAUTH_CLIENT_ID` (see
+[`docs/AUTHENTICATION.md`](AUTHENTICATION.md#google-sign-in-2026-09-28)
+for the Google Cloud Console setup steps — a public client ID only, no
+secret involved). To allow an owner to create "anyone with the link"
+shares (off by default), set `SHARE_PUBLIC_LINKS_ENABLED=true` — see
+[`docs/SHARING_SECURITY.md`](SHARING_SECURITY.md) and
+`docs/CONFIGURATION.md`'s own reference table for every tunable.
 
 **Once you put a reverse proxy/load balancer in front of this app, also
 set `TRUSTED_PROXY_COUNT`** (default `0`) to the exact number of proxy

@@ -23,6 +23,17 @@ const BACKEND_ROUTES = [
   '/voice',
   '/search',
   '/auth',
+  '/conversations',
+  '/chat',
+  // Secure conversation sharing (api/shares.py) -- deliberately its own
+  // path prefix, distinct from the frontend's own client-side `/shared/:ref`
+  // viewer *page* route, so this backend JSON API and that SPA page never
+  // collide at the same URL. Explicit NetworkOnly here is not optional the
+  // way it is for an ordinary GET: a cached shared-conversation response
+  // would be exactly the kind of private-content cache leak this feature's
+  // own security spec calls out by name.
+  '/share-view',
+  '/share-invitations',
 ]
 
 export default defineConfig({

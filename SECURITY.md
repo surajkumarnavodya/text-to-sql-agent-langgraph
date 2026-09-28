@@ -809,6 +809,169 @@ never becomes an unrestricted way to reach an arbitrary local resource:
   existing per-minute and concurrency limiters already govern; nothing
   about model selection bypasses either.
 
+## Google sign-in — security controls
+
+"Continue with Google" (2026-09-28, optional — `GOOGLE_OAUTH_CLIENT_ID`,
+requires `LOCAL_AUTH_ENABLED=true`) is a second way to reach this app's own
+self-hosted accounts, never a separate trust boundary. Full design in
+`docs/AUTHENTICATION.md`'s "Google sign-in" section; the security-relevant
+controls specifically:
+
+- **No client secret exists anywhere in this application.** The chosen
+  flow (Google Identity Services' ID-token flow, not the OAuth
+  authorization-code flow) needs none — a deliberate choice partly *because*
+  it removes an entire class of secret this feature would otherwise need to
+  protect. `GOOGLE_OAUTH_CLIENT_ID` is the only Google-related setting, and
+  is explicitly **public** (Google's own design — it ships inside the GIS
+  JS snippet the browser executes), served live via `GET /health`, never
+  treated as a secret anywhere in this codebase.
+- **Every token is verified server-side, in full, before any identity claim
+  is trusted** (`security/google_oidc.py::verify_google_id_token`, via
+  Google's own `google-auth` library): signature against Google's live,
+  rotating public keys (never the token's own `alg`/`kid`), issuer
+  restricted to Google's own domains, exact `aud` match against
+  `GOOGLE_OAUTH_CLIENT_ID`, `azp` cross-check, bounded-clock-skew
+  `exp`/`iat`, a server-issued single-use nonce checked against the token's
+  signed `nonce` claim (replay/CSRF defense — see the honest limitation on
+  this below), `sub` as the only durable identity key ever stored,
+  `email_verified` gating whether an email claim is trusted for
+  identity-linking purposes, and `hd` (hosted-domain restriction) read from
+  the **signed claim only** — never inferred from the email's `@domain`
+  suffix, which any account could claim regardless of Workspace membership.
+- **Every rejection returns a short, generic, safe message and logs a
+  structured `google_signin_token_rejected` security event with a stable
+  reason code** (`empty_or_malformed_input`/`issuer_rejected`/
+  `azp_mismatch`/`missing_subject`/`hosted_domain_not_allowed`/
+  `nonce_missing_or_unknown`/etc.) — **the raw credential is never logged,
+  on any path**, and the server response never reflects it back (verified
+  by test: `tests/test_api_auth_google.py::test_response_never_reflects_the_raw_credential_back`).
+- **`GET /auth/google/nonce` and `POST /auth/google` are both rate-limited
+  per caller** (`agent.rate_limit.BoundedLimiterCache`, the same mechanism
+  `/auth/login`/`/auth/register` already use) — guards against both
+  nonce-exhaustion and repeated forged-token submission.
+- **Never auto-merges accounts by email.** A new Google sign-in whose
+  (verified) email matches an existing local password account is refused
+  with an informative conflict, never silently attached — only an
+  already-authenticated local session can explicitly link its own account
+  (`POST /auth/google/link`, `user_id` taken from the caller's own verified
+  session, never the request body). An *unverified* email collision is
+  refused with a **generic**, non-confirming message specifically to avoid
+  becoming an account-enumeration oracle — this exact distinction was found
+  and fixed by this project's own test-writing process before it shipped
+  (a real design bug, not a hypothetical: `users.email`'s database-level
+  unique constraint made the original "skip the check for unverified email"
+  design unimplementable, since `create_user` would still hit the
+  constraint uncaught).
+- **A Google-only account cannot be silently given password access, and a
+  local-password attempt against one fails exactly like any other wrong
+  password** — a real, previously-latent bug (an uncaught `AttributeError`
+  from Argon2's own verify call against a `NULL` password hash, a genuine
+  account-enumeration side channel via HTTP status code) was found by
+  reading the code before it shipped and fixed with an explicit `is not
+  None` guard, covered by a named regression test
+  (`tests/test_api_auth_google.py::TestGoogleOnlyAccountLocalLoginRegression`).
+- **Sessions issued after a Google sign-in are this app's existing session
+  primitive, not a new one** — the same JWT access token +
+  `Secure`/`HttpOnly`/`SameSite` rotating refresh-token cookie every
+  local-account login already produces, inheriting that system's existing
+  reuse-detection and lifetime controls unchanged.
+- **Honest limitation, disclosed rather than hidden**: the sign-in nonce
+  defends against replaying an already-consumed credential and against a
+  token minted for an unrelated attempt, but — like any bearer-token scheme
+  without token binding — cannot prevent a token being used within its own
+  short lifetime if captured before the legitimate exchange completes. The
+  nonce store is also process-local/in-memory (mirroring
+  `agent/rate_limit.py`'s own disclosed limitation), a real constraint for
+  a multi-worker deployment without sticky sessions on the two Google auth
+  routes.
+- **Not end-to-end verified.** Server-side token verification was
+  confirmed with a real network round-trip to Google's own certificate
+  infrastructure (rejecting a forged token), and every identity-linking
+  rule was verified against a real local PostgreSQL identity database — but
+  a real, browser-based Google sign-in (an actual user completing actual
+  Google consent) has not been exercised in this environment. See
+  `docs/AUTHENTICATION.md`'s "What's verified vs. not" for the full,
+  itemized breakdown before relying on this in production.
+
+## Secure conversation sharing — security controls
+
+"Share conversation" (optional, `Settings.enable_conversation_sharing`,
+default on — public "anyone with the link" mode separately gated behind
+`Settings.share_public_links_enabled`, default off) turns a conversation
+into a controlled, read-only snapshot other people may view — never a live
+query channel, never an authentication session, and never a way to reach
+this app's SQL/RAG/web/model/image pipelines. Full design in
+`docs/SHARING_SECURITY.md`; the security-relevant controls specifically:
+
+- **Centralized RBAC + ABAC, one decision point.** Every share-touching
+  route and resolver calls `identity.share_policy.authorize_share_action`
+  before acting — deny-by-default on an unrecognized action, role, or
+  missing tenant. Object IDs are never trusted as authorization by
+  themselves: a route resolves a row by ID, then the *policy engine*, not
+  the query filter, decides whether the caller may act on it.
+- **A scoped tenant check, not a claim of new multi-tenancy.** This app has
+  no real tenant model (single-tenant by design, disclosed elsewhere in
+  this document); only the new sharing tables carry a `tenant_id`
+  (`security/tenancy.py`), and the ABAC engine genuinely enforces it —
+  "cross-tenant member cannot view even with a valid-looking ID" is a real,
+  tested code path, not a placeholder.
+- **Hash-only token storage, reusing this app's own proven primitive.**
+  Share links and invitations reuse `identity/security.py`'s existing
+  48-byte CSPRNG token generator and SHA-256 hasher (the same ones already
+  backing refresh/password-reset/email-verification tokens) — only the
+  hash is ever persisted; the raw value is returned exactly once, in the
+  owner's own synchronous API response, never logged or placed in an audit
+  event.
+- **Regeneration invalidates the old token immediately**, even if it
+  hasn't expired — a new `ShareLink` row is inserted and every prior
+  active row for that share is independently marked revoked in the same
+  transaction.
+- **Never confirms whether a share exists** on the anonymous-reachable
+  surface — every denial reason (not-found, expired, revoked, wrong
+  tenant, not a member) collapses to the same generic 404; only a
+  rate-limit response is ever distinguishable.
+- **`Cache-Control: private, no-store` and `Referrer-Policy: no-referrer`
+  on every response, including denials.** A real bug was found and fixed
+  during this feature's build by testing the actual running app rather
+  than relying on unit tests alone: raising `HTTPException` builds a
+  separate FastAPI response object that silently discards headers a route
+  had already set on its injected `Response` parameter — meaning the
+  *denial* path (the one that matters most for an anonymous endpoint) was
+  serving default headers instead of the intended private/no-referrer
+  ones. Every exception this feature raises now carries those headers
+  explicitly via `HTTPException(..., headers=...)`, confirmed both by a
+  named regression test and a second live `curl` check against a real
+  running instance.
+- **A projection allowlist, not a blocklist.** The backend-only
+  `build_share_projection` function names exactly which fields of a
+  persisted turn's metadata a viewer may ever see (SQL text, sources used,
+  bounded result snapshots, citations) — internal fields (query plans,
+  retry counts, raw failure text, schema-table hints) are categorically
+  absent, not selectively redacted, so a newly-added metadata field
+  defaults to invisible until deliberately added to the allowlist.
+- **Attachment downloads require a second, independent check.** Being
+  authorized to view a share is not sufficient to download an arbitrary
+  attachment id — the id must also be one the snapshot's own turns
+  actually reference; a mismatch is logged as a distinct IDOR-attempt
+  event, separate from an ordinary access denial.
+- **Structurally isolated from the SQL/AI pipeline.** `api/shares.py` has
+  no import of `agent.graph`/`agent.orchestrator` at all, verified via
+  static analysis of the module's own source, not just a behavioral claim
+  — there is no "Confirm and Run," chart regeneration, or way to trigger
+  SQL/web/document/vector/model/image work from opening a share.
+- **No CSRF token needed.** Every mutating route requires a Bearer
+  `Authorization` header, never a browser-auto-attached cookie, to act as
+  anything but an anonymous link viewer — the same reasoning this app's
+  other mutating routes already rely on.
+- **Verified against a real PostgreSQL identity database**, not only
+  SQLite-backed unit tests: the migration (both directions), real foreign
+  key/cascade/set-null behavior, and a full create → invite → accept →
+  view → revoke → re-share flow via `curl` against a genuinely running
+  instance. Not independently verified: behavior behind a real reverse
+  proxy/CDN, which was unavailable in this environment — an operator
+  deploying behind one should confirm it honors `Cache-Control:
+  private, no-store` for this path prefix rather than overriding it.
+
 ## Resource exhaustion / abuse protections
 
 Two independent, deliberately simple protections guard against both

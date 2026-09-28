@@ -450,3 +450,44 @@ def get_session_expensive_source_limiter(
         window_seconds=window_seconds,
         name=f"session_expensive_source[{session_id}]",
     )
+
+
+# Keyed by client IP -- `GET /shared/{ref}` and its attachment-download
+# sibling are reachable by a caller with no authenticated identity at all
+# (an "anyone with the link" visitor), so IP is the only available key, the
+# same fallback `api/main.py::_rate_limit_key` already uses for every other
+# unauthenticated-reachable route. Bounds both brute-force token-guessing
+# and ordinary link-scraping traffic against one share.
+_share_link_access_limiters = BoundedLimiterCache()
+
+# Keyed by the *authenticated* caller's subject -- invite/regenerate are
+# owner-only actions, always reached with a real session, so a per-caller
+# key (never IP) is both more precise and consistent with this codebase's
+# existing "identity when available" keying convention (see
+# `security.oidc.real_caller_subject`'s own docstring).
+_share_invite_limiters = BoundedLimiterCache()
+
+
+def get_share_link_access_limiter(client_ip: str, max_per_minute: int) -> SlidingWindowRateLimiter:
+    """Returns the per-IP limiter for anonymous `GET /shared/{ref}` (and its
+    attachment-download sibling) access, creating it on first use for that
+    IP -- see this module's own note above `_share_link_access_limiters`."""
+    return _share_link_access_limiters.get_or_create(
+        client_ip,
+        max_events=max_per_minute,
+        window_seconds=60.0,
+        name=f"share_link_access[{client_ip}]",
+    )
+
+
+def get_share_invite_limiter(caller_key: str, max_per_hour: int) -> SlidingWindowRateLimiter:
+    """Returns the per-caller limiter for `POST .../share/members/invite`
+    and `POST .../share/link/regenerate` -- both owner-only, metered
+    per-hour rather than per-minute since a legitimate owner invites/rotates
+    far less often than they ask questions."""
+    return _share_invite_limiters.get_or_create(
+        caller_key,
+        max_events=max_per_hour,
+        window_seconds=3600.0,
+        name=f"share_invite[{caller_key}]",
+    )

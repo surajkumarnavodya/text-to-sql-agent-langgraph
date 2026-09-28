@@ -68,6 +68,8 @@ rather than only discovered the first time a user attaches an image.
   "voice_enabled": true,
   "media_search_enabled": false,
   "local_auth_enabled": false,
+  "google_signin_enabled": false,
+  "google_client_id": null,
   "vision_enabled": true,
   "vision_provider": "ollama",
   "vision_model": "llava",
@@ -75,6 +77,13 @@ rather than only discovered the first time a user attaches an image.
   "ocr_enabled": true
 }
 ```
+
+`google_signin_enabled`/`google_client_id` reflect whether "Continue with
+Google" is available on this deployment (`GOOGLE_OAUTH_CLIENT_ID` set *and*
+`LOCAL_AUTH_ENABLED=true`) — `google_client_id` is the one deliberately
+public value served this way rather than baked into the frontend build, so
+it can be rotated with a process restart alone. See
+`docs/AUTHENTICATION.md`'s "Google sign-in" section.
 
 ### `GET /live`
 
@@ -448,12 +457,38 @@ docstring): `POST /auth/register`, `POST /auth/login`, `POST /auth/refresh`,
 /auth/sessions/{id}`. See `docs/AUTHENTICATION.md` and
 `docs/authentication-and-password-policy.md`.
 
+**Google sign-in** (same router, additionally requires `GOOGLE_OAUTH_CLIENT_ID`
+set — 404s otherwise): `GET /auth/google/nonce` (issues a single-use
+sign-in nonce), `POST /auth/google` (verifies a Google ID token, signs in
+or signs up), `GET`/`POST`/`DELETE /auth/google/link` (view/link/unlink a
+Google identity on the caller's *own* authenticated account). See
+`docs/AUTHENTICATION.md`'s "Google sign-in" section for the full token
+-verification contract and identity-linking rules.
+
 **Server-side chat history** (`api/chat_history.py`, same
 `LOCAL_AUTH_ENABLED` gate): `GET`/`POST /conversations`, `GET`/`PATCH`/
 `DELETE /conversations/{id}`, `GET`/`POST /conversations/{id}/messages`,
 `GET /chat/search?q=`. Every route requires a local account and is
 ownership-scoped to the caller — see `docs/chat-history-architecture.md`
 and `docs/chat-history-search.md`.
+
+**Secure conversation sharing** (`api/shares.py`, requires
+`LOCAL_AUTH_ENABLED=true` and `ENABLE_CONVERSATION_SHARING=true`, the
+latter on by default): owner-only management —
+`POST`/`GET`/`PATCH /conversations/{id}/share`, `POST
+/conversations/{id}/share/revoke`, `POST
+/conversations/{id}/share/link/regenerate`, `POST
+/conversations/{id}/share/members/invite`, `DELETE
+/conversations/{id}/share/members/{memberId}` — plus a viewer surface
+reachable **without authentication** for an "anyone with the link" share
+(`SHARE_PUBLIC_LINKS_ENABLED`, off by default): `GET /share-view/{ref}`,
+`GET /share-view/{ref}/attachments/{attachmentId}`, and `POST
+/share-invitations/{token}/accept` (redeems an invitation for the caller's
+own authenticated account). A shared conversation is always a read-only,
+server-filtered snapshot — never a live query channel, and never a way to
+reach `/ask`/`/execute` or any other AI/SQL route. See
+`docs/SHARING_SECURITY.md` for the full RBAC/ABAC model, token lifecycle,
+and cache/referrer protections.
 
 ## Auth: from a lightweight hook to real per-user identity, depending on configuration
 
@@ -468,7 +503,10 @@ full picture:
    identity and per-user data isolation** — chat history
    (`api/chat_history.py`) is strictly scoped to the authenticated
    caller's own `user_id`, never trusting a client-supplied value (see
-   `docs/chat-history-architecture.md`).
+   `docs/chat-history-architecture.md`). "Continue with Google"
+   (`GOOGLE_OAUTH_CLIENT_ID` set) is a second way to *reach* this same
+   mode — it produces the identical session a password login does, never
+   a separate `auth_mode` value of its own.
 2. **`oidc`** (`OIDC_ISSUER` set) — validates a JWT against any
    standard-compliant external identity provider. See
    `docs/AUTHENTICATION.md`.

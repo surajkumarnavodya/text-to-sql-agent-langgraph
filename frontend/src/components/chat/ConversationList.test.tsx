@@ -68,6 +68,7 @@ const baseProps = {
   onCommitRename: noop,
   onCancelRename: noop,
   onDelete: noop,
+  onShare: noop,
 }
 
 describe('ConversationList', () => {

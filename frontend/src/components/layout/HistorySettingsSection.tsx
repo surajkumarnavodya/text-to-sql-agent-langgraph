@@ -1,6 +1,7 @@
 import { CheckCircle2, Download, RefreshCw, XCircle } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
 import { AccentColorPicker } from '@/components/settings/AccentColorPicker'
+import { ConnectedAccountsSection } from '@/components/settings/ConnectedAccountsSection'
 import { FontPicker } from '@/components/settings/FontPicker'
 import { LanguageSelector } from '@/components/settings/LanguageSelector'
 import { ModelSelector } from '@/components/settings/ModelSelector'
@@ -10,6 +11,7 @@ import { Switch } from '@/components/ui/switch'
 import { useHealth, useRefreshSchema, useSchemaTables } from '@/hooks/queries'
 import { usePwaInstall } from '@/hooks/usePwaInstall'
 import { useChatStore } from '@/store/chatStore'
+import { useLocalAuthStore } from '@/store/localAuthStore'
 import { useSettingsStore } from '@/store/settingsStore'
 import { SectionBody, SectionHeader } from './SectionHeader'
 
@@ -24,6 +26,7 @@ import { SectionBody, SectionHeader } from './SectionHeader'
 export function HistorySettingsSection() {
   const { t } = useTranslation()
   const health = useHealth()
+  const localAuthStatus = useLocalAuthStore((state) => state.status)
   const schemaTables = useSchemaTables()
   const refreshSchemaMutation = useRefreshSchema()
   const { canInstall, promptInstall } = usePwaInstall()
@@ -134,6 +137,15 @@ export function HistorySettingsSection() {
           <ModelSelector />
         </SectionBody>
       </section>
+
+      {localAuthStatus === 'authenticated' && (
+        <section>
+          <SectionHeader id="connected-accounts" title={t('sidebar.connectedAccounts')} />
+          <SectionBody id="connected-accounts">
+            <ConnectedAccountsSection />
+          </SectionBody>
+        </section>
+      )}
 
       <section className="flex items-center justify-between">
         <label htmlFor="enable-insight" className="text-sm">

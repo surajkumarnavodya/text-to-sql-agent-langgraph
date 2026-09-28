@@ -2,6 +2,7 @@ import { create } from 'zustand'
 import { getHealth } from '@/lib/api'
 import {
   getCurrentUser,
+  googleSignIn,
   isTokenResponse,
   loginUser,
   logoutAllSessions,
@@ -44,6 +45,13 @@ interface LocalAuthState {
   setAuthView: (view: LocalAuthView) => void
   initialize: () => Promise<void>
   login: (email: string, password: string) => Promise<void>
+  /** Sign in, or sign up on first use, via a verified Google ID token
+   * (`credential`, from `GoogleSignInButton`'s callback) -- one backend
+   * flow decides which, this store's caller never has to say. Sets
+   * exactly the same `TokenResponse`-derived state `login`/`register`
+   * already do, so `AuthGate.tsx` treats a Google-authenticated session
+   * identically to a local one. */
+  loginWithGoogle: (credential: string) => Promise<void>
   /** Returns the raw response so the caller (the Register page) can tell
    * an immediate sign-in (`TokenResponse`) apart from "check your email"
    * (`MessageResponse`, when `REQUIRE_EMAIL_VERIFICATION` is on). */
@@ -100,6 +108,11 @@ export const useLocalAuthStore = create<LocalAuthState>((set) => ({
 
   login: async (email, password) => {
     const token = await loginUser(email, password)
+    set({ status: 'authenticated', user: token.user, accessToken: token.access_token, error: null })
+  },
+
+  loginWithGoogle: async (credential) => {
+    const token = await googleSignIn(credential)
     set({ status: 'authenticated', user: token.user, accessToken: token.access_token, error: null })
   },
 

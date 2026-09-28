@@ -5,7 +5,12 @@ module docstring for why an ORM + real (Alembic) migrations are used here
 specifically, rather than the raw-Core-plus-idempotent-`ensure_schema()`
 convention every other DB-backed module in this repo follows.
 
-14 tables, matching the schema this feature was specified against:
+19 tables, matching the schema this feature was specified against
+(14 from the original build, plus `external_identities` added 2026-09-28
+for Google sign-in, plus `conversation_shares`/`share_members`/
+`share_links`/`share_audit_events` added 2026-09-28 for secure
+conversation sharing -- see those four models' own docstrings and
+`identity/share_policy.py`'s module docstring for the full design):
 
 - `users` / `roles` / `permissions` / `user_roles` / `role_permissions` --
   accounts and RBAC. `roles.name` is deliberately seeded with the same
@@ -18,6 +23,11 @@ convention every other DB-backed module in this repo follows.
   granular permission layer that only gates the *new* user/history/admin
   endpoints (`identity/rbac.py`'s own `Permission` codes, stored in
   `permissions`/`role_permissions`).
+- `external_identities` -- one row per linked external-provider identity
+  (Google sign-in), `(provider, provider_subject)` unique and mapped to
+  exactly one `user_id`. `users.password_hash` is nullable specifically to
+  support a Google-only account with no local password at all -- see both
+  models' own docstrings.
 - `auth_sessions` / `signin_events` / `password_reset_tokens` /
   `email_verification_tokens` -- session and credential lifecycle.
   `auth_sessions.refresh_token_hash` stores only a SHA-256 hash of an
@@ -120,7 +130,15 @@ class User(Base):
     email: Mapped[str] = mapped_column(String(320), unique=True, index=True, nullable=False)
     username: Mapped[str] = mapped_column(String(64), unique=True, nullable=True)
     display_name: Mapped[str] = mapped_column(String(200), nullable=True)
-    password_hash: Mapped[str] = mapped_column(String(255), nullable=False)
+    # Nullable since 2026-09-28 (Google sign-in) -- a user provisioned via
+    # `identity.repositories.external_identities.create_user_from_external_identity`
+    # has no local password at all until they explicitly set one (see
+    # `identity/repositories/users.py::create_user`'s own `password`
+    # parameter, now optional). Never enable password login for a row with
+    # `password_hash IS NULL` by accident -- `identity/security.py
+    # ::verify_password` is never called with a `None` hash; every login-
+    # path call site must check for this explicitly first.
+    password_hash: Mapped[str] = mapped_column(String(255), nullable=True)
     # native_enum=False -> a VARCHAR + CHECK constraint, not a Postgres-native
     # ENUM type -- avoids the extra "ALTER TYPE ... ADD VALUE" migration
     # ceremony a native enum would need if a status is ever added later.
@@ -148,6 +166,9 @@ class User(Base):
 
     roles: Mapped[list[UserRole]] = relationship(
         back_populates="user", foreign_keys="UserRole.user_id", cascade="all, delete-orphan"
+    )
+    external_identities: Mapped[list[ExternalIdentity]] = relationship(
+        back_populates="user", cascade="all, delete-orphan"
     )
 
 
@@ -206,6 +227,51 @@ class RolePermission(Base):
     permission_id: Mapped[uuid.UUID] = mapped_column(
         Uuid(as_uuid=True), ForeignKey("permissions.id", ondelete="CASCADE"), primary_key=True
     )
+
+
+class ExternalIdentity(Base):
+    """Maps one external-provider identity (Google sign-in, 2026-09-28; the
+    shape is deliberately provider-generic so a second provider could reuse
+    this same table later) to exactly one local `User`.
+
+    `(provider, provider_subject)` is the actual identity key -- `sub` is
+    Google's own stable, permanent subject identifier for one Google
+    account, never the email/display name/picture, all of which a user can
+    change at will on Google's side (see `security/google_oidc.py`'s own
+    docstring for why `sub` and only `sub` is trusted as the durable
+    identity). The unique constraint below is what makes "an identity
+    already assigned to another user cannot be linked to a second one" a
+    database-enforced invariant, not just an application-level check that a
+    race condition could bypass -- `identity/repositories
+    /external_identities.py::link_external_identity` relies on catching
+    this constraint's `IntegrityError` for exactly that race.
+
+    `email_at_link`/`email_verified_at_link` are a point-in-time audit
+    snapshot only (what Google's token claimed at the moment of linking) --
+    never re-read for authorization decisions after that, since a user's
+    Google-side email can change independently of this row. The
+    authoritative, current email for the account is always `User.email`.
+    """
+
+    __tablename__ = "external_identities"
+    __table_args__ = (
+        UniqueConstraint(
+            "provider", "provider_subject", name="uq_external_identities_provider_subject"
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    provider: Mapped[str] = mapped_column(String(32), nullable=False)
+    provider_subject: Mapped[str] = mapped_column(String(255), nullable=False)
+    email_at_link: Mapped[str] = mapped_column(String(320), nullable=True)
+    email_verified_at_link: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    created_at: Mapped[datetime] = _created_at()
+    last_used_at: Mapped[datetime] = _created_at()
+
+    user: Mapped[User] = relationship(back_populates="external_identities")
 
 
 class AuthSession(Base):
@@ -521,3 +587,245 @@ class AuditLog(Base):
         DateTime(timezone=True), server_default=func.now(), nullable=False, index=True
     )
     metadata_json: Mapped[dict] = mapped_column("metadata", _METADATA_JSON, nullable=True)
+
+
+class ConversationShare(Base):
+    """The one durable "this conversation is shared" record per conversation
+    (`conversation_id` is `unique=True` -- there is never more than one; the
+    owner updates it in place via `PATCH`, never creates a second). See
+    `identity/share_policy.py`'s module docstring for the full RBAC/ABAC
+    design this table is checked against, and `identity/repositories
+    /shares.py` for every state transition.
+
+    `tenant_id` is a **scoped, forward-compatible addition**, not a sign
+    this app has become multi-tenant: `users`/`conversations` still have no
+    tenant concept at all (see this module's own top-of-file docstring and
+    `agent/rate_limit.py`'s existing "no-tenant-isolation" disclosure) --
+    `security.tenancy.resolve_actor_tenant_id` returns one fixed constant
+    for every real user in this deployment today. The column exists, and
+    `identity.share_policy.authorize_share_action` genuinely enforces it,
+    specifically so a future real multi-tenant retrofit only has to change
+    that one resolver function, not this schema or the policy engine.
+
+    `snapshot_message_sequence` is the server-side snapshot boundary (see
+    "Sharing data model and snapshot boundary" in this feature's own spec):
+    a viewer only ever sees `Prompt`/`AiOutput` rows with
+    `sequence_number <= snapshot_message_sequence` for this conversation --
+    a message sent after sharing was created/last updated is invisible
+    until the owner explicitly re-shares (`PATCH .../share` with
+    `refresh_snapshot=true`), never automatically.
+
+    Never hard-deleted -- `status`/`revoked_at` are how sharing is turned
+    off, so a conversation's own soft-delete (`Conversation.deleted_at`)
+    doesn't need to cascade into this table at all: `identity.share_policy`
+    independently re-checks `Conversation.deleted_at IS NULL` on every
+    access, so a deleted conversation is unreachable via its share
+    regardless of whether this row was proactively revoked too (defense in
+    depth, not reliance on remembering to revoke on every deletion path).
+    """
+
+    __tablename__ = "conversation_shares"
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    conversation_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("conversations.id", ondelete="CASCADE"),
+        nullable=False,
+        unique=True,
+        index=True,
+    )
+    owner_user_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    tenant_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    access_mode: Mapped[str] = mapped_column(
+        Enum(
+            "invite_only",
+            "anyone_with_link",
+            name="share_access_mode",
+            native_enum=False,
+            validate_strings=True,
+        ),
+        nullable=False,
+        default="invite_only",
+    )
+    default_permission: Mapped[str] = mapped_column(
+        Enum("viewer", name="share_default_permission", native_enum=False, validate_strings=True),
+        nullable=False,
+        default="viewer",
+    )
+    status: Mapped[str] = mapped_column(
+        Enum("active", "disabled", name="share_status", native_enum=False, validate_strings=True),
+        nullable=False,
+        default="active",
+    )
+    snapshot_message_sequence: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    snapshot_captured_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Default to a finite expiry, per this feature's own spec -- the owner
+    # UI always shows this, and `identity.repositories.shares.create_share`
+    # never leaves it unset without an explicit, deliberate owner choice.
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=True)
+    revoked_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Optimistic concurrency -- every PATCH must supply the version it read
+    # and increments this by exactly one; a stale write is rejected rather
+    # than silently overwriting a concurrent settings change (see
+    # `identity.repositories.shares.update_share`).
+    version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    created_at: Mapped[datetime] = _created_at()
+    updated_at: Mapped[datetime] = _updated_at()
+
+    members: Mapped[list[ShareMember]] = relationship(
+        back_populates="share", cascade="all, delete-orphan"
+    )
+    links: Mapped[list[ShareLink]] = relationship(
+        back_populates="share", cascade="all, delete-orphan"
+    )
+
+
+class ShareMember(Base):
+    """One invited/accepted viewer of a `ConversationShare` -- **never the
+    owner** (the owner is always `ConversationShare.owner_user_id`; the API
+    layer synthesizes the owner's own row in a "people with access" list so
+    there's exactly one place that distinction is made, not two competing
+    sources of truth for who owns a share).
+
+    `user_id` is null for a pending email invitation that hasn't been
+    accepted by (or matched to) an account yet -- `invited_email` carries
+    the target address in that state, and `invitation_token_hash` (never
+    the raw token -- see `identity/security.py::hash_refresh_token`, reused
+    directly rather than reinvented) is what `POST
+    /share-invitations/{token}/accept` redeems, exactly once, to fill in
+    `user_id` and flip `status` to `"active"`.
+    """
+
+    __tablename__ = "share_members"
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    share_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("conversation_shares.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=True, index=True
+    )
+    invited_email: Mapped[str] = mapped_column(String(320), nullable=True)
+    role: Mapped[str] = mapped_column(
+        Enum("viewer", name="share_member_role", native_enum=False, validate_strings=True),
+        nullable=False,
+        default="viewer",
+    )
+    status: Mapped[str] = mapped_column(
+        Enum(
+            "pending",
+            "active",
+            "revoked",
+            "expired",
+            name="share_member_status",
+            native_enum=False,
+            validate_strings=True,
+        ),
+        nullable=False,
+        default="pending",
+    )
+    invitation_token_hash: Mapped[str] = mapped_column(String(64), nullable=True, unique=True)
+    invitation_expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=True)
+    # An optional, member-specific access expiry -- independent of the
+    # share's own `expires_at` (a member can be granted a shorter window
+    # than the share as a whole).
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=True)
+    accepted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=True)
+    revoked_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = _created_at()
+    updated_at: Mapped[datetime] = _updated_at()
+
+    share: Mapped[ConversationShare] = relationship(back_populates="members")
+
+
+class ShareLink(Base):
+    """One version of a share's "anyone with the link" bearer token.
+    **Only `token_hash` (a SHA-256 hex digest, `identity.security
+    .hash_refresh_token` reused directly) is ever stored** -- the raw token
+    is generated (`identity.security.generate_refresh_token`, 48
+    CSPRNG-random bytes, comfortably exceeding this feature's own 128-bit
+    minimum), returned exactly once in the owner's own create/regenerate
+    API response, and never persisted, logged, or included in any audit
+    event's `safe_metadata` anywhere in this codebase.
+
+    Regenerating a link **inserts a new row** (`token_version` incremented)
+    and marks every prior row for the same `share_id` `revoked_at` in the
+    same transaction, rather than mutating `token_hash` in place -- this is
+    what makes "old tokens must fail even if not yet expired" trivially
+    true (a superseded row's own `revoked_at` is checked independently of
+    its `expires_at`) and keeps a genuine, queryable history of every link
+    version ever issued for incident response.
+    """
+
+    __tablename__ = "share_links"
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    share_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("conversation_shares.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    token_hash: Mapped[str] = mapped_column(String(64), nullable=False, unique=True, index=True)
+    token_version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=True)
+    revoked_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_used_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = _created_at()
+
+    share: Mapped[ConversationShare] = relationship(back_populates="links")
+
+
+class ShareAuditEvent(Base):
+    """Privacy-safe event log for the sharing feature -- **never** a raw
+    token, cookie, Authorization header, or private conversation/message
+    text (`safe_metadata` is a bounded, redacted JSON blob the write path
+    itself constructs from stable, non-sensitive fields only -- see
+    `identity.share_audit.record_share_event`'s own docstring for the
+    allowlist). `share_id` is `ON DELETE SET NULL` (mirroring `AuditLog`'s
+    own `actor_user_id`/`subject_user_id` precedent above) so this table's
+    own rows are never destroyed by anything happening to the share or
+    conversation they describe -- the audit trail must be able to outlive
+    both, which is exactly when an incident investigation needs it most.
+    `conversation_id` is deliberately a bare column, not a foreign key, for
+    the same reason.
+    """
+
+    __tablename__ = "share_audit_events"
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    share_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("conversation_shares.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    conversation_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True), nullable=True, index=True
+    )
+    actor_user_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    event_type: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    result: Mapped[str] = mapped_column(
+        Enum(
+            "allowed",
+            "denied",
+            "error",
+            name="share_audit_result",
+            native_enum=False,
+            validate_strings=True,
+        ),
+        nullable=False,
+    )
+    reason: Mapped[str] = mapped_column(String(128), nullable=True)
+    request_id: Mapped[str] = mapped_column(String(100), nullable=True)
+    safe_metadata: Mapped[dict] = mapped_column(_METADATA_JSON, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False, index=True
+    )

@@ -3226,6 +3226,166 @@ degrades to English text rather than breaking. See
 implementation" section for the full design and every other disclosed
 limitation.
 
+### Google sign-in (2026-09-28)
+
+A second way to reach this app's own self-hosted accounts (`identity/`,
+`Settings.local_auth_enabled`) — "Continue with Google" on both the sign-in
+and sign-up pages, one backend flow deciding which. Layered entirely on
+top of the pre-existing local-account system; does not touch OIDC mode,
+the static-token mode, or `agent/authz.py`'s RBAC. Full design, every
+server-side check, identity-linking rules, and the honest "what's
+live-verified vs. mocked vs. not verified at all" breakdown live in
+`docs/AUTHENTICATION.md`'s own "Google sign-in" section — this is a
+pointer, not a duplicate. Short version, since it touches several existing
+modules this file already documents elsewhere:
+
+- **Flow: Google Identity Services' ID-token flow, not the OAuth
+  authorization-code flow** — chosen specifically because Google sign-in
+  here is authentication only, never authorization to call any Google API
+  or to a user's own configured SQL database, so there's no scope this app
+  needs beyond `openid email profile` (GIS's own default) and therefore no
+  `client_secret` to ever hold server-side. `GOOGLE_OAUTH_CLIENT_ID` is the
+  only Google-related setting, and — unlike every other credential this
+  file discusses — is explicitly **public**, served to the frontend live
+  via `GET /health` (`google_signin_enabled`/`google_client_id`) rather
+  than baked into a `VITE_*` build-time variable the way this codebase's
+  pre-existing OIDC client ID is, specifically so it can be rotated with a
+  process restart alone, no rebuild.
+- **`security/google_oidc.py::verify_google_id_token`** does the real work,
+  via Google's own `google-auth` library (never a hand-rolled JWT decode):
+  signature against Google's live, rotating public keys (never trusting
+  the token's own `alg`/`kid`), issuer restricted to Google's own domains,
+  exact `aud` match against `GOOGLE_OAUTH_CLIENT_ID`, `azp` cross-check,
+  bounded-clock-skew `exp`/`iat`, a server-issued single-use nonce
+  (`issue_signin_nonce`/`consume_signin_nonce`, a bounded in-memory store
+  mirroring `attachments.ai_edit`'s own idempotency-cache shape) verified
+  against the token's signed `nonce` claim, `sub` as the only durable
+  identity key ever stored, `email_verified` gating whether an email claim
+  is trusted, and `hd` (hosted-domain restriction, `GOOGLE_OAUTH_ALLOWED_HOSTED_DOMAINS`)
+  read from the **signed claim**, never inferred from the email's own
+  `@domain` suffix.
+- **`identity/repositories/external_identities.py`** owns identity linking:
+  `ExternalIdentity` (`identity/models.py`, a real `UNIQUE(provider,
+  provider_subject)` constraint — the durable, race-safe mapping),
+  `find_or_create_user_for_google_identity` (the sign-in-or-sign-up
+  decision, four ordered checks — already-linked / verified-email-conflict
+  refused with an informative 409 / unverified-email-collision refused
+  generically with a non-confirming 401, since `users.email`'s own unique
+  constraint makes a second account genuinely impossible either way and
+  the two cases must not be distinguishable from the response or the
+  unverified path becomes an enumeration oracle / first-sign-in creates a
+  password-free user), `link_external_identity` (authenticated linking
+  only — `user_id` from the caller's own verified session, never the
+  request body; never auto-merges by email alone), `unlink_external_identity`
+  (refused if it would leave an account with no way to sign in at all).
+  `users.password_hash` was widened to nullable for this
+  (`a09ce853cb0d_google_signin_external_identities.py`, an Alembic
+  migration that only loosens a constraint, touches no existing row, and
+  refuses to downgrade if doing so would silently break a Google-only
+  account) — a real, previously-latent crash this surfaced and fixed: a
+  Google-only account attempting *local* password login used to hit an
+  uncaught `AttributeError` deep in Argon2's own verify call instead of the
+  ordinary generic 401 every other wrong-password attempt gets, a genuine
+  account-enumeration side channel via HTTP status code alone.
+- **Sessions are the *existing* ones, nothing new invented** — a
+  successful Google sign-in calls the exact same `_issue_tokens(...)`
+  helper `/auth/login`/`/auth/register` already use, producing the same
+  JWT access token + `Secure`/`HttpOnly`/`SameSite` rotating refresh-token
+  cookie every local-account session already gets.
+- **Frontend**: `GoogleSignInButton.tsx` (renders GIS's own button, fetches
+  a nonce once per mount, never stores the credential anywhere beyond
+  handing it to its caller), `localAuthStore.ts`'s new `loginWithGoogle`
+  action (identical `TokenResponse`-derived state `login`/`register`
+  already set), wired into both `SignIn.tsx`/`Register.tsx` behind
+  `GET /health`'s own capability flags, plus a `ConnectedAccountsSection.tsx`
+  in Settings for linking/unlinking from an already-authenticated session.
+- **Frontend production-build secret scanning**
+  (`scripts/scan_frontend_build_for_secrets.py`, new, CI-wired) — added
+  alongside this feature specifically because a Google client ID is
+  *expected* to appear in the built bundle (public, by design) while a
+  real secret never should; scans compiled JS/CSS/HTML/source maps for
+  known secret-shaped patterns plus, optionally, exact-value matches
+  against this deployment's own real configured secrets
+  (`security.redaction.configured_secret_fingerprints`) — distinct from
+  and complementary to the existing Git-history-only scanners
+  (`gitleaks`/`detect-secrets`).
+- **Honest verification status**: the Alembic migration, every
+  identity-linking repository function, and `verify_google_id_token`'s
+  rejection path making a real network round-trip to Google's own
+  certificate infrastructure were all live-verified against a real local
+  PostgreSQL identity database in this development environment. A
+  successful token verification is necessarily mocked in HTTP-level tests
+  (no way to produce a token Google's own library will accept without a
+  real Google account completing a real sign-in in a real browser). **A
+  real, browser-based, end-to-end Google sign-in has not been exercised in
+  this environment** — see `docs/AUTHENTICATION.md`'s own "What's verified
+  vs. not" section before relying on this in production.
+
+### Secure conversation sharing (2026-09-28)
+
+Turns a conversation into a controlled, read-only snapshot other people may
+view — never a live query channel, an authentication session, or a way to
+reach this app's SQL/RAG/web/model/image pipelines from a shared view. Full
+design in `docs/SHARING_SECURITY.md` — this is a pointer, not a duplicate.
+Short version, since it touches several existing modules this file already
+documents elsewhere:
+
+- **This app has no real tenant model (single-tenant by design, see
+  `agent/rate_limit.py`'s own existing "no-tenant-isolation" disclosure) --
+  a full multi-tenant retrofit was deliberately out of scope.** Only the
+  new sharing tables carry a scoped `tenant_id` (`security/tenancy.py`,
+  one function, one constant today), and `identity.share_policy
+  .authorize_share_action` genuinely enforces a tenant-match condition
+  against it — a real, tested ABAC dimension future multi-tenancy could
+  plug a real per-user value into without touching the policy engine.
+- **`identity/share_policy.py`** is the single RBAC/ABAC decision point
+  every route/resolver calls before acting (mirroring `agent/authz.py`'s
+  own "pure policy, no web-framework import" split) — deny-by-default on
+  an unrecognized action, role, or missing tenant; owner/viewer/
+  anonymous-link-viewer are the only three roles, "Editor" is never
+  modeled at all per this feature's own explicit scope.
+- **`identity/repositories/shares.py`** owns the snapshot boundary (a
+  message sent after sharing is invisible until the owner explicitly
+  refreshes it), optimistic-concurrency-controlled updates
+  (`ShareVersionConflictError` → 409), and `build_share_projection` — a
+  hard **allowlist** (not a blocklist) of which persisted-turn metadata
+  fields a viewer may ever see, so a newly-added internal field defaults
+  to invisible until deliberately added.
+- **Tokens reuse `identity/security.py`'s existing refresh-token
+  primitive directly** (48-byte CSPRNG, SHA-256 hash-only storage) rather
+  than reinventing one — the same "identical requirement, don't duplicate"
+  precedent `identity/repositories/tokens.py` already established for
+  password-reset/email-verification tokens.
+- **A real bug found only by live-testing the running app, not by
+  `TestClient` alone**: raising `HTTPException` builds a separate response
+  object that silently discards headers a route had already set on its
+  injected `Response` parameter — meaning the *denial* path of the
+  anonymous-reachable `GET /share-view/{ref}` served default cache/
+  referrer headers instead of the intended `private, no-store`/
+  `no-referrer` ones. Reproduced via `curl` against a real running
+  instance, fixed by moving every safe header onto
+  `HTTPException(..., headers=...)` explicitly, and closed with both a
+  named regression test and a second live re-verification.
+- **A second real design gap, found by this feature's own test-writing**:
+  `ConversationShare.conversation_id` is unique, so a revoked share could
+  never simply be re-created — `identity.repositories.shares
+  .reactivate_share` is the one function that clears `revoked_at`, wired
+  into `POST .../share`'s own idempotent-create path as a fresh grant
+  (new snapshot, new expiry) rather than a resurrection of stale settings.
+- **Deliberately a separate backend path prefix (`/share-view`) from the
+  frontend's own `/shared/:ref` client-side page route** — a real routing
+  collision was caught before it shipped (both would otherwise resolve to
+  the same URL, so either the API would intercept a genuine page load or
+  the SPA would swallow the API call).
+- **Verified against a real PostgreSQL identity database**: the migration
+  (both directions), real FK/cascade/SET NULL behavior, and a full
+  create → invite → accept → view → revoke → re-share flow via `curl`
+  against a genuinely running instance — not only `TestClient`. **A real
+  reverse proxy/CDN was not available to confirm it honors
+  `Cache-Control: private, no-store`** for this path prefix; see
+  `docs/SHARING_SECURITY.md`'s own "What's verified vs. not" before
+  deploying behind one.
+
 ## How to run
 
 See `README.md` for full setup. Short version:

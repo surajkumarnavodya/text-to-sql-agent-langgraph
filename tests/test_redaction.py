@@ -8,6 +8,7 @@ drivers/failure modes.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 from config.settings import Settings
@@ -17,6 +18,19 @@ from security.redaction import (
     redact_secrets,
 )
 from security.secrets import SecretStr
+
+# A real, well-formed JWT (three base64url segments) -- deterministically
+# generated with a throwaway, hardcoded, test-only signing key
+# ("test-signing-key-not-real", never used anywhere outside this file) via
+# `pyjwt`, not a value that was ever a genuine credential anywhere. Used to
+# prove the redaction regex matches the *shape* of a real JWT (Google ID
+# token, this app's own locally-issued access token, or any other), not a
+# hand-typed approximation of one.
+_SAMPLE_JWT = (
+    "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9."
+    "eyJzdWIiOiIxMTA0NDMzMjIzMjA5ODc2NTQzMjEiLCJlbWFpbCI6InRlc3RAZXhhbXBsZS5jb20ifQ."
+    "kQGJqUPAeRLvy3-9xfoCv-H_IKR8RgyYq-Iabc123XYZ"
+)
 
 _BASE_SETTINGS = Settings(
     ollama_host="http://localhost:11434",
@@ -163,3 +177,105 @@ class TestRedactConfiguredSecrets:
     def test_ordinary_answer_text_is_unchanged(self):
         text = "Total sales in 2013 were $1,204,592 across 4 territories."
         assert redact_configured_secrets(text, _settings()) == text
+
+
+class TestJwtAndOAuthFieldRedaction:
+    """Google sign-in (2026-09-28) needs this app's redaction net to catch a
+    JWT (a Google ID token, or this app's own locally-issued access token)
+    even when it isn't preceded by "Bearer ", plus the OAuth-adjacent field
+    names the task's own threat model calls out by name."""
+
+    def test_bare_jwt_with_no_bearer_prefix_is_redacted(self):
+        text = f"Google credential received: {_SAMPLE_JWT}"
+        redacted = redact_secrets(text, None)
+        assert _SAMPLE_JWT not in redacted
+        assert "***REDACTED***" in redacted
+
+    def test_bare_jwt_in_a_query_string_is_redacted(self):
+        text = f"GET /auth/callback?id_token={_SAMPLE_JWT}&state=xyz HTTP/1.1"
+        redacted = redact_secrets(text, None)
+        assert _SAMPLE_JWT not in redacted
+
+    def test_client_secret_field_is_redacted(self):
+        text = "token exchange failed: client_secret=GOCSPX-fake_secret_value_123"
+        redacted = redact_secrets(text, None)
+        assert "GOCSPX-fake_secret_value_123" not in redacted
+        assert "***REDACTED***" in redacted
+
+    def test_access_token_field_is_redacted(self):
+        text = "response body: access_token=ya29.fake-access-token-value&expires_in=3600"
+        redacted = redact_secrets(text, None)
+        assert "ya29.fake-access-token-value" not in redacted
+
+    def test_refresh_token_field_is_redacted(self):
+        text = "Set-Cookie: refresh_token=abcDEF123-opaque-value; Path=/auth"
+        redacted = redact_secrets(text, None)
+        assert "abcDEF123-opaque-value" not in redacted
+
+    def test_ordinary_prose_with_no_secret_shape_is_unchanged(self):
+        text = "The password policy requires at least 12 characters."
+        # "password" appears, but with no "=value" following it -- must not
+        # be misfired on by the key=value pattern.
+        assert redact_secrets(text, None) == text
+
+    def test_ordinary_email_shaped_text_is_not_mistaken_for_a_jwt(self):
+        """A real risk with a loose 'three dot-separated segments' pattern:
+        an email-adjacent or version-number-shaped string must not
+        false-positive. This app's pattern requires an `ey`-prefixed first
+        segment specifically (real JWTs always start this way, the base64
+        encoding of `{"`), which an email address never does."""
+        text = "Contact user.name.test@example.com for details, running v1.2.3 today."
+        assert redact_secrets(text, None) == text
+
+
+class TestNestedStructureMasking:
+    """The task's own explicit requirement: masking must hold regardless of
+    how deeply a secret is nested inside a larger structure (a logged
+    request/response body, a list of header dicts, ...) -- `redact_secrets`/
+    `redact_configured_secrets` operate on the final serialized string, so
+    nesting depth is irrelevant to whether the *substring* is found, but
+    this is worth proving explicitly rather than just assumed."""
+
+    def test_secret_nested_inside_a_json_object_is_redacted(self):
+        settings = _settings(api_auth_token=SecretStr("tok3n-abc123"))
+        payload = {
+            "request": {
+                "headers": {"Authorization": "Bearer tok3n-abc123"},
+                "body": {"nested": {"deeply": {"api_key": "tok3n-abc123"}}},
+            }
+        }
+        text = json.dumps(payload)
+        redacted = redact_configured_secrets(text, settings)
+        assert "tok3n-abc123" not in redacted
+
+    def test_secret_nested_inside_a_list_of_dicts_is_redacted(self):
+        settings = _settings(api_auth_token=SecretStr("tok3n-abc123"))
+        payload = [
+            {"event": "request_started"},
+            {"event": "auth_header", "value": "Bearer tok3n-abc123"},
+            {"event": "request_finished"},
+        ]
+        text = json.dumps(payload)
+        redacted = redact_configured_secrets(text, settings)
+        assert "tok3n-abc123" not in redacted
+
+    def test_jwt_nested_inside_a_query_string_inside_a_json_body_is_redacted(self):
+        payload = {"request_line": f"GET /callback?id_token={_SAMPLE_JWT} HTTP/1.1"}
+        text = json.dumps(payload)
+        redacted = redact_secrets(text, None)
+        assert _SAMPLE_JWT not in redacted
+
+    def test_multiple_distinct_secrets_in_the_same_structure_are_all_redacted(self):
+        settings = _settings(
+            api_auth_token=SecretStr("tok3n-abc123"), db_password=SecretStr("S3cr3t!")
+        )
+        payload = {
+            "db_error": "connection failed: password=S3cr3t!;host=db",
+            "auth_header": "Bearer tok3n-abc123",
+            "credential": _SAMPLE_JWT,
+        }
+        text = json.dumps(payload)
+        redacted = redact_configured_secrets(text, settings)
+        assert "S3cr3t!" not in redacted
+        assert "tok3n-abc123" not in redacted
+        assert _SAMPLE_JWT not in redacted
