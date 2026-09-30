@@ -757,6 +757,14 @@ class SchemaRefreshResult(BaseModel):
 
     database: str
     table_count: int
+    # Prompt 06 (06_DATABASE_DISCOVERY_CONTRACT.md) -- all additive, all
+    # optional with a value that means "nothing to report," so an older
+    # client that doesn't know these fields yet sees no behavior change.
+    view_count: int = 0
+    added_tables: list[str] = []
+    removed_tables: list[str] = []
+    changed_tables: list[str] = []
+    last_discovered_at: str | None = None
 
 
 class SchemaRefreshResponse(BaseModel):

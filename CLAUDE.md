@@ -131,7 +131,20 @@ below, and `docs/MULTI_SOURCE_GUIDE.md` for how to configure each source.
   to pull real tables/columns/types/FKs and synthesizes a compact
   `CREATE TABLE`-style DDL string per table (for LLM prompt consistency,
   not necessarily valid executable DDL). `get_schema_fingerprint()` hashes
-  that output for Chroma cache invalidation. `execution.py` owns read-only
+  that output for Chroma cache invalidation. **Prompt 06**
+  (`06_DATABASE_DISCOVERY_CONTRACT.md`) extended it: views are discovered
+  alongside tables (`TableSchemaInfo.is_view`, rendered as `CREATE VIEW`);
+  `ColumnInfo` gained `default`/`is_computed`/`is_identity`/`length`/
+  `precision`/`scale`, all sourced from data the `Inspector` already
+  returns — no new query; one table/view's own introspection failing no
+  longer aborts the whole database (logged and skipped instead). `db/
+  row_count_estimate.py` (new) adds an opt-in (`include_row_counts=True`),
+  catalog-only approximate row count per table/view (`sys
+  .dm_db_partition_stats`/`pg_stat_user_tables`/`information_schema
+  .tables.TABLE_ROWS`/`ALL_TABLES.NUM_ROWS` depending on `DB_TYPE`) —
+  deliberately never a `SELECT COUNT(*)`, and off by default so every
+  existing caller's per-refresh cost is unchanged unless it opts in.
+  `execution.py` owns read-only
   SQL execution mechanics (`execute_readonly_sql` — background-thread
   timeout enforcement plus a `fetchmany()` row cap), shared by
   `agent.nodes.execute_sql_node` and `api/main.py`'s `POST /execute`
@@ -160,11 +173,23 @@ below, and `docs/MULTI_SOURCE_GUIDE.md` for how to configure each source.
   engine) and embeds them into **that database's own Chroma collection**
   (never a shared one — see `get_collection`'s docstring for why), keyed by
   a hash of the introspected schema so re-embedding only happens when that
-  database's schema actually changed. `refresh_schema_index(engine, db_name,
+  database's schema actually changed. **Prompt 06**
+  (`06_DATABASE_DISCOVERY_CONTRACT.md`) made this genuinely incremental: a
+  per-database JSON manifest (`.schema_manifest__<db_name>.json`, replacing
+  the old bare-hash file — no migration needed, an orphaned old file is
+  just never read again) also stores a per-*table* fingerprint, so a
+  change to one table triggers a targeted `collection.upsert`/`delete` for
+  just that table instead of deleting and rebuilding the entire
+  collection. `get_last_discovery_diff(db_name, settings)` reads back
+  what changed (added/removed/changed table names) without touching
+  `build_index`'s own signature/return type. `refresh_schema_index(engine, db_name,
   settings, force)` is the single introspect → sample → embed pipeline for
   one database; `refresh_all_schema_indexes(settings, force)` runs it for
   every configured database and is what `scripts/build_embeddings.py` and
-  `api/main.py`'s startup/`POST /schema/refresh` actually call. `retriever.py`'s
+  `api/main.py`'s startup/`POST /schema/refresh` actually call — that route's
+  response now additionally reports `view_count`/`added_tables`/
+  `removed_tables`/`changed_tables`/`last_discovered_at` per database (new,
+  optional fields; existing fields unchanged). `retriever.py`'s
   `retrieve_relevant_schema(question, db_name, ...)` does top-k similarity
   search over one database's table-level DDL chunks — unchanged in shape
   from before, just explicitly scoped to one database's collection now.

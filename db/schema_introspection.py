@@ -16,16 +16,28 @@ that *does* query real column values (for a bounded set of low-cardinality
 columns) and re-renders DDL via this module's `render_ddl()` to include
 them -- kept separate so this module's "metadata only" contract stays true
 by construction, not by convention.
+
+**Prompt 06** (`06_DATABASE_DISCOVERY_CONTRACT.md`) extended this module:
+views are now discovered alongside tables (`TableSchemaInfo.is_view`);
+`ColumnInfo` gained `default`/`is_computed`/`is_identity`/`length`/
+`precision`/`scale`, all sourced from data the `Inspector` already
+returns per column -- no new query. One table/view's own introspection
+failing (a permissions issue on a specific object, a dialect quirk) no
+longer aborts the whole database -- see `introspect_schema`'s own
+docstring for the per-object isolation this now has.
 """
 
 from __future__ import annotations
 
 import hashlib
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from sqlalchemy import Engine, inspect
+from sqlalchemy.engine.interfaces import ReflectedColumn
+from sqlalchemy.engine.reflection import Inspector
 
+from db.row_count_estimate import estimate_row_count
 from security.sanitization import normalize_text
 
 logger = logging.getLogger(__name__)
@@ -38,12 +50,25 @@ _MAX_IDENTIFIER_LENGTH = 128
 
 @dataclass(frozen=True)
 class ColumnInfo:
-    """One column's shape, as introspected."""
+    """One column's shape, as introspected.
+
+    `default`/`is_computed`/`is_identity`/`length`/`precision`/`scale`
+    (Prompt 06) are all sourced from data SQLAlchemy's `Inspector` already
+    returns per column -- no second query. Each defaults to `None`/`False`
+    when a dialect doesn't populate it (fail-open, never a reason
+    introspection itself fails) rather than raising.
+    """
 
     name: str
     type: str
     nullable: bool
     is_primary_key: bool
+    default: str | None = None
+    is_computed: bool = False
+    is_identity: bool = False
+    length: int | None = None
+    precision: int | None = None
+    scale: int | None = None
 
 
 @dataclass(frozen=True)
@@ -57,19 +82,36 @@ class ForeignKeyInfo:
 
 @dataclass(frozen=True)
 class TableSchemaInfo:
-    """One table's full introspected shape, plus a synthesized DDL-like rendering.
+    """One table's (or view's) full introspected shape, plus a synthesized DDL-like rendering.
 
     `ddl` is not necessarily valid, executable DDL for every engine -- it's
     a compact, LLM-friendly `CREATE TABLE`-style text rendering of the
     introspected columns/keys, chosen because that's the format the DDL-fed
     prompt used before (and what most SQL-generation models are tuned on),
     now synthesized from live metadata instead of a hand-written file.
+
+    `is_view` (Prompt 06): whether this object is a view rather than a base
+    table -- `render_ddl` renders `CREATE VIEW` instead of `CREATE TABLE`
+    for one, so the LLM isn't told a view is something it can be joined
+    against like an indexed table without qualification. Views are
+    discovered and embedded exactly like tables otherwise (same retrieval,
+    same validation, same execution path) -- there is no separate
+    "view mode" anywhere downstream.
+
+    `row_count_estimate` (Prompt 06): an approximate, catalog-only row
+    count (see `db/row_count_estimate.py`) -- `None` unless
+    `introspect_schema` was called with `include_row_counts=True` (opt-in,
+    default off, so every existing caller's per-refresh cost is unchanged
+    unless it asks for this). Never embedded into `ddl`/the LLM prompt --
+    discovery/onboarding metadata only.
     """
 
     table_name: str
     columns: tuple[ColumnInfo, ...]
     foreign_keys: tuple[ForeignKeyInfo, ...]
     ddl: str
+    is_view: bool = False
+    row_count_estimate: int | None = None
 
 
 def _sanitize_identifier(value: str) -> str:
@@ -100,15 +142,18 @@ def render_ddl(
     columns: tuple[ColumnInfo, ...],
     foreign_keys: tuple[ForeignKeyInfo, ...],
     sample_values: dict[str, tuple[str, ...]] | None = None,
+    is_view: bool = False,
 ) -> str:
-    """Synthesizes a compact CREATE-TABLE-style text block for one table.
+    """Synthesizes a compact CREATE-TABLE-style text block for one table (or view).
 
     Every identifier (table name, column names/types, FK table/column
     names) is normalized via `_sanitize_identifier` before being formatted
     into the returned text -- this function's output is exactly what ends
     up embedded in Chroma and concatenated into the LLM prompt (see
     `agent.nodes.retrieve_schema_node`), so this is the boundary where
-    database-sourced text must already be safe.
+    database-sourced text must already be safe. `column.default`'s value
+    (an arbitrary DB-sourced expression string, e.g. `"((0))"`) is
+    sanitized the same way before rendering, for the same reason.
 
     Args:
         sample_values: Optional column name -> distinct values actually seen
@@ -123,9 +168,13 @@ def render_ddl(
             name, since that's the key `db.value_sampling.attach_sample_values`
             populates). Plain `introspect_schema()` always passes None,
             keeping its own "never touches table data" contract intact.
+        is_view: Renders `CREATE VIEW` instead of `CREATE TABLE` (Prompt 06)
+            -- purely a labeling difference for the LLM's benefit; the rest
+            of the rendering (columns, FKs, sample values) is identical.
     """
     safe_table_name = _sanitize_identifier(table_name)
-    lines = [f"CREATE TABLE {safe_table_name} ("]
+    keyword = "VIEW" if is_view else "TABLE"
+    lines = [f"CREATE {keyword} {safe_table_name} ("]
     column_lines = []
     for column in columns:
         safe_name = _sanitize_identifier(column.name)
@@ -135,10 +184,17 @@ def render_ddl(
             parts.append("PRIMARY KEY")
         if not column.nullable and not column.is_primary_key:
             parts.append("NOT NULL")
+        if column.is_identity:
+            parts.append("IDENTITY")
+        if column.is_computed:
+            parts.append("COMPUTED")
+        if column.default is not None:
+            parts.append(f"DEFAULT {_sanitize_identifier(column.default)}")
         # Looked up by the column's *original* name -- that's the key
         # db.value_sampling.attach_sample_values populates -- but the
         # values themselves are already sanitized at their source
         # (db.value_sampling._sample_column), not re-sanitized here.
+        # Always last: a SQL line comment consumes the rest of the line.
         values = (sample_values or {}).get(column.name)
         if values:
             parts.append(f"-- e.g. {', '.join(values)}")
@@ -155,8 +211,99 @@ def render_ddl(
     return "\n".join(lines)
 
 
-def introspect_schema(engine: Engine, schema: str | None = None) -> list[TableSchemaInfo]:
-    """Introspects every table (name, columns, types, FKs) visible to the connection.
+def _build_column_info(col: ReflectedColumn) -> ColumnInfo:
+    """Builds one `ColumnInfo` from one raw column dict returned by
+    `Inspector.get_columns()`.
+
+    `length`/`precision`/`scale` come from the reflected `type` object
+    itself (e.g. `String(50).length == 50`, `Numeric(18, 2).precision ==
+    18`), not a second query -- `getattr(..., None)` is a genuine `None`
+    for a type that doesn't have that attribute at all (e.g. `INTEGER` has
+    no `.length`), not a missing-value sentinel. `default`/`computed`/
+    `identity` are dialect-populated keys on the same dict that not every
+    engine/dialect reflects -- `.get(...)`, defaulting to `None`, keeps
+    this fail-open rather than raising on an engine that doesn't.
+    """
+    col_type = col["type"]
+    computed = col.get("computed")
+    identity = col.get("identity")
+    default = col.get("default")
+    return ColumnInfo(
+        name=str(col["name"]),
+        type=str(col_type),
+        nullable=bool(col.get("nullable", True)),
+        is_primary_key=False,  # set by the caller, which knows the PK constraint
+        default=str(default) if default is not None else None,
+        is_computed=computed is not None,
+        is_identity=identity is not None,
+        length=getattr(col_type, "length", None),
+        precision=getattr(col_type, "precision", None),
+        scale=getattr(col_type, "scale", None),
+    )
+
+
+def _introspect_one(
+    inspector: Inspector,
+    name: str,
+    schema: str | None,
+    is_view: bool,
+    engine: Engine | None = None,
+    db_type: str | None = None,
+) -> TableSchemaInfo:
+    """Introspects one table or view -- the unit `introspect_schema` isolates
+    a per-object failure to (see that function's own docstring).
+
+    `engine`/`db_type` are only used for the opt-in row-count estimate
+    (`include_row_counts=True`) -- both `None` (the default) skips it
+    entirely, no extra query issued.
+    """
+    pk_columns: set[str] = set()
+    if not is_view:
+        # Views have no PK constraint to speak of; get_pk_constraint on a
+        # view raises for some dialects, so it's skipped entirely rather
+        # than called-and-caught.
+        pk_constraint = inspector.get_pk_constraint(name, schema=schema)
+        pk_columns = set(pk_constraint.get("constrained_columns") or [])
+
+    columns = tuple(
+        replace(_build_column_info(col), is_primary_key=col["name"] in pk_columns)
+        for col in inspector.get_columns(name, schema=schema)
+    )
+
+    foreign_keys: tuple[ForeignKeyInfo, ...] = ()
+    if not is_view:
+        # Views don't carry their own FK constraints either.
+        foreign_keys = tuple(
+            ForeignKeyInfo(
+                constrained_columns=tuple(fk["constrained_columns"]),
+                referred_table=fk["referred_table"],
+                referred_columns=tuple(fk["referred_columns"]),
+            )
+            for fk in inspector.get_foreign_keys(name, schema=schema)
+            if fk.get("constrained_columns") and fk.get("referred_table")
+        )
+
+    ddl = render_ddl(name, columns, foreign_keys, is_view=is_view)
+
+    row_count_estimate: int | None = None
+    if engine is not None and db_type is not None:
+        row_count_estimate = estimate_row_count(engine, name, schema, db_type)
+
+    return TableSchemaInfo(
+        table_name=name,
+        columns=columns,
+        foreign_keys=foreign_keys,
+        ddl=ddl,
+        is_view=is_view,
+        row_count_estimate=row_count_estimate,
+    )
+
+
+def introspect_schema(
+    engine: Engine, schema: str | None = None, include_row_counts: bool = False
+) -> list[TableSchemaInfo]:
+    """Introspects every table and view (name, columns, types, FKs) visible
+    to the connection.
 
     Args:
         engine: A SQLAlchemy engine -- typically `db.connection.get_read_only_engine()`.
@@ -165,50 +312,69 @@ def introspect_schema(engine: Engine, schema: str | None = None) -> list[TableSc
         schema: Optional schema name to restrict introspection to (from
             `Settings.db_schema`). None means "the database's default
             schema for this connection" (SQLAlchemy's own default behavior).
+        include_row_counts: Opt-in (Prompt 06, default `False`) -- when
+            `True`, also issues one extra catalog-only query per table/view
+            (`db.row_count_estimate.estimate_row_count`) and populates
+            `TableSchemaInfo.row_count_estimate`. Off by default so every
+            existing caller's per-refresh cost (one query per table plus
+            two for PK/FK, already the case before this prompt) is
+            unchanged unless it explicitly asks for the extra round trip.
 
     Returns:
-        One `TableSchemaInfo` per table, ordered by table name for
+        One `TableSchemaInfo` per table/view, ordered by name for
         deterministic output (which matters for the schema-fingerprint hash
         used by `embeddings/schema_indexer.py`'s cache invalidation).
+
+    A single table/view whose own introspection fails (a permissions
+    issue on that one object, a dialect quirk `Inspector` chokes on) is
+    logged and skipped -- Prompt 06
+    (`06_DATABASE_DISCOVERY_CONTRACT.md`) -- rather than aborting
+    discovery for every other, perfectly-introspectable object in the same
+    database. This mirrors `embeddings.schema_indexer
+    .refresh_all_schema_indexes`'s existing "one bad database must not
+    block the others" posture, one level down (one bad object must not
+    block the others in the same database).
     """
     inspector = inspect(engine)
     table_names = sorted(inspector.get_table_names(schema=schema))
-    logger.info("Introspected %d table(s) in schema=%r", len(table_names), schema)
+    try:
+        view_names = sorted(inspector.get_view_names(schema=schema))
+    except NotImplementedError:
+        # A handful of third-party dialects don't implement view reflection
+        # at all -- treated exactly like "this database has no views",
+        # never a reason table discovery itself fails.
+        view_names = []
+    logger.info(
+        "Introspecting %d table(s) and %d view(s) in schema=%r",
+        len(table_names),
+        len(view_names),
+        schema,
+    )
+
+    row_count_engine = engine if include_row_counts else None
+    row_count_db_type = engine.dialect.name if include_row_counts else None
 
     tables: list[TableSchemaInfo] = []
-    for table_name in table_names:
-        pk_constraint = inspector.get_pk_constraint(table_name, schema=schema)
-        pk_columns = set(pk_constraint.get("constrained_columns") or [])
-
-        columns = tuple(
-            ColumnInfo(
-                name=col["name"],
-                type=str(col["type"]),
-                nullable=bool(col.get("nullable", True)),
-                is_primary_key=col["name"] in pk_columns,
+    for name, is_view in [(t, False) for t in table_names] + [(v, True) for v in view_names]:
+        try:
+            tables.append(
+                _introspect_one(
+                    inspector,
+                    name,
+                    schema,
+                    is_view,
+                    engine=row_count_engine,
+                    db_type=row_count_db_type,
+                )
             )
-            for col in inspector.get_columns(table_name, schema=schema)
-        )
-
-        foreign_keys = tuple(
-            ForeignKeyInfo(
-                constrained_columns=tuple(fk["constrained_columns"]),
-                referred_table=fk["referred_table"],
-                referred_columns=tuple(fk["referred_columns"]),
+        except Exception as exc:  # noqa: BLE001 - one bad object must not block the rest
+            logger.warning(
+                "Skipping %s %r in schema=%r: introspection failed: %s",
+                "view" if is_view else "table",
+                name,
+                schema,
+                exc,
             )
-            for fk in inspector.get_foreign_keys(table_name, schema=schema)
-            if fk.get("constrained_columns") and fk.get("referred_table")
-        )
-
-        ddl = render_ddl(table_name, columns, foreign_keys)
-        tables.append(
-            TableSchemaInfo(
-                table_name=table_name,
-                columns=columns,
-                foreign_keys=foreign_keys,
-                ddl=ddl,
-            )
-        )
 
     return tables
 

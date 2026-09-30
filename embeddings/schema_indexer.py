@@ -32,26 +32,47 @@ free-form prose into the embedding text.
 
 Cache invalidation: `db.schema_introspection.get_schema_fingerprint()`
 hashes the introspected schema; that hash is stored alongside the Chroma
-persist directory, one file per configured database (`.schema_hash__
-<db_name>` -- see `_hash_filename`). Re-embedding is skipped whenever the
-hash matches, so refreshing the schema (e.g. the UI's "Refresh Schema"
-button, or every app startup) doesn't redo embedding work unless that
-database's schema actually changed.
+persist directory, one file per configured database. Re-embedding is
+skipped whenever the hash matches, so refreshing the schema (e.g. the
+UI's "Refresh Schema" button, or every app startup) doesn't redo
+embedding work unless that database's schema actually changed.
 
 Multi-database support: every configured database (`Settings.databases`)
 gets its own Chroma collection (`get_collection`'s `db_name` param -- see
 its docstring for why a shared collection isn't used) and its own
-fingerprint file, so indexing/refreshing one database never touches
+manifest file, so indexing/refreshing one database never touches
 another's index. `refresh_all_schema_indexes()` is the entry point that
 loops every configured database; `embeddings/retriever.py::select_database`
 is what decides, per question, which database's collection to actually
 query.
+
+**Prompt 06** (`06_DATABASE_DISCOVERY_CONTRACT.md`) made re-embedding
+genuinely incremental. The old cache file (`.schema_hash__<db_name>`, a
+bare hash) is replaced by a small JSON manifest
+(`.schema_manifest__<db_name>.json`, see `_manifest_filename`) that also
+stores a **per-table** fingerprint. When the overall fingerprint changes
+but a previous manifest exists, `build_index` now diffs old vs. new
+per-table fingerprints and does a targeted `collection.upsert()` for just
+the added/changed tables plus `collection.delete()` for removed ones,
+instead of deleting and rebuilding the *entire* collection for a one-table
+change. A forced re-embed or a genuine first build (no manifest yet)
+still does the simple full-collection path. No explicit migration step is
+needed: an old bare-hash file is simply never read again (orphaned,
+harmless) -- the very next build finds no manifest, treats it as a first
+build, and starts writing the new format from then on.
+`get_last_discovery_diff()` reads the most recent manifest back for a
+caller (e.g. `POST /schema/refresh`) that wants to report what changed,
+without changing `build_index`/`refresh_schema_index`/
+`refresh_all_schema_indexes`'s own existing signatures or return types.
 """
 
 from __future__ import annotations
 
 import contextlib
+import json
 import logging
+from dataclasses import dataclass
+from datetime import UTC, datetime
 from functools import cache
 
 import chromadb
@@ -67,9 +88,86 @@ from db.value_sampling import attach_sample_values
 logger = logging.getLogger(__name__)
 
 
-def _hash_filename(db_name: str) -> str:
-    """Per-database schema-fingerprint cache filename -- see `build_index`."""
-    return f".schema_hash__{db_name}"
+@dataclass(frozen=True)
+class SchemaDiscoveryDiff:
+    """What changed for one database's schema the last time `build_index`
+    actually ran (Prompt 06) -- read back via `get_last_discovery_diff`.
+
+    On a genuine first build (no previous manifest to diff against),
+    `added_tables` legitimately lists every discovered table -- there is
+    no prior state, so every table *is* new relative to it. This is the
+    useful signal for an onboarding UI ("discovered 47 tables"), not a
+    quirk to suppress.
+    """
+
+    added_tables: tuple[str, ...]
+    removed_tables: tuple[str, ...]
+    changed_tables: tuple[str, ...]
+    last_discovered_at: str | None
+
+
+def _manifest_filename(db_name: str) -> str:
+    """Per-database schema-discovery manifest filename -- see `build_index`."""
+    return f".schema_manifest__{db_name}.json"
+
+
+def _read_manifest(settings: Settings, db_name: str) -> dict | None:
+    """Reads back the previous build's manifest, or `None` if there isn't
+    one yet (a genuine first build) or it's missing/corrupt -- fails open
+    (treated exactly like "no previous state"), never raises."""
+    path = settings.chroma_persist_dir / _manifest_filename(db_name)
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else None
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def _write_manifest(
+    settings: Settings,
+    db_name: str,
+    fingerprint: str,
+    table_fingerprints: dict[str, str],
+    added: list[str],
+    removed: list[str],
+    changed: list[str],
+) -> None:
+    settings.chroma_persist_dir.mkdir(parents=True, exist_ok=True)
+    path = settings.chroma_persist_dir / _manifest_filename(db_name)
+    manifest = {
+        "fingerprint": fingerprint,
+        "tables": table_fingerprints,
+        "last_discovered_at": datetime.now(UTC).isoformat(),
+        "added": added,
+        "removed": removed,
+        "changed": changed,
+    }
+    path.write_text(json.dumps(manifest), encoding="utf-8")
+
+
+def get_last_discovery_diff(
+    db_name: str, settings: Settings | None = None
+) -> SchemaDiscoveryDiff | None:
+    """Reads back what changed the last time `build_index` actually ran
+    (not skipped) for `db_name`.
+
+    Returns:
+        A `SchemaDiscoveryDiff`, or `None` if this database has never been
+        successfully indexed (no manifest exists yet) or its manifest is
+        unreadable -- never raises.
+    """
+    settings = settings or get_settings()
+    manifest = _read_manifest(settings, db_name)
+    if manifest is None:
+        return None
+    return SchemaDiscoveryDiff(
+        added_tables=tuple(manifest.get("added") or ()),
+        removed_tables=tuple(manifest.get("removed") or ()),
+        changed_tables=tuple(manifest.get("changed") or ()),
+        last_discovered_at=manifest.get("last_discovered_at"),
+    )
 
 
 def get_embedding_function(settings: Settings) -> embedding_functions.EmbeddingFunction:
@@ -189,8 +287,8 @@ def build_index(
             sees real column values.
         db_name: Which configured database (`Settings.databases[i].name`)
             these tables belong to -- determines the target Chroma
-            collection (see `get_collection`) and the cache-hash filename
-            (see `_hash_filename`), so different databases' indexes and
+            collection (see `get_collection`) and the manifest filename
+            (see `_manifest_filename`), so different databases' indexes and
             invalidation state never collide.
         force: If True, re-embeds even if the schema fingerprint hasn't changed.
         settings: Optional `Settings` override (mainly for tests).
@@ -205,6 +303,9 @@ def build_index(
 
     Returns:
         The number of table chunks indexed (or already-cached, if skipped).
+        Unchanged shape from before Prompt 06 -- callers that want to know
+        *what* changed (not just "something did") call
+        `get_last_discovery_diff(db_name, settings)` separately afterward.
 
     Raises:
         ValueError: if `tables` is empty -- an empty schema means either the
@@ -219,16 +320,17 @@ def build_index(
         )
 
     settings = settings or get_settings()
-    current_hash = get_schema_fingerprint(
-        fingerprint_tables if fingerprint_tables is not None else tables
-    )
-    hash_path = settings.chroma_persist_dir / _hash_filename(db_name)
+    basis_tables = fingerprint_tables if fingerprint_tables is not None else tables
+    current_hash = get_schema_fingerprint(basis_tables)
+    current_table_fingerprints = {
+        table.table_name: get_schema_fingerprint([table]) for table in basis_tables
+    }
 
-    if (
-        not force
-        and hash_path.exists()
-        and hash_path.read_text(encoding="utf-8").strip() == current_hash
-    ):
+    manifest = _read_manifest(settings, db_name)
+    previous_hash = manifest.get("fingerprint") if manifest else None
+    previous_table_fingerprints: dict[str, str] = (manifest or {}).get("tables") or {}
+
+    if not force and previous_hash == current_hash:
         logger.info(
             "Schema unchanged since last index build for database %r (%d tables); "
             "skipping re-embedding.",
@@ -237,15 +339,71 @@ def build_index(
         )
         return len(tables)
 
+    added = sorted(set(current_table_fingerprints) - set(previous_table_fingerprints))
+    removed = sorted(set(previous_table_fingerprints) - set(current_table_fingerprints))
+    changed = sorted(
+        name
+        for name in set(current_table_fingerprints) & set(previous_table_fingerprints)
+        if current_table_fingerprints[name] != previous_table_fingerprints[name]
+    )
+
     client = get_chroma_client(settings)
     collection_name = _collection_name(settings, db_name)
-    # Collection may not exist yet on a first run; exact error type varies by
-    # chromadb version, so suppress broadly rather than chasing it.
-    with contextlib.suppress(Exception):
-        client.delete_collection(collection_name)
-    collection = get_collection(client, settings, db_name)
+    is_first_build = manifest is None
 
-    collection.add(
+    if force or is_first_build:
+        # Collection may not exist yet on a first run; exact error type
+        # varies by chromadb version, so suppress broadly rather than
+        # chasing it. A forced re-embed always starts from a clean
+        # collection too -- the simple, always-correct path, same as
+        # before Prompt 06.
+        with contextlib.suppress(Exception):
+            client.delete_collection(collection_name)
+        collection = get_collection(client, settings, db_name)
+        _upsert_tables(collection, tables, db_name)
+        logger.info(
+            "Indexed %d table(s) into Chroma collection '%s' for database %r (full rebuild, %s).",
+            len(tables),
+            collection_name,
+            db_name,
+            "forced" if force else "first build",
+        )
+    else:
+        # The incremental path (Prompt 06): a previous manifest exists and
+        # this isn't forced, so only touch what actually changed instead of
+        # deleting and rebuilding the entire collection for e.g. one new
+        # table in a database with hundreds of them.
+        collection = get_collection(client, settings, db_name)
+        changed_or_added = set(added) | set(changed)
+        to_upsert = [table for table in tables if table.table_name in changed_or_added]
+        if to_upsert:
+            _upsert_tables(collection, to_upsert, db_name)
+        if removed:
+            with contextlib.suppress(Exception):
+                collection.delete(ids=removed)
+        logger.info(
+            "Incrementally re-indexed database %r: +%d -%d ~%d table(s) "
+            "(collection '%s', %d total).",
+            db_name,
+            len(added),
+            len(removed),
+            len(changed),
+            collection_name,
+            len(tables),
+        )
+
+    _write_manifest(
+        settings, db_name, current_hash, current_table_fingerprints, added, removed, changed
+    )
+    return len(tables)
+
+
+def _upsert_tables(collection: Collection, tables: list[TableSchemaInfo], db_name: str) -> None:
+    """Inserts-or-replaces one Chroma chunk per table -- shared by both the
+    full-rebuild and incremental paths in `build_index` (an upsert onto a
+    just-emptied/fresh collection behaves identically to an insert, so
+    there's no need for two separate write methods)."""
+    collection.upsert(
         ids=[table.table_name for table in tables],
         documents=[table.ddl for table in tables],
         metadatas=[
@@ -264,16 +422,6 @@ def build_index(
             for table in tables
         ],
     )
-
-    settings.chroma_persist_dir.mkdir(parents=True, exist_ok=True)
-    hash_path.write_text(current_hash, encoding="utf-8")
-    logger.info(
-        "Indexed %d table(s) into Chroma collection '%s' for database %r.",
-        len(tables),
-        collection_name,
-        db_name,
-    )
-    return len(tables)
 
 
 def refresh_schema_index(

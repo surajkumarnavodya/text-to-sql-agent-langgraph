@@ -123,7 +123,12 @@ from db.connection import (
 from db.execution import execute_readonly_sql
 from db.schema_introspection import introspect_schema
 from embeddings.golden_examples import save_golden_example
-from embeddings.schema_indexer import get_chroma_client, get_collection, refresh_all_schema_indexes
+from embeddings.schema_indexer import (
+    get_chroma_client,
+    get_collection,
+    get_last_discovery_diff,
+    refresh_all_schema_indexes,
+)
 from feedback.store import save_response_feedback
 from observability.metrics import get_default_metrics
 from security.audit_log import (
@@ -1439,16 +1444,32 @@ def schema_refresh(
     route previously had no rate limit of its own at all, despite
     re-introspecting/re-embedding every configured database being real
     work.
+
+    Each result also reports (Prompt 06, `06_DATABASE_DISCOVERY_CONTRACT
+    .md`) what actually changed for that database this call -- read back
+    via `get_last_discovery_diff`, which never re-derives anything
+    `refresh_all_schema_indexes`/`build_index` didn't already compute and
+    persist. A database that was skipped (schema unchanged) still reports
+    its most recent diff, which is correctly empty in that case.
     """
     settings = get_settings()
     enforce_api_action_rate_limit(request, "schema_refresh", settings, identity=identity)
     results = refresh_all_schema_indexes(settings)
-    return SchemaRefreshResponse(
-        databases=[
-            SchemaRefreshResult(database=db_name, table_count=len(tables))
-            for db_name, tables in results.items()
-        ]
-    )
+    databases = []
+    for db_name, tables in results.items():
+        diff = get_last_discovery_diff(db_name, settings)
+        databases.append(
+            SchemaRefreshResult(
+                database=db_name,
+                table_count=len(tables),
+                view_count=sum(1 for table in tables if table.is_view),
+                added_tables=list(diff.added_tables) if diff else [],
+                removed_tables=list(diff.removed_tables) if diff else [],
+                changed_tables=list(diff.changed_tables) if diff else [],
+                last_discovered_at=diff.last_discovered_at if diff else None,
+            )
+        )
+    return SchemaRefreshResponse(databases=databases)
 
 
 @app.get("/metrics/performance", response_model=PerformanceMetricsResponse)

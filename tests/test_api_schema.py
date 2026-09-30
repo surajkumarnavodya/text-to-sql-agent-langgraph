@@ -8,6 +8,7 @@ which had none before this pass either.
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from fastapi.testclient import TestClient
@@ -73,16 +74,52 @@ def client() -> TestClient:
 
 class TestSchemaRefresh:
     def test_returns_table_counts_per_database(self, monkeypatch, client):
+        table = SimpleNamespace(is_view=False)
+        view = SimpleNamespace(is_view=True)
         monkeypatch.setattr(
             "api.main.refresh_all_schema_indexes",
-            lambda settings: {"default": [object(), object()]},
+            lambda settings: {"default": [table, view]},
         )
+        monkeypatch.setattr("api.main.get_last_discovery_diff", lambda db_name, settings: None)
 
         response = client.post("/schema/refresh")
 
         assert response.status_code == 200
         body = response.json()
-        assert body["databases"] == [{"database": "default", "table_count": 2}]
+        assert body["databases"] == [
+            {
+                "database": "default",
+                "table_count": 2,
+                "view_count": 1,
+                "added_tables": [],
+                "removed_tables": [],
+                "changed_tables": [],
+                "last_discovered_at": None,
+            }
+        ]
+
+    def test_reports_the_discovery_diff_when_available(self, monkeypatch, client):
+        from embeddings.schema_indexer import SchemaDiscoveryDiff
+
+        monkeypatch.setattr(
+            "api.main.refresh_all_schema_indexes",
+            lambda settings: {"default": [SimpleNamespace(is_view=False)]},
+        )
+        diff = SchemaDiscoveryDiff(
+            added_tables=("new_table",),
+            removed_tables=("old_table",),
+            changed_tables=("orders",),
+            last_discovered_at="2026-09-30T00:00:00+00:00",
+        )
+        monkeypatch.setattr("api.main.get_last_discovery_diff", lambda db_name, settings: diff)
+
+        response = client.post("/schema/refresh")
+
+        result = response.json()["databases"][0]
+        assert result["added_tables"] == ["new_table"]
+        assert result["removed_tables"] == ["old_table"]
+        assert result["changed_tables"] == ["orders"]
+        assert result["last_discovered_at"] == "2026-09-30T00:00:00+00:00"
 
     def test_rate_limit_trip_returns_429(self, monkeypatch, client):
         """SEC-08: /schema/refresh previously had no rate limit at all,
