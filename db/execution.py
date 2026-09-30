@@ -59,7 +59,11 @@ def _apply_statement_timeout(connection, dialect_name: str, timeout_seconds: int
 
 
 def _execute_with_timeout(
-    sql: str, query_timeout_seconds: int, max_result_rows: int, engine: Engine | None = None
+    sql: str,
+    query_timeout_seconds: int,
+    max_result_rows: int,
+    engine: Engine | None = None,
+    params: dict[str, object] | None = None,
 ) -> tuple[list[str], list[tuple]]:
     """Runs `sql` on a worker thread and force-aborts it past `query_timeout_seconds`.
 
@@ -83,6 +87,19 @@ def _execute_with_timeout(
             with no argument) -- callers that resolved a specific database
             (e.g. `agent.nodes.execute_sql_node`, once a question has been
             auto-routed) must pass it explicitly instead.
+        params: Optional bind-parameter dict for `sql` (SQLAlchemy's own
+            `Connection.execute(statement, parameters)` mechanism -- see
+            `db/query_cost.py`'s Oracle strategy for a real existing use of
+            this same mechanism, just never exposed as a public parameter
+            of this function before `db/adapter.py`'s `DatabaseAdapter`
+            contract needed it). `None`/falsy (the default) takes the
+            *exact* original code path below (no second argument passed to
+            `connection.execute` at all) -- neither of this function's two
+            real callers (`agent.nodes.execute_sql_node`,
+            `api/main.py`'s `POST /execute`) pass this, since the
+            LLM-generation path embeds filter values as SQL literals,
+            validated by `agent/sql_validator.py`'s AST allowlist, rather
+            than binding parameters.
     """
     engine = engine or get_read_only_engine()
     result: dict[str, Any] = {}
@@ -94,7 +111,11 @@ def _execute_with_timeout(
             with engine.connect() as connection:
                 connection_holder["connection"] = connection
                 _apply_statement_timeout(connection, engine.dialect.name, query_timeout_seconds)
-                cursor_result = connection.execute(text(sql))
+                cursor_result = (
+                    connection.execute(text(sql), params)
+                    if params
+                    else connection.execute(text(sql))
+                )
                 result["columns"] = list(cursor_result.keys())
                 result["rows"] = cursor_result.fetchmany(max_result_rows)
         except BaseException as exc:  # noqa: BLE001 - re-raised on the caller's thread below
@@ -126,6 +147,7 @@ def execute_readonly_sql(
     query_timeout_seconds: int,
     max_result_rows: int | None = None,
     engine: Engine | None = None,
+    params: dict[str, object] | None = None,
 ) -> tuple[list[str], list[tuple]]:
     """Executes already-validated, already row-limited SQL read-only.
 
@@ -142,6 +164,9 @@ def execute_readonly_sql(
         engine: The specific database to execute against -- see
             `_execute_with_timeout`'s docstring. None (the default) keeps
             this function's original single-database behavior.
+        params: See `_execute_with_timeout`'s own docstring -- forwarded
+            unchanged. `None` (the default) is a no-op for every existing
+            caller.
 
     Returns:
         (columns, rows).
@@ -153,4 +178,18 @@ def execute_readonly_sql(
     resolved_max_rows = (
         max_result_rows if max_result_rows is not None else get_settings().max_result_rows
     )
-    return _execute_with_timeout(sql, query_timeout_seconds, resolved_max_rows, engine=engine)
+    return _execute_with_timeout(
+        sql, query_timeout_seconds, resolved_max_rows, engine=engine, params=params
+    )
+
+
+def supports_driver_level_statement_timeout(db_type: str) -> bool:
+    """Whether `db_type` has a simple, one-line session-level statement
+    timeout (`_STATEMENT_TIMEOUT_SQL` above) -- `True` for
+    postgresql/mysql, `False` for mssql/oracle (neither has an equivalent
+    single `SET`; `_execute_with_timeout`'s thread-based force-close still
+    covers all four uniformly regardless). Real per-engine variance --
+    see `db/adapter.py::DatabaseCapabilities` for the consolidated,
+    single-source-of-truth capability object this backs.
+    """
+    return db_type in _STATEMENT_TIMEOUT_SQL

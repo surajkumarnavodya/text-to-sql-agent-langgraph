@@ -286,6 +286,19 @@ _STRATEGIES = {
 }
 
 
+def supports_cost_estimation(db_type: str) -> bool:
+    """Whether `db_type` has a real cost-estimation strategy above.
+
+    Today `True` for all four `SUPPORTED_DB_TYPES` -- exposed as a real
+    function (rather than a hardcoded capability default) anyway, since
+    this dict is exactly the kind of thing a future, currently-unsupported
+    engine could add to without a matching capability entry elsewhere
+    silently going stale. See `db/adapter.py::DatabaseCapabilities` for
+    the consolidated capability object this backs.
+    """
+    return db_type in _STRATEGIES
+
+
 class _ConnectionTrackingEngine:
     """Thin `.connect()`-only proxy for an `Engine`, recording whichever
     live `Connection` a strategy function opens into `holder` -- lets

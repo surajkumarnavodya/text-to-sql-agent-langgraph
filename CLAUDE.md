@@ -137,6 +137,17 @@ below, and `docs/MULTI_SOURCE_GUIDE.md` for how to configure each source.
   `agent.nodes.execute_sql_node` and `api/main.py`'s `POST /execute`
   ("Confirm and Run") path — a pure database-execution concern with no
   LangGraph dependency, so it lives here rather than in `agent/`.
+  `adapter.py` (Prompt 03 of the platform initiative,
+  `03_DATABASE_ADAPTER_CONTRACT.md`) consolidates capability facts
+  otherwise scattered across three dicts in three files
+  (`SUPPORTED_DB_TYPES`, `execution.py`'s `_STATEMENT_TIMEOUT_SQL`,
+  `query_cost.py`'s `_STRATEGIES`) into one `DatabaseCapabilities` object,
+  plus a `DatabaseAdapter` Protocol and its one real implementation,
+  `SqlAlchemyDatabaseAdapter` — a zero-logic wrapper over this folder's
+  own existing functions. Not called by `agent/nodes.py` or any route in
+  this increment; the acceptance criterion it targets ("a new engine
+  needs no AI-layer changes") already held before this module existed,
+  per that doc's own honest framing.
 - `embeddings/` — `schema_indexer.py`'s `build_index(tables, db_name, ...)`
   takes already-introspected `TableSchemaInfo` objects (not a file, not an
   engine) and embeds them into **that database's own Chroma collection**
