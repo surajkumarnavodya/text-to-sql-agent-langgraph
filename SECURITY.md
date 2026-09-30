@@ -711,9 +711,9 @@ controls specific to what a file upload can carry that plain text cannot.
   complex background for a higher-fidelity generative result it never
   claimed to be.
 
-See `CLAUDE.md`'s "Chat attachments" and "Explicit image actions" sections
-for the full design and `docs/API.md`'s "Attachments" section for the
-request/response contracts.
+See `CLAUDE.md`'s "Chat attachments, image actions, and their security
+hardening" section for the full design and `docs/API.md`'s "Attachments"
+section for the request/response contracts.
 
 ## AI-guided (generative) image editing — security controls
 

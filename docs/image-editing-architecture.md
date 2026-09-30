@@ -8,8 +8,9 @@
 > configured vision model or OCR, and explicit `POST
 > /attachments/{id}/extract-text|resize|remove-text` actions exist for
 > real, deterministic image operations. See `CLAUDE.md`'s "Chat
-> attachments"/"Explicit image actions" sections and `docs/API.md`'s
-> "Attachments" section for the current, accurate state. **What remains
+> attachments, image actions, and their security hardening" section and
+> `docs/API.md`'s "Attachments" section for the current, accurate state.
+> **What remains
 > genuinely accurate below**: the local Konva-based editor's own feature
 > set (crop/rotate/draw/annotate) and its library-choice rationale.
 
@@ -224,8 +225,8 @@ endpoint accepts an image **plus a free-text natural-language edit
 instruction** and returns a generatively-edited result — `POST
 /attachments/{id}/remove-text` is real pixel editing, but it takes explicit
 region coordinates, not a prompt, and uses classical (non-generative)
-inpainting. See `CLAUDE.md`'s "Chat attachments"/"Explicit image actions"
-sections for what's real today; the rest of this section (the
+inpainting. See `CLAUDE.md`'s "Chat attachments, image actions, and their
+security hardening" section for what's real today; the rest of this section (the
 `AiGuidedEditAdapter` stub, its own honest in-UI error message) remains
 accurate for that specific, narrower capability.
 

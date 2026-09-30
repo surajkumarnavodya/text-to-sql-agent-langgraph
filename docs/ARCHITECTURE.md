@@ -773,31 +773,111 @@ harness and appends its numbers.
 
 ## 6. Configurable Ollama model selection
 
-A caller may pick which locally-installed Ollama model answers a given
-question (`POST /ask`'s optional `model` field) instead of always using
-`Settings.ollama_model`. The four LLM call sites in `agent/llm_client.py`
-(generation, planning, review, insight) each gained an optional `model`
-parameter (`None` uses the configured default, preserving every pre-existing
-call site); `agent.graph.run_agent` resolves the effective model once per
-question and stores it in `AgentState["selected_model"]` — the identical
-request-scoped pattern `selected_database` already establishes, so a
-question's model choice, like its database, stays fixed for the life of one
-run and is never a process-global variable two concurrent requests could
-clobber.
+Before this, `Settings.ollama_model` was the *only* model any of
+`agent/llm_client.py`'s four Ollama call sites (generation, planning,
+review, insight) could ever use — set once per process, with no
+per-request concept at all. A caller may now pick which locally-installed
+Ollama model answers a given question (`POST /ask`'s optional `model`
+field) without replacing any of that architecture: the same four call
+sites, the same cached `ollama.Client`, the same LangGraph graph shape.
 
-`agent/model_registry.py` is the one place three deliberately separate
-concepts meet: **configured/allowed** (`Settings.ollama_allowed_models`,
-validated server-side before any work starts — an invalid selection returns
-`HTTP 400`), **installed locally** (a live `ollama.Client().list()` lookup,
-queried only by `GET /models`, never by `/ask` itself), and **this app's own
-curated display metadata** (`config/ollama_models.yaml`, cosmetic only). The
-online Ollama Library was consulted exactly once, during development, to
-pick a small starter allowlist — it is never a runtime dependency.
+### Three deliberately separate concepts
 
-Full design, security posture, and the concurrency regression test proving
-no global mutable state exists: `CLAUDE.md`'s "Configurable Ollama model
-selection for Text-to-SQL" section. Configuration reference:
-`docs/CONFIGURATION.md`'s "Model selection" section.
+`agent/model_registry.py` is the one place these meet:
+
+1. **Configured/allowed** — `Settings.ollama_allowed_models`
+   (`OLLAMA_ALLOWED_MODELS`, comma-separated, mirroring `DB_CONNECTIONS`'/
+   `CORS_ALLOWED_ORIGINS`' own convention) — the only thing that actually
+   gates what `AskRequest.model` may request. `Settings.ollama_model` is
+   always unioned in even if an operator's own list omits it. Left unset,
+   it falls back to a small starter set evaluated against the live Ollama
+   Library once, during development, for local Text-to-SQL suitability —
+   **not a claim that this is every good model, or the full online
+   catalog**; an operator may list any model name regardless of whether
+   this starter set has ever heard of it. `Settings
+   .ollama_model_selection_enabled` (default `true`) is the kill switch —
+   `false` collapses the allowed set to exactly `(ollama_model,)`.
+2. **This application's own curated display metadata** —
+   `config/ollama_models.yaml` + `config/ollama_models.py` (display name,
+   parameter size, context length, resource level, capabilities,
+   description, `recommended`) — purely cosmetic, never a gate. A model
+   with no catalog entry gets a generic fallback, never dropped.
+3. **Installed locally** — a live `ollama.Client().list()` lookup against
+   the *connected* Ollama instance, queried only by `GET /models` and,
+   independently, by `GET /health`'s own vision-model-availability check
+   — **never called from `/ask` itself**, so selecting a model never adds
+   a second Ollama round trip per question.
+
+### Validation, request-scoping, and the concurrency guarantee
+
+**`GET /models`** (`Permission.ASK`) returns every configured model
+enriched with live installed status — never hides an
+allowed-but-uninstalled model, only flags it (`installed: false`).
+
+**`POST /ask`'s `model` field is validated *before* any admission-control
+slot is acquired or LLM/DB work starts** (`agent.model_registry
+.validate_model_selection`) — an unrecognized/disallowed value raises
+`InvalidModelSelectionError` (a plain `ValueError`, deliberately *not* an
+`agent.exceptions.AgentError`, since this is a malformed-request
+condition meant to become `HTTP 400`, not a graceful `AgentState`
+"failed" run) and is audit-logged. Deliberately does **not** also verify
+live installed status on every `/ask` — a configured-but-never-pulled
+model surfaces naturally through the existing `OllamaUnavailableError`
+handling instead.
+
+**Request-scoped, never global** (`AgentState["selected_model"]`,
+mirroring `selected_database`'s exact "resolved once by the caller,
+read-never-re-selected by every node" shape): `agent.graph.run_agent`
+gained a `model: str | None = None` parameter, resolves it to `model or
+settings.ollama_model` once up front, and stores it in `initial_state`.
+**No process-global mutable model variable was introduced anywhere** —
+verified with a real-`threading.Thread` regression test
+(`tests/test_model_selection_concurrency.py`) that forces a race window
+open and confirms two concurrent calls with different models never
+cross-contaminate.
+
+**Model boundaries preserved, per this feature's own explicit scope**:
+the embedding model, the vision model, voice transcription/synthesis,
+document/policy RAG's own LLM calls, and web-search answer synthesis are
+all completely untouched.
+
+### A real, previously-latent bug found and fixed while building this
+
+`Settings.ollama_allowed_models`/`cors_allowed_origins` both raised
+`pydantic_settings.exceptions.SettingsError` when set via a genuine
+`.env`/environment-variable value — pydantic-settings attempts its own
+JSON-array decoding of a compound-typed (`tuple[str, ...]`) field
+*before* any field validator runs, a distinct, earlier layer than
+Pydantic's own validation pipeline. Every existing CORS test had only
+ever exercised direct `Settings(cors_allowed_origins=(...))` construction
+(bypassing env-source decoding entirely), so this was never caught. Fixed
+on both fields via `Annotated[tuple[str, ...], NoDecode]`
+(`pydantic_settings.NoDecode`).
+
+### React UI
+
+`components/settings/ModelSelector.tsx` — a plain native `<select>`,
+backed by `useAvailableModels()` (`staleTime: 30_000`, so `GET /models`
+is never called on every keystroke). An uninstalled model's `<option>`
+is rendered `disabled`, but server-side validation still re-checks
+independently regardless, since a frontend restriction is never treated
+as a security boundary anywhere in this codebase. A reconciliation
+effect resets a persisted selection back to "use the default" if a later
+`GET /models` response no longer includes it.
+
+### Remaining limitations, disclosed rather than silently left
+
+Model availability is not live-reloaded mid-process — an
+`OLLAMA_ALLOWED_MODELS`/`OLLAMA_MODEL` change needs a process restart.
+Per-model role-based restriction (e.g. reserving a larger model for
+`analyst`+) was not requested and was not built — every role that can
+reach `/ask` at all can select any configured/installed model.
+Insight/planning/review always use the exact same model chosen for
+generation — there is no way to pick a different model for the
+narrative insight step alone.
+
+Configuration reference: `docs/CONFIGURATION.md`'s "Model selection"
+section.
 
 ## 7. Enterprise scalability/security assessment
 
@@ -825,7 +905,8 @@ auth" and related sections; `docs/CONFIGURATION.md`'s `TRUSTED_PROXY_COUNT`/
 A real, provider-backed generative image edit (`POST
 /attachments/{id}/ai-edit`, IMA Studio's `image_to_image` task category)
 sits alongside the deterministic local image actions described under
-"Chat attachments"/"Explicit image actions" in `CLAUDE.md` — the two are
+"Chat attachments, image actions, and their security hardening" in
+`CLAUDE.md` (and §15 above) — the two are
 deliberately kept on separate code paths (`attachments/ai_edit.py` vs.
 `attachments/blur.py`/`image_ops.py`/`inpaint.py`), never a shared
 "call the model for everything" handler, so a deterministic action (blur,
@@ -893,3 +974,679 @@ API surface, and two real bugs found and fixed by live-testing the running
 app rather than unit tests alone): [`docs/SHARING_SECURITY.md`](SHARING_SECURITY.md).
 Configuration reference: `docs/CONFIGURATION.md`'s "Local self-hosted
 accounts, Google sign-in & conversation sharing" section.
+
+## 11. Media search
+
+Content-based search over an **untagged** local image/video library — no
+filenames, no manual tags. Routed as the `"media_search"` orchestrator
+source (`agent.orchestrator.nodes.media_search_node`), gated by
+`ENABLE_MEDIA_SEARCH` + a real `MEDIA_LIBRARY_PATH` (both required — same
+flag-plus-config pattern as media generation's `enable_media_generation`/
+`ima_api_key`). Off by default, unlike voice mode: it needs a configured
+library path and pulls in a real, meaningfully larger dependency footprint
+(`torch`, `opencv-python`) that shouldn't land on every fresh clone
+uninvited.
+
+**Local CLIP embeddings by default, not a hosted API.** A deliberate
+deviation from a common assumption for this kind of feature (the original
+implementation prompt for this asked for "a hosted multimodal embedding
+API," listing Voyage/Vertex/OpenAI as candidates). Given this project's
+consistent "local-first, cloud only as a disclosed opt-in exception"
+identity (Ollama for the LLM, faster-whisper+Piper for voice mode both
+chosen explicitly over cloud alternatives), the default path instead uses
+`sentence-transformers`' `clip-ViT-B-32` running fully on-device
+(`media/embedding.py`) — no API key, no per-image cost, no media content
+ever leaving the machine. The **same** model embeds both images and query
+text, which is what guarantees they land in one comparable vector space;
+this is why `media/embedding.py` computes embeddings directly rather than
+through Chroma's own text-only `EmbeddingFunction` callback interface the
+way `embeddings/schema_indexer.py`/`rag/embedding.py` do. Built behind a
+small provider map (`Settings.media_embedding_provider`, shaped like
+`search/web_search.py`'s `SUPPORTED_SEARCH_PROVIDERS`) so a hosted
+provider could be added later as a second dict entry, without touching
+any call site — nothing exercises that path today. This is the one real
+exception to this project's otherwise-consistent "no torch" dependency
+posture (`faster-whisper`/`piper-tts`'s own requirements.txt comments both
+explicitly celebrate avoiding it) — a real, consequential tradeoff, not an
+oversight.
+
+**Vector store: the same ChromaDB this project already depends on**, not
+a new vendor (Pinecone/Qdrant/pgvector) — this app is explicitly
+"single-user, local-dev oriented" per `README.md`'s own Limitations
+section, so new vector-DB infrastructure would add real operational
+weight for no benefit at this scale. Two collections (`media/store.py`'s
+`media_images`/`media_video_segments`), mirroring
+`embeddings/golden_examples.py`'s "one collection per distinct purpose"
+convention — reusing the same process-lifetime-cached `PersistentClient`
+(`embeddings.schema_indexer.get_chroma_client`) every other Chroma-backed
+module here already shares.
+
+**Video pipeline**, per file ingested by `scripts/build_media_index.py`:
+
+1. **Scene-change keyframing** (`media/keyframes.py`, via `PySceneDetect`)
+   — segments a video at real scene boundaries, not fixed intervals, so a
+   long continuous shot isn't indexed as many near-identical frames.
+   `PySceneDetect` requires `opencv-python` unconditionally at its current
+   pinned version (confirmed against its own PyPI `requires_dist`
+   metadata before pinning — `av`/PyAV is only an optional extra for its
+   separate clip-export feature, not a way to avoid OpenCV here).
+2. **ASR** (`media/transcription.py`) — reuses `voice/stt.py`'s
+   faster-whisper model loader directly (`voice.stt.get_whisper_model`, a
+   small refactor extracted specifically for this reuse) rather than
+   loading a second Whisper model instance; per-Whisper-segment
+   timestamps are bucketed against each detected scene's own time range
+   (`transcript_for_range`), not just flattened into one string.
+3. **OCR** (`media/ocr.py`, via `pytesseract`/Tesseract) — on-screen text
+   in the representative keyframe. Needs the system Tesseract binary
+   installed separately (see `CLAUDE.md`'s "Windows / Visual
+   Studio-specific notes").
+4. **Captioning** (`media/captioning.py`) — reuses **Ollama**, this
+   project's existing local LLM runtime, with a vision-capable model
+   (`Settings.media_vision_model`, e.g. `llava`) rather than a separate
+   hosted vision-language model API. The only new setup step is `ollama
+   pull <model>`, mirroring the Piper voice-model download precedent
+   (`scripts/download_voice_model.py`). **Fails open**: a blank
+   `media_vision_model` (the default) or any call failure returns `None`,
+   not an error — the segment is still indexed and searchable via its ASR
+   transcript + OCR text alone.
+5. Each segment gets **up to two embeddings, sharing a `segment_id`**: one
+   from its combined caption/transcript/OCR text (via CLIP's own text
+   encoder), one from its keyframe image (via CLIP's image encoder) —
+   `media/search.py` queries both and merges/de-dupes hits that share a
+   `segment_id`, keeping the better-scoring modality.
+
+**Serving is a separate, persistent path from generated-media serving.**
+`api/media_library.py`'s `GET /media/library/{media_id}` is deliberately
+**not** built on `media_gen.cache.MediaCache` — that cache is in-memory,
+process-lifetime, and bounded to 100 entries with FIFO eviction, built for
+short-lived *generated* media, the wrong fit for a persistent library
+meant to stay searchable indefinitely. Instead it looks up `media_id`
+directly in the Chroma collections' own stored metadata to resolve either
+the original file (an image hit) or the representative keyframe thumbnail
+(a video-segment hit — a full clip is never streamed; the UI shows frame +
+timestamp instead), then re-validates the resolved path is still inside
+the expected root directory before ever opening it — a local-path-
+traversal defense in the same spirit as `media_gen/download.py`'s SSRF
+hardening, applied to disk paths instead of URLs.
+
+**Untrusted content is framed as data, not sanitized/quoted.** OCR text,
+ASR transcripts, and generated captions are all attacker-influenceable (a
+sign in a photo, or spoken audio, could contain an instruction-like
+string) once they reach `media_search_node`'s answer-composition prompt.
+Rather than introducing a new sanitize/escape step, this follows the
+exact convention `rag/graph.py` and `web_search_node` already established
+for the same class of risk: the system prompt explicitly frames hit
+captions/OCR/ASR text as **untrusted data, never instructions** — see
+`SECURITY.md`'s "Media search" section.
+
+**Router disambiguation from "generation."** `media_search` and
+`generation` are the two media-adjacent sources, and the one real
+ambiguity between them ("make a picture of X" vs. "find a picture of X")
+is handled by `agent.orchestrator.nodes._MEDIA_SEARCH_VS_GENERATION_GUIDANCE`,
+appended to the classifier prompt only when *both* sources are available.
+Unlike `generation_result`, `media_search_result` **does** contribute a
+text bullet to `synthesis_node`'s combined answer (it has a natural
+citable answer — what was found, and roughly when for a video — unlike a
+freshly-created asset); its hits still separately drive
+`MediaSearchResultCard.tsx`'s own thumbnail rendering.
+
+**API + standalone page.** `POST /search/media` (`api/media_search.py`)
+searches directly, independent of the conversational `/ask` flow, reusing
+the existing shared `api_action_rate_limit_per_minute` rather than a
+dedicated limiter. `frontend/src/pages/MediaSearch.tsx` is a standalone
+page (mirrors `KnowledgeSources.tsx`'s shape) with its own nav entry, for
+direct use outside chat.
+
+**Known gaps, named rather than silently left:**
+- **No dense-video-captioning quality tuning has been done.** Whichever
+  small Ollama vision model is pulled works as-is; no evaluation of
+  caption quality across different models/prompts was performed as part
+  of building this.
+- **The eval harness extension (`eval/media_benchmark/`) ships as an
+  empty template**, not a populated dataset — this repo has no checked-in
+  media library to grade against.
+- **A full video clip is never streamed** — only a representative frame +
+  timestamp range. Real HTTP range-request video streaming is a
+  deliberately out-of-scope follow-up.
+
+## 12. Content moderation gate
+
+Both content-ingestion pipelines — media search's images/video
+(`media/ingest.py`) and document/policy RAG's PDFs (`rag/ingestion.py`) —
+run every chunk of every file through `moderation/gate.py::moderate_chunks`
+before either one ever calls its own store's upsert/insert functions.
+**Mandatory whenever `ENABLE_MEDIA_SEARCH` or `ENABLE_DOCUMENT_RAG`/
+`ENABLE_POLICY_RAG` is on** — deliberately no `ENABLE_CONTENT_MODERATION`
+toggle exists that could silently disable it while leaving either pipeline
+on; missing provider/store config fails ingestion closed
+(`moderation.exceptions.ModerationNotConfiguredError`), mirroring
+`rag.store.RagStoreNotConfiguredError`'s existing pattern.
+
+**Chunking, per type, before moderation ever runs** (a classifier has
+input limits, and checking only a whole asset can miss a problem buried in
+one part of it):
+- **Image**: one chunk, unless it exceeds `MEDIA_IMAGE_TILE_THRESHOLD_PX`
+  in either dimension (default 2048px), in which case it's split into an
+  NxN grid of temp-file tiles first (`media/ingest.py::_tile_image_for_moderation`)
+  — a classifier's own internal downsampling could otherwise shrink away a
+  small region of concern in a very large image.
+- **Video**: one chunk per already-detected scene segment (reusing
+  `media/keyframes.py`'s existing segmentation, no second pass) — both the
+  keyframe image and its combined caption/transcript/OCR text are checked.
+  `media/ingest.py::_ingest_video` is restructured into two phases:
+  extract-and-moderate-every-segment-first, then only if *all* of them
+  pass does the existing embed+store loop run — one rejected segment
+  blocks the whole video, so nothing may be stored until every segment has
+  been checked.
+- **PDF**: one chunk per page's text, plus one per embedded image
+  (`pypdf`'s `page.images`). A page flagged likely-scanned (the existing
+  `_OCR_SUSPECT_CHAR_THRESHOLD` heuristic, previously just a warning shown
+  to the uploader) is now actually rasterized (`pymupdf`, chosen over
+  `pdf2image` specifically because it needs no system Poppler binary) and
+  OCR'd via the **existing** `media.ocr.extract_text` — the OCR'd text is
+  used both for moderation and for the real retrieval chunk that page
+  contributes, so a scanned page that passes moderation is also now
+  actually searchable (previously it indexed as an empty, unsearchable
+  chunk).
+
+**Decision rule: a hard-reject on any chunk rejects the entire asset —
+never a partial ingestion.** Every chunk is still checked (not
+short-circuited on the first hit, so the audit trail is complete via
+`security.audit_log.log_security_event`), but nothing from a rejected file
+is ever embedded or stored anywhere. This required reordering
+`rag/ingestion.py::ingest_pdf` specifically: the pre-moderation flow called
+`rag/store.py::insert_document` (which can itself persist the file's raw
+bytes, if `ENABLE_PDF_DOWNLOAD` is on) *before* any content check ran — a
+real gap where a rejected file's bytes could already be sitting in the
+store ahead of the rejection being known. Now nothing touches
+`rag/store.py` until moderation has passed; a rejected PDF never gets a
+`rag.documents` row at all.
+
+**Taxonomy and its honest limits** (`moderation/taxonomy.py`). Azure AI
+Content Safety (the only provider implemented, `moderation/provider.py`,
+called via its REST API with `httpx` — no vendor SDK) checks four real
+harm categories — Hate, SelfHarm, Sexual, Violence, each scored 0/2/4/6,
+hard-rejecting at or above `MODERATION_SEVERITY_THRESHOLD` (default 4).
+Azure has **no dedicated "weapons," "drugs," or "synthetic/AI-generated
+media" category** — stated honestly rather than glossed over:
+- **Weapons**: a coarse Violence-category proxy for imagery (Azure can't
+  distinguish "weapon" from "violence" generally) plus a custom text
+  blocklist (`config/moderation_blocklist.yaml`) against OCR/caption/
+  transcript/extracted text.
+- **Drugs**: the same text blocklist only — no visual signal at all.
+- **Synthetic/manipulated ("hallucinated"/deepfake) media**: a
+  **disclosed placeholder**, not a real detector. Every image/video chunk
+  is recorded as `"not_checked"` for this category rather than silently
+  omitted or falsely presented as covered — no mainstream moderation API
+  reliably classifies this today. Deliberately a soft-flag, never a
+  hard-reject, even once a real detector is eventually plugged in
+  (deepfake classifiers have real, well-documented accuracy limits; an
+  auto-rejected false positive on real user content was judged worse than
+  under-flagging). See `docs/RISK_REGISTER.md`'s R-014.
+
+**A disclosed exception to "fully local."** Unlike every other model in
+this stack (Ollama, local CLIP, `faster-whisper`/Piper), accurate content
+moderation has no comparable on-device option today — this gate calls a
+third-party cloud API for every chunk of every ingested file. The
+provider is pluggable (`moderation.provider.SUPPORTED_MODERATION_PROVIDERS`),
+so this is a deliberate, named tradeoff (see `docs/RISK_REGISTER.md`'s
+R-013), not an unexamined one.
+
+**Metadata store (`moderation/store.py`), dedupe, and pooling.** A
+dedicated SQL Server connection (`MODERATION_STORE_CONNECTION_STRING`) —
+deliberately separate from both `DB_CONNECTIONS` and
+`RAG_STORE_CONNECTION_STRING`, since media search is independently
+toggleable from document/policy RAG. One table,
+`moderation.media_assets`, keyed by content hash (`file_hash`, a unique
+index) — a previously-seen hash (whether it passed or was rejected)
+short-circuits before any extraction/moderation/embedding work, the
+feature's main performance win. `record_asset` is delete-then-insert
+(upsert-by-hash), so a `force=True` re-run replaces the same content's
+old record rather than failing on the unique-index collision. Unlike
+`db/connection.py`/`rag/store.py` (both left on SQLAlchemy's `QueuePool`
+defaults of 5/10), this engine sets `pool_size`/`max_overflow` explicitly
+(`MODERATION_STORE_POOL_SIZE`/`_MAX_OVERFLOW`, default 10/20) since
+ingestion can run many concurrent DB writes.
+
+**Concurrency: this project's first bounded thread pool.** Before this,
+`scripts/build_media_index.py` was a plain sequential `for` loop — no
+background-job/task-queue/worker-pool infrastructure existed anywhere in
+this codebase. A real async job queue (Celery/RQ) was judged heavier
+infrastructure than this project's stated scale justifies, so
+`scripts/build_media_index.py` instead gained a bounded
+`concurrent.futures.ThreadPoolExecutor` (`MEDIA_INGEST_WORKERS`, default
+4) — I/O-bound work (the moderation API call, DB writes) benefits from
+threads despite the GIL. The PDF upload path (`api/documents.py`) needed
+no equivalent change: FastAPI already dispatches each sync request handler
+to its own worker thread.
+
+**Known, narrow limitation:** the PDF dedupe short-circuit is keyed purely
+on content hash, not `(hash, collection, sensitivity_category)`.
+Re-uploading byte-identical PDF content to a *different* collection or
+with a different sensitivity tag than its first upload reuses the first
+upload's existing `rag.documents` row rather than creating a second one
+for the new intent — a deliberately accepted tradeoff for the common case
+(skip redundant moderation/embedding for a true duplicate).
+
+## 13. Voice mode
+
+Optional, **on by default** (`ENABLE_VOICE_MODE=true`) — unlike media
+generation, this feature spends no money and makes no external network
+call once its one-time local model downloads are done, so there's no
+cost-control reason to make it opt-in. Spoken questions are transcribed
+via `faster-whisper` (CTranslate2-based Whisper), spoken answers
+synthesized via Piper. Both run fully local inference (no `torch` pulled
+in by either — `faster-whisper` uses `ctranslate2`, Piper uses
+`onnxruntime`, already a transitive dep via chromadb). `voice/stt.py`/
+`voice/tts.py` each wrap their backend behind a single
+`transcribe()`/`synthesize()` call so either could be swapped later
+without touching `api/voice.py`.
+
+**A transcribed question is never treated specially.** `POST
+/voice/transcribe`'s result is submitted through the exact same `POST
+/ask` path a typed question uses — `agent.input_guard.check_input`
+therefore applies unconditionally, with no separate code path for voice
+input to bypass.
+
+**One voice turn, inline in the composer — record once, review, then the
+user presses Send.** `frontend/src/hooks/useVoiceConversation.ts` drives
+listen → transcribe (`idle` → `listening` → `transcribing` → back to
+`idle`, plus a `speaking` phase while a spoken answer plays back) per
+mic-button click. There is **no separate takeover card** —
+`ChatInput.tsx` keeps its normal textarea/mic/send layout the whole time;
+the mic button itself toggles in place to a stop button while
+`phase === 'listening'`, and while `isTranscribing`/`isSpeaking` it shows
+a small spinner/volume icon instead. While listening, the textarea is
+read-only and shows the live interim caption (see "Live captions" below)
+in place of its real value; once the local `POST /voice/transcribe`
+result comes back, `useVoiceConversation` hands its **raw `text` only**
+(never `corrected_text`, the optional AI-cleaned rewrite — see
+`voice/correction.py`) to `ChatInput` via an `onTranscribed` callback,
+which drops it straight into the textarea, exactly as if it had been
+typed. Nothing is auto-submitted, and the existing Send button (or Enter)
+is the only confirmation step. `ChatInput` tags the question as
+voice-originated (`QueryHistoryEntry.originatedFromVoice`) as long as the
+box still holds that transcript, including through manual edits — only
+clearing the box and typing fresh from empty drops the tag.
+
+**Autoplay warm-up for the very first spoken answer.** The gap between
+the mic-button click and the actual `<audio>.play()` call in
+`playAnswer` can be several seconds (recording + local transcription +
+the agent's own LLM round trip), long enough that some browsers no longer
+treat that later, code-triggered play as tied to the original click and
+silently block it. `start()` works around this by calling `.play()`
+synchronously inside the click handler itself, on a ~0-byte silent WAV
+(`SILENT_AUDIO_SRC`), on the same `<audio>` element `playAnswer` reuses.
+
+**Live captions are a disclosed, deliberate exception to "fully local."**
+While listening, `frontend/src/hooks/useSpeechRecognition.ts` wraps the
+browser's built-in `SpeechRecognition`/`webkitSpeechRecognition` Web
+Speech API purely to show word-by-word interim captions as the user
+talks. In Chromium-based browsers this API sends microphone audio to the
+browser vendor's own cloud speech service — a real, narrow exception to
+this feature's otherwise-local STT/TTS design, chosen deliberately
+(offered to and picked by the user over a laggier fully-local
+chunked-transcription alternative) because no local model can produce
+true instant word-by-word captions from a streaming batch architecture
+like `faster-whisper`'s. The caption is **never** what gets submitted —
+the local Whisper result from `POST /voice/transcribe`, run once the
+browser detects end-of-utterance, remains the sole authoritative
+transcript; the live caption is discarded the moment it comes back.
+Browsers without this API get no live caption and no auto-stop signal —
+the textarea shows a static "recording" placeholder instead, and the
+mic-turned-stop button is the only way to end listening; local
+transcription and TTS playback are unaffected either way.
+
+**Schema-aware transcription accuracy.** `voice.stt._build_vocabulary_hint`
+introspects every configured database's table/column names and feeds a
+short, deduped, length-capped (`Settings.stt_vocabulary_max_chars`)
+comma-joined string to Whisper's `initial_prompt` — biases recognition
+toward real schema terms instead of similar-sounding common words.
+Computed fresh per call rather than cached; fails open (returns `""`,
+logs a warning) on any introspection error.
+
+**Security.** A recorded upload is capped by both size
+(`Settings.voice_max_upload_mb`) and duration
+(`Settings.voice_max_duration_seconds`, checked by cheaply probing the
+decoded audio's length via PyAV *before* running the comparatively
+expensive Whisper model). `POST /voice/synthesize`'s input text is capped
+by the existing `Settings.max_question_length`.
+
+**What gets spoken back.** A voice-originated turn that succeeds gets a
+spoken answer, in priority order: `state.insight` → `state
+.synthesized_answer`/the relevant per-source answer → a row-count
+fallback ("Found N rows.") — never silent on success. Origin tracking is
+a plain boolean (`QueryHistoryEntry.originatedFromVoice`, set by
+`ChatInput.submit()` whenever the textarea still holds a voice transcript
+at send time, never by typing) so a typed question can never trigger
+`POST /voice/synthesize` at all — a structural guarantee, not a runtime
+check. `TurnCard.tsx` renders the spoken audio afterward with `controls`
+only (no `autoPlay`) so the user can manually replay it.
+
+**Piper voice models are a separate one-time download**, same shape as
+`ollama pull` — `scripts/download_voice_model.py` fetches
+`<voice>.onnx`/`<voice>.onnx.json` from the public `rhasspy/piper-voices`
+repo into `voice/models/` (gitignored). Faster-whisper's own model needs
+no such step — it auto-downloads from Hugging Face Hub on first use.
+
+**Capability discovery.** `GET /health` carries a `voice_enabled` field;
+the React dashboard only shows the mic button and its own settings toggle
+when the server says the feature is actually available — the
+"all-or-nothing infra flag, plus a per-session UI switch" shape.
+
+## 14. SQL result charting
+
+A confirmed SQL result never auto-renders a chart — an unobtrusive
+"Visualize" button (disabled, with a reason, when nothing in the result is
+chartable) is the only way one appears, and removing it drops back to
+just the answer + table, never the other way around. This replaced an
+earlier, always-on Plotly-figure-from-the-backend design entirely
+(`plotly` is no longer a dependency) in favor of a fully client-side
+engine: **the backend's own `chart_recommendation`
+(`agent/result_charting.py`'s `classify_columns`/`recommend_chart`, still
+computed and returned on every `/execute` call as
+`column_types`/`chart_recommendation`/`truncated`) is only ever a seed
+for the *initial* axis/type choice — every chart type's actual
+enabled/disabled state is recomputed from the real returned columns/rows
+on the frontend, every time** — which is also what lets the user switch
+chart types (or send a follow-up like "show this as a pie chart") without
+a server round trip or re-running SQL at all.
+
+`frontend/src/lib/chartEngine.ts` is the one place chart logic lives:
+`inferColumnRoles` (numeric/date/text, preferring the backend's
+`column_types` hint but falling back to client-side inference so a result
+reloaded from chat history still works), `getChartTypeOptions` (every one
+of 11 types — kpi/bar/bar-horizontal/bar-stacked/line/area/pie/doughnut/
+scatter/mixed/table — with a real validity rule and an always-populated
+reason), `recommendChart`, `prepareChart` (sort/top-N/date-grouping
+transforms, all disclosed via `notices`), and the Chart.js
+dataset/options builders. **"mixed" (bar+line) never adds a second
+y-axis** — per the loaded data-viz skill's own non-negotiable ("two
+measures of different scale → two charts, never a dual axis"), it's only
+offered when the two measures are within a 10x magnitude ratio of each
+other (`MIXED_SCALE_RATIO_LIMIT`), sharing one axis.
+
+`ChartSection.tsx` (`frontend/src/components/sql/`) owns the whole flow:
+closed (Visualize button) → editing (`ChartPicker` + `ChartCustomizePanel`
++ a live preview, "Generate chart"/"Reset to recommended"/"Cancel") →
+generated (`ResultChart.tsx`'s Chart.js render + "Customize"/"Remove
+chart"). `TurnCard.tsx` lazy-loads this whole subtree (`React.lazy`) so
+Chart.js — the largest single remaining dependency chunk — is never
+downloaded for a turn nobody visualizes. State
+(`QueryHistoryEntry.chartOptions`, plus `confirmedColumnTypes`/
+`confirmedChartRecommendation`/`confirmedTruncated`) is session-only, the
+same lifetime as `confirmedColumns`/`confirmedRows` themselves; reset to
+`null` on every fresh "Confirm and Run."
+
+The categorical palette (`--chart-cat-1..6` in `index.css`, light and
+dark) was generated and validated against this app's own real light/dark
+card surfaces via the data-viz skill's `validate_palette.js` (lightness
+band, chroma floor, CVD/normal-vision separation, contrast) — used in the
+fixed order the skill mandates, never cycled/regenerated per chart.
+
+**Lightweight NL follow-up chart-type switching**
+(`frontend/src/lib/chartFollowup.ts`, `chatStore.tryApplyChartTypeFollowup`):
+a message like "show this as a pie chart", "switch to line", or "bar
+chart instead" is detected by a small, deliberately non-LLM set of
+regexes (a switch-shaped phrase combined with a recognized chart-type
+keyword; either signal alone is not enough, which is what keeps an
+ordinary question like "show sales as a percentage of total" from
+misfiring). If detected, `ChatInput.tsx`'s `submit()` never calls `/ask`
+at all — it re-validates the requested type against the most recent
+chartable turn's *actual* result and either applies it directly or shows
+why it can't, rather than sending nonsense to the SQL agent as if it were
+a real question. Deliberately scoped as "lightweight, not full NLU" — a
+phrasing outside this pattern set simply falls through to a normal
+question, the safe, disclosed failure mode.
+
+**A genuine jsdom/Chart.js incompatibility, found and fixed as
+infrastructure, not app-code**: jsdom's `HTMLCanvasElement.getContext('2d')`
+is unimplemented (returns `undefined`), which Chart.js treats not as
+"no-op the draw calls" but as a fully-failed construction — the resulting
+half-built chart instance then crashes deep in its own internal
+attach/detach resize-bind logic the moment anything calls `.update()` on
+it (e.g. a chart-type switch in a test). Fixed with two additive stubs in
+`frontend/src/test/setup.ts` (a `ResizeObserver` stub, and a minimal fake
+2D context via `Proxy` so every canvas method no-ops instead of the real
+context acquisition failing) — the same category as that file's
+pre-existing `Blob.prototype.arrayBuffer`/`matchMedia` polyfills for
+missing jsdom capabilities, deliberately still short of pulling in the
+full `canvas` npm package (no pixel output is asserted on in any test
+here).
+
+**Current test coverage** (verify against the live suite rather than
+trusting a fixed count — see "How to run tests / lint" in `CLAUDE.md`):
+`frontend/src/lib/chartEngine.test.ts`, `chartFollowup.test.ts`,
+`frontend/src/store/chatStore.chartFollowup.test.ts`,
+`frontend/src/components/sql/ChartSection.test.tsx`/`ResultChart.test.tsx`,
+and `tests/test_result_charting.py`/`tests/test_api_execute.py` on the
+backend side.
+
+**Known limitations, named rather than silently left**: (1) the NL
+follow-up detector is intentionally a small pattern set, not full
+intent/slot NLU; (2) a chart's `title`/axis labels are user-entered free
+text rendered by Chart.js's own canvas text renderer (not `innerHTML`,
+so no injection surface), but no explicit sanitization/length cap exists
+beyond `Settings.max_question_length` not applying here at all (chart
+titles are local UI state, never sent to the backend); (3) a chart
+config doesn't survive a page reload or a reloaded-from-server past
+conversation turn, by the same disclosed design as the rest of this
+app's session-only confirmed-result state.
+
+## 15. Chat attachments, image actions, and security hardening
+
+Closes a real, previously-disclosed gap (see "Frontend UI redesign"
+above): attaching a file to a chat question used to only ever hold it in
+the browser tab's memory for local preview/editing, with no backend
+endpoint that accepted it at all and no way for the model to see its
+content. `attachments/` is a top-level package implementing the full
+validate → store → process → answer pipeline, wired in as a new
+`"attachments"` orchestrator source alongside `sql`/`documents`/`policy`/
+`web`/`generation`/`media_search`.
+
+### Storage model, and why it's deliberately NOT `rag/ingestion.py`'s pipeline
+
+A chat attachment is ephemeral, per-conversation, per-caller content
+given directly to the model as context for the question that attached
+it — not a permanent, shared knowledge base entry retrieved many times
+later the way an uploaded Knowledge Sources PDF is. So this reuses
+`rag.ingestion.extract_pdf_pages` for the one genuinely shared piece (PDF
+text extraction) but does **not** run attachments through
+`rag/ingestion.py::ingest_pdf`'s moderation gate, vector embedding, or SQL
+Server `VECTOR` storage — `attachments/store.py`'s `AttachmentStore` is a
+bounded, in-memory, process-lifetime registry (FIFO eviction past 200
+entries, same accepted tradeoff as `media_gen.cache.MediaCache`), keyed by
+a server-generated `attachment_id`, never persisted to a database. Bytes
+live under `Settings.attachment_storage_dir` (default `./data/attachments`,
+gitignored), one file per `attachment_id` — the actual on-disk path is
+built entirely from that id plus the validated extension, never from the
+caller's filename at all, a stronger path-traversal defense than
+sanitizing the filename would be (there's nothing to escape with `../`
+if the filename never touches the path in the first place).
+
+Processing happens once, eagerly, at upload time (`POST
+/attachments/upload` → `attachments.pipeline.validate_and_store_upload`),
+not lazily when a question later references the attachment — this is what
+makes a follow-up question ("what's the total in that spreadsheet I
+uploaded earlier?") free. Re-uploading byte-identical content (by
+SHA-256, scoped per caller) reuses the existing record outright rather
+than reprocessing it, including a previously-*failed* outcome.
+
+Every `Attachment` carries an `owner_subject` (the authenticated caller's
+`security.oidc.AuthIdentity.subject`, OIDC mode only). `AttachmentStore
+.get`/`resolve_many`/`delete` all silently treat a wrong-owner id exactly
+like a never-existed one — never confirming another caller's attachment
+even exists, the same account-enumeration-avoidance shape
+`identity.exceptions.InvalidCredentialsError` already uses for login.
+
+### Per-file-kind processors and the attachment-QA subgraph
+
+One processor class per file kind (`attachments/processors/`:
+`image_processor.py`, `pdf_processor.py`, `docx_processor.py`,
+`xlsx_processor.py`, `pptx_processor.py`, `json_processor.py`,
+`csv_processor.py`, `text_processor.py`), a `FileProcessor` Protocol +
+`registry.get_processor_for` picking the right one by `media_type`. A
+scanned PDF page falls back to OCR via `media.ocr.extract_text`
+(Tesseract), the same rasterize-via-`pymupdf` pattern
+`rag/ingestion.py::_ocr_suspect_pages` already established for the
+Knowledge Sources pipeline (a small, deliberate duplication rather than
+sharing that module's private helper — see `pdf_processor.py`'s own
+docstring for why these stay two separate pipelines). CSV/XLSX
+processors use the standard library `csv` module / `openpyxl` directly,
+never pandas — this codebase has a documented pandas/Python-3.14
+datetime segfault footgun (see `CLAUDE.md`'s "Python 3.14 gotchas"), and
+a chat attachment's spreadsheet is exactly the kind of arbitrary,
+unvalidated schema where a stray date-looking column could trigger it.
+
+Images are decoded/verified/resized/re-encoded by `attachments
+/image_processing.py` (Pillow) — downscaled to
+`Settings.max_attachment_image_dimension_px` and re-encoded through a
+fresh buffer, which strips EXIF/ICC/XMP metadata, before being base64
+data-URL-encoded. Describing *what's in* an image reuses this project's
+existing local Ollama vision-model call
+(`attachments/vision.py::describe_images`, the exact same
+`client.chat(..., images=[...])` shape `media/captioning.py` already
+uses) — fully local, no API key, no outbound network call.
+
+The attachment-QA LangGraph subgraph (`attachments/graph.py`,
+`run_attachment_qa`) is a 7-node flow: `validate_attachments` (resolves
+ids → owned, stored attachments; a missing/inaccessible id becomes a
+structured `AttachmentError`, never a crash) → `process_attachments` →
+`build_attachment_context` (`attachments/context_builder.py` —
+delimited, per-attachment-budget-capped, de-duplicated by content hash,
+never claims an attachment contains information if it failed to process)
+→ `build_multimodal_message` (collects image data URLs, or the OCR
+fallback) → `call_model` (the vision call if images are present, else a
+plain Ollama text call grounded strictly in the attachment context —
+framed as untrusted data, never instructions, the same posture
+`rag/graph.py`'s own `generate_node` already has) → `validate_response`
+(records `used_attachment_ids`, fails closed if nothing usable came
+back). Compiled once per process (`functools.lru_cache`).
+
+### Orchestrator wiring: the one genuinely new architectural wrinkle
+
+`"attachments"` is added to `agent/orchestrator/nodes.py`'s source list,
+but unlike every other source there, its *availability* depends on the
+current request (did the caller attach anything?), not standing config —
+`get_available_sources` takes a new `has_attachments` parameter.
+`router_node` **forces** `"attachments"` into the final route whenever
+available, regardless of what the LLM classifier picks — the classifier's
+only real job when attachments are present is deciding whether some
+*other* source is *also* needed. `agent.orchestrator.graph.run_orchestrated`
+gained a new parameter, `attachment_ids`, that **breaks its own
+pre-existing "flag off → call `run_agent` directly" short-circuit**:
+attaching a file must work regardless of `Settings.enable_multi_source_router`
+— the short-circuit condition is now `not enable_multi_source_router and
+not has_attachments`, preserving the byte-for-byte-unchanged guarantee
+for every caller that never attaches anything.
+
+### API surface and frontend
+
+`POST /attachments/upload` (multipart, one or more files — each
+validated/processed independently) and `DELETE /attachments/{id}`
+(`api/attachments.py`, gated by `Permission.ASK`). `AskRequest` gained
+`attachment_ids: list[str]`; `AskResponse` gained `attachment_result`
+(`answer`, `status`, `used_attachment_ids`, `vision_unavailable`).
+`Settings.enable_chat_attachments` (default `true`) is the flag; a
+`max_attachment_*` family of settings bounds image/document size, total
+per-message size, attachment count, extracted-text length, PDF page
+count, and spreadsheet row count.
+
+`useChatAttachments.ts` (frontend) uploads each file to `POST
+/attachments/upload` immediately on selection (one request per file) and
+tracks per-chip `uploading`/`ready`/`error` status. Editing an
+already-uploaded image re-uploads the edited bytes as a fresh attachment
+and deletes the stale one server-side. Attachments are deliberately
+**not** cleared from the composer after sending — a second question
+about the same file needs no re-upload.
+
+### Explicit image actions: extract text, resize, remove text (2026-09-26)
+
+Before this, an attached image could only ever be described by the
+vision model (or OCR'd only as an internal fallback) — there was no way
+to ask for exactly one of four distinct capabilities on purpose:
+
+- **(A) Image understanding** — unchanged, `attachments/vision.py` via `POST /ask` with `attachment_ids`.
+- **(B) OCR / text extraction** (`attachments/ocr_extract.py`, `POST /attachments/{id}/extract-text`) — a real Tesseract pass (`pytesseract.image_to_data`), returning `raw_text`/`cleaned_text` (exact recognized text, never an LLM paraphrase) plus per-word bounding boxes/confidence. Non-empty `raw_text` is persisted onto the attachment's own `extracted_text` so a follow-up question can see it via the normal attachment-context path.
+- **(C) Deterministic manipulation — resize** (`attachments/image_ops.py`, `POST /attachments/{id}/resize`) — pure Pillow work, no model call: width/height with `contain`/`cover`/`stretch` fit modes, EXIF-orientation correction, output-format conversion, a small named-preset list.
+- **(D) Image editing — remove text** (`attachments/inpaint.py`, `GET /attachments/{id}/detect-text-regions` + `POST /attachments/{id}/remove-text`) — real pixel editing via OpenCV's classical `cv2.inpaint` (Telea's fast-marching algorithm), explicitly **not** a generative AI model and **not** a solid-color rectangle; every response carries an honest limitation warning saying so. Region selection is either OCR-proposed (merged per-line, capped, largest-area-first) and caller-confirmed, or manually drawn. If OCR is unavailable or finds nothing, `detect-text-regions` returns an empty list rather than an error — the frontend falls open to manual click-and-drag selection.
+
+Both (C) and (D) always produce a **brand-new** attachment
+(`attachments.pipeline.register_derived_image`), never mutate the source
+in place. A capability registry (`attachments/capabilities.py`, `GET
+/attachments/capabilities`) reports live `vision_input`/`ocr`/
+`image_resize`/`image_text_removal` flags computed from current
+`Settings`, never hardcoded — one honest nuance: `ocr`/`image_text_removal`
+report whether the `pytesseract` Python package is importable, not
+whether the Tesseract system binary is installed; a missing binary
+degrades one request to an empty result with a warning rather than
+flipping the capability flag. Resize and text removal's actual pixel
+editing need no external binary and are fully, genuinely verified,
+including an explicit test asserting the edited region's pixels are
+*not* a flat, uniform fill — the concrete way this codebase distinguishes
+real inpainting from a rectangle pasted over the text.
+
+### Attachment security hardening: routing fix, zip/PDF safety, injection detection (2026-09-27)
+
+Two independent pieces of follow-up work, both closing gaps found by
+directly inspecting the attachment pipeline against a real security-review
+brief rather than assuming prior coverage was complete.
+
+**Routing bug: "extract image text" (and other real-world phrasing) could
+still reach SQL generation.** `agent/orchestrator/nodes.py::get_available_sources`
+always includes `"sql"` (a database is always configured), so attaching
+any file made 2+ sources available, which unconditionally triggered the
+LLM classifier — with no built-in reason not to also pick `"sql"` just
+because a database happens to be configured. Fixed with
+`_looks_like_attachment_only_question`, a deterministic, zero-LLM-call
+pre-check: when attachments are present and the question matches an
+unambiguous OCR/image-understanding/resize/text-removal/document phrasing
+**and** contains no database keyword (database, sql, table, records, rows,
+columns, query, report, revenue, count, filter), `router_node` skips
+`classify_sources` entirely and routes to `["attachments"]` alone. A
+single database keyword anywhere in the question defers to the classifier
+instead. Defense-in-depth: `classify_sources`'s prompt also gained
+`_ATTACHMENT_VS_SQL_GUIDANCE`, explicit few-shot examples of what NOT to
+also pick, for phrasings the deterministic check doesn't confidently
+catch.
+
+**Also root-caused, same session: "no vision model configured" for a
+genuinely attached image.** `MEDIA_VISION_MODEL` was simply unset, and
+Tesseract wasn't installed on the reference dev machine either, so both
+paths failed with one generic message. Fixed by (1) actually configuring
+a real, already-pulled vision-capable Ollama model (verified live) and
+(2) replacing the single generic failure message with
+`attachments.state.ModelCallOutcome` (`no_content`/`vision_ok`/
+`vision_empty`/`text_llm_ok`/`text_llm_empty`/`text_llm_unavailable`), so
+"vision was never configured," "a configured vision model answered
+empty," and "the text-only model was unreachable" each produce a
+genuinely different, actionable message. `GET /health` gained live vision
+diagnostics (`vision_enabled`/`vision_model`/`vision_model_available`/
+`ocr_enabled`).
+
+**A structured security-brief audit found five further, concrete gaps**
+(verified by reading the actual code, not assumed):
+
+1. **No decompression-bomb guard for DOCX/XLSX/PPTX.** All three are plain ZIP archives; none of `python-docx`/`openpyxl`/`python-pptx` bound total decompressed size or entry count before parsing. Closed by `attachments/zip_safety.py::check_zip_safety` — reads only the archive's own central-directory metadata (no actual decompression) and rejects before the real parser ever touches an entry. Also rejects an absolute or `..`-traversal-shaped internal path as a defense-in-depth signal (this app never extracts an entry to disk, so there's no real zip-slip write target today).
+2. **No PDF dangerous-content preflight.** `attachments/pdf_safety.py::check_pdf_safety` adds a **catalog-level** check (the document's root `/Root` dict plus its `/Names` name tree) for embedded JavaScript, an embedded-files name tree, an automatic open action, or document-level additional actions — deliberately not a full page/annotation walk (a disclosed scope boundary, not a silent gap). Test fixtures are real PDFs built with `pypdf`'s own `add_js`/`add_attachment` writer helpers, never a checked-in malware sample.
+3. **No parser timeout.** `attachments/pipeline.py::process_attachment` now runs every processor call on a small (`max_workers=4`), process-wide bounded thread pool with a hard timeout (`Settings.attachment_processing_timeout_seconds`) — the same "the calling thread stops waiting; Python can't force-kill another thread" caveat `api/main.py::_run_orchestrated_with_timeout` already discloses for `/ask`.
+4. **No prompt-injection detection on attachment text.** `security/injection_patterns.py::INJECTION_PATTERNS` was wired into the typed question, the retrieved-schema RAG-poisoning scan, and the persistent Knowledge Sources PDF pipeline — but never into chat attachments. Closed by `attachments/pipeline.py::_scan_for_injection_patterns`, mirroring `rag/ingestion.py`'s own "detection-only, log a security event, never block" policy exactly.
+5. **Malware scanning could be off in production with no warning.** `MALWARE_SCAN_PROVIDER` defaults to `"disabled"`, but nothing previously stopped `ENVIRONMENT=production` from starting that way. Closed by a new `Settings` `model_validator`, `_require_malware_scanning_in_production` — production with chat attachments, document RAG, policy RAG, or media search enabled and scanning off refuses to start.
+
+Also found and fixed as a side effect of this audit: `data/attachments/`
+was never gitignored, unlike every other runtime-data directory this
+project has — closed alongside this pass. Several attachment-related
+settings were also missing from `.env.example` — backfilled.
+
+**Verification snapshot at the time this hardening pass was built** (a
+historical record, not a standing guarantee — re-run the suite for
+current numbers): 1926 backend tests (58 new) and 208 frontend tests (10
+new) passed; `tsc --noEmit` clean; `oxlint` clean. Every new
+attachment-hardening test fixture is synthetic/programmatically generated
+(real `pypdf`/`zipfile` writer output) — no malicious samples committed.
+
+**Not independently verified in this pass:** no live ClamAV daemon was
+available, so the "scanner unreachable"/"scanner error" fail-closed path
+is unit-tested against a mocked socket only. The PDF preflight's
+page/annotation-level action detection remains unimplemented
+(catalog-level only, as designed and disclosed above).

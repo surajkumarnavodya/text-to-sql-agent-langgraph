@@ -10,9 +10,10 @@
 > dedicated LangGraph subgraph (`attachments/graph.py`). A later pass also
 > added explicit `POST /attachments/{id}/extract-text|resize|remove-text`
 > actions. **Do not use this document as the current state of the image
-> attachment pipeline** — see `CLAUDE.md`'s "Chat attachments" and
-> "Explicit image actions" sections, `docs/API.md`'s "Attachments" section,
-> and `SECURITY.md`'s "Chat attachments — security controls" section
+> attachment pipeline** — see `CLAUDE.md`'s "Chat attachments, image
+> actions, and their security hardening" section, `docs/API.md`'s
+> "Attachments" section, and `SECURITY.md`'s "Chat attachments — security
+> controls" section
 > instead. **Update, 2026-09-27**: the image **editor**'s own "AI-guided
 > editing" panel (a natural-language-prompted generative edit, distinct
 > from the real "Resize"/"Remove text" actions above) is also no longer a

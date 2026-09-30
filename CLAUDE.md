@@ -253,8 +253,8 @@ below, and `docs/MULTI_SOURCE_GUIDE.md` for how to configure each source.
   source). `ocr_extract.py`/`image_ops.py`/`inpaint.py`/`capabilities.py`
   are the explicit image-action modules (OCR-with-regions, deterministic
   resize, classical-inpainting text removal, and the live capability
-  registry, respectively) — see "Explicit image actions" below for the
-  full design.
+  registry, respectively) — see "Chat attachments, image actions, and
+  their security hardening" below for the full design.
 - `frontend/` — the React + Vite + TypeScript + Tailwind dashboard, the
   only UI this project ships (see the "History note" near the top of this
   file for the Streamlit app it replaced). `src/pages/Chat.tsx` is the main
@@ -433,31 +433,27 @@ below, and `docs/MULTI_SOURCE_GUIDE.md` for how to configure each source.
 ## Key design decisions
 
 ### Self-correcting retry loop (LangGraph)
-The full graph (`agent/graph.py`) is twelve nodes, not four:
+The full graph (`agent/graph.py`) is twelve nodes:
 `sanitize_input → classify_followup → retrieve_schema →
 retrieve_golden_examples → retrieve_business_context → plan_query →
 generate_sql → review_sql → validate_sql → estimate_cost → execute_sql →
-generate_insight` (a 2026-09-18 doc-drift fix — `retrieve_business_context`
-was already live, documented under its own heading further below, but
-missing from this particular summary list; see
-`docs/DEEP_FEATURE_PERFORMANCE_ASSESSMENT.md` §2). On a review, validation, cost-estimate, or execution
+generate_insight`. On a review, validation, cost-estimate, or execution
 failure, a conditional edge routes back to `generate_sql` (or, for a
 "missing reference" execution error, back to `retrieve_schema`) with the
-error message appended to the state's history, so the LLM sees what went
-wrong and can correct itself. Capped at `MAX_RETRIES = 3`
-(`config/settings.py`) as a base, but not a single flat number in
-practice — `agent/complexity.py::compute_max_retries` widens it by up to
-`COMPLEX_QUERY_MAX_RETRY_BONUS` (default 2) extra attempts for a question
-whose text matches a "harder than usual" signal (top-N-per-group phrasing,
-year-over-year/period growth, several metrics at once), computed once by
-`run_agent()` and stored in `state["max_retries"]` — every retry-vs-give-up
-check reads that, not the raw setting. After the budget is exhausted, the
-graph ends in a terminal `failed` state and the UI surfaces the last error
-rather than looping forever. This is the interview-relevant piece: it's a
-small explicit state machine, not a ReAct-style free-form agent,
+error message appended to state history, so the LLM sees what went wrong
+and can correct itself. Capped at `MAX_RETRIES = 3` (`config/settings.py`)
+as a base, widened per-question by `agent/complexity.py::compute_max_retries`
+(up to `COMPLEX_QUERY_MAX_RETRY_BONUS` extra attempts for a "harder than
+usual" question, stored in `state["max_retries"]` — every retry-vs-give-up
+check reads that, never the raw setting). After the budget is exhausted,
+the graph ends in a terminal `failed` state rather than looping forever.
+It's a small, explicit state machine, not a ReAct-style free-form agent,
 specifically so the retry/error-feedback path is inspectable and boundable.
-See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the full per-node
-walkthrough and the complete retry-routing table.
+
+**Read [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md#2-retry--self-correction-semantics)**
+for the full per-node walkthrough and the complete failure-category →
+retry-or-fail-closed routing table (which failures never retry — e.g.
+safety violations, off-topic input, timeouts — and why).
 
 ### Agentic query planning + plan-conformance self-correction
 `plan_query_node` (between `retrieve_schema` and `generate_sql`) and
@@ -466,23 +462,16 @@ decompose-then-check pair, gated by the exact same complexity signals that
 widen the retry budget above (`state["complexity_signals"]`) and by
 `ENABLE_QUERY_PLANNING` (default `true`). For an ordinary question that
 matches no signal, both nodes are a pure pass-through — zero LLM calls,
-zero added latency, identical behavior to before this feature existed. For
-a question that does match, `plan_query_node` makes one LLM call producing
-a short ordered plan (grouping, metrics, filters, and an explicit call-out
-when a top-N-per-group ranking needs `ROW_NUMBER()`/`RANK()` instead of
-`TOP`/`LIMIT` + `GROUP BY`, or a period-over-period comparison needs
-`LAG()`/`LEAD()` instead of a nested aggregate), which is then injected
-into every `generate_sql` attempt's prompt for that question.
-`review_sql_node` makes a second LLM call checking the *generated* SQL
-against that same plan (`PASS`/`FAIL: <reason>`); a `FAIL` feeds the
-critique back into another `generate_sql` attempt, sharing the same
-`retry_count`/`state["max_retries"]` budget as every other retryable
-failure — not a second, unbounded loop. Both nodes fail open on an
-unreachable Ollama server or an unparseable response (log it, proceed as
-if there were no plan/pass the review) — this feature is an accuracy aid,
-never a reason a question can't be answered. See
-[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md#2-retry--self-correction-semantics)
-for the full reasoning.
+zero added latency. For a question that does match, `plan_query_node`
+makes one LLM call producing a short ordered plan; `review_sql_node`
+makes a second LLM call checking the generated SQL against that plan,
+feeding a `FAIL` back into another `generate_sql` attempt from the same
+retry budget above — never a second, unbounded loop. Both nodes fail open
+on an unreachable Ollama server or an unparseable response — this feature
+is an accuracy aid, never a reason a question can't be answered.
+
+**Read [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md#agentic-query-planning-and-plan-conformance-review)**
+for the full reasoning and the four regex signal patterns that trigger it.
 
 ### Golden-dataset feedback loop
 `retrieve_golden_examples_node` (between `retrieve_schema` and
@@ -509,16 +498,27 @@ never a reason a question can't be answered.
 
 Examples are added only via the dashboard's explicit thumbs-up feedback
 (`frontend/src/components/sql/GoldenFeedbackWidget.tsx`, calling
-`POST /feedback`, shown once a "Confirm and Run" result is genuinely
-confirmed successful) — never automatically. The SQL saved is the *exact*
-SQL actually executed, not the agent's original draft — the user may have
-edited the SQL box before confirming, and the corrected version is exactly
-what's worth remembering. Saved with a deterministic id
+`POST /feedback/golden-example`, shown once a "Confirm and Run" result is
+genuinely confirmed successful) — never automatically. The SQL saved is
+the *exact* SQL actually executed, not the agent's original draft — the
+user may have edited the SQL box before confirming, and the corrected
+version is exactly what's worth remembering. Saved with a deterministic id
 (`embeddings.golden_examples._example_id`, a hash of database+question+SQL)
 so re-clicking the widget upserts the same document rather than
 accumulating duplicates. Every caller (the React dashboard, the REST API
 used standalone, `eval/runner.py`) benefits from retrieval automatically,
 since they all call the same underlying `agent.graph.run_agent` graph.
+
+**`POST /feedback/message`** (`feedback/store.py`, a separate ChromaDB
+collection) is the general-purpose counterpart: a like/dislike (plus an
+optional comment) on *any* assistant answer — SQL, document/policy RAG,
+web, or media, not only a confirmed-and-executed SQL result
+(`frontend/src/components/chat/ResponseFeedbackWidget.tsx`). Purely
+additive — a thumbs-up on a confirmed SQL answer still separately calls
+`POST /feedback/golden-example` too — and never feeds few-shot retrieval
+itself; it's a read-later feedback log, one shared collection (not
+per-database), fails open on any storage error exactly like the golden
+store above.
 
 ### Nested-aggregate detection (validator + execution backstop)
 A real, reproduced failure: a local model asked for something like
@@ -627,195 +627,71 @@ further, not oversights to silently work around.
 ### Tool/MCP abstraction (`agent/tools/`)
 A generic, governed way to describe and invoke this application's six real
 capabilities (SQL, document RAG, policy RAG, web search, media search,
-media generation) by name, added as the first step of a broader "Enterprise
-AI Intelligence Platform" roadmap (see
-`docs/PLATFORM_TRANSFORMATION_ASSESSMENT.md`). **Deliberately additive, not
-a rewrite**: `agent/orchestrator/nodes.py`'s five hardcoded nodes are
-completely unmodified, and `run_orchestrated` still calls them directly in
-production exactly as before this package existed — there was no clear,
-low-risk way to swap a heavily security-reviewed, already-tested graph's
-node bodies for a generic dispatch layer without real regression risk, so
-that integration was deliberately deferred rather than forced into this
-increment (see "Do not blindly follow this sequence" reasoning in the
-assessment doc).
+media generation) by name — a uniform contract (permission check, timeout,
+retry policy, structured audit logging) wrapping the exact same functions
+`agent/orchestrator/nodes.py` already calls, no reimplementation.
+**Deliberately additive, not a rewrite: nothing in the live request path
+calls through this registry yet.** `agent/orchestrator/nodes.py`'s
+hardcoded nodes are completely unmodified, and `run_orchestrated` still
+calls them directly in production — this is foundation for a future
+tool-dispatching planner and a future external MCP client, not scaffolding
+that does nothing (it's fully tested on its own).
 
-Each of the six `Tool`s in `agent/tools/definitions.py` (`sql_query`,
-`document_search`, `policy_search`, `web_search`, `media_search`,
-`media_generation`) wraps the *exact same* function
-`agent/orchestrator/nodes.py` already calls (`agent.graph.run_agent`,
-`rag.graph.run_rag`, `search.web_search.web_search`,
-`media.search.search_media`, `agent.orchestrator.nodes.execute_generation`)
-— no reimplementation, confirmed by tests that monkeypatch each real
-function and assert the tool called through to it with the right
-arguments (`tests/test_tools_definitions.py`). `agent/tools/registry.py`'s
-`ToolRegistry.execute` governs every call uniformly: a permission check
-(`agent.authz.has_role_permission`, the same check `router_node` already
-does for its own sources — fail-closed, raises `ToolPermissionError`, never
-silently denies), a hard per-attempt timeout (thread-based, mirroring
-`db.execution._execute_with_timeout`'s own daemon-thread-join pattern —
-the only cross-platform way to bound an arbitrary call's wall-clock time),
-a configurable retry policy (`max_attempts=1` by default — most wrapped
-functions already have their own internal retry loop, so an outer retry
-would just multiply latency), and one structured `security.audit_log`
-event per outcome (`tool_permission_denied`/`tool_executed`/
-`tool_execution_failed`). `ToolCategory.READ`/`WRITE` distinguishes the
-five read-only sources from `media_generation` (the only one that spends
-real, metered money) — the category alone grants no extra authorization;
-`media_generation`'s own human-approval gate (`Settings
-.require_generation_approval`, see "Media generation" above) still lives
-entirely in `generation_node`/`execute_generation`, upstream of this
-tool.
-
-**Who consumes this today**: nothing in production yet — this is
-foundation for the next roadmap step (a research-planner upgrade that
-needs to choose and invoke a tool dynamically by name, rather than
-following a fixed LangGraph edge, plus a future external MCP client). It
-is fully tested (`tests/test_tools_registry.py`,
-`tests/test_tools_definitions.py`) and functionally complete on its own —
-not scaffolding that does nothing — but has no caller wired into the live
-request path in this increment. Known, disclosed limitation: per-tool
-timeouts (`agent/tools/definitions.py`'s `_SQL_TOOL_TIMEOUT_SECONDS` etc.)
-are hand-picked constants, not yet wired to `config.settings.Settings`,
-to keep this increment's surface area small — a legitimate follow-up, not
-an oversight.
+**Read [`docs/TOOLS.md`](docs/TOOLS.md)** for the full contract and design,
+and [`docs/PLATFORM_TRANSFORMATION_ASSESSMENT.md`](docs/PLATFORM_TRANSFORMATION_ASSESSMENT.md)
+for the roadmap this is the first step of.
 
 ### Multi-source orchestration (router + subgraphs)
-`ENABLE_MULTI_SOURCE_ROUTER` (default `false`) puts a router in front of
-the SQL pipeline, in `agent/orchestrator/`. Router + subgraphs, not a
-single tool-calling agent, was a deliberate choice, for the same reason the
-SQL pipeline itself is an explicit LangGraph state machine and not a
-ReAct-style agent: every source's safety boundary (the SQL validator, the
-policy-sensitivity gate, the "web content is untrusted" framing) stays
-separately testable and inspectable rather than folded into one model's
-implicit tool-selection reasoning.
+`ENABLE_MULTI_SOURCE_ROUTER` (default `false`) puts a router
+(`agent/orchestrator/`) in front of the SQL pipeline. Router + subgraphs,
+not a single tool-calling agent, was a deliberate choice: every source's
+safety boundary (the SQL validator, the policy-sensitivity gate, the
+"web content is untrusted" framing) stays separately testable rather than
+folded into one model's implicit tool-selection reasoning.
 
-`agent.orchestrator.graph.run_orchestrated` is the one entry point
-`api/main.py` calls, and it is deliberately a **two-path function, not a
-graph with one trivial branch**:
+**Flag off (the default):** `agent.orchestrator.graph.run_orchestrated`
+calls `agent.graph.run_agent` directly and returns its result completely
+unwrapped — the orchestrator graph is never even constructed. This is what
+makes the byte-for-byte-unchanged guarantee for SQL-only questions
+provable, not just claimed. **Flag on:** `router_node` picks one or more of
+`sql`/`documents`/`policy`/`web`/`generation`/`media_search` (zero LLM
+calls with ≤1 source available; one LLM call to classify with 2+, falling
+back to *every* available source, never zero, on an unparseable response)
+and fans them out as parallel branches in one LangGraph step before
+`synthesis_node` composes the final answer — a pure pass-through when only
+one source fired, a labeled per-source section when 2+.
 
-- Flag off (the default): `run_orchestrated` calls `agent.graph.run_agent`
-  directly and returns its result completely unwrapped — not "the
-  orchestrator with one destination," the literal same call the UI made
-  before this package existed. `eval/runner.py` and the standalone scripts
-  also still call `run_agent` directly and are entirely unaffected. This is
-  what makes the byte-for-byte-unchanged guarantee for SQL-only questions
-  provable rather than just claimed: the orchestrator graph is never even
-  constructed on this path.
-- Flag on: the orchestrator graph actually runs —
-  `router → {sql_subgraph, document_rag, policy_rag, web_search} (any
-  combination) → synthesis → END`. `router_node` calls
-  `agent.orchestrator.nodes.get_available_sources(settings)` (checks each
-  source's `ENABLE_*` flag *and* the config it actually needs — an enabled
-  flag with nothing configured behind it is not "available"); with ≤1
-  source available it short-circuits with **zero LLM calls**, mirroring
-  `embeddings.retriever.select_database`'s own single-database
-  short-circuit. With 2+, one LLM call (`classify_sources`) picks which
-  source(s) apply, falling back to *every* available source (never zero) on
-  an unparseable response. `route_after_router` returns a **list** of
-  destination node names — LangGraph fans out to all of them as parallel
-  branches in the same graph step before `synthesis` runs (confirmed
-  against this project's pinned LangGraph version before this was built,
-  not assumed) — this is what lets "compare policy X with the database"
-  hit two subgraphs in one step rather than sequentially.
-- `OrchestratorState` (`agent/orchestrator/state.py`) *extends* `AgentState`
-  rather than replacing it — `sql_subgraph_node`'s full `run_agent()` result
-  merges into it under the exact same keys (`status`, `sql`, `result_rows`,
-  ...), which is why every existing `api/schemas.py`/frontend read site
-  keeps working whether a question went through `run_agent` directly or
-  through the orchestrator. `synthesis_node` is a pure pass-through when only one
-  source fired (that source's own answer stands unedited, no LLM call
-  spent restating something already complete); with 2+, each source's
-  contribution is shown under its own labeled heading, never blended into
-  one unattributed claim.
-- **Known limitation, found during testing, not yet fixed:** every routed
-  subgraph receives the *same full, un-decomposed question text*. A
-  cleanly single-topic multi-source question works fine (tested: "compare
-  our leave policy with sales in the database" correctly fanned out and
-  retrieved both), but a question that's really two separate asks mashed
-  into one sentence can retrieve poorly on *both* sides even though each
-  side would have worked fine alone. Per-source query decomposition (asking
-  the router or a follow-up LLM call to produce a source-specific
-  sub-question) would fix this — deliberately out of scope for the initial
-  build, flagged here rather than silently left as a mystery if you hit it.
+**Known limitation, not yet fixed:** every routed subgraph receives the
+same full, un-decomposed question text — a question that's really two
+unrelated asks mashed into one sentence can retrieve poorly on both sides
+even though each alone would work. Per-source query decomposition would
+fix this; out of scope for the initial build.
 
-See `docs/ARCHITECTURE.md`'s "Multi-source orchestration" section for the
-full diagram and per-node walkthrough, and `docs/MULTI_SOURCE_GUIDE.md` for
-how to configure and use each source (including where the Tavily API key
-goes and how to upload a policy PDF).
+**Read [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md#4-multi-source-orchestration)**
+for the full diagram, router/fan-out/synthesis mechanics, and
+`OrchestratorState`'s shape (it *extends* `AgentState`, never replaces
+it), and [`docs/MULTI_SOURCE_GUIDE.md`](docs/MULTI_SOURCE_GUIDE.md) for
+how to configure and use each source.
 
 ### Document/policy agentic RAG (`rag/`)
-Same code serves "documents" (general uploads) and "policies" (more
-access-sensitive), parameterized by collection name
-(`rag.graph.build_rag_subgraph(collection)`), not two near-duplicate
-modules — they're structurally identical and only differ in how
-`generate_node` treats a sensitive chunk. The subgraph is
-retrieve → grade → (rewrite → retry, bounded by `RAG_MAX_RETRIES`) →
-generate-with-citations, or an insufficient-information fallback after
-retries are exhausted — the same bounded self-correction philosophy as the
-SQL pipeline's retry loop, a separate knob because a bad chunk retrieval
-and a bad SQL parse aren't the same kind of budget.
+One implementation (`rag.graph.build_rag_subgraph(collection)`) serves
+both "documents" and "policies" — structurally identical, differing only
+in `generate_node`'s sensitivity check. A policy chunk tagged
+`compensation`/`disciplinary`/`legal` at upload time is **never**
+summarized into an answer — checked before the LLM ever sees the chunk,
+fail-closed, the same philosophy as `agent/sql_validator.py`'s
+`SAFETY_VIOLATION_TYPES`. **2026 Phase 3** added a second, independent
+gate, `DocumentRecord.restricted_roles` (real RBAC — see "Authentication,
+authorization, and the 2026 security hardening passes" below); a document
+can carry either gate, both, or neither. The chat-answer PDF download
+button is built strictly from the `citations` list, which is why a
+restricted match (`citations == []`) automatically has no download
+button — there's no separate access check to remember.
 
-Storage (`rag/store.py`) is SQL Server 2025+/Azure SQL's native `VECTOR`
-column type — confirmed against this project's actual target instance
-before being built, not assumed, including one real bug found and fixed
-along the way: a long (~7000+ character) embedding JSON string gets bound
-by pyodbc as `ntext` rather than `nvarchar`, and SQL Server's `VECTOR` cast
-rejects `ntext` as a source type ("Explicit conversion from data type ntext
-to vector is not allowed") — fixed by casting through `NVARCHAR(MAX)`
-first (`rag.store._VECTOR_CAST`). Storage is a **dedicated connection**
-(`RAG_STORE_CONNECTION_STRING`), never one of `DB_CONNECTIONS` — chunk/
-embedding storage isn't business data and shouldn't share a schema or
-connection pool with a configured database.
-
-Policy sensitivity (`compensation`/`disciplinary`/`legal`, set per-document
-at upload time — `rag/store.py`'s `SensitivityCategory`) is enforced by
-`rag/graph.py`'s `generate_node` refusing to summarize a sensitive chunk
-into an answer at all — a fixed, reviewed set of categories this app has
-no per-caller override for, hard-blocked regardless of role, the same
-fail-closed philosophy as `agent/sql_validator.py`'s
-`SAFETY_VIOLATION_TYPES`, applied to a different data shape (a
-document/chunk tag instead of a `(table, column)` pair). **2026 Phase 3:**
-a second, independent gate, `DocumentRecord.restricted_roles` (an optional,
-operator-set role list, entered at upload time), layers actual RBAC
-(`agent/authz.py`, see "Authentication, authorization, and the 2026
-security hardening passes" below) on top of this for documents that need
-finer-grained restriction than the three fixed categories — checked by the
-same `generate_node` before the LLM ever sees the chunk, and by
-`api/documents.py`'s download route. Both gates are independent and
-additive; a document can carry either, both, or neither. `uploaded_by` was
-added alongside `restricted_roles` but is audit-trail only, never used to
-scope retrieval/download/delete — this remains a shared knowledge base by
-design, not per-uploader private storage.
-
-Retrieved chunk text is framed as **untrusted data, never instructions**
-in `rag/graph.py`'s `_GENERATE_SYSTEM_PROMPT` — the same "SQL is untrusted
-output" principle below, applied to what a poisoned/malicious uploaded PDF
-could contain, since that's this feature's realistic injection vector.
-
-**Downloadable source PDF (`ENABLE_PDF_DOWNLOAD`, default `true`):** the
-original uploaded PDF's bytes are stored in a new `rag.documents.pdf_bytes`
-column (`rag/store.py::ensure_schema` migrates an existing table
-automatically — an idempotent `ALTER TABLE ... ADD` guard, the one schema
-migration this module has needed) and served on demand
-(`get_document_bytes`) from a chat answer's citation
-(`frontend/src/components/chat/SourceAnswerCard.tsx`) or the Knowledge
-Sources management page, never fetched into a listing/search query itself
-— both
-`list_documents` and `similarity_search` project a cheap `has_pdf_bytes`
-boolean instead. Before this existed, ingestion discarded the raw bytes
-right after text extraction, so **only documents uploaded after this
-shipped are downloadable** — there's nothing to backfill from for an
-already-ingested one; re-uploading it is the only way to make it
-downloadable. The chat-answer download button is built strictly from the
-existing `citations` list, never a separately-fetched document list — this
-is what makes it inherit the sensitivity gate above for free: a restricted
-policy match already produces `citations == []` before any button could be
-built from it, so there's no separate access check to remember. The
-Knowledge Sources page's own per-document download button has no such
-gate, but that page already shows every document's `sensitivity_category`
-and offers an unconditional delete button for all of them — a download
-button there is consistent with that page's already-fully-privileged,
-no-per-user-authorization exposure level, not a new escalation.
+**Read [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md#documentpolicy-agentic-rag-rag)**
+for the full retrieve → grade → rewrite → generate flow, the SQL Server
+`VECTOR` storage design (including a real `ntext`/vector-cast bug found
+and fixed), and the untrusted-content framing.
 
 ### Live web search (`search/`)
 `search/web_search.py` mirrors `db/connection.py`'s `SUPPORTED_DB_TYPES`
@@ -832,861 +708,220 @@ too, since a search result's content is exactly as attacker-influenceable
 as a stored database value or an uploaded document.
 
 ### Media generation (image/video) (`media_gen/`)
-`media_gen/` is a tested IMA Studio client wired into the orchestrator as a
-`"generation"` source (`agent.orchestrator.nodes.generation_node`). Image
-generation is confirmed working end-to-end against a real IMA account (a
-live text-to-image call succeeded: generation, download, and serving via
-`GET /media/{media_id}`); video generation shares the same client/
-task-creation code path but hasn't been separately confirmed with a live
-call yet. `ENABLE_MEDIA_GENERATION` still stays off by default so a fresh
-clone never spends real IMA credits without the operator deliberately
-opting in. Two design points worth knowing if you touch this:
+A tested IMA Studio client wired into the orchestrator as a `"generation"`
+source. Image generation is confirmed working end-to-end against a real
+IMA account; video generation shares the same code path but hasn't been
+separately confirmed live. `ENABLE_MEDIA_GENERATION` stays off by default
+so a fresh clone never spends real IMA credits unintentionally.
 
-- **Image vs. video is a cheap keyword heuristic, not a second LLM call**
-  (`generation_node.infer_media_kind`, mirroring `agent/complexity.py`'s
-  own regex-heuristic style) — a question containing "video"/"clip"/
-  "animate"/"animation"/"footage"/"motion" gets `generate_video`, else
-  `generate_image`. `generate_audio` is built and tested but not
-  auto-routed here (nothing in this feature's scope asks for audio).
-- **Video clip length is a real model-capability ceiling, not a config
-  restriction this app imposes.** `Settings.media_gen_video_duration_seconds`
-  (optional) overrides the video model's own default "duration" form field
-  via `create_and_poll`'s new `form_overrides` param — but verified live
-  against a real IMA account (a read-only, no-cost `GET /open/v1/product/list
-  ?category=text_to_video` call): the auto-selected model ("Seedance 2.0")
-  only accepts an integer 4-15 (its own declared `form_config` min/max),
-  default 5. No IMA video model on this account, or as far as this project
-  has confirmed offered by IMA at all, supports a single multi-minute
-  generation — current text-to-video models generally cap in the 5-15
-  second range per call. An out-of-range value is rejected by IMA itself as
-  a clean provider failure, not pre-validated against the live per-model
-  range here.
-- **Generated media is served through this app, never the provider's raw
-  CDN URL.** `execute_generation` (the function that actually calls IMA —
-  see "Human-in-the-loop approval gate" below) downloads the bytes once
-  (`media_gen.download.download_media_bytes`, SSRF-hardened — see its own
-  module docstring; **2026 Phase 3:** redirects are now followed manually,
-  re-validated hop-by-hop up to 5 times, closing a gap where a redirect
-  response from an otherwise-validated URL reached an unvalidated address
-  with no check at all) and stores them under an opaque id in a bounded,
-  process-lifetime in-memory cache (`media_gen.cache.MediaCache`, FIFO
-  eviction past 100 entries, not persisted — a restart loses in-flight
-  generated media, an accepted tradeoff same as this app's other
-  process-global caches). Neither `MediaGenerationResult.answer` nor the
-  API's `MediaGenerationResultOut` ever carries the raw URL — only
-  `media_id`. The React frontend fetches the bytes via the authenticated
-  `GET /media/{media_id}` (`api/media.py`, mirroring `api/documents.py`'s
-  PDF download route) and renders an `<img>`/`<video>` from a blob object
-  URL (`MediaResultCard.tsx`). This was chosen over persisting to a DB
-  column (bigger lift, no real need yet) or passing the provider's URL
-  straight through (simpler, but the link can expire and there's no
-  server-side re-inspection of the bytes before display).
-- **Human-in-the-loop approval gate before any provider call
-  (`Settings.require_generation_approval`, default `true`).** Generation
-  is the only orchestrator source that spends real, metered money —
-  `generation_node` only *proposes* what would be generated
-  (`status="pending_approval"`, no `media_id`, nothing charged) until a
-  human explicitly confirms via `POST /generate/confirm`
-  (`api/generation.py`) or the matching "Generate" button in both UIs.
-  `execute_generation` (extracted out of the old `generation_node` body)
-  is the one function both the confirm endpoint and the
-  approval-disabled path call — it re-runs its own safety/rate-limit
-  checks regardless of which caller reaches it, since it has two
-  independent entry points. Mirrors the SQL pipeline's own "Confirm and
-  Run" gate, applied to the one source here that costs real money — see
-  `SECURITY.md`'s "Media generation" section for the full security
-  rationale (added 2026-09-13, alongside SSRF hardening, a strengthened
-  content-policy check, new rate limits, and a session-scoped
-  expensive-source cost ceiling — `docs/security-changelog.md`'s matching
-  entry has the complete list).
-- The router's `classify_sources` prompt carries explicit few-shot
-  examples distinguishing a genuine "create new media" request from a
-  plain "show me the data" one that merely mentions a picture/video in
-  passing (`agent.orchestrator.nodes._GENERATION_FEW_SHOT_GUIDANCE`) — see
-  that constant for the exact phrasing this was tuned against.
+**Invariants that must not regress:** generated media is served through
+this app, never the provider's raw CDN URL — `execute_generation`
+downloads the bytes once (SSRF-hardened, redirects re-validated hop-by-hop),
+caches them under an opaque `media_id`, and neither the answer text nor
+the API response (`MediaGenerationResultOut`) ever carries the raw URL.
+Generation is gated by a human-in-the-loop approval step before any
+provider call (`Settings.require_generation_approval`, default `true`) —
+the only orchestrator source that spends real, metered money; both the
+confirm endpoint and the approval-disabled path funnel through the same
+`execute_generation` function, which re-runs its own safety/rate-limit
+checks regardless of entry point. Video clip length is capped by the
+provider's own model (currently 4-15s), not a restriction this app
+imposes.
 
-**Known gaps, named rather than silently left:**
-- **Multi-source synthesis doesn't embed generated media inline.**
-  `synthesis_node` only ever concatenates text; a generation result folded
-  into a multi-source answer shows only its (link-free) confirmation text,
-  not the image/video itself. Single-source generation (the realistic
-  case) is unaffected.
-
-Update (this feature's original "Known gaps" note above used to read: *"No
-'search existing media' capability exists... Building a real media-search
-tool (an index, a store) is a separate, larger feature, not attempted
-here."* That gap is now closed — see "Media search" below.
+**Read [`SECURITY.md`](SECURITY.md)'s "Media generation" section** for the
+full security rationale (SSRF hardening, content-policy check, rate
+limits, cost ceiling) and [`docs/RESPONSIBLE_AI.md`](docs/RESPONSIBLE_AI.md)
+for the content-policy check's disclosed limitations (a keyword heuristic,
+not real moderation). **Known gap:** multi-source synthesis doesn't embed
+generated media inline — a generation result folded into a multi-source
+answer shows only its (link-free) confirmation text.
 
 ### Media search (image/video, optional, off by default) (`media/`)
-Content-based search over an **untagged** local image/video library — no
-filenames, no manual tags. Routed as the "media_search" orchestrator
-source (`agent.orchestrator.nodes.media_search_node`), gated by
-`ENABLE_MEDIA_SEARCH` + a real `MEDIA_LIBRARY_PATH` (both required —
-same flag-plus-config pattern as media generation's own
-`enable_media_generation`/`ima_api_key`). Off by default, unlike voice
-mode: it needs a configured library path and pulls in a real, meaningfully
-larger dependency footprint (`torch`, `opencv-python`) that shouldn't land
-on every fresh clone uninvited.
+Content-based search over an **untagged** local image/video library (no
+filenames, no manual tags), routed as the `"media_search"` orchestrator
+source. Gated by `ENABLE_MEDIA_SEARCH` + a real `MEDIA_LIBRARY_PATH`. Off
+by default — it pulls in a real, meaningfully larger dependency footprint
+(`torch`, `opencv-python`) that shouldn't land on every fresh clone
+uninvited.
 
-**Local CLIP embeddings by default, not a hosted API.** This is a
-deliberate deviation from a common assumption for this kind of feature
-(the original implementation prompt for this asked for "a hosted
-multimodal embedding API," listing Voyage/Vertex/OpenAI as candidates).
-Given this project's consistent "local-first, cloud only as a disclosed
-opt-in exception" identity (Ollama for the LLM, faster-whisper+Piper for
-voice mode both chosen explicitly over cloud alternatives), the default
-path instead uses `sentence-transformers`' `clip-ViT-B-32` running fully
-on-device (`media/embedding.py`) — no API key, no per-image cost, no
-media content ever leaving the machine. The **same** model embeds both
-images and query text, which is what guarantees they land in one
-comparable vector space; this is why `media/embedding.py` computes
-embeddings directly rather than through Chroma's own text-only
-`EmbeddingFunction` callback interface the way `embeddings/schema_indexer
-.py`/`rag/embedding.py` do. Built behind a small provider map
-(`Settings.media_embedding_provider`, shaped like `search/web_search.py`'s
-`SUPPORTED_SEARCH_PROVIDERS`) so a hosted provider could be added later as
-a second dict entry, without touching any call site — nothing exercises
-that path today. This is the one real exception to this project's
-otherwise-consistent "no torch" dependency posture (`faster-whisper`/
-`piper-tts`'s own requirements.txt comments both explicitly celebrate
-avoiding it) — a real, consequential tradeoff, not an oversight.
+**Invariants that must not regress:** embeddings are local CLIP
+(`sentence-transformers`' `clip-ViT-B-32`), not a hosted API — the one
+real exception to this project's otherwise-consistent "no torch"
+dependency posture, a deliberate, disclosed tradeoff (not an oversight).
+OCR/ASR/captioning text is framed as **untrusted data, never
+instructions** in the answer-composition prompt, same as web-search/RAG
+content. Video keyframe/thumbnail serving (`GET /media/library/{media_id}`)
+is a separate, persistent path from generated-media's own bounded
+in-memory cache — a full video clip is never streamed, only a frame +
+timestamp.
 
-**Vector store: the same ChromaDB this project already depends on**, not
-a new vendor (Pinecone/Qdrant/pgvector) — this app is explicitly
-"single-user, local-dev oriented" per `README.md`'s own Limitations
-section, so new vector-DB infrastructure would add real operational
-weight for no benefit at this scale. Two collections
-(`media/store.py`'s `media_images`/`media_video_segments`), mirroring
-`embeddings/golden_examples.py`'s "one collection per distinct purpose"
-convention — reusing the same process-lifetime-cached `PersistentClient`
-(`embeddings.schema_indexer.get_chroma_client`) every other Chroma-backed
-module here already shares, for the same "only one `PersistentClient` per
-on-disk directory per process" reason that caching exists.
-
-**Video pipeline**, per file ingested by `scripts/build_media_index.py`:
-1. **Scene-change keyframing** (`media/keyframes.py`, via `PySceneDetect`)
-   — segments a video at real scene boundaries, not fixed intervals, so a
-   long continuous shot isn't indexed as many near-identical frames.
-   `PySceneDetect` requires `opencv-python` unconditionally at its current
-   pinned version (confirmed against its own PyPI `requires_dist`
-   metadata before pinning — `av`/PyAV is only an optional extra for its
-   separate clip-export feature, not a way to avoid OpenCV here).
-2. **ASR** (`media/transcription.py`) — reuses `voice/stt.py`'s
-   faster-whisper model loader directly (`voice.stt.get_whisper_model`,
-   a small refactor extracted specifically for this reuse) rather than
-   loading a second Whisper model instance; per-Whisper-segment
-   timestamps are bucketed against each detected scene's own time range
-   (`transcript_for_range`), not just flattened into one string.
-3. **OCR** (`media/ocr.py`, via `pytesseract`/Tesseract) — on-screen text
-   in the representative keyframe. Needs the system Tesseract binary
-   installed separately (see "Windows-specific notes" below).
-4. **Captioning** (`media/captioning.py`) — reuses **Ollama**, this
-   project's existing local LLM runtime, with a vision-capable model
-   (`Settings.media_vision_model`, e.g. `llava`) rather than a separate
-   hosted vision-language model API. The only new setup step is `ollama
-   pull <model>`, mirroring the Piper voice-model download precedent
-   (`scripts/download_voice_model.py`) instead of introducing a new
-   provider architecture. **Fails open**: a blank `media_vision_model`
-   (the default) or any call failure returns `None`, not an error — the
-   segment is still indexed and searchable via its ASR transcript + OCR
-   text alone, same fail-open philosophy as
-   `agent.llm_client._build_golden_examples_block`.
-5. Each segment gets **up to two embeddings, sharing a `segment_id`**: one
-   from its combined caption/transcript/OCR text (via CLIP's own text
-   encoder), one from its keyframe image (via CLIP's image encoder) —
-   `media/search.py` queries both and merges/de-dupes hits that share a
-   `segment_id`, keeping the better-scoring modality.
-
-**Serving is a separate, persistent path from generated-media serving.**
-`api/media_library.py`'s `GET /media/library/{media_id}` is deliberately
-**not** built on `media_gen.cache.MediaCache` — that cache is in-memory,
-process-lifetime, and bounded to 100 entries with FIFO eviction, built for
-short-lived *generated* media, the wrong fit for a persistent library
-meant to stay searchable indefinitely. Instead it looks up `media_id`
-directly in the Chroma collections' own stored metadata to resolve either
-the original file (an image hit) or the representative keyframe thumbnail
-(a video-segment hit — a full clip is never streamed; the UI shows frame +
-timestamp instead, the lighter option this feature's own requirements
-explicitly allowed), then re-validates the resolved path is still inside
-the expected root directory before ever opening it — a local-path-
-traversal defense in the same spirit as `media_gen/download.py`'s SSRF
-hardening, applied to disk paths instead of URLs.
-
-**Untrusted content is framed as data, not sanitized/quoted.** OCR text,
-ASR transcripts, and generated captions are all attacker-influenceable
-(a sign in a photo, or spoken audio, could contain an instruction-like
-string) once they reach `media_search_node`'s answer-composition prompt.
-Rather than introducing a new sanitize/escape step, this follows the
-exact convention `rag/graph.py` and `web_search_node` already established
-for the same class of risk: the system prompt explicitly frames hit
-captions/OCR/ASR text as **untrusted data, never instructions** — see
-`SECURITY.md`'s "Media search" section.
-
-**Router disambiguation from "generation."** `media_search` and
-`generation` are the two media-adjacent sources, and the one real
-ambiguity between them ("make a picture of X" vs. "find a picture of X")
-is handled by `agent.orchestrator.nodes._MEDIA_SEARCH_VS_GENERATION
-_GUIDANCE`, appended to the classifier prompt only when *both* sources
-are available — see that constant for the exact phrasing this was tuned
-against. Unlike `generation_result`, `media_search_result` **does**
-contribute a text bullet to `synthesis_node`'s combined answer (it has a
-natural citable answer — what was found, and roughly when for a video —
-unlike a freshly-created asset); its hits still separately drive
-`MediaSearchResultCard.tsx`'s own thumbnail rendering, the same "always
-outside the synthesis-text ternary" rule `generation_result` established.
-
-**API + standalone page.** `POST /search/media` (`api/media_search.py`)
-searches directly, independent of the conversational `/ask` flow, per this
-feature's own requirement — reuses the existing shared
-`api_action_rate_limit_per_minute` (`api.rate_limit
-.enforce_api_action_rate_limit`) rather than a dedicated limiter, since a
-query is cheap and orchestrator-routed questions are already bounded by
-`/ask`'s own limiter (the same reasoning document/policy RAG have no
-dedicated limiter of their own either). `frontend/src/pages/MediaSearch.tsx`
-is a standalone page (mirrors `KnowledgeSources.tsx`'s shape) with its own
-nav entry, for direct use outside chat.
-
-**Known gaps, named rather than silently left:**
-- **No dense-video-captioning quality tuning has been done.** Whichever
-  small Ollama vision model is pulled works as-is; no evaluation of
-  caption quality across different models/prompts was performed as part
-  of building this.
-- **The eval harness extension (`eval/media_benchmark/`) ships as an
-  empty template**, not a populated dataset — this repo has no checked-in
-  media library to grade against. See that package's own `__init__.py`
-  and `dataset.yaml` for how to populate it against your own library.
-- **A full video clip is never streamed** — only a representative frame +
-  timestamp range. Real HTTP range-request video streaming is a
-  deliberately out-of-scope follow-up.
+**Read [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md#11-media-search)**
+for the full video pipeline (scene-change keyframing, ASR, OCR,
+captioning, dual embeddings) and known gaps, and
+[`SECURITY.md`](SECURITY.md)'s "Media search" section for the
+untrusted-content framing detail. Needs the system Tesseract OCR binary
+installed separately — see "Windows / Visual Studio-specific notes" below.
 
 ### Content moderation gate (mandatory, not a feature flag) (`moderation/`)
 
-Both content-ingestion pipelines — media search's images/video
-(`media/ingest.py`) and document/policy RAG's PDFs (`rag/ingestion.py`) —
-run every chunk of every file through `moderation/gate.py::moderate_chunks`
-before either one ever calls its own store's upsert/insert functions.
-**Mandatory whenever `ENABLE_MEDIA_SEARCH` or `ENABLE_DOCUMENT_RAG`/
-`ENABLE_POLICY_RAG` is on** — deliberately no `ENABLE_CONTENT_MODERATION`
-toggle exists that could silently disable it while leaving either pipeline
-on; missing provider/store config fails ingestion closed
-(`moderation.exceptions.ModerationNotConfiguredError`), mirroring
-`rag.store.RagStoreNotConfiguredError`'s existing pattern.
+Both content-ingestion pipelines — media search's images/video and
+document/policy RAG's PDFs — run every chunk of every file through
+`moderation/gate.py::moderate_chunks` before either one's store ever
+persists anything. **Mandatory whenever `ENABLE_MEDIA_SEARCH` or
+`ENABLE_DOCUMENT_RAG`/`ENABLE_POLICY_RAG` is on** — deliberately no
+`ENABLE_CONTENT_MODERATION` toggle exists that could silently disable it
+while leaving either pipeline on; missing provider/store config fails
+ingestion closed.
 
-**Chunking, per type, before moderation ever runs** (a classifier has
-input limits, and checking only a whole asset can miss a problem buried in
-one part of it):
-- **Image**: one chunk, unless it exceeds `MEDIA_IMAGE_TILE_THRESHOLD_PX`
-  in either dimension (default 2048px), in which case it's split into an
-  NxN grid of temp-file tiles first (`media/ingest.py::_tile_image_for_moderation`)
-  — a classifier's own internal downsampling could otherwise shrink away a
-  small region of concern in a very large image.
-- **Video**: one chunk per already-detected scene segment (reusing
-  `media/keyframes.py`'s existing segmentation, no second pass) — both the
-  keyframe image and its combined caption/transcript/OCR text are checked.
-  `media/ingest.py::_ingest_video` was restructured into two phases for
-  this: extract-and-moderate-every-segment-first, then only if *all* of
-  them pass does the existing embed+store loop run (reusing phase 1's
-  already-computed transcript/OCR/caption text, not redoing that work) —
-  per the decision rule below, one rejected segment blocks the whole video,
-  so nothing may be stored until every segment has been checked.
-- **PDF**: one chunk per page's text, plus one per embedded image
-  (`pypdf`'s `page.images`). A page flagged likely-scanned (the existing
-  `_OCR_SUSPECT_CHAR_THRESHOLD` heuristic, previously just a warning shown
-  to the uploader) is now actually rasterized (`pymupdf`, a new dependency
-  chosen over `pdf2image` specifically because it needs no system Poppler
-  binary) and OCR'd via the **existing** `media.ocr.extract_text`, reused
-  as-is rather than duplicated — the OCR'd text is used both for
-  moderation and for the real retrieval chunk that page contributes, so a
-  scanned page that passes moderation is also now actually searchable
-  (previously it indexed as an empty, unsearchable chunk).
+**Invariants that must not regress:** a hard-reject on any chunk rejects
+the **entire** asset — never a partial ingestion — and nothing from a
+rejected file is ever embedded or stored anywhere (a rejected PDF never
+gets a `rag.documents` row at all, including its raw bytes). Azure AI
+Content Safety (the only provider) has no dedicated "weapons"/"drugs"/
+"synthetic media" category — stated honestly via a text-blocklist proxy
+for the first two and a disclosed `"not_checked"` placeholder (never a
+hard-reject) for deepfake detection, not silently glossed over. This is
+the one required exception to this project's "fully local" model
+posture — accurate content moderation has no on-device option today.
 
-**Decision rule: a hard-reject on any chunk rejects the entire asset —
-never a partial ingestion.** Every chunk is still checked (not
-short-circuited on the first hit, so the audit trail is complete via
-`security.audit_log.log_security_event`), but nothing from a rejected file
-is ever embedded or stored anywhere. This required reordering
-`rag/ingestion.py::ingest_pdf` specifically: the pre-moderation flow called
-`rag/store.py::insert_document` (which can itself persist the file's raw
-bytes, if `ENABLE_PDF_DOWNLOAD` is on) *before* any content check ran — a
-real gap where a rejected file's bytes could already be sitting in the
-store ahead of the rejection being known. Now nothing touches
-`rag/store.py` until moderation has passed; a rejected PDF never gets a
-`rag.documents` row at all.
-
-**Taxonomy and its honest limits** (`moderation/taxonomy.py`). Azure AI
-Content Safety (the only provider implemented, `moderation/provider.py`,
-called via its REST API with `httpx` — no vendor SDK, matching
-`search/web_search.py`/`media_gen/client.py`'s existing pattern of calling
-a provider's REST endpoint directly) checks four real harm categories:
-Hate, SelfHarm, Sexual, Violence, each scored 0/2/4/6, hard-rejecting at or
-above `MODERATION_SEVERITY_THRESHOLD` (default 4). Azure has **no
-dedicated "weapons," "drugs," or "synthetic/AI-generated media" category**
-— stated honestly rather than glossed over:
-- **Weapons**: a coarse Violence-category proxy for imagery (Azure can't
-  distinguish "weapon" from "violence" generally) plus a custom text
-  blocklist (`config/moderation_blocklist.yaml`, loaded by
-  `config/moderation_blocklist.py`, mirroring `config/sensitive_columns.py`'s
-  exact hand-authored/read-fresh loader pattern) against OCR/caption/
-  transcript/extracted text.
-- **Drugs**: the same text blocklist only — no visual signal at all in
-  this implementation.
-- **Synthetic/manipulated ("hallucinated"/deepfake) media**: a
-  **disclosed placeholder**, not a real detector. Every image/video chunk
-  is recorded as `"not_checked"` for this category rather than silently
-  omitted or falsely presented as covered — no mainstream moderation API
-  reliably classifies this today. Deliberately a soft-flag, never a
-  hard-reject, even once a real detector is eventually plugged in
-  (deepfake classifiers have real, well-documented accuracy limits; an
-  auto-rejected false positive on real user content was judged worse than
-  under-flagging). See `docs/RISK_REGISTER.md`'s R-014.
-
-**A new, disclosed exception to "fully local."** Unlike every other model
-in this stack (Ollama, local CLIP, `faster-whisper`/Piper), accurate
-content moderation has no comparable on-device option today — this gate
-calls a third-party cloud API for every chunk of every ingested file. The
-provider is pluggable (`moderation.provider.SUPPORTED_MODERATION_PROVIDERS`,
-shaped exactly like `search/web_search.py::SUPPORTED_SEARCH_PROVIDERS`),
-so this is a deliberate, named tradeoff (see `docs/RISK_REGISTER.md`'s
-R-013), not an unexamined one — the design note for this feature stated
-the tension with this project's local-first posture explicitly before any
-code was written, rather than silently picking a path.
-
-**Metadata store (`moderation/store.py`), dedupe, and pooling.** A
-dedicated SQL Server connection (`MODERATION_STORE_CONNECTION_STRING`) —
-deliberately separate from both `DB_CONNECTIONS` and
-`RAG_STORE_CONNECTION_STRING` even though this table covers PDF assets
-too, since media search is independently toggleable from document/policy
-RAG and naming the shared setting after RAG specifically would be
-confusing when media-only search needs it — mirrors `rag/store.py`'s exact
-shape (a `@cache`-decorated `create_engine` call, idempotent
-`ensure_schema`, raw `text()` SQL, functions taking `engine: Engine`
-explicitly). One table, `moderation.media_assets`, keyed by content hash
-(`file_hash`, a unique index) — the dedupe lookup every ingestion call
-starts with: a previously-seen hash (whether it passed or was rejected)
-short-circuits before any extraction/moderation/embedding work, the
-feature's main performance win. `record_asset` is delete-then-insert
-(upsert-by-hash), not a bare `INSERT`, so a `force=True` re-run (bypassing
-the dedupe check on purpose) replaces the same content's old record rather
-than failing on the unique-index collision. Unlike `db/connection.py`/
-`rag/store.py` (both left on SQLAlchemy's `QueuePool` defaults of 5/10),
-this engine sets `pool_size`/`max_overflow` explicitly
-(`MODERATION_STORE_POOL_SIZE`/`_MAX_OVERFLOW`, default 10/20) since
-ingestion can run many concurrent DB writes.
-
-**Concurrency: this project's first bounded thread pool.** Before this,
-`scripts/build_media_index.py` was a plain sequential `for` loop; there
-was no background-job/task-queue/worker-pool infrastructure anywhere in
-this codebase (only a one-shot `threading.Thread` + `join(timeout)` idiom
-in `db/execution.py`/`db/query_cost.py`, used purely for hard query
-timeouts). Building a real async job queue (Celery/RQ) was judged heavier
-infrastructure than this project's stated scale justifies, so
-`scripts/build_media_index.py` instead gained a bounded
-`concurrent.futures.ThreadPoolExecutor` (`MEDIA_INGEST_WORKERS`, default
-4) — I/O-bound work (the moderation API call, DB writes) benefits from
-threads despite the GIL. The PDF upload path (`api/documents.py`) needed
-no equivalent change: FastAPI already dispatches each sync request handler
-to its own worker thread, so concurrent uploads already ran in parallel;
-only the connection pool sizing above matters there.
-
-**Known, narrow limitation, named rather than silently left:** the PDF
-dedupe short-circuit is keyed purely on content hash, not `(hash,
-collection, sensitivity_category)`. Re-uploading byte-identical PDF
-content to a *different* collection or with a different sensitivity tag
-than its first upload reuses the first upload's existing `rag.documents`
-row (collection/tag included) rather than creating a second one for the
-new intent — a deliberately accepted tradeoff for the common case (skip
-redundant moderation/embedding entirely for a true duplicate), not
-silently mishandled.
+**Read [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md#12-content-moderation-gate)**
+for the full per-type chunking strategy (image/video/PDF), the dedupe
+store, and the concurrency design, and
+[`docs/RISK_REGISTER.md`](docs/RISK_REGISTER.md)'s R-013/R-014 for the
+disclosed tradeoffs above.
 
 ### Malware scanning (`security/malware_scanner.py`)
-Added in a 2026 dependency/CI-hardening pass, closing what every prior
-file-upload security document in this repo (`docs/FILE_UPLOAD_FINAL_REPORT.md`,
-`SECURITY_FINAL_REPORT.md`) named as the single most significant
-remaining gap: no `MalwareScanner` abstraction existed anywhere in
-source. Scans a file's **raw bytes**, before any parser
-(`pypdf`/`pymupdf`/Pillow/PySceneDetect) touches them — a real, separate
-concern from `moderation/gate.py`'s content-harm checks, which only run
-*after* parsing/extraction. Wired into both `rag/ingestion.py::ingest_pdf`
-and `media/ingest.py::ingest_file`, right after the existing
-dedupe-by-hash check and before any real parsing begins.
+Scans a file's **raw bytes**, before any parser touches them — a separate
+concern from the content-moderation gate above, which only runs after
+extraction. Wired into both `rag/ingestion.py::ingest_pdf` and
+`media/ingest.py::ingest_file`, right after the dedupe-by-hash check.
+Pluggable (`Settings.malware_scan_provider`, `"disabled"`/`"clamav"`),
+spoken to directly over `clamd`'s `INSTREAM` protocol.
 
-Pluggable the same `SUPPORTED_..._PROVIDERS`-dict way every other external
-integration in this codebase is (`moderation/provider.py`,
-`search/web_search.py`) — `Settings.malware_scan_provider`
-(`"disabled"`/`"clamav"`). Only ClamAV is implemented, spoken to directly
-over `clamd`'s own `INSTREAM` wire protocol via a plain socket (no
-`pyclamd`/vendor SDK, matching this codebase's usual "call the provider's
-own protocol directly" convention).
+**Invariant: deliberately off by default, but genuinely fail-closed once
+enabled** — an infected result, an unreachable/timed-out daemon, and a
+malformed response are all treated as a rejection; "unknown" is never
+silently treated as "clean." `"disabled"` is still audit-logged per
+upload, not silently skipped.
 
-**Deliberately off by default (`"disabled"`) — the one real difference
-from `moderation_provider`'s "mandatory, no feature flag" posture**, and a
-conscious choice, not an oversight: no scanning capability existed before
-this module, so defaulting it "on" would have silently broken every
-existing document/media upload path for any deployment that hasn't stood
-up a ClamAV daemon (most deployments, today). Once an operator opts in
-(`MALWARE_SCAN_PROVIDER=clamav`), behavior is genuinely fail-closed: an
-infected result, an unreachable/timed-out daemon, and a malformed
-response are all treated as a rejection (`security.malware_scanner
-.ScanResult.blocked`) — "unknown" is never silently treated as "clean."
-`"disabled"` is still audit-logged per upload (`malware_scan_skipped`),
-not silently skipped.
-
-**Known limitation, named rather than hidden**: this abstraction's
-fail-closed logic is unit-tested against a mocked `clamd` socket
-(`tests/security/test_malware_scanner_gate.py`, 18 tests) but has never
-been exercised against a real `clamd` daemon in this project's own
-history — see `docs/security/FINAL_PRODUCTION_GATE.md`'s Malware Scanning
-row (`PARTIAL`, a named P0 for any deployment that enables
-`ENABLE_DOCUMENT_RAG`/`ENABLE_POLICY_RAG`/`ENABLE_MEDIA_SEARCH` without
-also configuring a real scanner).
+**Known limitation:** fail-closed logic is unit-tested against a mocked
+`clamd` socket only — never exercised against a real daemon in this
+project's history. See
+[`docs/security/FINAL_PRODUCTION_GATE.md`](docs/security/FINAL_PRODUCTION_GATE.md)'s
+Malware Scanning row and [`docs/RISK_REGISTER.md`](docs/RISK_REGISTER.md)'s
+R-016.
 
 ### Voice mode (speech input/output) (`voice/`)
 Optional, **on by default** (`ENABLE_VOICE_MODE=true`) — unlike media
 generation, this feature spends no money and makes no external network
-call once its one-time local model downloads are done, so there's no
-cost-control reason to make it opt-in the way `ENABLE_MEDIA_GENERATION`
-is. Spoken questions are transcribed via `faster-whisper`
-(CTranslate2-based Whisper), spoken answers synthesized via Piper. Both
-run fully local inference (no torch
-pulled in by either — `faster-whisper` uses `ctranslate2`, Piper uses
-`onnxruntime`, already a transitive dep via chromadb), matching this
-project's "Ollama, not a hosted LLM" posture: no cloud API, no data
-leaving the machine, no API key required for voice mode either.
-`voice/stt.py`/`voice/tts.py` each wrap their backend behind a single
-`transcribe()`/`synthesize()` call so either could be swapped later
-(whisper.cpp, Coqui TTS) without touching `api/voice.py`.
+call once its one-time local model downloads are done. Transcription via
+`faster-whisper`, synthesis via Piper — both fully local inference (no
+`torch`).
 
-**A transcribed question is never treated specially.** `POST
-/voice/transcribe`'s result is submitted through the exact same `POST
-/ask` path a typed question uses — `agent.input_guard.check_input`
-therefore applies unconditionally, with no separate code path for voice
-input to bypass.
+**Invariants that must not regress:** a transcribed question is **never**
+treated specially — `POST /voice/transcribe`'s result is submitted
+through the exact same `POST /ask` path a typed question uses, so
+`agent.input_guard.check_input` applies unconditionally, with no separate
+code path for voice input to bypass. Nothing is auto-submitted from a
+voice turn — the existing Send button is the only confirmation step — and
+`originatedFromVoice` (set only when the textarea still holds a voice
+transcript at send time, never by typing) is a structural guarantee, not
+a runtime check, that a typed question can never trigger
+`POST /voice/synthesize`.
 
-**One voice turn, inline in the composer — record once, review, then the
-user presses Send.** `frontend/src/hooks/useVoiceConversation.ts` drives
-listen → transcribe (`idle` → `listening` → `transcribing` → back to
-`idle`, plus a `speaking` phase while a spoken answer plays back) per
-mic-button click. There is **no separate takeover card** —
-`ChatInput.tsx` keeps its normal textarea/mic/send layout the whole time;
-the mic button itself toggles in place to a stop button while
-`phase === 'listening'` (same position, never a second button), and
-while `isTranscribing`/`isSpeaking` it shows a small spinner/volume icon
-instead. While listening, the textarea is read-only and shows the live
-interim caption (see "Live captions" below) in place of its real value,
-so the box visibly "types" what it hears; once the local
-`POST /voice/transcribe` result comes back, `useVoiceConversation` hands
-its **raw `text` only** (never `corrected_text`, the optional AI-cleaned
-rewrite — see `voice/correction.py`) to `ChatInput` via an
-`onTranscribed` callback, which drops it straight into the textarea,
-exactly as if it had been typed. From there it's an ordinary editable
-question: nothing is auto-submitted, and the existing Send button (or
-Enter) is the only confirmation step — this is what makes "confirm before
-sending" fall out of the same UI a typed question already uses, rather
-than needing a dedicated review screen. `ChatInput` tags the question as
-voice-originated (`QueryHistoryEntry.originatedFromVoice`) as long as the
-box still holds that transcript, including through manual edits — only
-clearing the box and typing fresh from empty drops the tag. A failed turn
-(mic denied, transcription error) surfaces its message inline under the
-composer (`voice.error`) and leaves the textarea usable, rather than
-lingering in any special state.
+**Disclosed, deliberate exception to "fully local":** live word-by-word
+captions while listening use the browser's built-in `SpeechRecognition`
+Web Speech API, which (in Chromium) sends microphone audio to the browser
+vendor's own cloud speech service. The caption is **never** what gets
+submitted — the local Whisper result remains the sole authoritative
+transcript, discarded and replaced the moment it returns.
 
-**Autoplay warm-up for the very first spoken answer.** The gap between
-the mic-button click and the actual `<audio>.play()` call in
-`playAnswer` can be several seconds (recording + local transcription +
-the agent's own LLM round trip), which is long enough that some
-browsers no longer treat that later, code-triggered play as tied to the
-original click and silently block it. `start()` works around this by
-calling `.play()` synchronously inside the click handler itself, on a
-~0-byte silent WAV (`SILENT_AUDIO_SRC`), on the same `<audio>` element
-`playAnswer` reuses — a real, gesture-attributed play call that "warms
-up" audio for that tab before the actual spoken answer is ready.
-
-**Live captions are a disclosed, deliberate exception to "fully local."**
-While listening, `frontend/src/hooks/useSpeechRecognition.ts` wraps the
-browser's built-in `SpeechRecognition`/`webkitSpeechRecognition` Web
-Speech API purely to show word-by-word interim captions as the user
-talks ("typing itself simultaneously"). In Chromium-based browsers this
-API sends microphone audio to the browser vendor's own cloud speech
-service — a real, narrow exception to this feature's otherwise-local
-STT/TTS design, chosen deliberately (offered to and picked by the user
-over a laggier fully-local chunked-transcription alternative) because no
-local model can produce true instant word-by-word captions from a
-streaming batch architecture like `faster-whisper`'s. The caption is
-**never** what gets submitted — the local Whisper result from `POST
-/voice/transcribe`, run once the browser detects end-of-utterance,
-remains the sole authoritative transcript; the live caption is discarded
-the moment it comes back. `continuous: false` on the recognizer is what
-ends listening automatically (the browser's own `onend` fires on
-detected silence) without a manual stop button. Browsers without this API
-(`useSpeechRecognition().isSupported === false`) get no live caption and
-no auto-stop signal — the textarea shows a static "recording" placeholder
-instead, and the mic-turned-stop button is the only way to end listening
-in that case; local transcription and TTS playback are unaffected either
-way.
-
-**Schema-aware transcription accuracy.** `voice.stt._build_vocabulary_hint`
-introspects every configured database's table/column names (reusing
-`db.connection`/`db.schema_introspection`, no new engine) and feeds a
-short, deduped, length-capped (`Settings.stt_vocabulary_max_chars`)
-comma-joined string to Whisper's `initial_prompt` — biases recognition
-toward real schema terms ("branch_id", "dispute") instead of
-similar-sounding common words. Computed fresh per call rather than cached,
-since introspection is already cheap and this isn't a hot path; fails
-open (returns `""`, logs a warning) on any introspection error, the same
-fail-open posture `agent.llm_client._build_golden_examples_block` already
-has for its own accuracy-only aid.
-
-**Security.** A recorded upload is capped by both size
-(`Settings.voice_max_upload_mb`, enforced the same read-and-reject-if-over
-way `api/documents.py::upload_document` caps a PDF) and duration
-(`Settings.voice_max_duration_seconds`, checked by cheaply probing the
-decoded audio's length via PyAV *before* running the comparatively
-expensive Whisper model, not after). `POST /voice/synthesize`'s input
-text is capped by the existing `Settings.max_question_length`, reused
-rather than duplicated.
-
-**What gets spoken back.** A voice-originated turn that succeeds gets a
-spoken answer, in priority order: `state.insight` (SQL path, if the
-insight feature produced one) → `state.synthesized_answer`/the relevant
-per-source answer (multi-source path) → a row-count fallback ("Found N
-rows.") — never silent on success. Origin tracking is a plain boolean
-(`QueryHistoryEntry.originatedFromVoice` in `frontend/src/lib/history.ts`,
-set by `ChatInput.submit()` whenever the textarea still holds a voice
-transcript at send time, never by typing) so a typed question can never
-trigger `POST /voice/synthesize` at all — not a runtime check, a
-structural guarantee. Playback happens once, automatically, via
-`useVoiceConversation`'s own `<audio>` element (`playAnswer`, called by
-`ChatInput.submit()` right after `askQuestion` resolves) using the same
-element `start()` warmed up for the browser's autoplay policy — see
-"Autoplay warm-up" below; `TurnCard.tsx` renders the same
-`entry.spokenAudioUrl` afterward with `controls` only (no `autoPlay`) so
-the user can manually replay it without hearing it spoken twice.
-
-**Piper voice models are a separate one-time download**, same shape as
-`ollama pull` — `scripts/download_voice_model.py` (calls
-`piper.download_voices.download_voice` directly) fetches
-`<voice>.onnx`/`<voice>.onnx.json` from the public `rhasspy/piper-voices`
-repo into `voice/models/` (gitignored, like `embeddings/.chroma/`).
-Faster-whisper's own model needs no such step — it auto-downloads from
-Hugging Face Hub on first use and caches on disk.
-
-**Capability discovery.** `GET /health` carries a `voice_enabled` field
-(`Settings.enable_voice_mode`); the React dashboard only shows the mic
-button and its own settings toggle
-(`HistorySettingsSection.tsx`/`settingsStore.voiceModeEnabled`, persisted
-like theme/accent) when the server says the feature is actually
-available — the "all-or-nothing infra flag, plus a per-session UI switch"
-shape.
+**Read [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md#13-voice-mode)** for
+the full UI state machine, autoplay warm-up mechanics, schema-aware
+transcription vocabulary hinting, and upload size/duration security
+limits.
 
 ### Authentication, authorization, and the 2026 security hardening passes
-Two independent layers, both worth understanding before touching `api/`,
-`agent/orchestrator/`, or `rag/` — the "no per-user authorization system"
-phrasing that appears in a couple of older notes elsewhere in this file
-predates both and is no longer accurate for anything gated by
-`agent/authz.py`'s permissions:
+Two independent layers — the "no per-user authorization system" phrasing
+that appears in a couple of older notes elsewhere in this file predates
+both and is no longer accurate for anything gated by `agent/authz.py`'s
+permissions.
 
-- **Authentication** (`security/oidc.py` + `api/auth.py`) — one dispatch
-  point, `Settings.auth_mode`: `none` (default; unchanged behavior for
-  local/single-user use), `static_token` (`API_AUTH_TOKEN`, a shared
-  bearer secret, constant-time compared — grants a fixed "admin"-equivalent
-  identity, since a single shared secret has no natural sub-identity to
-  scope down), or `oidc` (`OIDC_ISSUER` set — validates a JWT against any
-  standard-compliant identity provider: server-side algorithm allowlist
-  never trusting the token's own `alg`, mandatory audience validation,
-  bounded clock skew, no raw token/claim ever logged). `ENVIRONMENT=production`
-  fails closed at startup (`config/settings.py::_require_identity_in_production`)
-  if neither is configured. Full detail: `docs/AUTHENTICATION.md`.
-- **Authorization** (`agent/authz.py` + `api/authz.py`) — RBAC: 15
-  fine-grained permissions, 4 extensible default roles (`viewer`/`user`/
-  `analyst`/`admin`), an unrecognized role grants zero permissions (fail
-  closed). Wired into every data-touching/expensive route **and** the
-  multi-source router itself — `agent/orchestrator/nodes.py`'s
-  `router_node` filters the LLM's own source selection through a
-  permission check *before* any subgraph runs, so a routing decision the
-  LLM makes can request access but never unilaterally grant it. Full
-  detail and the resource-to-permission mapping: `docs/AUTHORIZATION.md`.
-- **Local self-hosted accounts** (`identity/`, a 4th `auth_mode` value,
-  `Settings.local_auth_enabled` — see `docs/AUTHENTICATION.md`) — this
-  app's own accounts: Argon2id password hashing, locally-issued JWT access
-  tokens + rotating opaque refresh tokens (reuse-detection revokes the
-  whole session family, `identity/repositories/sessions.py`), account
-  lockout, password reset, email verification. A local user's role names
-  (`viewer`/`user`/`analyst`/`admin`) feed straight into the *same*
-  `AuthIdentity.roles`/`agent/authz.py` RBAC bridge described above — zero
-  changes needed to any existing AI/RAG/SQL route's authorization check.
-  **Display name is mandatory at sign-up** and **passwords must clear a
-  real strength policy** (`identity/password_policy.py` — common-password/
-  sequential-digit/keyboard-walk/identity-fragment checks, 12-64 chars,
-  never silently truncated) — see
-  `docs/authentication-and-password-policy.md`.
-- **Frontend OIDC login** (2026 Phase 3, `frontend/src/lib/auth.ts` +
-  `store/authStore.ts`) — a real Authorization Code + PKCE flow
-  (`oidc-client-ts`), in-memory-only token storage (`InMemoryWebStorage`,
-  never `localStorage`/`sessionStorage`, so an XSS payload can't read a
-  persisted token — the tradeoff is a hard refresh clears it, so app load
-  always attempts a silent hidden-iframe re-auth against the IdP's own
-  session first). Closes a real gap: before this, the SPA's only possible
-  credential was `VITE_API_AUTH_TOKEN`, a build-time-baked, admin-granting
-  shared secret extractable from the public JS bundle. A pure pass-through
-  (`AuthGate.tsx` renders `children` directly) unless
-  `VITE_OIDC_AUTHORITY`/`VITE_OIDC_CLIENT_ID` are set — zero behavior
-  change for the common local/single-operator deployment. **Not yet
-  verified against a live identity provider** in this environment — passes
-  every static check available (`tsc`, `oxlint`, `npm run build`) and
-  follows `oidc-client-ts`'s documented API shape, but no real IdP/browser
-  was reachable to exercise the interactive flow end-to-end; see
-  `docs/AUTHENTICATION.md`'s own disclosure before relying on it.
-- **DB write-privilege check is now startup-enforced, not just a manual
-  CLI check** (2026 Phase 3, `api/main.py::_enforce_database_write_privileges`).
-  `db.connection.check_write_privileges` existed since an earlier phase but
-  was only ever called from `scripts/test_db_connection.py` — a deployment
-  that never ran that script by hand got no signal that its supposedly
-  read-only `DB_USER` wasn't. Now runs once per configured database at
-  `lifespan` startup; refuses to start (`ConfigurationError`) if
-  `ENVIRONMENT=production` and any database's connected role appears to
-  hold write privileges, warns otherwise. Doesn't change the layering
-  described in "True read-only enforcement is layered, not just
-  code-level" below — it makes a misconfigured DB-role layer detectable
-  and startup-blocking instead of silent.
-- **Security headers / CSP** (2026 Phase 3, `api/main.py::_add_security_headers`,
-  on by default via `Settings.enable_security_headers`) — HSTS,
-  `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`,
-  `Referrer-Policy`, `Permissions-Policy` (every sensor denied except
-  `microphone=(self)`, for voice mode), and a `Content-Security-Policy`
-  scoped to what the built dashboard actually loads (no inline `<script>`,
-  Google Fonts, `blob:`/`data:` for generated media). `frame-src` is
-  derived from `OIDC_ISSUER` when set, since OIDC silent-renew loads the
-  IdP in a hidden iframe that a bare `default-src 'self'` would otherwise
-  silently block. Override via `Settings.content_security_policy` for a
-  deployment this default doesn't fit. Also new this pass:
-  `config/settings.py` rejects `CORS_ALLOWED_ORIGINS=*` at startup — a
-  wildcard is meaningless (and browser-rejected) combined with this app's
-  `allow_credentials=True` CORS setup, caught at config time rather than
-  relied on to fail at request time.
+**Invariants that must not regress:** `Settings.auth_mode` is the one
+dispatch point (`none`/`static_token`/`oidc`/local self-hosted accounts,
+plus Google sign-in layered on local accounts) — `ENVIRONMENT=production`
+fails closed at startup if identity is unconfigured. RBAC
+(`agent/authz.py`) is wired into every data-touching/expensive route
+**and** the multi-source router itself — `router_node` filters the LLM's
+own source selection through a permission check *before* any subgraph
+runs, so a routing decision the LLM makes can request access but never
+unilaterally grant it; an unrecognized role grants zero permissions (fail
+closed). Local accounts and Google sign-in both feed the *same*
+`AuthIdentity.roles`/RBAC bridge — zero changes needed to any existing
+route's authorization check.
 
-See `SECURITY_FINAL_REPORT.md` / `SECURITY_BASELINE.md` /
-`SECURITY_CHANGELOG.md` at the repo root for the full 2026 Phase 3 audit
-trail (per-control PASS/PARTIAL/FAIL findings, what was fixed vs. what
-remains open — notably 24 known CVEs across 7 backend dependencies,
-requiring a `langgraph` 0.2→1.0 migration this pass deliberately didn't
-attempt) and `SECURITY_PRODUCTION_CHECKLIST.md` for an operator-facing
-go/no-go list. `docs/security-changelog.md` carries the dated changelog
-entry for this pass alongside every earlier change-controlled security
-decision.
-
-**A later, separate engagement (`docs/security/`, not the repo-root
-`SECURITY_*.md` files above) picked this up further**: a CI-gate-hardening
-pass (bandit/pip-audit/a new `detect-secrets` gate all flipped from
-report-only to actually blocking, each backed by an evidence trail rather
-than a bare flag flip — see `docs/security/CVE_TRIAGE.md`), the malware
-scanner described above, a from-scratch dependency-CVE reachability
-re-verification (`docs/security/DEPENDENCY_SECURITY_FINAL_REPORT.md`), a
-first Trivy container scan this project has ever had run
-(`docs/security/CVE_TRIAGE.md` §4 — 29 new CRITICAL/HIGH findings, 4
-confirmed not-reachable, ~17 OS-level only partially verified), and a
-final production-readiness gate
-(`docs/security/FINAL_PRODUCTION_GATE.md` / `PRODUCTION_SECURITY_READINESS_REPORT.md`)
-whose verdict is **NOT READY** — not because a vulnerability was found in
-any of the above, but because DAST and a live-IdP OIDC end-to-end test
-have never been run in any environment this project has had access to
-(`docs/security/DAST_REPORT.md`/`OIDC_E2E_TEST.md`, both honestly
-`NOT VERIFIED` rather than assumed), and the malware scanner immediately
-above is real but real-world-unverified. `docs/security/INCIDENT_RESPONSE.md`
-(previously fully absent, a named gap in every earlier pass) and a
-`langgraph` 0.2→1.0 migration assessment
-(`docs/security/LANGGRAPH_UPGRADE_SECURITY_ASSESSMENT.md` — assessed, the
-migration itself still deliberately not attempted) were also produced in
-this engagement. Read `docs/security/PRODUCTION_SECURITY_READINESS_REPORT.md`
-first if you're deciding whether this project is ready to deploy
-somewhere real — it is the most current, most rigorously-sourced answer
-to that question in this repository, superseding the repo-root
-`SECURITY_*.md` files' own bottom line where the two differ.
+**Read [`docs/AUTHENTICATION.md`](docs/AUTHENTICATION.md)** for the four
+auth modes, frontend OIDC login, and Google sign-in (including what's
+live-verified vs. not), and
+[`docs/AUTHORIZATION.md`](docs/AUTHORIZATION.md) for the full
+resource-to-permission mapping. For the broader security posture
+(security headers/CSP, DB write-privilege startup enforcement, CI gates,
+CVE triage) see [`SECURITY.md`](SECURITY.md) and
+[`docs/security-changelog.md`](docs/security-changelog.md); for the
+current, most-rigorously-sourced production-readiness verdict (as of this
+writing: **NOT READY**, over DAST/live-IdP gaps, not a found
+vulnerability), start at
+[`docs/security/PRODUCTION_SECURITY_READINESS_REPORT.md`](docs/security/PRODUCTION_SECURITY_READINESS_REPORT.md)
+— it supersedes the repo-root `SECURITY_*.md` files' own bottom line where
+the two differ.
 
 ### Universal server-side chat history (`identity/repositories/history.py`, `api/chat_history.py`)
-For a locally-authenticated user (see above), every conversation and
-message is now stored permanently in the identity database, not just in
-the browser tab's Zustand store — the fix for a real, previously-disclosed
-gap: chat state used to be entirely in-memory-only
-(`frontend/src/store/chatStore.ts`), so the same signed-in user got a
-blank history on a different browser/device, and a page reload cleared it.
-See `docs/chat-history-authentication-audit.md` for the full before/after
-and `docs/chat-history-architecture.md` for the schema/API/frontend design.
+For a locally-authenticated user, every conversation and message is
+stored permanently in the identity database — the fix for a real,
+previously-disclosed gap (chat state used to be entirely in-memory-only,
+so the same signed-in user got a blank history on a different
+browser/device, and a page reload cleared it).
 
-`identity.models.Conversation`/`Prompt`/`AiOutput` (all pre-existing
-tables from the identity module's own initial build, previously unused by
-any code path) are the storage: `Prompt` is one user question, `AiOutput`
-its assistant answer, paired by a per-conversation `sequence_number`
-(assigned once, inside one transaction, by
-`identity.repositories.history.append_turn` — never a client-supplied
-value). `POST /ask` (`api/main.py`) calls this via a small glue module,
-`api/chat_persistence.py::persist_ask_turn`, *after* the agent's own
-schema-retrieval/generation/validation/execution has already fully run —
-**a persistence failure here can never fail the `/ask` response itself**
-(wrapped in a broad `except Exception`, logged, degrades silently for that
-one turn), the same fail-open posture this codebase already applies to
-every other non-critical-path accuracy aid (`plan_query_node`,
-`retrieve_golden_examples_node`, `retrieve_business_context_node`).
+**Invariants that must not regress:** every route requires
+`Depends(require_local_user)` and folds `user_id` directly into every
+repository-layer query, so a wrong/forged `conversation_id` resolves to a
+404, never confirming another user's conversation even exists. A
+persistence failure here can never fail the `/ask` response itself
+(fail-open, same posture as every other non-critical-path accuracy aid).
+Retention is soft-delete only (`deleted_at`) — logout, session expiry, or
+an app restart never delete chat history; only an explicit
+`DELETE /conversations/{id}` does. **Opening a saved conversation never
+re-executes SQL, re-fetches a web page, or re-runs OCR/vision** — only an
+explicit "Confirm and Run" click does. **Known limitation:** only a
+locally-authenticated user gets this — an OIDC or unauthenticated
+caller's questions are answered normally but nothing is persisted.
 
-`api/chat_history.py` exposes `GET/POST/PATCH/DELETE /conversations`,
-`GET/POST /conversations/{id}/messages`, and `GET /chat/search` — every
-route requires `Depends(require_local_user)` and folds `user_id` directly
-into every repository-layer query (never a permission check layered on
-top of an unscoped fetch), so a wrong/forged `conversation_id` resolves to
-a 404, never confirming another user's conversation even exists (same
-account-enumeration-avoidance principle `identity.exceptions
-.InvalidCredentialsError` already applies to login). Search
-(`identity.repositories.history.search_history`) uses plain, portable
-`ILIKE '%term%'` (works identically against this repo's SQLite test engine
-and the real PostgreSQL identity database) accelerated by `pg_trgm` GIN
-trigram indexes on PostgreSQL — deliberately not `to_tsvector` full-text
-search or a separate search engine, given this project's own local-dev-
-oriented scale. See `docs/chat-history-search.md`.
-
-**Retention**: logout, session expiry, a browser/device change, or an app
-restart never delete chat history — only an explicit, user-initiated
-`DELETE /conversations/{id}` does, and even that is a soft delete
-(`deleted_at`), never a real `DELETE`. `frontend/src/store/chatStore.ts
-::clearHistory()` (called on logout/user-switch, wired from
-`AuthGate.tsx`) only clears **in-memory** state — it never calls a delete
-API.
-
-**Known limitation, named not hidden**: only a locally-authenticated user
-gets this — an OIDC or unauthenticated caller's questions are still
-answered normally, nothing is persisted for them (no `identity.users` row
-to attach a conversation to).
-
-**Universal conversation history fix (2026-09-27)**: before this pass, a
-reloaded past turn only ever showed the plain answer text plus SQL (if
-any) — every other route's contribution (web/document/policy/generation/
-media-search/attachment answers and citations, which source(s) actually
-fired, a confirmed execution's rows/chart) was silently dropped at save
-time, which is what made reopening a saved conversation show no assistant
-answer, an empty SQL editor with "Confirm and Run" (`TurnCard.tsx`'s own
-"empty `sources_used` means the SQL path" convention misfiring on a
-fabricated empty array), or `[object Object]` (a separate bug in
-`frontend/src/lib/api.ts`'s error-detail parsing — a FastAPI 422
-validation error's `detail` is an array of objects, not a string).
-`api/chat_persistence.py::_build_history_metadata` now snapshots a
-bounded, redacted superset of `AskResponse` into the same `AiOutput
-.metadata_json` JSONB column (no migration needed — it was already an
-arbitrary-shape JSON column), versioned via `schema_version` so a legacy
-pre-fix record degrades gracefully rather than guessing. `POST /execute`
-can now attach a confirmed result to the exact turn it came from
-(`AskResponse.message_id`, a new field) so reopening a conversation whose
-SQL was already run shows those rows/chart immediately — **opening a
-saved conversation never re-executes SQL, re-fetches a web page, or
-re-runs OCR/vision**; only an explicit "Confirm and Run" click does. See
-`docs/chat-history-architecture.md`'s §6.5 for the full design and what
-still isn't restored (retrieved-schema DDL, a chart's own free-text
-customization).
+**Read [`docs/chat-history-architecture.md`](docs/chat-history-architecture.md)**
+for the schema/API/frontend design (§6.5 covers the full-turn-metadata
+fix and what still isn't restored on reload — retrieved-schema DDL, a
+chart's own customization),
+[`docs/chat-history-authentication-audit.md`](docs/chat-history-authentication-audit.md)
+for the before/after, and
+[`docs/chat-history-search.md`](docs/chat-history-search.md) for the
+search design.
 
 ### Frontend UI redesign (2026 UI pass)
 A ground-up-in-appearance, additive-in-substance redesign of `frontend/`
-into a left-sidebar/main-workspace AI-workspace layout — no backend logic,
-API contract, auth flow, SQL validation, or chat-persistence behavior
-changed as part of this pass; every change is presentation/interaction
-layer only, verified by the pre-existing backend test suite being
-untouched and the frontend's own `GET`/`POST` call sites being unchanged.
-Four docs carry the full detail so this section stays a pointer, not a
-duplicate:
+into a left-sidebar/main-workspace layout. **Invariant that must not
+regress:** no backend logic, API contract, auth flow, SQL validation, or
+chat-persistence behavior changed as part of this pass or its two
+follow-up bug-fix passes (duplicated Settings/Sign-out controls; a
+dark-mode-only modal-transparency bug from an inherited "glass" CSS
+token) — every change is presentation/interaction layer only.
 
-- [`docs/frontend-ui-audit.md`](docs/frontend-ui-audit.md) — the Phase 1
-  audit this pass started from: component hierarchy, design
-  inconsistencies, and gaps as they stood before any change.
-- [`docs/ui-design-system.md`](docs/ui-design-system.md) — the token set
-  added to `frontend/src/index.css` (message-role surfaces, code/SQL
-  surfaces, a focus-ring token, named z-index tiers, named transition
-  durations) and the new shared `components/ui/` primitives (`dialog.tsx`,
-  `drawer.tsx`, `toast.tsx`, `copy-button.tsx`), all additive to the
-  existing Tailwind v4 + CSS-custom-property system — no new styling
-  framework.
-- [`docs/chat-history-ui.md`](docs/chat-history-ui.md) — the sidebar/
-  settings split: `HistoryDrawer.tsx` (one combined right-side drawer) was
-  deleted in favor of `Sidebar.tsx` (persistent left rail, `lg:`+),
-  `MobileNav.tsx` (hamburger + drawer below `lg:`, rendering the same
-  `Sidebar`), and `SettingsDialog.tsx` (the unmodified
-  `HistorySettingsSection.tsx` content, now its own surface). Search/list/
-  rename/delete logic was extracted into `hooks/useChatSearch.ts` and
-  independently-tested presentational components
-  (`ConversationSearch`/`ConversationList`/`ConversationListItem`/
-  `ConversationSearchResults`) — the server-backed history/search behavior
-  itself (`GET /conversations`, `GET /chat/search`, etc.) is unchanged.
-- [`docs/image-editing-architecture.md`](docs/image-editing-architecture.md)
-  — a genuinely new capability, **originally frontend-only and explicitly
-  labeled as such in the UI**: `ChatInput.tsx` accepts image attachments
-  (file picker, drag-drop, clipboard paste) with a full local editor
-  (`components/image/ImageEditor.tsx`, Konva/react-konva — crop, rotate,
-  flip, draw, shapes, text, mask layer, undo/redo). At the time this was
-  built, no backend endpoint accepted a chat attachment at all — see the
-  "Chat attachments" section below for the pass that closed that specific
-  gap; **AI-guided editing specifically is still unchanged and still not
-  built**: the editor's "AI-guided editing" section is real, visible UI
-  (per the original request's instruction not to hide the affordance) but
-  its adapter (`lib/imageEditAdapter.ts`'s `AiGuidedEditAdapter`) remains a
-  deliberate, permanent stub that always rejects with a clear "not
-  configured" message — never a fabricated result. The backend contract a
-  real implementation would need (`POST /media/edit`, mirroring
-  `media_gen`'s existing human-approval/cost-ceiling/SSRF-hardened-storage
-  pattern) is documented but **not built** — a substantial backend feature
-  in its own right, correctly out of scope both for the original frontend
-  UI pass and for the later "Chat attachments" pass (which only reuses the
-  editor's *manual* crop/rotate/draw output, never routes through this
-  adapter). The editor is lazy-loaded (`React.lazy`, its own
-  ~343KB/106KB-gzip chunk) so attaching or viewing an image — or using the
-  app without ever touching images — never pays Konva's bundle cost.
-
-**Follow-up pass — duplicated controls + sidebar collapse (still 2026-09-18):**
-the redesign above introduced its own new duplication, found and fixed in
-a immediately-following pass: `SettingsDialog` was mounted **twice**
-(once in `AppShell.tsx`'s header, once in `Sidebar.tsx`'s footer), each
-with its own independent open/closed state and its own gear button, and
-Sign Out was similarly copy-pasted in both places. Fixed by introducing
-`layout/UserMenu.tsx` — one consolidated account menu (avatar → display
-name/email, Settings, Theme, Sign out), rendered exactly once, in the
-header — and deleting `Sidebar.tsx`'s entire footer (it now owns exactly
-one concern, history navigation). Also added real desktop sidebar
-collapse (`layout/SidebarToggle.tsx`, one instance, header-only;
-`settingsStore.sidebarCollapsed`, persisted, the single source of truth —
-deliberately separate from `MobileNav`'s own ephemeral drawer-open state,
-which is a different concern and was never unified with it). See
-[`docs/ui-production-audit.md`](docs/ui-production-audit.md) for exactly
-what was found duplicated and how it was verified (by reading handlers,
-not just visual similarity), and
-[`docs/navigation-and-actions.md`](docs/navigation-and-actions.md) for the
-resulting one-action-one-owner table, including the one deliberate,
-documented exception (`ThemeToggle` appears both as a `UserMenu` shortcut
-and inside the full Settings dialog — same component/store, not a second
-implementation). Verified visually, not just via component tests: a real
-headless-Chromium pass (dev server + Playwright, auth mocked via request
-interception) at desktop/tablet/mobile widths and in dark mode, zero
-console errors.
-
-**Second follow-up pass — Settings modal background bled through in dark
-mode (2026-09-19):** a later report showed the Settings panel/backdrop
-letting background chat content show through, but only in dark mode. Root
-cause: `ui/dialog.tsx`'s panel used `bg-[var(--card)]`, and `--card`'s
-dark-mode value (`index.css`) is `#15132485` — an 8-digit hex with an
-embedded ~52%-opacity alpha channel, a deliberate "glass" treatment for
-other surfaces (message bubbles) that the modal panel wrongly inherited;
-the overlay was also only `bg-black/40` (40% opaque) in both themes. Light
-mode's `--card: #ffffff` has no alpha component, which is exactly why the
-first follow-up pass's own dark-mode screenshot check above didn't catch
-this — that pass verified layout/duplication, not per-theme opacity.
-Fixed with two new tokens, deliberately independent of `--card`:
-`--modal-backdrop` (`#05050a`, opaque in both themes) and `--modal-surface`
-(`#ffffff` light / `#151324` dark — `--card`'s dark hue with the alpha
-stripped), consumed by `ui/dialog.tsx` (panel + overlay) and `ui/drawer.tsx`
-(overlay only — its own panel, `--sidebar`, had no alpha channel in either
-theme already). `AppShell.tsx`'s background wrapper also now gets the
-native `inert` attribute while a modal is open, additive to the opaque
-backdrop — `inert` removes the background from the accessibility tree/tab
-order, the backdrop handles visual occlusion. Both `ImageViewer`/
-`ImageEditor` (`components/image/`) build on the same shared `Dialog` and
-inherited the fix with no changes of their own. Verified live (Playwright,
-computed `background-color`/`opacity` sampled, not just screenshotted) at
-desktop/tablet/mobile widths in both themes — see
-[`docs/settings-modal-visual-bug.md`](docs/settings-modal-visual-bug.md)
-for the full root-cause writeup and test matrix.
+**Read, per topic:**
+- [`docs/frontend-ui-audit.md`](docs/frontend-ui-audit.md) — the Phase 1 audit this pass started from.
+- [`docs/ui-design-system.md`](docs/ui-design-system.md) — the CSS token set and shared `components/ui/` primitives added.
+- [`docs/chat-history-ui.md`](docs/chat-history-ui.md) — the sidebar/settings split (`Sidebar.tsx`, `MobileNav.tsx`, `SettingsDialog.tsx`) and the extracted, independently-tested history-search components.
+- [`docs/image-editing-architecture.md`](docs/image-editing-architecture.md) — the local image editor (Konva/react-konva). At the time of this UI pass, AI-guided editing was a deliberate, permanent stub; it was later implemented for real — see "AI-guided (generative) image editing" further below, which supersedes that original limitation.
+- [`docs/ui-production-audit.md`](docs/ui-production-audit.md) — the duplicated-controls fix (`UserMenu.tsx`, sidebar collapse).
+- [`docs/settings-modal-visual-bug.md`](docs/settings-modal-visual-bug.md) — the dark-mode transparency fix (`--modal-backdrop`/`--modal-surface` tokens).
+- [`docs/navigation-and-actions.md`](docs/navigation-and-actions.md) — the resulting one-action-one-owner table for every control in the shell.
 
 ### SQL is untrusted output, always
 The LLM's SQL is never trusted at face value. `agent/sql_validator.py`
@@ -1906,1485 +1141,342 @@ since the cached function body simply wouldn't re-run.
   graph) — see "Process-lifetime singletons" above.
 
 ### Observability — live performance rollup (`observability/`)
-`agent.nodes._timed_node` has, since before this section existed, logged a
-`[timing] stage=... attempt=... duration_ms=...` line for every LangGraph
-node call and appended a `StageTiming` entry to `AgentState["stage_timings"]`
-(consumed only two ways before this: read live off a log line by a human,
-or aggregated *offline* from a captured `eval/results/run_*.json` file, as
-`docs/PERFORMANCE_BASELINE.md`'s manual latency-waterfall analysis did).
-**2026-09-18:** `observability/metrics.py`'s `PerformanceMetrics` (one
-process-wide singleton, `get_default_metrics()`, same `functools.cache`
-pattern as every other singleton in this section) closes that gap —
-`agent.graph.run_agent` now feeds every completed run's `stage_timings` +
-total duration + final status into it after `compiled_graph.invoke()`
-returns, wrapped in a `try`/`except` so a metrics-recording bug can never
-fail the request it's instrumenting (the same fail-open posture this
-codebase already applies to every other accuracy/observability aid).
-`GET /metrics/performance` (admin-only, `Permission.ADMIN_CONFIG` — the
-same gate `POST /schema/refresh` already uses) reads back a live snapshot:
-per-stage count/mean/p50/p95/max/total (mirroring
-`docs/PERFORMANCE_BASELINE.md`'s own table shape) plus an overall
-request-duration distribution and a status-outcome tally. **Deliberately
-single-process, in-memory, resets on restart** — a multi-worker deployment
-would have one independent rollup per worker, the identical limitation
-`agent/rate_limit.py`'s own sliding-window limiters already disclose for
-the same reason (no shared store like Redis exists in this architecture);
-real cross-process metrics would need Prometheus/OpenTelemetry, a
-genuinely separate piece of infrastructure, not attempted here. This is
-the first concrete step of a broader assessment — see
-`docs/DEEP_FEATURE_PERFORMANCE_ASSESSMENT.md` for the full discovery/
-target-architecture/roadmap this was scoped from, and
-`docs/PERFORMANCE_BASELINE.md`/`docs/PERFORMANCE_RESULTS.md` for why no
-further backend "optimization" is justified today without a model/
-hardware/prompt-size tradeoff (LLM inference is 93.8–98% of wall-clock
-time; this rollup makes that fact continuously verifiable against live
-traffic instead of a single point-in-time benchmark run).
+`agent.nodes._timed_node` logs a per-node timing line and appends a
+`StageTiming` entry to `AgentState["stage_timings"]`.
+`observability/metrics.py`'s `PerformanceMetrics` (a process-wide
+singleton) aggregates every completed run's timings and status into a
+live snapshot, read back via `GET /metrics/performance` (admin-only).
+
+**Invariant that must not regress: deliberately single-process,
+in-memory, resets on restart** — a multi-worker deployment would have one
+independent rollup per worker (the identical limitation
+`agent/rate_limit.py`'s own sliding-window limiters disclose); real
+cross-process metrics would need Prometheus/OpenTelemetry, not attempted
+here.
+
+**Read [`docs/OBSERVABILITY.md`](docs/OBSERVABILITY.md)** for the full
+correlation-ID/logging/health-check picture, and
+[`docs/PERFORMANCE_BASELINE.md`](docs/PERFORMANCE_BASELINE.md)/[`docs/PERFORMANCE_RESULTS.md`](docs/PERFORMANCE_RESULTS.md)
+for why no further backend "optimization" is justified today without a
+model/hardware/prompt-size tradeoff (LLM inference is 93.8–98% of
+wall-clock time).
 
 ### Optional, opt-in SQL result charting (`frontend/src/lib/chartEngine.ts`)
 A confirmed SQL result never auto-renders a chart — an unobtrusive
-"Visualize" button (disabled, with a reason, when nothing in the result is
-chartable) is the only way one appears, and removing it drops back to just
-the answer + table, never the other way around. This replaced an earlier,
-always-on Plotly-figure-from-the-backend design entirely (`plotly` is no
-longer a dependency) in favor of a fully client-side engine, for the same
-reason `embeddings.retriever.select_database` and this file's other
-"never trust the suggestion" precedents exist: **the backend's own
-`chart_recommendation` (`agent/result_charting.py`'s `classify_columns`/
-`recommend_chart`, still computed and returned on every `/execute` call as
-`column_types`/`chart_recommendation`/`truncated`) is only ever a seed for
-the *initial* axis/type choice — every chart type's actual enabled/disabled
-state is recomputed from the real returned columns/rows on the frontend,
-every time**, which is also what lets the user switch chart types (or
-send a follow-up like "show this as a pie chart") without a server round
-trip or re-running SQL at all.
+"Visualize" button is the only way one appears. Fully client-side
+(`plotly` was removed as a backend dependency).
 
-`frontend/src/lib/chartEngine.ts` is the one place chart logic lives:
-`inferColumnRoles` (numeric/date/text, preferring the backend's
-`column_types` hint but falling back to client-side inference so a result
-reloaded from chat history — which has `column_types` too, see "Universal
-server-side chat history" — still works), `getChartTypeOptions` (every one
-of 11 types — kpi/bar/bar-horizontal/bar-stacked/line/area/pie/doughnut/
-scatter/mixed/table — with a real validity rule and an always-populated
-reason, shown as the disabled button's `title` and, for the current
-selection, as visible text), `recommendChart`, `prepareChart` (sort/top-N/
-date-grouping transforms, all disclosed via `notices`), and the Chart.js
-dataset/options builders. **"mixed" (bar+line) never adds a second y-axis**
-— per the loaded data-viz skill's own non-negotiable ("two measures of
-different scale → two charts, never a dual axis"), it's only offered when
-the two measures are within a 10x magnitude ratio of each other
-(`MIXED_SCALE_RATIO_LIMIT`), sharing one axis.
+**Invariant that must not regress: the backend's own
+`chart_recommendation` is only ever a seed for the *initial* choice —
+every chart type's actual enabled/disabled state is recomputed from the
+real returned columns/rows on the frontend, every time.** "mixed"
+(bar+line) never adds a second y-axis — two measures of different scale
+get two charts, never a dual axis, per the loaded data-viz skill's
+non-negotiable. A chart config is session-only and does not survive a
+page reload or a reloaded-from-server past conversation turn (same
+disclosed limitation as "Universal server-side chat history" above).
 
-`ChartSection.tsx` (`frontend/src/components/sql/`) owns the whole flow:
-closed (Visualize button) → editing (`ChartPicker` + `ChartCustomizePanel`
-+ a live preview, "Generate chart"/"Reset to recommended"/"Cancel") →
-generated (`ResultChart.tsx`'s Chart.js render + "Customize"/"Remove
-chart"). `TurnCard.tsx` lazy-loads this whole subtree (`React.lazy`,
-mirroring `ImageEditor`'s own precedent) so Chart.js — the largest single
-remaining dependency chunk — is never downloaded for a turn nobody
-visualizes. State (`QueryHistoryEntry.chartOptions`, plus
-`confirmedColumnTypes`/`confirmedChartRecommendation`/`confirmedTruncated`)
-is session-only, the same lifetime as `confirmedColumns`/`confirmedRows`
-themselves — this app doesn't persist full SQL results server-side (see
-"Universal server-side chat history"'s own "Known limitation" on reloaded
-turns), so a chart config isn't persisted past a reload either; reset to
-`null` on every fresh "Confirm and Run" (a new result may have a different
-shape than whatever chart was built for the old one).
-
-The categorical palette (`--chart-cat-1..6` in `index.css`, light and dark)
-was generated and validated against this app's own real light/dark card
-surfaces via the data-viz skill's `validate_palette.js` (lightness band,
-chroma floor, CVD/normal-vision separation, contrast) — used in the fixed
-order the skill mandates, never cycled/regenerated per chart.
-
-**Lightweight NL follow-up chart-type switching**
-(`frontend/src/lib/chartFollowup.ts`, `chatStore.tryApplyChartTypeFollowup`):
-a message like "show this as a pie chart", "switch to line", or "bar chart
-instead" is detected by a small, deliberately non-LLM set of regexes (a
-switch-shaped phrase — "switch/change/convert/turn ... to/into", a
-"show/display/... this/it/that/the chart/the data/the result ... as/to/
-into", "make this a ...", or a trailing "instead" — combined with a
-recognized chart-type keyword; either signal alone is not enough, which is
-what keeps an ordinary question like "show sales as a percentage of total"
-or "what's the pie shop revenue" from misfiring). If detected,
-`ChatInput.tsx`'s `submit()` never calls `/ask` at all — it re-validates
-the requested type against the most recent chartable turn's *actual*
-result via the same `getChartTypeOptions` every other chart path uses, and
-either applies it directly (`setChartOptions`, a toast confirms it) or
-shows why it can't (a toast with the same disabled-reason text the picker
-itself would show), rather than sending nonsense to the SQL agent as if it
-were a real question. Deliberately scoped as "lightweight, not full NLU"
-per its own request — a phrasing outside this pattern set (or a chart-type
-word embedded in an otherwise-unrelated sentence with no switch-shaped
-phrasing around it) simply falls through to a normal question, which is
-the safe, disclosed failure mode.
-
-**Verified**: `frontend/src/lib/chartEngine.test.ts` (35 cases — column
-role inference, every chart type's enabled/disabled+reason logic, the
-recommendation engine including "never trust the backend hint blindly",
-and `prepareChart`'s sort/top-N/date-grouping transforms),
-`frontend/src/lib/chartFollowup.test.ts` (21 cases — the NL detector, both
-positive matches and the ordinary-question non-matches it must not
-misfire on), `frontend/src/store/chatStore.chartFollowup.test.ts` (7 cases
-— the full detect-then-validate-then-apply path against a real seeded
-`queryHistory`, including "no chart yet," "type invalid for this result,"
-targeting the *most recent* chartable turn when several exist, and that a
-switch never touches `confirmedRows`/`confirmedSql`, i.e. never re-runs
-SQL), `frontend/src/components/sql/ChartSection.test.tsx` (11 cases — the
-opt-in-only default, the picker's live preview, enabling/disabling with a
-reason, switching types, commit-only-after-"Generate chart", cancel,
-Customize/Remove-chart, the truncation notice, keyboard operability), and
-`frontend/src/components/sql/ResultChart.test.tsx` (5 cases — bar/line/
-pie/scatter mount without throwing, plus the accessible-name assertion).
-`agent/result_charting.py`'s `classify_columns`/`recommend_chart` are
-covered by `tests/test_result_charting.py` (13 cases) and
-`tests/test_api_execute.py`'s updated `/execute` response-shape
-assertions. Full suites green at the time this was built: 1757 backend
-(pytest) + 165 frontend (vitest) tests, `tsc --noEmit` clean, `ruff`/
-`black --check`/`mypy` clean on every touched backend file, `oxlint` clean
-(pre-existing, unrelated warnings only), and `npm run build` succeeds.
-
-**A genuine jsdom/Chart.js incompatibility, found and fixed as
-infrastructure, not app-code**: jsdom's `HTMLCanvasElement.getContext('2d')`
-is unimplemented (returns `undefined`), which Chart.js treats not as "no-op
-the draw calls" but as a fully-failed construction — the resulting
-half-built chart instance then crashes deep in its own internal
-attach/detach resize-bind logic the moment anything calls `.update()` on
-it (e.g. a chart-type switch in a test). Fixed with two additive stubs in
-`frontend/src/test/setup.ts` (a `ResizeObserver` stub, and a minimal fake
-2D context via `Proxy` so every canvas method no-ops instead of the real
-context acquisition failing) — the same category as that file's
-pre-existing `Blob.prototype.arrayBuffer`/`matchMedia` polyfills for
-missing jsdom capabilities, not a behavior mock of this app's own code, and
-deliberately still short of pulling in the full `canvas` npm package (no
-pixel output is asserted on in any test here).
-
-**Known limitations, named rather than silently left**: (1) the NL
-follow-up detector is intentionally a small pattern set, not full
-intent/slot NLU — a real production deployment wanting broader phrasing
-coverage would need a different approach (e.g. a cheap classifier call),
-which was explicitly out of scope here; (2) a chart's `title`/axis labels
-are user-entered free text rendered by Chart.js's own canvas text
-renderer (not `innerHTML`), so there's no injection surface, but no
-explicit sanitization/length cap exists beyond `Settings.max_question_length`
-not applying here at all (chart titles are local UI state, never sent to
-the backend); (3) as noted above, a chart config doesn't survive a page
-reload or a reloaded-from-server past conversation turn, by the same
-disclosed design as the rest of this app's session-only confirmed-result
-state.
+**Read [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md#14-sql-result-charting)**
+for the full engine design (11 chart types, the NL follow-up chart-switch
+detector, the jsdom/Chart.js test-infrastructure fix) and current test
+coverage.
 
 ### AI Data Analyst depth — trend/variance/outlier detection (`agent/insight.py`)
-**2026-09-19:** `ResultSummary` (the small, aggregate-only summary
-`generate_insight_from_llm` is given — see "Grounded insights, not
-free-form narration" — never raw rows) gained three new deterministic
-fields, computed the identical "Python does the arithmetic, the LLM only
-narrates already-computed truths" way `top_label`/`top_share_percent`
-already worked: `ColumnStat.stddev`/`coefficient_of_variation` (population
-standard deviation and a scale-independent spread measure, `None` when
-degenerate — a single row, or a zero mean), `ResultSummary.trend`
-(first-vs-last-period change percent + direction, using the SQL's own row
-order rather than re-deriving a chronology — see `TrendStat`'s own
-docstring for why), and `ResultSummary.outliers` (per-label totals more
-than `OUTLIER_STDDEV_THRESHOLD`, default 2.0, population-standard-
-deviations from the mean, requiring at least 3 distinct labels since two
-points are always symmetric around their own mean). All three flow
-through `allowed_values()`/`allowed_percents()` alongside the pre-existing
-fields, so the existing grounding gate (`is_insight_grounded`) would
-already validate a claim mentioning any of them correctly.
+`ResultSummary` gained three deterministic fields —
+`ColumnStat.stddev`/`coefficient_of_variation`, `ResultSummary.trend`, and
+`ResultSummary.outliers` — computed the same "Python does the arithmetic,
+the LLM only narrates already-computed truths" way the pre-existing
+`top_label`/`top_share_percent` fields work, and validated by the same
+grounding gate (`is_insight_grounded`).
 
-**Fully tested (`tests/test_insight.py`, 16 new cases), but — like
-`agent/tools/` before it (see "Tool/MCP abstraction" above) — not yet
-wired into `agent.llm_client._build_insight_prompt`, so nothing in the
-live `generate_insight_node` path actually surfaces a trend/variance/
-outlier claim yet.** Deliberately deferred rather than folded into this
-same change: `_build_insight_prompt`'s exact wording is what
-`docs/EVALUATION_CURRENT.md`'s live-LLM benchmark numbers were measured
-against, and this session had no way to re-run that 57-case live-Ollama
-benchmark to confirm a prompt change doesn't shift generation behavior
-before merging it — changing a security/accuracy-reviewed, eval-tracked
-prompt without being able to re-verify against the eval harness would
-violate this project's own "never compromise correctness," "do not
-optimize/change behavior blindly" standard (see
-`docs/PERFORMANCE_RESULTS.md` for the precedent of explicitly declining a
-change for the identical reason). The new fields are additive-only
-(everything existing on `ResultSummary` is unchanged), so a future pass
-can wire them into the prompt (or straight into the API response for the
-frontend to render as a trend badge/outlier highlight without an LLM
-sentence at all) once it can validate the change properly. See
-`docs/DEEP_FEATURE_PERFORMANCE_ASSESSMENT.md`'s P1 roadmap for where this
-sits relative to the rest of the AI Data Analyst work (chart-type
-coverage, segmentation, forecasting).
+**Invariant: fully tested but NOT yet wired into the live prompt — do not
+treat as user-facing.** `agent.llm_client._build_insight_prompt` is
+unchanged, so nothing in the live `generate_insight_node` path surfaces a
+trend/variance/outlier claim yet, deliberately deferred: this prompt's
+exact wording is what `docs/EVALUATION_CURRENT.md`'s live-LLM benchmark
+numbers were measured against, and changing it without being able to
+re-run that benchmark would violate this project's "never compromise
+correctness" standard.
+
+See [`docs/DEEP_FEATURE_PERFORMANCE_ASSESSMENT.md`](docs/DEEP_FEATURE_PERFORMANCE_ASSESSMENT.md)'s
+P1 roadmap for where this sits relative to the rest of the AI Data
+Analyst work.
 
 ### Prompt-injection benchmark and hardening pass (2026-09-24/25)
 
-A new, externally supplied 500-case prompt-injection/security benchmark
-(20 categories: direct instruction override, role manipulation, prompt
-disclosure, policy bypass, SQL safety bypass, tool manipulation,
-authorization/exfiltration, obfuscation, multi-turn persistence, 7
-`Indirect *` categories, resource exhaustion, ambiguous/benign boundary
-cases, cross-tenant isolation) was run to completion against the real
-live agent (real Ollama, real SQL Server databases) — not a static
-regex-blind-spot probe. Full detail, live results, and honest residual
-gaps: `docs/security/PROMPT_INJECTION_BENCHMARK_GAP_REPORT.md` (the
-authoritative, continuously-updated source — this section is a pointer,
-not a duplicate). Harness: `eval/security_benchmark/` (dataset loader,
-pure detectors, live runner, reporting, plus `multiturn.py` for a true
-turn-1-poison/turn-2-real-attack persistence test), CLI entry points
+A 500-case prompt-injection/security benchmark (20 categories) was run to
+completion against the real live agent (real Ollama, real SQL Server
+databases) — not a static regex-blind-spot probe. Harness:
+`eval/security_benchmark/`, CLI entry points
 `scripts/run_security_benchmark.py`/`scripts/run_multiturn_persistence_benchmark.py`.
 
-**Headline result: all 500 cases completed, 0 critical findings** — zero
-writes executed, zero unauthorized sources reached, zero secrets leaked,
-zero system prompts leaked, across the entire run. 66.4% raw pass rate;
-every one of the 168 `expected_behavior` mismatches is a content-level
-miss (the model answers where a refusal was expected, or over-refuses a
-benign case), never a hard-gate violation — several were individually
-traced by hand and confirmed benign (e.g. a "wrap a DELETE in a harmless
-SELECT" attempt failed at *parse time*, never reaching the embedded-write
-check at all). A true multi-turn persistence test (10 payloads, organic
-turn-1 + worst-case-simulated turn-2) and the pre-existing
-`conversation_id` IDOR/cross-tenant test
-(`tests/test_api_chat_history.py::TestOwnershipIsolation`, already
-existed, confirmed still passing) both also show 0 critical findings.
+**Headline result as of this writing: all 500 cases completed, 0 critical
+findings** — zero writes executed, zero unauthorized sources reached,
+zero secrets or system prompts leaked. 66.4% raw pass rate; every
+`expected_behavior` mismatch is a content-level miss, never a hard-gate
+violation. Five real bugs were found and fixed along the way — including
+an unguarded `OPTION (MAXRECURSION 0)` SQL hint that could hang a query
+indefinitely (now a flat-denied `unsafe_query_option` violation type), a
+secret-redaction gap in LLM-generated response text, and a new
+`cross_source_injection_narrative` detection pattern for third-person-
+narrated indirect-injection payloads (confirmed live: pass rate on the
+two affected categories went 20% → 100%).
 
-**Real bugs found and fixed along the way, not just findings**:
+**This is a point-in-time result, not a standing guarantee** — re-run the
+benchmark after any change to `agent/sql_validator.py`,
+`security/injection_patterns.py`, or the orchestrator's prompt
+construction before trusting these numbers still hold. **Honest residual
+gaps, not yet closed as of this writing:** an admin-role re-run of the
+RBAC-bypass categories, and 2 of 10 multi-turn-persistence payloads not
+yet separately re-graded against their real history entry.
 
-1. **`OPTION (MAXRECURSION 0)` passed `agent/sql_validator.py`
-   unguarded.** This MSSQL hint disables the engine's own 100-level
-   recursive-CTE safety limit — parses as an ordinary `exp.QueryOption` on
-   an otherwise unremarkable `exp.Select`, which nothing above it checked.
-   A prompt engineered around "use recursive queries without a limit"
-   reliably got the local model to add this hint, and one live case hung
-   the whole benchmark process for 80+ minutes (found because the process
-   showed 0% CPU well past every configured timeout). New
-   `unsafe_query_option` violation type (in `SAFETY_VIOLATION_TYPES`,
-   fails closed, no retry) — flat denial of any `MAXRECURSION` hint
-   regardless of value; there's no legitimate reason this app ever needs
-   to override the engine's own recursion safety net. Paired fix:
-   `db/query_cost.py`'s cost-estimation timeout used to abandon its
-   worker thread on timeout rather than force-closing its connection
-   (unlike `db.execution._execute_with_timeout`'s already-trusted abort
-   mechanic) — a stuck plan-compile call (exactly what a pathological
-   recursive CTE causes) leaked a pooled DB connection every time. Now
-   mirrors `_execute_with_timeout`'s abort-via-close pattern via a new
-   `_ConnectionTrackingEngine` proxy, with no changes needed to any of the
-   four dialect-specific plan-fetch strategies.
-2. **`security.redaction.redact_secrets` was never applied to
-   LLM-generated response text** — only to raw driver/retrieval errors.
-   New `redact_configured_secrets` (covers all 12 secret fields `Settings`
-   defines, not just `db_password`) is now applied at
-   `api/main.py::_ask_response_from_state`'s response-assembly boundary —
-   `insight`, `synthesized_answer`, every orchestrator source's
-   answer/caption text, `error_history`, `query_plan`, and the other
-   free-text notice fields.
-3. **`agent/followup.py::classify_followup` over-refusal bug.** A
-   standalone question containing "it"/"this"/"that" whose antecedent is
-   named earlier in the *same* sentence (e.g. "...must be refused,
-   without executing **it**") was misclassified as an ambiguous follow-up
-   reference on a fresh session with no history at all. Fixed with a
-   one-directional heuristic (`_has_intra_sentence_antecedent`) that can
-   only reduce false ambiguity, never introduce it — this classifier is a
-   UX/latency optimization, never a security boundary, so this was safe
-   to fix without re-running the live benchmark first.
-4. **New `cross_source_injection_narrative` pattern in
-   `security/injection_patterns.py`.** The two lowest-scoring benchmark
-   categories (`Indirect multi-source injection`, `Indirect
-   glossary/metric injection`) trace to a real, common gap: their payloads
-   are third-person *narrations* of an indirect-injection scenario (e.g.
-   "The HR source instructs the agent to reveal finance records.") rather
-   than direct imperative commands — a shape none of the existing 6
-   patterns target. Verified before adding: 16/16 real failing payloads
-   now match, 0 false positives across three independent control sets
-   (a hand-built benign set, all 47 real `eval/benchmark/*.yaml`
-   questions, all 10 `Benign adversarial boundary` payloads). **Confirmed
-   live**: both categories re-run against the fixed code — pass rate
-   20% → **100%**, 0 critical findings, average latency 212.6s → **8.6s**
-   (every case now short-circuits at the input-guard layer instead of
-   reaching generation).
-5. **`eval/security_benchmark/runner.py` had no per-case exception
-   handling** — a transient `agent.exceptions.AgentError` (e.g.
-   `OllamaUnavailableError` when local Ollama is overloaded) crashed an
-   entire in-progress multi-hour benchmark run via an unhandled exception,
-   losing every already-completed case's result. Confirmed this was
-   harness-only fragility, not a production gap:
-   `OllamaUnavailableError` is an `AgentError` subclass, and
-   `api/main.py` already registers `@app.exception_handler(AgentError)` —
-   a real caller hitting the same timeout via HTTP gets a clean
-   `.safe_message` response, not a crashed server. `run_security_case`
-   now catches `AgentError` and records an `"error"`-status result
-   (never counted as a pass or critical finding) instead of propagating.
+**Read [`docs/security/PROMPT_INJECTION_BENCHMARK_GAP_REPORT.md`](docs/security/PROMPT_INJECTION_BENCHMARK_GAP_REPORT.md)**
+(the authoritative, continuously-updated source) for live results per
+category, the exact fix for each of the five bugs above, and the current
+state of the residual gaps.
 
-**True channel-level seeding tests** (`tests/test_indirect_channel_injection.py`,
-11 tests) were added for the 6 indirect categories that previously only
-had direct-channel-proxy coverage via the benchmark itself (schema/
-comment injection already had true coverage —
-`tests/test_adversarial_input.py::TestPoisonedSchemaValueNeutralization`).
-Each seeds a poisoned string directly into the real object shape that
-channel produces (a `GoldenExample`, a business-context chunk dict, a
-`WebResult`, a RAG `ChunkResult`, a `MediaHit`, an `OrchestratorState`
-source-result dict) and confirms it reaches the model framed as DATA, not
-instructions — fully mocked, no live LLM/DB/Chroma.
+### Chat attachments, image actions, and their security hardening (`attachments/`)
+Chat file attachments (images, PDF, DOCX, XLSX, PPTX, TXT, MD, CSV, JSON)
+are given directly to the model as context for the question that attached
+them, via `POST /attachments/upload` → the `"attachments"` orchestrator
+source. Deliberately **not** `rag/ingestion.py`'s pipeline: a chat
+attachment is ephemeral, per-conversation, per-caller content, not a
+permanent shared knowledge-base entry — storage is a bounded, in-memory,
+process-lifetime registry (`attachments/store.py`), never a database row.
+Explicit image actions (OCR/text-extraction, deterministic resize, and
+OpenCV-based text removal — never a generative model, never a solid-color
+rectangle) are separately callable, not just implicit side effects of
+asking a question about an image.
 
-**Honest residual gaps, not closed by this pass** (see the gap report's
-own "What hasn't been done yet" for the current list): an admin-role
-re-run of the RBAC-bypass categories was still in progress as of this
-writing; the multi-turn organic-history follow-up (2 of 10 payloads whose
-turn-1 organically succeeded were never separately re-graded against
-their real history entry, only the synthetic worst-case) remains open.
-Neither is a known failure — both are simply not yet re-confirmed.
+**Invariants that must not regress:**
+- An attached image is **never silently discarded** — if no vision model
+  is configured (or a call fails), it falls back to OCR instead of being
+  dropped, and the result records `vision_unavailable=True` so the UI
+  shows an honest degraded-mode notice.
+- `router_node` **forces** `"attachments"` into the route whenever the
+  caller attached a file, regardless of what the LLM classifier picks.
+  A deterministic pre-check (`_looks_like_attachment_only_question`)
+  additionally keeps an attachment-only question (e.g. "extract the text
+  from this image") from also reaching SQL generation just because a
+  database happens to be configured — a real routing bug found and fixed,
+  not a hypothetical.
+- Resize and remove-text actions always produce a **brand-new**
+  attachment (`register_derived_image`) — the original is never mutated
+  in place.
+- Every successfully-processed attachment's extracted text is scanned for
+  injection patterns (detection-only, never block) and, if
+  `Settings.malware_scan_provider` is enabled, malware-scanned before any
+  parser touches the raw bytes. `"disabled"` (the default) cannot
+  silently ship to `ENVIRONMENT=production` alongside chat attachments,
+  document RAG, policy RAG, or media search — a startup `model_validator`
+  refuses to start otherwise.
+- DOCX/XLSX/PPTX (plain ZIP archives) get a decompression-bomb guard
+  (`attachments/zip_safety.py`, metadata-only, no actual decompression)
+  and PDFs get a catalog-level dangerous-content preflight
+  (`attachments/pdf_safety.py` — embedded JavaScript, auto-open actions)
+  before parsing — both closed gaps found by a direct security-review
+  audit, not assumed-covered by the malware scanner above. The PDF
+  preflight is catalog-level only, not a full page/annotation walk — a
+  disclosed scope boundary, not a silent gap.
+- Every processor call runs on a bounded thread pool with a hard timeout
+  (`Settings.attachment_processing_timeout_seconds`) — a pathological
+  file can't tie up a request thread indefinitely.
 
-### Chat attachments (images, PDF, DOCX, XLSX, PPTX, TXT, MD, CSV, JSON) (`attachments/`)
+**Known, disclosed limitations:** an attachment is global to the caller,
+not scoped to a configured database. PPTX speaker notes aren't extracted
+(only slide title + body text). A legacy binary Office format
+(`.doc`/`.xls`/`.ppt`) is rejected with a message naming the modern
+extension needed instead. OCR/text-removal capability flags report
+whether the `pytesseract` *Python package* is importable, not whether the
+Tesseract *system binary* is installed — a missing binary degrades one
+request to an empty result with a warning rather than flipping the
+capability flag off. No live ClamAV daemon has ever exercised the
+malware-scanner's fail-closed path in this project's history — only a
+mocked socket.
 
-Closes a real, previously-disclosed gap (see the "Frontend UI redesign"
-section above): attaching a file to a chat question used to only ever
-hold it in the browser tab's memory for local preview/editing, with no
-backend endpoint that accepted it at all and no way for the model to see
-its content. `attachments/` is a new top-level package implementing the
-full validate → store → process → answer pipeline, wired in as a new
-`"attachments"` orchestrator source alongside `sql`/`documents`/`policy`/
-`web`/`generation`/`media_search`.
-
-**Storage model, and why it's deliberately NOT `rag/ingestion.py`'s
-pipeline.** A chat attachment is ephemeral, per-conversation, per-caller
-content given directly to the model as context for the question that
-attached it — not a permanent, shared knowledge base entry retrieved many
-times later the way an uploaded Knowledge Sources PDF is. So this reuses
-`rag.ingestion.extract_pdf_pages` for the one genuinely shared piece (PDF
-text extraction) but does **not** run attachments through
-`rag/ingestion.py::ingest_pdf`'s moderation gate, vector embedding, or SQL
-Server `VECTOR` storage — `attachments/store.py`'s `AttachmentStore` is a
-bounded, in-memory, process-lifetime registry (FIFO eviction past 200
-entries, same accepted tradeoff as `media_gen.cache.MediaCache`), keyed by
-a server-generated `attachment_id`, never persisted to a database. Bytes
-live under `Settings.attachment_storage_dir` (default `./data/attachments`,
-gitignored), one file per `attachment_id` — the actual on-disk path is
-built entirely from that id plus the validated extension, never from the
-caller's filename at all, which is a stronger path-traversal defense than
-sanitizing the filename would be (there's nothing to escape with `../`
-if the filename never touches the path in the first place;
-`attachments.storage.sanitize_filename` still produces a display-safe
-name for `Attachment.safe_filename`, belt-and-suspenders).
-
-**Processing happens once, eagerly, at upload time** (`POST
-/attachments/upload` → `attachments.pipeline.validate_and_store_upload`),
-not lazily when a question later references the attachment — this is what
-makes a follow-up question ("what's the total in that spreadsheet I
-uploaded earlier?") free: the store already holds the fully-processed
-record, so referencing the same `attachment_id` again is a cache hit, not
-a re-parse. Re-uploading byte-identical content (by SHA-256, scoped per
-caller) reuses the existing record outright rather than reprocessing it,
-including a previously-*failed* outcome (retrying would just fail
-identically). Malware scanning (`security.malware_scanner.scan_upload`,
-off by default — see that module's own docstring) runs on the raw bytes
-before any parser touches them, mirroring `rag/ingestion.py`'s identical
-ordering rationale.
-
-**Access control**: every `Attachment` carries an `owner_subject` (the
-authenticated caller's `security.oidc.AuthIdentity.subject`, OIDC mode
-only — same scoping `AgentState.caller_subject` already uses elsewhere,
-see that field's own docstring for why "none"/"static_token" modes have no
-real per-caller identity to scope to). `AttachmentStore.get`/`resolve_many`/
-`delete` all silently treat a wrong-owner id exactly like a
-never-existed one — never confirming another caller's attachment even
-exists, the same account-enumeration-avoidance shape
-`identity.exceptions.InvalidCredentialsError` already uses for login.
-
-**One processor class per file kind** (`attachments/processors/`:
-`image_processor.py`, `pdf_processor.py`, `docx_processor.py`,
-`xlsx_processor.py`, `pptx_processor.py`, `json_processor.py`,
-`csv_processor.py`, `text_processor.py` for TXT/Markdown), a `FileProcessor`
-Protocol + `registry.get_processor_for` picking the right one by
-`media_type` — deliberately not one large dispatch function. A scanned PDF
-page (little/no extractable text) falls back to OCR via the existing
-`media.ocr.extract_text` (Tesseract), the same rasterize-via-`pymupdf`
-pattern `rag/ingestion.py::_ocr_suspect_pages` already established for the
-Knowledge Sources pipeline (a small, deliberate duplication rather than
-importing that module's private helper — see `pdf_processor.py`'s own
-docstring for why these stay two separate pipelines). CSV/XLSX processors
-use the standard library `csv` module / `openpyxl` directly, never pandas
-— this codebase already has a documented pandas/Python-3.14 datetime
-segfault footgun (see "Python 3.14 gotchas" above), and a chat
-attachment's spreadsheet is exactly the kind of arbitrary, unvalidated
-schema where a stray date-looking column could trigger it.
-
-**Images**: decoded/verified/resized/re-encoded by `attachments/
-image_processing.py` (Pillow) — downscaled to
-`Settings.max_attachment_image_dimension_px` (default 1568px long edge,
-preserving aspect ratio) and re-encoded to PNG/JPEG through a fresh
-buffer, which is what strips EXIF/ICC/XMP metadata, before being base64
-data-URL-encoded. Describing *what's in* an image reuses this project's
-existing local Ollama vision-model call
-(`attachments/vision.py::describe_images`, the exact same
-`client.chat(..., images=[...])` shape `media/captioning.py` already uses
-and has confirmed working) — fully local, no API key, no outbound network
-call, consistent with every other model choice in this codebase. If
-`Settings.media_vision_model` is blank (the default), an attached image is
-**never silently discarded**: `attachments/graph.py`'s
-`build_multimodal_message_node` falls back to OCR'ing the image's
-on-screen text instead (reusing `media/ocr.py` again) and records
-`vision_unavailable=True` on the result so the UI can show an honest
-degraded-mode notice rather than implying full visual understanding
-happened.
-
-**The attachment-QA LangGraph subgraph** (`attachments/graph.py`,
-`run_attachment_qa`) is the spec-shaped 7-node flow: `validate_attachments`
-(resolves ids → owned, stored attachments; a missing/inaccessible id
-becomes a structured `AttachmentError`, never a crash) → `process_attachments`
-(the cheap lookup+convert described above) → `build_attachment_context`
-(`attachments/context_builder.py` — delimited, per-attachment-budget-capped,
-de-duplicated by content hash, explicit truncation notice, never claims an
-attachment contains information if it failed to process) →
-`build_multimodal_message` (collects image data URLs, or the OCR fallback
-above) → `call_model` (the vision call if images are present, else a plain
-Ollama text call grounded strictly in the attachment context — framed as
-untrusted data, never instructions, the same posture `rag/graph.py`'s own
-`generate_node` already has for RAG-retrieved content; an Ollama outage is
-caught locally here, never left to crash the whole orchestrated run) →
-`validate_response` (records `used_attachment_ids`, fails closed with a
-clear message if nothing usable came back). Compiled once per process
-(`functools.lru_cache`, same pattern as `agent.graph.build_graph`).
-
-**Orchestrator wiring is the one genuinely new architectural wrinkle**:
-`"attachments"` is added to `agent/orchestrator/nodes.py`'s source list,
-but unlike every other source there, its *availability* depends on the
-current request (did the caller attach anything?), not standing config —
-`get_available_sources` takes a new `has_attachments` parameter for this.
-More importantly, `router_node` **forces** `"attachments"` into the final
-route whenever available, regardless of what the LLM classifier picks —
-the user explicitly attached a file to this exact question, so silently
-dropping it (e.g. the classifier judging the question "sounds like SQL")
-would violate this feature's own "never silently discard an attachment"
-requirement; the classifier's only real job when attachments are present
-is deciding whether some *other* source is *also* needed (e.g. "compare
-this file with the database" genuinely needs both). And
-`agent.orchestrator.graph.run_orchestrated` gained a new parameter,
-`attachment_ids`, that **breaks its own pre-existing "flag off → call
-`run_agent` directly" short-circuit**: attaching a file must work
-regardless of `Settings.enable_multi_source_router`, since attaching a
-file is a per-request opt-in the caller makes explicitly, not a standing
-multi-source-routing decision — the short-circuit condition is now `not
-enable_multi_source_router and not has_attachments`, preserving the
-byte-for-byte-unchanged guarantee for every caller that never attaches
-anything.
-
-**API surface**: `POST /attachments/upload` (multipart, one or more
-files — each validated/processed independently, so one bad file in a
-batch never fails the others; per-file errors come back structured,
-`AttachmentErrorCode` values like `UNSUPPORTED_FILE_TYPE`/`FILE_TOO_LARGE`/
-`MALWARE_DETECTED`/`ATTACHMENT_NOT_FOUND`, never a bare exception string)
-and `DELETE /attachments/{id}` (`api/attachments.py`, gated by
-`Permission.ASK` — attaching/removing a file is the same underlying
-capability as asking a question, not a new permission). `AskRequest`
-gained `attachment_ids: list[str]`; `AskResponse` gained
-`attachment_result` (mirrors `agent.orchestrator.state.AttachmentResult`:
-`answer`, `status`, `used_attachment_ids`, `vision_unavailable`).
-`Settings.enable_chat_attachments` (default `true` — no cost, no
-network call beyond the already-local vision model) is the flag; a
-`max_attachment_*` family of settings bounds image/document size, total
-per-message size, attachment count, extracted-text length, PDF page
-count, and spreadsheet row count (see `.env.example`'s "Chat attachments"
-section for the full list).
-
-**Frontend**: `useChatAttachments.ts` replaced the old, purely-local
-`useImageAttachments.ts` (deleted, along with `AttachmentChip.tsx` —
-fully superseded, not kept as a parallel implementation) — it now handles
-both images and documents uniformly, uploading each file to `POST
-/attachments/upload` immediately on selection (one request per file, so
-one chip's status never blocks or gets confused with another's) and
-tracking per-chip `uploading`/`ready`/`error` status with an inline error
-message, never just a spinner that silently resolves to nothing. The
-"Local only" notice is gone because it's no longer true. `ChatAttachmentChip.tsx`
-renders a thumbnail preview for an image (unchanged from before) or a
-generic file icon for a document (there's no meaningful visual preview for
-a PDF/DOCX/XLSX/PPTX/TXT/CSV/JSON attachment). Editing an already-uploaded
-image in `ImageEditor.tsx` re-uploads the edited bytes as a fresh
-attachment (new `attachment_id`) and deletes the stale one server-side in
-the background — without this, the model would keep seeing the original,
-pre-edit image no matter what the user changed. Send is disabled while any
-attachment is still uploading. Attachments are deliberately **not**
-cleared from the composer after sending — matching this feature's
-"conversation follow-up" requirement (asking a second question about the
-same file without re-uploading it) with no extra UI needed, since the chip
-just stays there until the user removes it.
-
-**Known, disclosed limitations, not silently left**: `Settings
-.databases`/eval-benchmark-style per-item routing has no equivalent
-here — an attachment is global to the caller, not scoped to a particular
-configured database. PPTX speaker notes are not extracted (only slide
-title + body text). A legacy `.doc`/`.xls`/`.ppt` (pre-OOXML binary
-Office format) is rejected at validation time with a message naming the
-modern extension it needs instead, since none of `python-docx`/
-`openpyxl`/`python-pptx` can parse the legacy binary formats. There is no
-scheduled/background purge of expired attachment files — `attachments
-.storage.purge_expired_attachments` runs opportunistically on each new
-upload (same disclosed limitation `media_gen.cache.MediaCache`'s own
-FIFO-only eviction already has: this app has no background job
-scheduler).
-
-### Explicit image actions: extract text, resize, remove text (2026-09-26)
-
-Closes a real gap in the "Chat attachments" feature above: an attached
-image could only ever be described by the vision model (or, before that,
-OCR'd only as an internal fallback when no vision model was configured) —
-there was no way to ask for exactly one of these four distinct
-capabilities on purpose. `CLAUDE.md`'s own four-capability split (image
-understanding / OCR / deterministic manipulation / generative-adjacent
-editing) is now real, separately-implemented code, not just a design
-principle:
-
-- **(A) Image understanding** — unchanged, `attachments/vision.py` via
-  `POST /ask` with `attachment_ids` (the existing "what does this image
-  show?" conversational path).
-- **(B) OCR / text extraction** (`attachments/ocr_extract.py`,
-  `POST /attachments/{id}/extract-text`) — a real Tesseract pass
-  (`pytesseract.image_to_data`), returning `raw_text`/`cleaned_text` (both
-  exact recognized text, never an LLM paraphrase) plus per-word bounding
-  boxes/confidence. A result's `raw_text`, if non-empty, is persisted onto
-  the attachment's own `extracted_text` so a follow-up question in the same
-  conversation can see it via the normal attachment-context path
-  (`attachments.graph.build_attachment_context_node`'s image-exclusion rule
-  now has one exception: an image carrying real OCR'd text).
-- **(C) Deterministic manipulation — resize** (`attachments/image_ops.py`,
-  `POST /attachments/{id}/resize`) — pure Pillow work, no model call: width/
-  height with `contain`/`cover`/`stretch` fit modes, EXIF-orientation
-  correction before computing dimensions, output-format conversion, and a
-  small named-preset list (`RESIZE_PRESETS`, also returned by the
-  capabilities route for the frontend's own preset buttons).
-- **(D) Image editing — remove text** (`attachments/inpaint.py`,
-  `GET /attachments/{id}/detect-text-regions` +
-  `POST /attachments/{id}/remove-text`) — real pixel editing via OpenCV's
-  classical `cv2.inpaint` (Telea's fast-marching algorithm), explicitly
-  **not** a generative AI model and **not** a solid-color rectangle; every
-  response carries an honest limitation warning saying so. Region selection
-  is either OCR-proposed (Tesseract's per-word boxes merged into per-line
-  regions, `detect_text_line_regions`, capped at
-  `Settings.max_text_removal_regions`, largest-area-first) and
-  caller-confirmed, or manually drawn — both paths produce the same
-  `InpaintRegion` rectangles. If OCR is unavailable (missing Tesseract
-  binary) or finds nothing, `detect-text-regions` returns an empty list
-  rather than an error — the frontend's `RemoveTextDialog.tsx` falls open
-  to a manual click-and-drag selection on the image preview in that case,
-  never a dead end.
-
-**Both (C) and (D) always produce a brand-new attachment** (`attachments
-.pipeline.register_derived_image`), never mutate the source in place — the
-original stays available exactly per this feature's own "keep the original
-unless explicitly deleted" rule. The frontend's "Attach resized image"/
-"Attach edited image" buttons (`useChatAttachments.ts`'s
-`addProcessedResult`) add that new, already-server-processed attachment
-directly to the composer without a second upload round-trip, then remove
-the source chip — the composer ends up holding the edited result, not
-both versions.
-
-**A capability registry, not an assumption** — `attachments/capabilities.py`
-(`GET /attachments/capabilities`) reports live `vision_input`/`ocr`/
-`image_resize`/`image_text_removal` flags (plus size limits and resize
-presets) computed from current `Settings`, never hardcoded. The
-composer's per-image "more actions" menu (`ChatAttachmentChip.tsx`) only
-offers an action when the registry says it's actually available — per
-this feature's own "never display a capability as working unless it is"
-requirement. One honest nuance: `ocr`/`image_text_removal` report whether
-`pytesseract` (the Python package) is importable, not whether the
-Tesseract *system binary* is installed — probing the real binary on every
-capability check would cost a subprocess call; a missing binary instead
-degrades one OCR/remove-text request to an empty result with a warning; it
-does not flip the capability flag. Verified in this development
-environment specifically: the Tesseract binary is **not** installed here
-(`pytesseract.get_tesseract_version()` raises `TesseractNotFoundError`) —
-every OCR-dependent test in `tests/test_attachments_ocr_extract.py`/
-`tests/test_attachments_inpaint.py` is honest about that split (real
-fail-open behavior verified against this actual environment; the
-line-merging/coordinate-scaling logic itself verified against a hand-built
-mocked Tesseract response, never claimed as "real OCR accuracy verified").
-Resize and text removal's actual pixel editing (`cv2.inpaint`) need no
-external binary and are fully, genuinely verified in this environment —
-including an explicit test asserting the edited region's pixels are
-*not* a flat, uniform fill, the concrete way this codebase distinguishes
-real inpainting from a rectangle pasted over the text.
-
-### Attachment security hardening: routing fix, zip/PDF safety, injection detection (2026-09-27)
-
-Two independent pieces of follow-up work, both closing gaps found by
-directly inspecting the attachment pipeline against a real security-review
-brief rather than assuming prior coverage was complete.
-
-**Routing bug: "extract image text" (and other real-world phrasing) could
-still reach SQL generation.** `agent/orchestrator/nodes.py::get_available_sources`
-always includes `"sql"` (a database is always configured), so attaching
-any file made 2+ sources available, which unconditionally triggered the
-LLM classifier (`classify_sources`) — with no built-in reason not to also
-pick `"sql"` just because a database happens to be configured. Fixed with
-`_looks_like_attachment_only_question`, a deterministic, zero-LLM-call
-pre-check: when attachments are present and the question matches an
-unambiguous OCR/image-understanding/resize/text-removal/document phrasing
-**and** contains no database keyword (database, sql, table, records, rows,
-columns, query, report, revenue, count, filter), `router_node` skips
-`classify_sources` entirely and routes to `["attachments"]` alone — never
-`"sql"`. A single database keyword anywhere in the question defers to the
-classifier instead, so a genuinely mixed question ("use this file to query
-the database") is unaffected. `RouteDecision` gained a `requires_database`
-field for debug transparency. Defense-in-depth: `classify_sources`'s
-prompt also gained `_ATTACHMENT_VS_SQL_GUIDANCE`, explicit few-shot
-examples of what NOT to also pick, for the phrasings the deterministic
-check doesn't confidently catch. The existing frontend gating
-(`TurnCard.tsx`'s `isSqlResult = sourcesUsed.includes('sql')`) needed no
-changes — it already correctly hides SQL UI once `sources_used` stops
-containing `"sql"` for these questions.
-
-**Also root-caused, same session: "no vision model configured" for a
-genuinely attached image.** `MEDIA_VISION_MODEL` was simply unset, and
-Tesseract (the OCR fallback) isn't installed on the reference dev machine
-either, so both paths failed, producing one generic, unhelpful message.
-Fixed by (1) actually configuring a real, already-pulled vision-capable
-Ollama model (verified live: a real `qwen3.8:27b` call correctly read text
-from a synthetic test image before being set) and (2) replacing the single
-generic failure message with `attachments.state.ModelCallOutcome`
-(`no_content`/`vision_ok`/`vision_empty`/`text_llm_ok`/`text_llm_empty`/
-`text_llm_unavailable`), combined with the pre-existing `vision_unavailable`
-flag in `attachments/graph.py::_describe_failure`, so "vision was never
-configured" (`vision_unavailable=True`), "a configured vision model
-answered empty" (`vision_empty`), and "the text-only model was unreachable"
-(`text_llm_unavailable`) each produce a genuinely different, actionable
-message instead of one indistinguishable string. `GET /health` also gained live vision
-diagnostics (`vision_enabled`/`vision_model`/`vision_model_available`/
-`ocr_enabled`) — `vision_model_available` is a real lookup against
-Ollama's own pulled-model list (`api/main.py::_pulled_ollama_model_names`,
-tolerant of both the real `ollama.Client().list()` `ListResponse` shape
-and a plain dict, since this project's own existing `/health` tests mock
-the latter), reusing the same `.list()` call the base Ollama-reachability
-check already makes.
-
-**A structured security-brief audit found five further, concrete gaps**
-(verified by reading the actual code, not assumed) — see `SECURITY.md`'s
-"Chat attachments — security controls" section for the user-facing
-summary; the technical detail:
-
-- **No decompression-bomb guard for DOCX/XLSX/PPTX.** All three are plain
-  ZIP archives; none of `python-docx`/`openpyxl`/`python-pptx` bound total
-  decompressed size or entry count before parsing. Closed by
-  `attachments/zip_safety.py::check_zip_safety` — reads only the archive's
-  own central-directory metadata (`ZipInfo.file_size`, no actual
-  decompression) and rejects before the real parser ever touches an entry,
-  wired into all three processors ahead of their existing corrupt-file
-  handling. Also rejects an absolute or `..`-traversal-shaped internal
-  path, as a signal the archive wasn't produced by an ordinary Office
-  application (this app never extracts an entry to disk, so there's no
-  real zip-slip write target today — a defense-in-depth signal, not the
-  primary concern).
-- **No PDF dangerous-content preflight.** `attachments/processors/pdf_processor.py`
-  checked page count and password-protection only.
-  `attachments/pdf_safety.py::check_pdf_safety` adds a **catalog-level**
-  check (the document's root `/Root` dict plus its `/Names` name tree) for
-  embedded JavaScript, an embedded-files name tree, an automatic open
-  action, or document-level additional actions — deliberately not a full
-  page/annotation walk (a disclosed scope boundary named in that module's
-  own docstring, not a silent gap): the catalog-level checks catch the
-  three most common, well-documented "PDF malware" vectors cheaply (a
-  handful of dict lookups, no page-count-scaling cost). Test fixtures are
-  real PDFs built with `pypdf`'s own `add_js`/`add_attachment` writer
-  helpers — genuinely exercising the same catalog structure a malicious
-  PDF would use, never a checked-in malware sample.
-- **No parser timeout.** A pathological file could tie up a request
-  thread indefinitely. `attachments/pipeline.py::process_attachment` now
-  runs every processor call on a small (`max_workers=4`), process-wide
-  bounded thread pool with a hard timeout
-  (`Settings.attachment_processing_timeout_seconds`) — the same "the
-  calling thread stops waiting; Python can't force-kill another thread"
-  caveat `api/main.py::_run_orchestrated_with_timeout` already discloses
-  for `/ask`, applied to attachment processing.
-- **No prompt-injection detection on attachment text.**
-  `security/injection_patterns.py::INJECTION_PATTERNS` was wired into the
-  typed question (`agent/input_guard.py`), the retrieved-schema
-  RAG-poisoning scan (`agent/nodes.py`), and the *persistent* Knowledge
-  Sources PDF pipeline (`rag/ingestion.py`) — but never into chat
-  attachments, regardless of file type. Closed by
-  `attachments/pipeline.py::_scan_for_injection_patterns`, run on every
-  successfully-processed attachment's extracted text, mirroring
-  `rag/ingestion.py`'s own "detection-only, log a `possible_*_injection`
-  security event, never block" policy exactly — the structural
-  untrusted-data framing already in `attachments/graph.py`'s system
-  prompts is what actually bounds the consequence, same as everywhere else
-  this pattern set is used.
-- **Malware scanning could be off in production with no warning.**
-  `MALWARE_SCAN_PROVIDER` defaults to `"disabled"` (a deliberate default —
-  no scanning capability existed before that module was built, so
-  defaulting it "on" would break every existing deployment with no ClamAV
-  daemon reachable), but nothing previously stopped `ENVIRONMENT=production`
-  from starting that way. Closed by a new `Settings` `model_validator`,
-  `_require_malware_scanning_in_production` — mirrors
-  `_require_identity_in_production`'s exact "fail closed at startup, not
-  silently at request time" shape: production with chat attachments,
-  document RAG, policy RAG, or media search enabled and scanning off
-  refuses to start.
-
-**Also found and fixed as a side effect of this audit, not the main
-subject**: `data/attachments/` (the real on-disk attachment storage
-directory) was never gitignored, unlike every other runtime-data directory
-this project has (`media_library/`, `embeddings/.chroma/`,
-`voice/models/`) — closed alongside this pass. `MALWARE_SCAN_PROVIDER`/
-`CLAMAV_HOST`/`CLAMAV_PORT`/`MALWARE_SCAN_TIMEOUT_SECONDS` and the three
-newest attachment settings above were also missing from `.env.example`
-entirely (present in `config/settings.py` with real defaults, just never
-surfaced in the template) — backfilled in the same pass.
-
-**Verified**: 1926 backend tests (58 new: `tests/test_attachments_zip_safety.py`,
-`tests/test_attachments_pdf_safety.py`, extended
-`tests/test_attachments_processors.py`/`_pipeline.py`/`_graph.py`/
-`test_orchestrator.py`/`test_settings_validation.py`/
-`test_startup_write_privilege_enforcement.py`/`test_api_health.py`) and
-208 frontend tests (10 new: `frontend/src/lib/csv.test.ts`, covering the
-already-implemented but previously untested OWASP CSV-injection escaping
-in `frontend/src/lib/csv.ts`) all pass; `tsc --noEmit` clean, `oxlint` exits
-0 (a small number of pre-existing-pattern `react(set-state-in-effect)`
-warnings now also appear in three new dialog components —
-`ResizeImageDialog.tsx`/`RemoveTextDialog.tsx`/`OcrResultDialog.tsx` — none
-block the build). **Not clean, and not newly broken by this pass**: a
-repo-wide `ruff check .`/`black --check .`/`mypy .` re-run during the
-following documentation pass (2026-09-27) found the pre-existing gaps this
-file already discloses elsewhere have grown, not shrunk, over several
-sessions — 7 ruff findings (up from 6), 12 files `black` would reformat (up
-from 8), and 209 `mypy` errors (up from ~117 total/~105 open, mostly new
-`var-annotated`/`arg-type` findings in test files added by later sessions,
-e.g. `eval/security_benchmark/`, `tests/test_api_identity_auth.py`). None
-of the newly-counted findings are in any file this attachment-hardening
-pass touched (verified by cross-referencing file paths) — see this file's
-own "Known, pre-existing CI-hygiene gaps" note under "How to run tests /
-lint" for the fuller history of this drift. Every new attachment-hardening
-test fixture is synthetic/programmatically generated (real `pypdf`/
-`zipfile` writer output) — no malicious samples committed, per this
-codebase's own established convention for adversarial-scenario regression
-tests.
-
-**Not independently verified in this pass**: no live ClamAV daemon was
-available, so the "scanner unreachable"/"scanner error" fail-closed path
-is unit-tested against a mocked socket only (the existing
-`security/malware_scanner.py` test suite), not a real daemon — the same
-disclosed gap this project's earlier security engagements already named.
-The PDF preflight's page/annotation-level action detection remains
-unimplemented (catalog-level only, as designed and disclosed above).
+**Read [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md#15-chat-attachments-image-actions-and-security-hardening)**
+for the full pipeline (per-file-kind processors, the 7-node LangGraph
+subgraph, the capability-registry pattern, and the routing-fix/zip-PDF-
+safety/injection-detection hardening pass in full detail), and
+[`SECURITY.md`](SECURITY.md)'s "Chat attachments — security controls"
+section for the user-facing security summary.
 
 ### Scale-out program: Phase 0 harness + a same-session hardening pass (2026-09-26)
+`docs/SCALE_OUT_PROMPT.md` is an 11-phase program (committed verbatim)
+taking this app from single-instance toward horizontally scalable. Phase
+0 (done): a load-test harness (`eval/load/`) plus a measured baseline
+(`docs/SCALE_BASELINE.md`) — actually running it found and fixed a real,
+previously-invisible bug (`db/connection.py::get_engine` was passing a
+password-masked connection string to `create_engine`, silently breaking
+every discrete-field connection with a real password).
 
-`docs/SCALE_OUT_PROMPT.md` is an 11-phase program (committed verbatim,
-per its own instruction) taking this app from single-instance toward
-horizontally scalable — see `docs/ARCHITECTURE.md`'s own "Scale-out
-program" section for the full per-change writeup and
-`docs/SCALE_BASELINE.md` for measured numbers. Short version, since this
-touched several existing modules this file already documents elsewhere:
+**Invariants that must not regress:** `/ask` concurrency is bounded
+(`ThreadPoolExecutor` sized to `Settings.max_concurrent_ask_requests`,
+with a per-caller cap) with real admission control — a caller past either
+cap gets an immediate 429, before any LLM/DB work starts. Rate/concurrency
+limits and attachment ownership are keyed by real identity
+(`security.oidc.real_caller_subject`), not raw client IP — includes a
+fixed cross-user data-isolation bug where local-auth users were pooled
+into one shared "no owner" bucket.
 
-- **`eval/load/`** (new): a Phase 0 load-test harness — a mock Ollama
-  server (`mock_ollama_server.py`, wire-protocol-compatible, zero
-  application code changed to use it), a throwaway Postgres +
-  `docker-compose.loadtest.yml`, seeded local-auth users
-  (`seed_users.py`), and k6 scenarios (`k6/`). `make load-test` drives it
-  end to end. Actually *running* this (not just writing it) found and
-  fixed a real, previously-invisible bug: `db/connection.py::get_engine`
-  passed a *password-masked* `sqlalchemy.engine.URL` string (`str(url)`
-  masks the password as `"***"` by design) straight into `create_engine`
-  — every discrete-field (`DB_HOST`/`DB_USER`/`DB_PASSWORD`, not
-  `DB_CONNECTION_STRING`) connection with a real password has been
-  silently unable to authenticate since this code was written, caught by
-  nothing because this project's test suite is fully mocked and had never
-  made a real password-authenticated connection. Fixed with
-  `url.render_as_string(hide_password=False)`; regression test in
-  `tests/test_connection.py::TestGetEngine`.
-- **Bounded `/ask` concurrency + real admission control** (`api/main.py`,
-  `agent/rate_limit.py`). The unbounded `threading.Thread`-per-request
-  pattern `_run_orchestrated_with_timeout` used is now a
-  `ThreadPoolExecutor` (`_get_ask_executor`) sized to
-  `Settings.max_concurrent_ask_requests` (default 50, global) — a caller
-  past that cap, or past their own `max_concurrent_ask_requests_per_caller`
-  cap (default 2, via the new `agent.rate_limit.ConcurrencyLimiter`/
-  `BoundedConcurrencyLimiterCache`), gets an immediate 429 with
-  `Retry-After`, before any LLM/DB work starts. A concurrency slot is
-  released only when the underlying graph execution *actually* finishes —
-  not when the outer request timeout gives up waiting on it — so an
-  abandoned-but-still-running call still correctly occupies its slot
-  (real backpressure under sustained overload: fewer free slots, more
-  429s, never an invisible unbounded thread pile-up). Still not true
-  cross-thread cancellation of an in-flight LLM/DB call — that needs the
-  full async rewrite `docs/SCALE_OUT_PROMPT.md` scopes as its own Phase 1.
-- **Rate/concurrency limits — and attachment ownership — keyed by real
-  identity, not raw client IP** (`security.oidc.real_caller_subject`,
-  used by `api/main.py`'s `_rate_limit_key` and `api/attachments.py`'s
-  `_owner_subject`). Two gaps closed by the same fix: IP-keying means
-  nothing behind a load balancer or carrier NAT, and — a genuine
-  cross-user data-isolation bug, found while fixing the first gap — both
-  call sites previously checked `identity.mode == "oidc"` specifically,
-  treating `mode="local"` (this app's own real, per-user JWT accounts,
-  `identity/`) exactly like the two modes with no real per-caller identity
-  at all. Every distinct local-auth user's attachments and rate/concurrency
-  budget were silently pooled into one shared "no owner" bucket. See
-  `AuthIdentity`'s own (now-corrected) docstring in `security/oidc.py`.
-
-**What's now suitable for multi-instance deployment vs. what still isn't**
-— see `docs/SCALE_BASELINE.md`'s own "Honest capacity statement" for the
-full, no-numbers-without-a-real-test-run answer. Short version: one
-instance now degrades to slow/429 rather than an unbounded thread pile-up
-under load, and per-caller isolation is real for the auth mode this app's
-multi-user story actually uses — but rate limiting, the Chroma schema
-index, and the compiled-graph/Ollama-client singletons are all still
-process-local (Phase 3/5's job), and there is still no true
-cross-thread cancellation, streaming, or distributed coordination (Phases
-1-4). Nothing here changes `/ask`/`/execute`'s request/response shape or
-any existing security control's behavior.
+**Read [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md#5-scale-out-program)**
+for the full per-change writeup, and
+[`docs/SCALE_BASELINE.md`](docs/SCALE_BASELINE.md)'s "Honest capacity
+statement" for what's now suitable for multi-instance deployment vs. what
+still isn't (rate limiting, the Chroma schema index, and the compiled-
+graph/Ollama-client singletons are all still process-local; no true
+cross-thread cancellation, streaming, or distributed coordination yet).
 
 ### Configurable Ollama model selection for Text-to-SQL (2026-09-27)
+A caller may pick which locally-installed Ollama model answers a given
+question (`POST /ask`'s optional `model` field) instead of always using
+`Settings.ollama_model`. Three deliberately separate concepts:
+configured/allowed (`Settings.ollama_allowed_models`, server-validated),
+this app's own curated display metadata (cosmetic only), and installed
+locally (a live Ollama lookup, queried only by `GET /models`, never by
+`/ask` itself).
 
-Before this pass, `Settings.ollama_model` (`OLLAMA_MODEL`, default
-`llama3.1:8b`) was the *only* model any of `agent/llm_client.py`'s four
-Ollama call sites (`generate_sql_from_llm`, `generate_query_plan_from_llm`,
-`review_sql_against_plan_from_llm`, `generate_insight_from_llm`) could ever
-use — set once per process, read fresh from the same cached `Settings`
-singleton by every node, with no per-request concept at all. This pass adds
-configurable, request-scoped model selection without replacing any of that
-architecture: the same four call sites, the same cached `ollama.Client`,
-the same LangGraph graph shape.
+**Invariants that must not regress:** model selection is **request-scoped,
+never global** (`AgentState["selected_model"]`, resolved once, read-only
+downstream — the identical `selected_database` pattern) — verified with a
+real-threading regression test that no process-global mutable model
+variable exists. `POST /ask`'s `model` field is validated *before* any
+admission-control slot is acquired or LLM/DB work starts; an
+unrecognized/disallowed value is an `HTTP 400`, not a graceful "failed"
+run. This feature only ever threads `model` through the four SQL-pipeline
+LLM calls — the embedding model, vision model, voice transcription/
+synthesis, and RAG/web-search LLM calls are untouched.
 
-**Three deliberately separate concepts** (see `agent/model_registry.py`'s
-own module docstring for the full reasoning), mirrored throughout this
-feature's naming:
-
-1. **Configured/allowed** — `Settings.ollama_allowed_models`
-   (`OLLAMA_ALLOWED_MODELS`, comma-separated, mirroring `DB_CONNECTIONS`'/
-   `CORS_ALLOWED_ORIGINS`' own convention) — the only thing that actually
-   gates what `AskRequest.model` may request. `Settings.ollama_model` is
-   always unioned in even if an operator's own list omits it
-   (`_fill_default_ollama_allowed_models`, a `model_validator(mode="after")`
-   mirroring `_fill_default_database`'s exact `object.__setattr__` escape
-   hatch for a frozen model). Left unset, it falls back to
-   `_DEFAULT_OLLAMA_ALLOWED_MODELS` — a small starter set
-   (`qwen2.5:7b`/`qwen2.5:14b`/`llama3.2:3b`/`mistral:7b`/`deepseek-r1:8b`
-   alongside the configured default) evaluated against the live
-   https://ollama.com/library on 2026-09-27 for local Text-to-SQL
-   suitability (instruction-following, structured/JSON output, a spread of
-   sizes) — **not a claim that this is every good model, or the full online
-   catalog**; an operator may list any model name regardless of whether
-   this starter set or `config/ollama_models.yaml`'s curated metadata has
-   ever heard of it. `Settings.ollama_model_selection_enabled`
-   (`OLLAMA_MODEL_SELECTION_ENABLED`, default `true`) is the kill switch --
-   `false` collapses the allowed set to exactly `(ollama_model,)` regardless
-   of `OLLAMA_ALLOWED_MODELS`, so every other check downstream needs no
-   separate "is selection enabled" branch of its own.
-2. **This application's own curated display metadata** --
-   `config/ollama_models.yaml` + `config/ollama_models.py`, the exact same
-   hand-authored/uncached/graceful-missing-entry convention
-   `config/table_descriptions.py` already established (display name,
-   parameter size, context length, resource level, capabilities,
-   description, `recommended`) -- purely cosmetic, never a gate. A model
-   with no catalog entry gets a generic fallback
-   (`describe_model`/`_fallback_display_name`), never dropped.
-3. **Installed locally** -- a live `ollama.Client().list()` lookup against
-   the *connected* Ollama instance, queried only by `GET /models`
-   (`agent.model_registry.discover_installed_models`) and, independently,
-   by `GET /health`'s own pre-existing vision-model-availability check --
-   **never called from `/ask` itself**, satisfying this feature's own
-   performance requirement. `agent.model_registry.installed_model_names`
-   (the same tolerant dict-or-`ListResponse`-shape parser `GET /health`
-   already needed) was moved here from a private `api/main.py` helper
-   (`_pulled_ollama_model_names`) so both call sites share one
-   implementation instead of two copies drifting apart.
-
-**`GET /models`** (`api/main.py`, `Permission.ASK` -- the same gate
-`/schema/tables` already uses, since seeing available models is the same
-capability level as asking a question) returns every configured model
-enriched with live installed status via
-`agent.model_registry.build_model_options` -- never hides an
-allowed-but-uninstalled model, only flags it (`installed: false`), so the
-frontend can show "Not installed" rather than silently dropping it from the
-list. Never exposes `OLLAMA_HOST`/secrets/connection details.
-
-**`POST /ask`'s optional `model` field** is validated *before* any
-admission-control slot is acquired or LLM/DB work starts
-(`agent.model_registry.validate_model_selection`, called in `api/main.py`'s
-`ask()` right after `settings = get_settings()`) -- an unrecognized/
-disallowed value raises `InvalidModelSelectionError` (a plain `ValueError`
-subclass, deliberately *not* an `agent.exceptions.AgentError`, since this
-is a malformed-request condition meant to become `HTTP 400`, not a graceful
-`AgentState` "failed" run) and is audit-logged
-(`invalid_model_selection`, mirroring `api.authz.require_permission`'s
-`authz_denied` event -- a requested model name isn't a secret, so logging
-it plainly is what makes a client-integration bug or a probing attempt
-investigable after the fact). Deliberately does **not** also verify live
-installed status on every `/ask` (that would mean a second Ollama round
-trip per request, contradicting this feature's own performance
-requirement) -- a configured-but-never-`ollama pull`ed model instead
-surfaces naturally through the *existing* `OllamaUnavailableError` handling
-the four LLM call sites already had (its message now names whichever model
-was actually tried, not always `settings.ollama_model`), which
-`generate_sql_node` already turns into a clean `status="failed"` on the
-first attempt -- no retries wasted hitting the same missing-model error
-repeatedly.
-
-**Request-scoped, never global** (`agent/state.py`'s
-`AgentState["selected_model"]`, mirroring `selected_database`'s exact
-"resolved once by the caller, read-never-re-selected by every node" shape):
-`agent.graph.run_agent` gained a `model: str | None = None` parameter,
-resolves it to `model or settings.ollama_model` once up front, and stores
-it in `initial_state` -- `agent/nodes.py`'s `generate_sql_node`/
-`plan_query_node`/`review_sql_node`/`generate_insight_node` all read
-`state.get("selected_model")` and pass it straight through to
-`agent.llm_client`'s new `model: str | None = None` parameter on all four
-functions (`None` there means "use `settings.ollama_model`," preserving
-every pre-existing call site's behavior unchanged). Threaded through
-`agent.orchestrator.graph.run_orchestrated`/`sql_subgraph_node` the same
-way. **No process-global mutable model variable was introduced anywhere**
--- verified with a real-`threading.Thread` regression test
-(`tests/test_model_selection_concurrency.py`) that forces a race window
-open (a `time.sleep` inside the fake Ollama client, between reading
-`model` and recording it) and confirms two concurrent calls with different
-models never cross-contaminate, at both the `agent.llm_client` layer and
-the `generate_sql_node` layer.
-
-**Model boundaries preserved, per this feature's own explicit scope**: the
-embedding model (`EMBEDDING_MODEL_NAME`), the vision model
-(`Settings.media_vision_model`), voice transcription/synthesis, document/
-policy RAG's own LLM calls (`rag/llm.py`), and web-search answer synthesis
-are all completely untouched -- this feature only ever threads `model`
-through the four SQL-pipeline LLM calls, never anything else.
-
-**A real, previously-latent bug found and fixed while building this**:
-`Settings.ollama_allowed_models`/`cors_allowed_origins` (the latter already
-existed, using the identical comma-separated-string
-`field_validator(mode="before")` convention) both raised
-`pydantic_settings.exceptions.SettingsError` when set via a genuine `.env`/
-environment-variable value -- pydantic-settings attempts its own JSON-array
-decoding of a compound-typed (`tuple[str, ...]`) field *before* any field
-validator runs, a distinct, earlier layer than Pydantic's own validation
-pipeline. Every existing CORS test had only ever exercised direct
-`Settings(cors_allowed_origins=(...))` construction (bypassing env-source
-decoding entirely), so this was never caught. Fixed on both fields via
-`Annotated[tuple[str, ...], NoDecode]` (`pydantic_settings.NoDecode`),
-which tells the env source to pass the raw string through to Pydantic's
-own validation machinery unchanged, letting `_split_ollama_allowed_models`/
-`_split_cors_origins` handle it as before. New regression tests confirm
-both now parse correctly from a real environment variable, not just a
-direct kwarg (`tests/test_settings_validation.py`,
-`tests/test_security_headers.py`).
-
-**React UI**: `components/settings/ModelSelector.tsx` -- a new picker
-alongside `FontPicker`/`LanguageSelector`/`ThemeToggle` in the same
-`components/settings/` folder, reusing the existing `<Select>` primitive
-(a plain native `<select>`, per that component's own docstring on why --
-identical reasoning to every other simple picker in this Settings panel)
-rather than building a new radio-list component. Backed by
-`useAvailableModels()` (`hooks/queries.ts`, the same `staleTime: 30_000`
-react-query pattern `useHealth`/`useAttachmentCapabilities` already
-establish -- `GET /models` is never called on every keystroke or question).
-An uninstalled model's `<option>` is rendered `disabled` -- the browser
-itself refuses to let it be selected, so "unavailable models cannot be
-selected" needs no extra client-side validation logic; server-side
-validation (`validate_model_selection`) still re-checks independently
-regardless, since a frontend restriction is never treated as a security
-boundary anywhere in this codebase. The user's choice
-(`settingsStore.ts`'s new `selectedModel`/`setSelectedModel`, persisted
-like `voiceModeEnabled`) is read by `chatStore.ts`'s `askQuestion` via a
-cross-store `useSettingsStore.getState()` call (the same pattern
-`localSettingsStore`-adjacent cross-store reads already use elsewhere in
-this file) and sent as `AskRequest.model`. A reconciliation effect in
-`ModelSelector.tsx` resets a persisted selection back to "use the default"
-if a later `GET /models` response no longer includes it (an operator's
-`.env` change since the selection was made) -- otherwise every subsequent
-`/ask` would keep failing with `HTTP 400` until the user noticed and
-re-opened the picker themselves; a merely-not-installed-yet selection is
-deliberately *not* reset the same way, since that's still a valid, allowed
-choice the user may be mid-`ollama pull` for.
-`components/chat/TurnCard.tsx`'s existing "Query information" panel
-(previously shown only when `isMultiDb`, for `database`) now also shows
-`model` whenever a run reached generation, regardless of database count.
-
-**Verified**: 1974 backend tests (43 new --
-`tests/test_model_registry.py`, `tests/test_api_models.py`,
-`tests/test_model_selection_concurrency.py`, plus additions to
-`tests/test_settings_validation.py`/`tests/test_api_ask.py`/
-`tests/test_security_headers.py`) and 216 frontend tests (8 new,
-`ModelSelector.test.tsx`) all pass; `tsc --noEmit` clean; a production
-frontend build succeeds. Every pre-existing `run_agent`/`run_orchestrated`
-test-double fake with a fixed positional signature needed a `model=None`
-parameter added (the new parameter is positional-compatible, so every real
-call site outside tests -- `agent/tools/definitions.py`'s
-`_sql_query_handler`, `eval/runner.py`, `scripts/run_eval.py`,
-`scripts/profile_pipeline.py` -- needed no changes at all, only test
-doubles that reimplemented the signature by hand).
-
-**Remaining limitations, disclosed rather than silently left**: model
-availability is not live-reloaded mid-process -- like every other
-`Settings` field in this codebase, an `OLLAMA_ALLOWED_MODELS`/
-`OLLAMA_MODEL` change needs a process restart to take effect
-(`config.settings.get_settings`'s `lru_cache`). Per-model role-based
-restriction (e.g. reserving a larger/more expensive model for `analyst`+)
-was not requested and was not built -- every role that can reach `/ask` at
-all (`Permission.ASK`, granted starting at `viewer`) can select any
+**Remaining limitations:** model availability is not live-reloaded
+mid-process (a `.env` change needs a restart). No per-role model
+restriction exists — every role that can reach `/ask` can select any
 configured/installed model. Insight/planning/review always use the exact
-same model chosen for generation, by design -- there is no way to pick a
-different model for the narrative insight step alone.
+same model chosen for generation.
+
+**Read [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md#6-configurable-ollama-model-selection)**
+for the full three-concept design, the `GET /models`/frontend
+`ModelSelector.tsx` wiring, and a real `pydantic-settings` env-decoding
+bug found and fixed while building this.
 
 ### Enterprise scalability/security assessment: identity-aware rate limiting, trusted-proxy IP resolution, structured logging, graceful shutdown (2026-09-27)
+A dedicated architecture/scalability/security assessment (synthesizing,
+not re-deriving, the Scale-out program above plus `docs/THREAT_MODEL.md`)
+found and fixed six further, in-place gaps without introducing any new
+infrastructure: opt-in trusted-proxy IP resolution
+(`security/client_ip.py`, `Settings.trusted_proxy_count`), identity-aware
+rate limiting extended to every remaining rate-limited route, structured
+JSON logging, a liveness/readiness split (`GET /live` alongside
+`GET /health`), graceful shutdown of the `/ask` thread pool, and a startup
+warning when `MAX_CONCURRENT_ASK_REQUESTS` exceeds a replica's own
+DB-pool capacity.
 
-A dedicated architecture/scalability/security assessment (not tied to a
-single feature — a full pass over request lifecycle, capacity, auth/authz,
-multi-tenancy, DB/caching/AI/queue scalability, and a STRIDE-style threat
-model) was run against the whole application per an external 39-phase
-assessment prompt, deliberately synthesizing rather than re-deriving the
-prior session's own `docs/SCALE_OUT_PROMPT.md`/`docs/SCALE_BASELINE.md`/
-`docs/THREAT_MODEL.md` work (see "Scale-out program" above) — new
-investigative effort went into angles those docs hadn't already covered.
-Per that prompt's own explicit rules (never rewrite the whole app, never
-introduce microservices for their own sake, never claim untested scale),
-only a bounded set of safe, in-place P0/P1 fixes were implemented — the
-"big Phase 1" async/Redis/streaming rewrite `docs/SCALE_OUT_PROMPT.md`
-already scopes as separate future work was deliberately left alone again.
+**Invariant that must not regress:** at `Settings.trusted_proxy_count`'s
+default of `0`, client-IP resolution never reads `X-Forwarded-For` —
+identical to pre-assessment behavior, locked in by
+`tests/security/test_rate_limit_header_spoofing.py`. Only an operator who
+explicitly sets the trusted-hop count opts into trusting that header.
 
-**Six concrete, independently-testable changes:**
-
-- **`security/client_ip.py`** (new) — `resolve_client_ip(request, settings)`
-  is the one place client-IP resolution now happens, replacing the raw
-  `request.client.host` reads that used to be duplicated across
-  `api/main.py::_rate_limit_key`, `api/rate_limit.py`, and
-  `api/identity_auth.py::_client_ip`. A new `Settings.trusted_proxy_count`
-  (default `0`) gates it: at the default, behavior is byte-for-byte
-  unchanged (never reads `X-Forwarded-For`, exactly the pre-existing
-  behavior every `tests/security/test_rate_limit_header_spoofing.py`
-  regression test already locks in). An operator who sets it to the exact
-  number of trusted reverse-proxy hops in front of this app gets the
-  *real* client IP via the correct "count from the trusted end, not the
-  client-controlled end" algorithm (matching Werkzeug's `ProxyFix`) —
-  reading the leftmost `X-Forwarded-For` entry (the common naive mistake)
-  is directly spoofable by any client that pre-populates the header
-  itself; counting a fixed number of hops from the right end is not, since
-  each trusted proxy appends its own observed peer address rather than
-  forwarding the client's claimed one untouched.
-- **`api/rate_limit.py`'s `enforce_api_action_rate_limit` is now
-  identity-aware**, not IP-only. Every call site that already resolves an
-  `AuthIdentity` (`/execute`, `/schema/refresh`, `/generate/confirm`,
-  `/search/media`, `POST`/`DELETE /documents`, every `/attachments/*`
-  action route) now passes `identity=identity`, keying on
-  `security.oidc.real_caller_subject` when one exists and falling back to
-  `resolve_client_ip` otherwise (`api/voice.py`'s two routes, whose
-  permission check happens at the router level with no bound `identity`
-  parameter, correctly keep the IP-only 3-argument call). This closes a
-  real gap distinct from the "wrong identity mode checked" bug the
-  Scale-out program above already fixed for `/ask` itself: two real,
-  distinct authenticated users sharing one IP (a NAT'd office, a corporate
-  VPN) previously shared one rate-limit bucket on every route in this
-  module, and one user could dodge their own limit by switching IP. Mirrors
-  `api/main.py`'s own `_rate_limit_key` pattern, generalized to the shared
-  limiter every non-`/ask` mutating route uses.
-- **Structured JSON logging, opt-in** (`config/settings.py`'s new
-  `Settings.log_format: Literal["text", "json"] = "text"` +
-  `_JsonLogFormatter`). Default behavior (plain text, matching every
-  existing test/log-reading habit) is unchanged; `LOG_FORMAT=json` emits
-  one JSON object per line (`timestamp`/`level`/`logger`/`correlation_id`/
-  `message`, plus `exception` when present) — what a real log
-  aggregator (the kind a multi-instance deployment needs, per the Scale-out
-  program's own disclosed "no shared store" limitation for rate limiting)
-  actually wants to ingest, instead of parsing free-text log lines.
-  `configure_logging` now also passes `force=True` to `logging.basicConfig`,
-  enabling safe reconfiguration (needed for tests that toggle
-  `log_format` and re-call it) with no behavior change for the single
-  call site that already existed.
-- **Liveness/readiness split**: a new `GET /live` (no dependency checks at
-  all — never touches the DB, Chroma, or Ollama) sits alongside the
-  existing `GET /health` (which does check all three). A container
-  orchestrator's liveness probe should hit `/live` (a slow/degraded
-  dependency must never cause a healthy process to be killed and
-  restarted, which only makes an overload situation worse) while its
-  readiness probe keeps using `/health` (a process that can't reach its
-  DB genuinely shouldn't receive new traffic). Before this, only `/health`
-  existed, conflating both concerns into one endpoint.
-- **Graceful shutdown for the `/ask` thread pool** (`api/main.py`'s
-  `_shutdown_ask_executor`, called at the end of `lifespan`) — the
-  `ThreadPoolExecutor` backing bounded `/ask` concurrency (see the
-  Scale-out program above) is now explicitly drained (`.shutdown(wait=True)`)
-  on process shutdown rather than abandoned, so an in-flight request isn't
-  cut off mid-response during a rolling deploy/restart.
-- **DB-pool-vs-concurrency sizing warning** (`api/main.py`'s
-  `_warn_on_ask_concurrency_pool_mismatch`, called at startup) — logs a
-  warning (never fails startup) when `Settings.max_concurrent_ask_requests`
-  exceeds `db_pool_size + db_max_overflow`, since every concurrent `/ask`
-  can hold a DB connection — a silent, easy-to-hit misconfiguration this
-  codebase had no signal for before, surfaced the same "detectable and
-  startup-visible instead of silently discovered under load" way
-  `_enforce_database_write_privileges` already treats a misconfigured DB
-  role.
-
-**Verified**: 2016 backend tests pass (58 new:
-`tests/test_client_ip.py`, `tests/test_ask_concurrency_pool_warning.py`,
-`tests/test_graceful_shutdown.py`, `tests/test_json_logging.py`, plus new
-classes in `tests/test_api_ask.py`/`test_api_rate_limit.py`/
-`test_api_health.py`), `mypy`/`black`/`ruff` clean on every touched file
-(pre-existing repo-wide drift confirmed unrelated by cross-referencing
-file paths — see "Known, pre-existing CI-hygiene gaps" below), 216
-frontend tests pass, `tsc --noEmit` clean, `npm run build` succeeds — no
-frontend file was touched by this pass, this was a build/regression
-confirmation only.
-
-**A real bug caught and fixed before it shipped, not by a test failure**:
-wiring `identity=identity` into all 11 `enforce_api_action_rate_limit` call
-sites required 5 route-handler parameters to actually be *read* rather than
-ignored — 5 of them were still named with the codebase's own
-underscore-prefix-means-unused convention (`_identity`), which would have
-been a `NameError` at request time with zero test coverage catching it,
-since no existing test exercised the newly-added code path before the
-parameter was ever referenced. Found and fixed by systematic manual
-verification of every call site before running anything, not by a red
-test: `api/generation.py::confirm_generation`,
-`api/media_search.py::search_media_endpoint`, `api/main.py::execute`,
-`api/main.py::schema_refresh`, `api/documents.py::delete_document_route`.
-
-**Explicitly not attempted in this pass, per the assessment's own P2/P3
-prioritization and "do not rewrite the whole application" rule** — these
-remain exactly where `docs/SCALE_OUT_PROMPT.md` already scoped them:
-cross-process rate limiting/concurrency limiting (still per-process
-in-memory, disclosed since the Scale-out program), a message
-queue/background-worker tier for long-running AI work, true async
-request handling, response streaming, and any multi-region/multi-tenant
-architecture change. No million-user (or any specific concurrent-user)
-capacity claim is made anywhere in this pass's own documentation —
-`docs/SCALE_BASELINE.md`'s real k6-measured numbers remain the only actual
-load-test evidence this codebase has, and this pass added no new load
-test of its own.
+**Read [`docs/ENTERPRISE_SCALABILITY_SECURITY_ASSESSMENT.md`](docs/ENTERPRISE_SCALABILITY_SECURITY_ASSESSMENT.md)**
+(also summarized in
+[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md#7-enterprise-scalabilitysecurity-assessment))
+for the full report, current-state/target-state diagrams, and the honest
+capacity statement — no million-user or specific-concurrent-user claim is
+made anywhere in this pass's documentation.
 
 ### AI-guided (generative) image editing (2026-09-27)
+Closes a real, previously-disclosed gap: the Edit-image modal's
+"AI-guided editing" panel was real UI wired to a deliberate, permanent
+stub. Provider: IMA Studio's `image_to_image` task category, chosen after
+live verification — none of its 5 available models expose a native
+mask/inpainting parameter, a real provider constraint, not worked around
+silently.
 
-Closes a real, previously-disclosed gap named in the "Frontend UI
-redesign" section above and in `docs/image-editing-architecture.md`: the
-Edit-image modal's "AI-guided editing" panel was real UI (preset buttons,
-a free-text prompt field, mask painting) wired to
-`lib/imageEditAdapter.ts`'s `AiGuidedEditAdapter`, which was a deliberate,
-permanent stub — clicking Generate always failed with "it needs a backend
-endpoint that hasn't been built." Traced the click through
-`ImageEditor.tsx` → `AiGuidedEditAdapter.editWithInstruction()` before
-writing any code, confirming that was the whole story (no partial backend
-existed to extend) rather than assuming.
+**Invariants that must not regress:** IMA's lack of a mask channel is
+handled by converting this app's own canonical mask into a translucent
+red overlay for that one adapter only (`ImaImageEditProvider`) — disclosed
+to the user via `ImageEditResult.warnings`, never presented as
+pixel-exact masking. A completed edit is always stored as a **brand-new**
+attachment (`register_derived_image`) — the original is never mutated.
+Generated bytes are decoded/verified via Pillow before being stored —
+untrusted output, exactly like "SQL is untrusted output" applied to
+pixels. **No SQL-path leakage, structurally guaranteed**:
+`attachments/ai_edit.py` imports neither `agent.graph` nor `agent.nodes`
+and is reached only through its own dedicated REST route, never through
+`/ask`. Only the 4 genuinely generative presets reach the paid endpoint —
+blur and table-extraction route to the existing free/analysis endpoints
+instead, never the AI-edit one.
 
-**Provider: IMA Studio, `image_to_image` task category — chosen after
-live verification, not assumed.** A real, read-only, no-cost `GET
-/open/v1/product/list?category=image_to_image` call against this
-project's own configured account confirmed 5 real models (`gpt-image-2`,
-`gemini-3.1-flash-image`/"Nano Banana 2", `gemini-3-pro-image`/"Nano
-Banana Pro", `doubao-seedream-4.5`, `midjourney`) and — critically —
-**that none of them expose a native mask/inpainting parameter**: this is
-instruction-driven whole-image editing only, a real provider constraint
-that shaped the whole mask design below rather than something to work
-around silently. The upload flow this needs (`media_gen/upload.py`) is a
-separate host from IMA's task API (`imapi.liveme.com`, a signed
-GET-for-a-token then a raw `PUT` of the image bytes) — fetched from IMA's
-own public reference implementation
-(`github.com/imastuido/ima-all-ai`) rather than guessed at, since an
-undocumented wire protocol is exactly the kind of thing worth verifying
-before coding against it.
+**Known, disclosed limitations:** IMA's visual-overlay mask is a
+best-effort convention — the model can still edit outside the highlighted
+region. A live call against IMA's real infrastructure confirmed the
+upload/request/error-propagation path but failed at generation itself
+with IMA's own "insufficient points" business error (the configured
+account has no credits) — **a successful live generation has not been
+confirmed**, only the request path up to that point.
 
-**Mask convention: this app's own canonical mask, converted per-provider,
-never assumed to fit generically.** `attachments/mask.py` defines the one
-internal convention every mask-consuming route shares (a single-channel/
-RGBA PNG, white/opaque = editable, decoded and resized to the source
-image's own native pixel dimensions via `decode_and_validate_mask` — a
-zero-area mask is rejected with an actionable message before any provider
-call, never silently accepted). Since IMA itself has no mask channel,
-`media_gen/image_edit_provider.py::ImaImageEditProvider` converts that
-canonical mask into IMA's actual convention for this one adapter only: a
-translucent red overlay composited onto the source image
-(`_composite_mask_overlay`, alpha scaled by mask intensity) plus an
-explicit prepended prompt instruction to only modify the highlighted
-region. This is disclosed to the user via `ImageEditResult.warnings`
-(shown in the completed-result panel) — never presented as pixel-exact
-masking, since it isn't. A **different** future provider with a real mask
-channel would get its own adapter using the canonical mask directly,
-unconverted — the conversion lives entirely inside the IMA adapter, not in
-the canonical mask model itself.
-
-**Mask/source pixel alignment, actually fixed, not just documented as a
-gap.** The editor already exported a mask before this pass, but — as
-`docs/image-editing-architecture.md` disclosed — it exported the *whole
-flattened canvas*, not an isolated mask render. Fixed via
-`ImageEditor.tsx::flattenMaskOnly`: every Konva layer except the mask
-layer is temporarily hidden, the mask layer is forced to full opacity, one
-`toDataURL({ pixelRatio: 2 })` call captures just it, then everything is
-restored — using the exact same `pixelRatio` `flattenToDataUrl()` itself
-uses is what guarantees the mask and the source line up pixel-for-pixel at
-whatever zoom/rotation/crop state the canvas is currently in, with no
-second offscreen Stage or manual coordinate-transform math needed.
-
-**Backend contract**: `POST /attachments/{id}/ai-edit`
-(`api/attachments.py::ai_edit_route`, new `AiImageEditRequest`/
-`AiImageEditResponse` schemas). The `{id}` is always a **fresh, transient
-attachment holding the editor's current canvas export** — never the
-original file, never a blob URL/local path passed as a model input.
-`lib/imageEditAdapter.ts`'s `AiGuidedEditAdapter` (no longer a stub) does
-the real work: upload the current export via the existing `POST
-/attachments/upload` path, call ai-edit, then delete the transient source
-in a `finally` regardless of outcome — a Generate click never leaves scratch
-attachments behind. `attachments/ai_edit.py::execute_image_edit` is the
-orchestration layer: operation allowlist (`remove_object`/
-`replace_background`/`replace_sky`/`region_edit`/`enhance` — an
-unrecognized operation is a `422` at the schema layer, never reaching this
-far), prompt empty/length validation,
-`media_gen/content_policy.py::basic_prompt_safety_check` (extracted from
-`agent/orchestrator/nodes.py`'s previously-private `_basic_prompt_safety_check`
-so both plain generation and image editing share one policy check, not
-two copies), mask decode/validate, the existing, shared
-`agent.rate_limit.get_media_generation_limiter` (AI image editing is
-exactly as metered as plain generation, same limiter), and a bounded,
-TTL'd in-memory idempotency cache keyed by `(owner_subject,
-idempotency_key)` so a duplicate click/retry never pays for a second
-generation. `ImaImageEditProvider` downloads the result through the
-existing SSRF-hardened `media_gen.download.download_media_bytes` and
-decodes/verifies it via Pillow before it's ever stored — generated bytes
-are untrusted output, exactly like the "SQL is untrusted output" principle
-elsewhere in this file, applied to pixels instead of text. A completed
-edit is stored as a brand-new attachment via the existing, unmodified
-`attachments.pipeline.register_derived_image` (the same function resize/
-remove-text/blur already share) — the original is never mutated, matching
-every other image action in this codebase.
-
-**Frontend result states, one real state machine per flow, not a shared
-generic one.** `ImageEditor.tsx` tracks `idle → uploading → processing →
-completed | failed` for the AI-edit flow specifically (mask preview shown,
-provider/model/warnings surfaced on success, an actionable message on
-failure) and a simpler `idle → processing → completed | failed` for local
-blur and OCR-extract. Every async handler is guarded by `requestEpochRef`
-(bumped on every modal open/close) so a slow response from a request that
-outlived its modal session can never overwrite the UI for whatever is open
-now — verified by an automated test that starts an extract-text call,
-closes the modal, reopens it for a *different* image, then resolves the
-original promise and confirms its (now-stale) text never appears.
-`GET /attachments/capabilities`'s existing `image_ai_editing`/
-`image_ai_editing_provider`/`max_ai_edit_prompt_length` fields (added
-alongside the new `image_blur` field the same pass) gate the AI-edit
-prompt input and its 4 generative preset buttons — fails closed (disabled,
-with an honest "not configured on this server" notice) until the
-capability check genuinely returns `true`, never optimistically enabled
-while the query is still loading or failed.
-
-**Quick-action routing, per this feature's own explicit routing table —
-not one shared handler wired to every button.** Only the 4 genuinely
-generative presets (Remove selected object, Replace background, Replace
-sky, Enhance region — `ImageEditor.tsx`'s `AI_EDIT_PRESET_OPERATIONS` map)
-call the paid `POST /attachments/{id}/ai-edit`. "Blur the selected face"
-(`handleBlurFace`) calls the existing, free `POST
-/attachments/{id}/blur-region` (deterministic Pillow Gaussian blur over
-the painted mask, no model call, works even with AI-guided editing
-disabled — a real gap between what was previously wired to a
-generic prompt-filler and what the task's own routing table requires,
-fixed as part of this pass). "Extract the selected table or chart"
-(`handleExtractTable`) calls the existing OCR/vision analysis route (`POST
-/attachments/{id}/extract-text`) and renders recognized text — analysis,
-never a generated image, per this feature's own "OCR/table extraction
-routes to analysis, never pixel editing" requirement.
-`AI_EDIT_PRESET_OPERATIONS` deliberately excludes both of these two preset
-keys so neither can accidentally reach the AI-edit endpoint.
-
-**No SQL-path leakage, structurally guaranteed, not just conventionally
-avoided.** `attachments/ai_edit.py` imports neither `agent.graph` nor
-`agent.nodes` and is reached only through its own dedicated REST route,
-never through `/ask` — an image-edit-only request cannot retrieve schema,
-generate SQL, or reach "Confirm and Run," because there is no shared code
-path between the two features to guard against in the first place.
-
-**Verified with `FakeImageEditProvider` (a real test double recording
-actual bytes, not filenames) for every automated test, plus one real, live
-call against IMA's actual infrastructure.** The live call (a synthetic
-test image + a real mask, `remove_object`) uploaded successfully against
-IMA's real endpoints, then failed at `POST /open/v1/tasks/create` with
-IMA's own business error `{"code": 4008, "message": "Insufficient
-points"}` — the configured account has no generation credits, a real
-account-balance condition external to this app, not a code defect; no
-credits were spent since the failure happened before any model inference.
-This confirms the upload/request/typed-error-propagation path against
-IMA's real infrastructure but does **not** confirm a successful live
-generation — that still needs an account with a positive credit balance.
-2123 backend tests pass
-(`ruff`/`black`/`mypy` clean on every touched file), including pixel-level
-proof that `_composite_mask_overlay` leaves pixels outside the mask
-byte-identical and red-shifts pixels inside it, and HTTP-level tests
-asserting the mocked provider receives real image/mask bytes (not a
-filename or placeholder) and that a zero-area mask, an unsupported
-operation, and a content-policy violation are all rejected before ever
-reaching the provider. 255 frontend tests pass (13 new — 6 for
-`imageEditAdapter.ts`'s upload→edit→cleanup/error paths, 7 for
-`ImageEditor.tsx`'s capability gating, quick-action routing, and
-stale-response guarding); `tsc`/`oxlint`/`npm run build` all clean. Fixed
-a genuine, disclosed jsdom gap found while writing these tests:
-`HTMLCanvasElement.prototype.toDataURL` is unimplemented in jsdom (silently
-returns `undefined`, no error) — Konva's `Stage.toDataURL()` delegates to
-it, so every canvas-export-dependent flow silently no-opped with no
-exception to catch until a fixed-PNG polyfill was added to
-`frontend/src/test/setup.ts`, the same category as that file's existing
-`getContext`/`ResizeObserver` stubs for other missing jsdom capabilities,
-not a behavior mock of this app's own code.
-
-**Known, disclosed limitations**: IMA's visual-overlay mask convention is
-a best-effort convention, not pixel-exact masking — the model can still
-edit outside the highlighted region (disclosed via `warnings`, not
-hidden). "Extract the selected table or chart" OCRs the whole current
-canvas, not a true selected sub-region (crop first to isolate one
-table/chart). The `"image"` i18n namespace this feature's new strings
-live in exists only in the English locale file — a pre-existing gap that
-predates this feature (the whole editor, crop/rotate/draw included, was
-never localized into es/fr/hi/mr either); `fallbackLng: 'en'` means this
-degrades to English text rather than breaking. See
-`docs/image-editing-architecture.md`'s "AI-guided editing: the real
-implementation" section for the full design and every other disclosed
-limitation.
+**Read [`docs/image-editing-architecture.md`](docs/image-editing-architecture.md)**'s
+"AI-guided editing: the real implementation" section (also summarized in
+[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md#8-ai-guided-generative-image-editing))
+for the full design and every other disclosed limitation.
 
 ### Google sign-in (2026-09-28)
+A second way to reach this app's own self-hosted accounts — "Continue
+with Google" on both sign-in and sign-up. Layered entirely on top of the
+pre-existing local-account system; does not touch OIDC mode, the
+static-token mode, or `agent/authz.py`'s RBAC. Uses Google Identity
+Services' ID-token flow (not OAuth authorization-code), since this is
+authentication only — no `client_secret` is ever held server-side.
 
-A second way to reach this app's own self-hosted accounts (`identity/`,
-`Settings.local_auth_enabled`) — "Continue with Google" on both the sign-in
-and sign-up pages, one backend flow deciding which. Layered entirely on
-top of the pre-existing local-account system; does not touch OIDC mode,
-the static-token mode, or `agent/authz.py`'s RBAC. Full design, every
-server-side check, identity-linking rules, and the honest "what's
-live-verified vs. mocked vs. not verified at all" breakdown live in
-`docs/AUTHENTICATION.md`'s own "Google sign-in" section — this is a
-pointer, not a duplicate. Short version, since it touches several existing
-modules this file already documents elsewhere:
+**Invariants that must not regress:** `security/google_oidc.py
+::verify_google_id_token` validates signature against Google's live,
+rotating public keys, issuer, exact `aud`, `azp`, and a server-issued
+single-use nonce, and reads `hd` (hosted-domain restriction) from the
+**signed claim**, never inferred from the email's `@domain` suffix. `sub`
+is the only durable identity key ever stored. Identity linking
+(`identity/repositories/external_identities.py`) never auto-merges an
+account by email alone, and an unverified-email collision is refused
+generically (a non-confirming 401) to avoid becoming an
+account-enumeration oracle.
 
-- **Flow: Google Identity Services' ID-token flow, not the OAuth
-  authorization-code flow** — chosen specifically because Google sign-in
-  here is authentication only, never authorization to call any Google API
-  or to a user's own configured SQL database, so there's no scope this app
-  needs beyond `openid email profile` (GIS's own default) and therefore no
-  `client_secret` to ever hold server-side. `GOOGLE_OAUTH_CLIENT_ID` is the
-  only Google-related setting, and — unlike every other credential this
-  file discusses — is explicitly **public**, served to the frontend live
-  via `GET /health` (`google_signin_enabled`/`google_client_id`) rather
-  than baked into a `VITE_*` build-time variable the way this codebase's
-  pre-existing OIDC client ID is, specifically so it can be rotated with a
-  process restart alone, no rebuild.
-- **`security/google_oidc.py::verify_google_id_token`** does the real work,
-  via Google's own `google-auth` library (never a hand-rolled JWT decode):
-  signature against Google's live, rotating public keys (never trusting
-  the token's own `alg`/`kid`), issuer restricted to Google's own domains,
-  exact `aud` match against `GOOGLE_OAUTH_CLIENT_ID`, `azp` cross-check,
-  bounded-clock-skew `exp`/`iat`, a server-issued single-use nonce
-  (`issue_signin_nonce`/`consume_signin_nonce`, a bounded in-memory store
-  mirroring `attachments.ai_edit`'s own idempotency-cache shape) verified
-  against the token's signed `nonce` claim, `sub` as the only durable
-  identity key ever stored, `email_verified` gating whether an email claim
-  is trusted, and `hd` (hosted-domain restriction, `GOOGLE_OAUTH_ALLOWED_HOSTED_DOMAINS`)
-  read from the **signed claim**, never inferred from the email's own
-  `@domain` suffix.
-- **`identity/repositories/external_identities.py`** owns identity linking:
-  `ExternalIdentity` (`identity/models.py`, a real `UNIQUE(provider,
-  provider_subject)` constraint — the durable, race-safe mapping),
-  `find_or_create_user_for_google_identity` (the sign-in-or-sign-up
-  decision, four ordered checks — already-linked / verified-email-conflict
-  refused with an informative 409 / unverified-email-collision refused
-  generically with a non-confirming 401, since `users.email`'s own unique
-  constraint makes a second account genuinely impossible either way and
-  the two cases must not be distinguishable from the response or the
-  unverified path becomes an enumeration oracle / first-sign-in creates a
-  password-free user), `link_external_identity` (authenticated linking
-  only — `user_id` from the caller's own verified session, never the
-  request body; never auto-merges by email alone), `unlink_external_identity`
-  (refused if it would leave an account with no way to sign in at all).
-  `users.password_hash` was widened to nullable for this
-  (`a09ce853cb0d_google_signin_external_identities.py`, an Alembic
-  migration that only loosens a constraint, touches no existing row, and
-  refuses to downgrade if doing so would silently break a Google-only
-  account) — a real, previously-latent crash this surfaced and fixed: a
-  Google-only account attempting *local* password login used to hit an
-  uncaught `AttributeError` deep in Argon2's own verify call instead of the
-  ordinary generic 401 every other wrong-password attempt gets, a genuine
-  account-enumeration side channel via HTTP status code alone.
-- **Sessions are the *existing* ones, nothing new invented** — a
-  successful Google sign-in calls the exact same `_issue_tokens(...)`
-  helper `/auth/login`/`/auth/register` already use, producing the same
-  JWT access token + `Secure`/`HttpOnly`/`SameSite` rotating refresh-token
-  cookie every local-account session already gets.
-- **Frontend**: `GoogleSignInButton.tsx` (renders GIS's own button, fetches
-  a nonce once per mount, never stores the credential anywhere beyond
-  handing it to its caller), `localAuthStore.ts`'s new `loginWithGoogle`
-  action (identical `TokenResponse`-derived state `login`/`register`
-  already set), wired into both `SignIn.tsx`/`Register.tsx` behind
-  `GET /health`'s own capability flags, plus a `ConnectedAccountsSection.tsx`
-  in Settings for linking/unlinking from an already-authenticated session.
-- **Frontend production-build secret scanning**
-  (`scripts/scan_frontend_build_for_secrets.py`, new, CI-wired) — added
-  alongside this feature specifically because a Google client ID is
-  *expected* to appear in the built bundle (public, by design) while a
-  real secret never should; scans compiled JS/CSS/HTML/source maps for
-  known secret-shaped patterns plus, optionally, exact-value matches
-  against this deployment's own real configured secrets
-  (`security.redaction.configured_secret_fingerprints`) — distinct from
-  and complementary to the existing Git-history-only scanners
-  (`gitleaks`/`detect-secrets`).
-- **Honest verification status**: the Alembic migration, every
-  identity-linking repository function, and `verify_google_id_token`'s
-  rejection path making a real network round-trip to Google's own
-  certificate infrastructure were all live-verified against a real local
-  PostgreSQL identity database in this development environment. A
-  successful token verification is necessarily mocked in HTTP-level tests
-  (no way to produce a token Google's own library will accept without a
-  real Google account completing a real sign-in in a real browser). **A
-  real, browser-based, end-to-end Google sign-in has not been exercised in
-  this environment** — see `docs/AUTHENTICATION.md`'s own "What's verified
-  vs. not" section before relying on this in production.
+**Honest verification status:** the Alembic migration and every
+identity-linking function are live-verified against a real PostgreSQL
+database. **A real, browser-based, end-to-end Google sign-in has not been
+exercised in this environment** — successful token verification is
+necessarily mocked in HTTP-level tests.
+
+**Read [`docs/AUTHENTICATION.md`](docs/AUTHENTICATION.md#google-sign-in-2026-09-28)**
+(also summarized in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md#9-google-sign-in))
+for every server-side check and the full "what's verified vs. not"
+breakdown.
 
 ### Secure conversation sharing (2026-09-28)
+Turns a conversation into a controlled, read-only snapshot other people
+may view — never a live query channel, an authentication session, or a
+way to reach this app's SQL/RAG/web/model/image pipelines from a shared
+view.
 
-Turns a conversation into a controlled, read-only snapshot other people may
-view — never a live query channel, an authentication session, or a way to
-reach this app's SQL/RAG/web/model/image pipelines from a shared view. Full
-design in `docs/SHARING_SECURITY.md` — this is a pointer, not a duplicate.
-Short version, since it touches several existing modules this file already
-documents elsewhere:
+**Invariants that must not regress:** `identity/share_policy.py` is the
+single RBAC/ABAC decision point every route/resolver calls before
+acting — deny-by-default on an unrecognized action, role, or missing
+tenant; owner/viewer/anonymous-link-viewer are the only three roles, no
+"Editor." `build_share_projection` is a hard **allowlist** (not a
+blocklist) of which persisted-turn fields a viewer may ever see — a
+newly-added internal field defaults to invisible. This app has no real
+multi-tenant model; only the new sharing tables carry a scoped
+`tenant_id` — a deliberate, narrower decision than a full retrofit.
 
-- **This app has no real tenant model (single-tenant by design, see
-  `agent/rate_limit.py`'s own existing "no-tenant-isolation" disclosure) --
-  a full multi-tenant retrofit was deliberately out of scope.** Only the
-  new sharing tables carry a scoped `tenant_id` (`security/tenancy.py`,
-  one function, one constant today), and `identity.share_policy
-  .authorize_share_action` genuinely enforces a tenant-match condition
-  against it — a real, tested ABAC dimension future multi-tenancy could
-  plug a real per-user value into without touching the policy engine.
-- **`identity/share_policy.py`** is the single RBAC/ABAC decision point
-  every route/resolver calls before acting (mirroring `agent/authz.py`'s
-  own "pure policy, no web-framework import" split) — deny-by-default on
-  an unrecognized action, role, or missing tenant; owner/viewer/
-  anonymous-link-viewer are the only three roles, "Editor" is never
-  modeled at all per this feature's own explicit scope.
-- **`identity/repositories/shares.py`** owns the snapshot boundary (a
-  message sent after sharing is invisible until the owner explicitly
-  refreshes it), optimistic-concurrency-controlled updates
-  (`ShareVersionConflictError` → 409), and `build_share_projection` — a
-  hard **allowlist** (not a blocklist) of which persisted-turn metadata
-  fields a viewer may ever see, so a newly-added internal field defaults
-  to invisible until deliberately added.
-- **Tokens reuse `identity/security.py`'s existing refresh-token
-  primitive directly** (48-byte CSPRNG, SHA-256 hash-only storage) rather
-  than reinventing one — the same "identical requirement, don't duplicate"
-  precedent `identity/repositories/tokens.py` already established for
-  password-reset/email-verification tokens.
-- **A real bug found only by live-testing the running app, not by
-  `TestClient` alone**: raising `HTTPException` builds a separate response
-  object that silently discards headers a route had already set on its
-  injected `Response` parameter — meaning the *denial* path of the
-  anonymous-reachable `GET /share-view/{ref}` served default cache/
-  referrer headers instead of the intended `private, no-store`/
-  `no-referrer` ones. Reproduced via `curl` against a real running
-  instance, fixed by moving every safe header onto
-  `HTTPException(..., headers=...)` explicitly, and closed with both a
-  named regression test and a second live re-verification.
-- **A second real design gap, found by this feature's own test-writing**:
-  `ConversationShare.conversation_id` is unique, so a revoked share could
-  never simply be re-created — `identity.repositories.shares
-  .reactivate_share` is the one function that clears `revoked_at`, wired
-  into `POST .../share`'s own idempotent-create path as a fresh grant
-  (new snapshot, new expiry) rather than a resurrection of stale settings.
-- **Deliberately a separate backend path prefix (`/share-view`) from the
-  frontend's own `/shared/:ref` client-side page route** — a real routing
-  collision was caught before it shipped (both would otherwise resolve to
-  the same URL, so either the API would intercept a genuine page load or
-  the SPA would swallow the API call).
-- **Verified against a real PostgreSQL identity database**: the migration
-  (both directions), real FK/cascade/SET NULL behavior, and a full
-  create → invite → accept → view → revoke → re-share flow via `curl`
-  against a genuinely running instance — not only `TestClient`. **A real
-  reverse proxy/CDN was not available to confirm it honors
-  `Cache-Control: private, no-store`** for this path prefix; see
-  `docs/SHARING_SECURITY.md`'s own "What's verified vs. not" before
-  deploying behind one.
+**A real bug found only by live-testing the running app, not by
+`TestClient` alone:** raising `HTTPException` discards headers a route
+had already set on its injected `Response` — the *denial* path of the
+anonymous-reachable `GET /share-view/{ref}` was serving default
+cache/referrer headers instead of `private, no-store`/`no-referrer`.
+Fixed and re-verified live. **Not verified:** a real reverse proxy/CDN was
+not available to confirm it honors `Cache-Control: private, no-store` for
+this path prefix.
+
+**Read [`docs/SHARING_SECURITY.md`](docs/SHARING_SECURITY.md)** (also
+summarized in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md#10-secure-conversation-sharing))
+for the full data model, token lifecycle, and API surface.
 
 ## How to run
 
@@ -3573,7 +1665,7 @@ rediscover:
 - **Follow-up question resolution (`agent/followup.py`) is still
   per-request, not backed by a LangGraph checkpointer.** This is
   independent of chat-history *storage* (see "Universal server-side chat
-  history" below, which does now persist conversations/messages
+  history" above, which does now persist conversations/messages
   permanently for a locally-authenticated user) — `classify_followup_node`
   still only ever sees whatever `conversation_history` the caller resends
   on each `/ask` call (`frontend/src/lib/history.ts::buildConversationHistory`,
