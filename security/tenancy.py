@@ -38,6 +38,8 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from identity.models import User
 
+    from security.oidc import AuthIdentity
+
 #: The single tenant every real user in this deployment belongs to today.
 #: Never persisted -- it exists purely so `ConversationShare.tenant_id` and
 #: every ABAC tenant comparison have a concrete, stable value to compare
@@ -61,5 +63,34 @@ def resolve_actor_tenant_id(user: User | None) -> str | None:
     deployment would need to change here instead of anywhere else.
     """
     if user is None:
+        return None
+    return DEFAULT_TENANT_ID
+
+
+def resolve_tenant_id_for_identity(identity: AuthIdentity | None) -> str | None:
+    """Same behavior and meaning as `resolve_actor_tenant_id` above, for the
+    one other real caller shape this codebase has: a request authenticated
+    via `security.oidc.AuthIdentity` (OIDC/static-token/local-account modes
+    alike -- see that class's own docstring) rather than a local-accounts
+    `identity.models.User` ORM row.
+
+    A sibling function, not a reuse of `resolve_actor_tenant_id` itself,
+    because the two types are genuinely different and not interchangeable:
+    `api/shares.py` (the only existing caller of `resolve_actor_tenant_id`)
+    always has a real `User` in hand, while `api/main.py`'s `/ask` handler
+    (this function's first caller -- see `agent/state.py`'s `tenant_id`
+    field) only ever has an `AuthIdentity`. Forcing one call site to
+    construct or fake the other's type would be worse than one small
+    sibling function with the identical contract.
+
+    Returns `None` for `identity is None` (no caller to resolve a tenant
+    for). Always `DEFAULT_TENANT_ID` for any real, non-`None` identity
+    today, deliberately not yet distinguishing `auth_mode`s (`none`/
+    `static_token`'s shared-sentinel identities vs. a genuine per-caller
+    `oidc`/`local` one) -- that distinction is exactly the kind of design
+    decision a real multi-tenant retrofit needs to make deliberately, not
+    one this plumbing-only change should guess at.
+    """
+    if identity is None:
         return None
     return DEFAULT_TENANT_ID

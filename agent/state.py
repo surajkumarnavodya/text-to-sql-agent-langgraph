@@ -235,6 +235,28 @@ class AgentState(TypedDict, total=False):
     # `agent.llm_client.generate_insight_from_llm`'s own docstring for why.
     selected_model: str | None
 
+    # Input, set once by the caller (`agent.graph.run_agent` /
+    # `agent.orchestrator.graph.run_orchestrated`) via
+    # `security.tenancy.resolve_tenant_id_for_identity` -- which tenant the
+    # authenticated caller belongs to. `None` for an anonymous/no-identity
+    # caller (mirrors `caller_subject` above). Always
+    # `security.tenancy.DEFAULT_TENANT_ID` today, since this codebase is
+    # explicitly single-tenant by design (see `security/tenancy.py`'s own
+    # module docstring for the full decision record) -- introduced here as
+    # plumbing only, ahead of any real enforcement, so a future prompt that
+    # adds genuine multi-tenant checks doesn't need another `AgentState`
+    # migration to get a tenant id to check against. Deliberately
+    # request-scoped, exactly like `selected_database`/`selected_model`
+    # above -- never a process-global -- so one caller's tenant can never
+    # leak into a concurrent request for a different one. Read, never
+    # re-resolved, by any node that comes to depend on it later; today,
+    # nothing reads it -- the only real enforcement of tenant scoping in
+    # this codebase remains `identity.share_policy.authorize_share_action`,
+    # which resolves its own tenant id independently via
+    # `security.tenancy.resolve_actor_tenant_id` and does not read this
+    # field.
+    tenant_id: str | None
+
     # Set by retrieve_schema
     schema_tables: list[TableSchema]
     schema_context_text: str

@@ -265,6 +265,7 @@ def run_agent(
     enable_insight: bool = True,
     caller_roles: tuple[str, ...] = (),
     model: str | None = None,
+    tenant_id: str | None = None,
 ) -> AgentState:
     """Runs the full agent graph for a single natural-language question.
 
@@ -306,6 +307,16 @@ def run_agent(
             per-retry -- see that field's own docstring in `agent/state.py`
             for why a question's model choice, like its `selected_database`,
             must stay fixed for the life of one run.
+        tenant_id: The authenticated caller's tenant, resolved once by the
+            caller (`api/main.py`'s `/ask` handler, via
+            `security.tenancy.resolve_tenant_id_for_identity`) exactly like
+            `caller_roles` above. `None` (the default -- every caller before
+            this field existed) means "no tenant to resolve," the same
+            "no elevated permissions"-shaped default `caller_roles=()`
+            already establishes. Stored in `state["tenant_id"]`; nothing
+            reads it yet -- see that field's own docstring in
+            `agent/state.py` for why it exists ahead of any real
+            enforcement.
     """
     settings = get_settings()
     effective_model = model or settings.ollama_model
@@ -334,6 +345,7 @@ def run_agent(
     initial_state: AgentState = {
         "question": question,
         "caller_roles": caller_roles,
+        "tenant_id": tenant_id,
         "rejection_reason": None,
         "rejection_message": None,
         "rate_limit_message": None,

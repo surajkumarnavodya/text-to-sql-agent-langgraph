@@ -135,6 +135,7 @@ from security.audit_log import (
 from security.client_ip import resolve_client_ip
 from security.oidc import AuthIdentity, real_caller_subject
 from security.redaction import redact_configured_secrets, redact_secrets
+from security.tenancy import resolve_tenant_id_for_identity
 
 configure_logging()
 logger = logging.getLogger(__name__)
@@ -997,6 +998,7 @@ def _run_orchestrated_with_timeout(
     on_done: Callable[[], None],
     attachment_ids: list[str] | None = None,
     model: str | None = None,
+    tenant_id: str | None = None,
 ) -> Mapping[str, Any]:
     """Runs `run_orchestrated` on `_get_ask_executor`'s bounded pool and
     gives up *waiting* past `timeout_seconds`, raising `_AskRequestTimedOut`
@@ -1034,6 +1036,7 @@ def _run_orchestrated_with_timeout(
                 caller_subject=caller_subject,
                 attachment_ids=attachment_ids,
                 model=model,
+                tenant_id=tenant_id,
             )
         except BaseException as exc:  # noqa: BLE001 - re-raised on the caller's thread below
             error["error"] = exc
@@ -1177,6 +1180,7 @@ def ask(
             on_done=_release_ask_slots,
             attachment_ids=payload.attachment_ids,
             model=selected_model,
+            tenant_id=resolve_tenant_id_for_identity(identity),
         )
     except _AskRequestTimedOut:
         # See Settings.request_timeout_seconds's docstring: this is "stop

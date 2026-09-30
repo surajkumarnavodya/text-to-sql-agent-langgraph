@@ -1683,9 +1683,16 @@ class TestRunOrchestrated:
         captured: dict[str, object] = {}
 
         def fake_run_agent(
-            question, conversation_history, enable_insight, caller_roles, model=None
+            question, conversation_history, enable_insight, caller_roles, model=None, tenant_id=None
         ):
-            captured["args"] = (question, conversation_history, enable_insight, caller_roles, model)
+            captured["args"] = (
+                question,
+                conversation_history,
+                enable_insight,
+                caller_roles,
+                model,
+                tenant_id,
+            )
             return fake_result
 
         monkeypatch.setattr(orchestrator_graph, "run_agent", fake_run_agent)
@@ -1700,7 +1707,7 @@ class TestRunOrchestrated:
         result = orchestrator_graph.run_orchestrated("how many orders?", None, True)
 
         assert result is fake_result
-        assert captured["args"] == ("how many orders?", None, True, (), None)
+        assert captured["args"] == ("how many orders?", None, True, (), None, None)
 
     def test_flag_on_routes_through_the_graph_to_sql(self, monkeypatch):
         settings = _settings(enable_multi_source_router=True)
@@ -1813,7 +1820,7 @@ class TestRunOrchestrated:
         monkeypatch.setattr(
             orchestrator_graph,
             "run_agent",
-            lambda question, conversation_history, enable_insight, caller_roles, model=None: fake_result,
+            lambda question, conversation_history, enable_insight, caller_roles, model=None, tenant_id=None: fake_result,
         )
         result = orchestrator_graph.run_orchestrated("how many orders?", attachment_ids=None)
         assert result is fake_result

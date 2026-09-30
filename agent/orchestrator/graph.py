@@ -152,6 +152,7 @@ def run_orchestrated(
     caller_subject: str | None = None,
     attachment_ids: list[str] | None = None,
     model: str | None = None,
+    tenant_id: str | None = None,
 ) -> AgentState | OrchestratorState:
     """Routes a question to one or more sources and returns the combined result.
 
@@ -200,6 +201,11 @@ def run_orchestrated(
             via `OrchestratorState["selected_model"]` on the multi-source
             path; passed directly to `run_agent` on the short-circuit path
             below.
+        tenant_id: Same shape and meaning as `agent.graph.run_agent`'s
+            parameter of the same name -- forwarded unchanged on both the
+            short-circuit path (directly to `run_agent`) and the
+            multi-source path (`OrchestratorState["tenant_id"]`). Nothing
+            reads it yet on either path.
 
     Returns:
         When `Settings.enable_multi_source_router` is off AND no
@@ -213,7 +219,14 @@ def run_orchestrated(
     settings = get_settings()
     has_attachments = bool(attachment_ids)
     if not settings.enable_multi_source_router and not has_attachments:
-        return run_agent(question, conversation_history, enable_insight, caller_roles, model)
+        return run_agent(
+            question,
+            conversation_history,
+            enable_insight,
+            caller_roles,
+            model,
+            tenant_id,
+        )
 
     logger.info(
         "Starting orchestrated run for question=%r (attachment_count=%d)",
@@ -231,6 +244,7 @@ def run_orchestrated(
         "question": question,
         "caller_roles": caller_roles,
         "caller_subject": caller_subject,
+        "tenant_id": tenant_id,
         "session_id": session_id,
         "pending_attachment_ids": attachment_ids or [],
         "rejection_reason": None,

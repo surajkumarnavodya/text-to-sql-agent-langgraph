@@ -214,6 +214,21 @@ below, and `docs/MULTI_SOURCE_GUIDE.md` for how to configure each source.
   abstraction" below. **Additive, not a replacement**: the orchestrator
   graph's own hardcoded nodes are unmodified and still the only thing
   `run_orchestrated` actually calls in production today.
+- `agent/provenance.py`, `analytics/`, `recommendation/`, `semantic/` —
+  typed contracts for the Enterprise AI Analytics & Recommendation
+  Platform initiative (`00_MASTER_IMPLEMENTATION_CONTRACT.md`):
+  `agent/provenance.py`'s `DataTruthLevel`/`ProvenancedClaim`
+  (DATABASE_FACT/AI_INFERENCE/CONFIRMED_BUSINESS_TRUTH); `analytics/`'s
+  `AnalyticsProvider` + a real adapter over `agent.insight.ResultSummary`'s
+  already-computed, never-rendered `trend`/`outliers`/`stddev`;
+  `recommendation/`'s `RecommendationProvider` (contracts only, no
+  implementation exists); `semantic/metrics.py`'s governed
+  `MetricDefinition`/`MetricRegistry`, loading the same
+  `data/knowledge/metrics.yaml` `retrieval/` already parses for fuzzy
+  retrieval, deliberately not a reuse of `retrieval.models.ChunkType
+  .METRIC`. Same "additive, not wired into any live route yet" posture as
+  `agent/tools/` above — see `02_TARGET_ARCHITECTURE.md` for the full
+  design and its explicit "stubbed today, wired later" table.
 - `rag/` — document/policy agentic RAG, one implementation shared by both
   the "documents" and "policies" collections (parameterized by collection
   name, not two near-duplicate modules): `store.py` (SQL Server native
