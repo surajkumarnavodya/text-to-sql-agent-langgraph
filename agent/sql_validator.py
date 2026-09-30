@@ -361,6 +361,67 @@ class ValidationResult(BaseModel):
         return self
 
 
+def _cte_reference_table_ids(statement: exp.Expression) -> frozenset[int]:
+    """Identifies which `exp.Table` nodes in `statement` are pure references
+    to a CTE this same statement defines (`WITH x AS (...) SELECT ... FROM
+    x`), as opposed to a real database table -- sqlglot represents both
+    identically as `exp.Table`, since it does no semantic name resolution.
+
+    2026-09-30 (`05_SQL_SERVER_DIALECT_VALIDATION_CONTRACT.md`): a real bug,
+    found by actually running T-SQL CTEs through this module rather than
+    assuming sqlglot support meant correctness. `qualify_table_schema`
+    walked every `exp.Table` node and schema-qualified any without a `db`
+    arg -- including a CTE reference in the main query, rewriting `FROM
+    RecentOrders` into `employee.RecentOrders`, which doesn't exist. The
+    same blind spot made `find_unexpected_table_references` flag the CTE
+    name as "unexpected" and `references_multiple_tables` report `True`
+    for a single-real-table CTE query. This function is the one shared fix
+    all four call sites (this one plus `find_restricted_column_references`)
+    now use instead of a bare `find_all(exp.Table)`.
+
+    Processes CTEs in definition order: within CTE N's own body, a table
+    reference is only ever a "virtual" CTE reference if its name matches an
+    EARLIER CTE (T-SQL/ANSI SQL forbids forward/self references in a
+    non-recursive CTE) -- this correctly handles one CTE building on
+    another (`WITH a AS (...), b AS (SELECT * FROM a) SELECT * FROM b`).
+    Outside every CTE body (the main query, or a later CTE's own body), a
+    table reference matching *any* defined CTE alias is a virtual
+    reference. A self-referential name collision inside a CTE's own body
+    (the CTE alias happens to also be a real table's name) is deliberately
+    left as a real-table reference -- the conservative direction, since
+    treating it as a CTE reference risks hiding a real table access, while
+    the reverse only risks an unnecessary schema-qualification/false-
+    positive-detection on a vanishingly rare naming collision.
+
+    Returns the `id()` of every `exp.Table` node identified this way -- an
+    identity set, not a name set, since the same table *name* can validly
+    appear at two different positions with two different meanings (a CTE
+    alias outside its own body vs. a same-named real table referenced
+    inside it).
+    """
+    with_clause = statement.args.get("with")
+    if with_clause is None:
+        return frozenset()
+    ctes = with_clause.expressions
+    seen_aliases: set[str] = set()
+    excluded_ids: set[int] = set()
+    cte_body_ids: set[int] = set()
+    for cte in ctes:
+        for table in cte.this.find_all(exp.Table):
+            cte_body_ids.add(id(table))
+            name = (table.name or "").lower()
+            if name in seen_aliases:
+                excluded_ids.add(id(table))
+        if cte.alias:
+            seen_aliases.add(cte.alias.lower())
+    for table in statement.find_all(exp.Table):
+        if id(table) in cte_body_ids:
+            continue
+        if (table.name or "").lower() in seen_aliases:
+            excluded_ids.add(id(table))
+    return frozenset(excluded_ids)
+
+
 def _find_nested_aggregate(statement: exp.Expression) -> tuple[exp.AggFunc, exp.AggFunc] | None:
     """Finds an aggregate function called inside another aggregate function's own arguments.
 
@@ -624,7 +685,12 @@ def find_unexpected_table_references(
     except SqlglotError:
         return []
 
-    referenced = {table.name for table in statement.find_all(exp.Table) if table.name}
+    cte_refs = _cte_reference_table_ids(statement)
+    referenced = {
+        table.name
+        for table in statement.find_all(exp.Table)
+        if table.name and id(table) not in cte_refs
+    }
     known_lower = {name.lower() for name in known_tables}
     return sorted(name for name in referenced if name.lower() not in known_lower)
 
@@ -654,7 +720,12 @@ def references_multiple_tables(sql: str, dialect: str | None = DEFAULT_DIALECT) 
     except SqlglotError:
         return False
 
-    referenced = {table.name.lower() for table in statement.find_all(exp.Table) if table.name}
+    cte_refs = _cte_reference_table_ids(statement)
+    referenced = {
+        table.name.lower()
+        for table in statement.find_all(exp.Table)
+        if table.name and id(table) not in cte_refs
+    }
     return len(referenced) >= 2
 
 
@@ -747,8 +818,11 @@ def find_restricted_column_references(
     except SqlglotError:
         return []
 
+    cte_refs = _cte_reference_table_ids(statement)
     referenced_tables_lower = {
-        table.name.lower() for table in statement.find_all(exp.Table) if table.name
+        table.name.lower()
+        for table in statement.find_all(exp.Table)
+        if table.name and id(table) not in cte_refs
     }
     referenced_columns_lower = {
         column.name.lower() for column in statement.find_all(exp.Column) if column.name
@@ -790,13 +864,25 @@ def enforce_row_limit(sql: str, max_rows: int, dialect: str | None = DEFAULT_DIA
 
     current_limit: int | None = None
     limit_clause = statement.args.get("limit")
-    if limit_clause is not None:
+    literal: exp.Expression | None = None
+    if isinstance(limit_clause, exp.Fetch):
+        # ANSI SQL:2008 / T-SQL `OFFSET n ROWS FETCH NEXT m ROWS ONLY`
+        # pagination -- sqlglot stores this shape under the same "limit" arg
+        # key as an ordinary LIMIT/TOP clause, but as an `exp.Fetch` node
+        # whose row count lives in `count`, not `expression`. Missing this
+        # case (2026-09-30, 05_SQL_SERVER_DIALECT_VALIDATION_CONTRACT.md)
+        # meant an explicit `FETCH NEXT 20 ROWS ONLY` was never recognized
+        # as an existing cap, silently widening it to `max_rows` (e.g. 20 ->
+        # 1000) every time -- not a security issue (never exceeds the
+        # ceiling), but a real correctness regression this fixes.
+        literal = limit_clause.args.get("count")
+    elif limit_clause is not None:
         literal = limit_clause.expression
-        if isinstance(literal, exp.Literal) and literal.is_number:
-            try:
-                current_limit = int(literal.this)
-            except (TypeError, ValueError):
-                current_limit = None
+    if isinstance(literal, exp.Literal) and literal.is_number:
+        try:
+            current_limit = int(literal.this)
+        except (TypeError, ValueError):
+            current_limit = None
 
     if current_limit is None or current_limit > max_rows:
         statement = statement.limit(max_rows)
@@ -867,6 +953,11 @@ def qualify_table_schema(
     because it's genuinely in a different schema on purpose) is left alone --
     this only fills in a *missing* schema, never overrides one.
 
+    A reference to a CTE this same statement defines (`WITH x AS (...)
+    SELECT ... FROM x`) is also left alone -- see
+    `_cte_reference_table_ids` for why: a CTE alias is not a schema object,
+    and schema-qualifying it (`employee.x`) breaks the query outright.
+
     Args:
         sql: Already-validated, row-limited SQL text (the output of
             `enforce_row_limit`).
@@ -884,7 +975,10 @@ def qualify_table_schema(
     if not schema:
         return sql
     statement = sqlglot.parse_one(sql, read=dialect)
+    cte_refs = _cte_reference_table_ids(statement)
     for table in statement.find_all(exp.Table):
+        if id(table) in cte_refs:
+            continue
         if not table.args.get("db"):
             table.set("db", exp.to_identifier(schema))
     return statement.sql(dialect=dialect)

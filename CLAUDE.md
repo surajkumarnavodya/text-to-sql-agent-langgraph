@@ -993,6 +993,22 @@ until the user clicks **Confirm and Run**, and that button always
 re-validates and re-executes the *current* SQL text fresh, rather than
 trusting whatever the agent's last internal attempt produced.
 
+**Prompt 05** (`05_SQL_SERVER_DIALECT_VALIDATION_CONTRACT.md`) verified
+every T-SQL construct (TOP, OFFSET/FETCH, CTEs, window functions,
+DATEADD/DATEDIFF/DATEPART/DATENAME, EOMONTH, STRING_AGG, TRY_CAST/
+TRY_CONVERT, PERCENTILE_CONT WITHIN GROUP, PIVOT/UNPIVOT, bracket
+identifiers) against the real validator and found it already handles
+all of them — the allowlist is on parsed *shape*, never on which
+keywords/functions are used. It found and fixed two real bugs instead:
+`qualify_table_schema`/`find_unexpected_table_references`/
+`references_multiple_tables`/`find_restricted_column_references` all
+mistook a CTE *reference* for a real table (sqlglot represents both as
+an identical `exp.Table` node) — closed by the shared
+`_cte_reference_table_ids` helper; and `enforce_row_limit` didn't
+recognize an existing `FETCH NEXT n ROWS ONLY` as an existing cap
+(only checked `exp.Limit`, not `exp.Fetch`), silently widening a small
+explicit fetch count to `max_rows` on every call.
+
 ### True read-only enforcement is layered, not just code-level
 `get_read_only_engine()` does not itself strip write privileges — there's no
 generic, cross-database way to do that purely at the SQLAlchemy layer. The
