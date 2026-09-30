@@ -168,6 +168,89 @@ class TestExecuteReadonlyForwarding:
             adapter.execute_readonly("SELECT 1", 30)
 
 
+class TestExecuteReadonlyAppliesSchemaQualification:
+    """04_SQL_SERVER_ADAPTER_CONTRACT.md: `execute_readonly` must apply
+    `agent.sql_validator.qualify_table_schema` exactly like the two real
+    production call sites (`execute_sql_node`/`POST /execute`) already do
+    -- otherwise a schema-qualified connection (this project's own real
+    `HrAutomationDb` example) would silently fail every query through
+    this adapter, reproducing an already-fixed bug."""
+
+    def test_no_configured_schema_is_a_no_op(self, monkeypatch):
+        """The common case (no `DB_<NAME>_SCHEMA` set) must send the exact
+        original SQL text downstream, unchanged."""
+        monkeypatch.setattr(adapter_module, "get_read_only_engine", lambda conn: _SENTINEL_ENGINE)
+        instance = SqlAlchemyDatabaseAdapter(_settings(db_type="mssql"))
+        captured: dict[str, object] = {}
+        monkeypatch.setattr(
+            adapter_module,
+            "execute_readonly_sql",
+            lambda sql, timeout, max_rows, engine=None, params=None: captured.setdefault("sql", sql)
+            or (["c"], []),
+        )
+        instance.execute_readonly("SELECT * FROM Employee", 30)
+        assert captured["sql"] == "SELECT * FROM Employee"
+
+    def test_configured_schema_qualifies_unqualified_tables_using_the_engines_own_dialect(
+        self, monkeypatch
+    ):
+        monkeypatch.setattr(adapter_module, "get_read_only_engine", lambda conn: _SENTINEL_ENGINE)
+        instance = SqlAlchemyDatabaseAdapter(_settings(db_type="mssql", db_schema="employee"))
+        captured: dict[str, object] = {}
+        monkeypatch.setattr(
+            adapter_module,
+            "execute_readonly_sql",
+            lambda sql, timeout, max_rows, engine=None, params=None: captured.setdefault("sql", sql)
+            or (["c"], []),
+        )
+        instance.execute_readonly("SELECT * FROM Employee", 30)
+        assert captured["sql"] == "SELECT * FROM employee.Employee"
+
+    def test_already_qualified_table_is_left_alone(self, monkeypatch):
+        monkeypatch.setattr(adapter_module, "get_read_only_engine", lambda conn: _SENTINEL_ENGINE)
+        instance = SqlAlchemyDatabaseAdapter(_settings(db_type="mssql", db_schema="employee"))
+        captured: dict[str, object] = {}
+        monkeypatch.setattr(
+            adapter_module,
+            "execute_readonly_sql",
+            lambda sql, timeout, max_rows, engine=None, params=None: captured.setdefault("sql", sql)
+            or (["c"], []),
+        )
+        instance.execute_readonly("SELECT * FROM dbo.AlreadyQualified", 30)
+        assert captured["sql"] == "SELECT * FROM dbo.AlreadyQualified"
+
+    def test_qualification_is_dialect_generic_not_mssql_only(self, monkeypatch):
+        """`qualify_table_schema` itself is dialect-parameterized -- this
+        adapter must not hardcode `tsql`, it must read the connection's own
+        resolved `sqlglot_dialect` from `DatabaseCapabilities`."""
+        monkeypatch.setattr(adapter_module, "get_read_only_engine", lambda conn: _SENTINEL_ENGINE)
+        instance = SqlAlchemyDatabaseAdapter(_settings(db_type="postgresql", db_schema="reporting"))
+        captured: dict[str, object] = {}
+        monkeypatch.setattr(
+            adapter_module,
+            "execute_readonly_sql",
+            lambda sql, timeout, max_rows, engine=None, params=None: captured.setdefault("sql", sql)
+            or (["c"], []),
+        )
+        instance.execute_readonly("SELECT * FROM orders", 30)
+        assert captured["sql"] == "SELECT * FROM reporting.orders"
+
+    def test_original_sql_argument_is_never_mutated_for_the_caller(self, monkeypatch):
+        """The qualified copy is execution-only -- a caller inspecting the
+        string it passed in must still see its own unmodified value (moot
+        for an immutable `str`, but documents the contract explicitly)."""
+        monkeypatch.setattr(adapter_module, "get_read_only_engine", lambda conn: _SENTINEL_ENGINE)
+        instance = SqlAlchemyDatabaseAdapter(_settings(db_type="mssql", db_schema="employee"))
+        monkeypatch.setattr(
+            adapter_module,
+            "execute_readonly_sql",
+            lambda sql, timeout, max_rows, engine=None, params=None: (["c"], []),
+        )
+        original = "SELECT * FROM Employee"
+        instance.execute_readonly(original, 30)
+        assert original == "SELECT * FROM Employee"
+
+
 class TestEstimateCostForwarding:
     def test_forwards_engine_sql_db_type_and_settings(self, adapter, monkeypatch):
         captured: dict[str, object] = {}

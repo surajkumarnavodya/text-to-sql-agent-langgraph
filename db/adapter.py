@@ -37,6 +37,22 @@ functions with zero reimplementation" pattern `analytics/provider.py`/
 `02_TARGET_ARCHITECTURE.md`). **Not called by `agent/nodes.py` or any
 route in this increment** -- see `03_DATABASE_ADAPTER_CONTRACT.md`'s own
 "stubbed today, wired later" note.
+
+**2026-09-30 (`04_SQL_SERVER_ADAPTER_CONTRACT.md`):** `execute_readonly`
+now applies `agent.sql_validator.qualify_table_schema` before executing,
+exactly like `agent.nodes.execute_sql_node`/`api/main.py`'s `POST
+/execute` already do -- Prompt 03's own claim that this adapter is "a
+correct... second way to reach the exact same functions every existing
+call site already calls directly" wasn't quite true until this fix: a
+connection whose tables live under a non-default schema (this project's
+own real `HrAutomationDb` example -- `employee`, connection default
+`dbo`; see CLAUDE.md's Python-3.14-gotchas section) would have silently
+failed every query with "Invalid object name" through this adapter,
+reproducing the exact bug already found and fixed at the two real call
+sites. `qualify_table_schema` itself is dialect-generic, not MSSQL-only
+-- this is the one real, currently-relevant instance of the gap in this
+project (see `04_SQL_SERVER_ADAPTER_CONTRACT.md` for why it's framed
+around SQL Server without overclaiming an MSSQL-specific code path).
 """
 
 from __future__ import annotations
@@ -45,6 +61,7 @@ from typing import Protocol, runtime_checkable
 
 from sqlalchemy import Engine
 
+from agent.sql_validator import qualify_table_schema
 from config.settings import ConfigurationError, Settings, get_settings
 from db.connection import (
     SUPPORTED_DB_TYPES,
@@ -234,6 +251,10 @@ class DatabaseAdapter(Protocol):
         contract (timeout enforcement, row-cap-independent-of-LIMIT,
         optional bind parameters).
 
+        `sql` is schema-qualified for this execution only, exactly like
+        `agent.nodes.execute_sql_node`/`api/main.py`'s `POST /execute`
+        already do -- see `04_SQL_SERVER_ADAPTER_CONTRACT.md`.
+
         Raises:
             SQLAlchemyError: on a SQL execution error.
             TimeoutError: if execution exceeds `timeout_seconds`.
@@ -265,7 +286,12 @@ class SqlAlchemyDatabaseAdapter:
     cross-database tuning knobs: cost-estimation thresholds, row caps,
     pool sizing). Uses the already-cached `get_read_only_engine` under
     the hood -- constructing this adapter never creates a second engine
-    or connection pool.
+    or connection pool. `execute_readonly` additionally applies
+    `agent.sql_validator.qualify_table_schema` using this connection's own
+    `db_schema`/dialect, one real, non-zero-logic exception to the
+    "pure wrapper" claim above -- see `04_SQL_SERVER_ADAPTER_CONTRACT.md`
+    for why that's still additive, not a behavior change for either real
+    production call site (neither of which uses this adapter).
     """
 
     def __init__(self, connection: DbConnectionLike, settings: Settings | None = None) -> None:
@@ -296,8 +322,17 @@ class SqlAlchemyDatabaseAdapter:
         max_result_rows: int | None = None,
         params: dict[str, object] | None = None,
     ) -> tuple[list[str], list[tuple]]:
+        # Schema-qualifies unqualified table references for this execution
+        # only, exactly like `execute_sql_node`/`POST /execute` -- see
+        # `qualify_table_schema`'s own docstring. A no-op (returns `sql`
+        # unchanged) when the connection has no configured schema, which is
+        # every connection except this project's own real non-default-schema
+        # case (see 04_SQL_SERVER_ADAPTER_CONTRACT.md).
+        execution_sql = qualify_table_schema(
+            sql, self._connection.db_schema, dialect=self._capabilities.sqlglot_dialect
+        )
         return execute_readonly_sql(
-            sql, timeout_seconds, max_result_rows, engine=self._engine(), params=params
+            execution_sql, timeout_seconds, max_result_rows, engine=self._engine(), params=params
         )
 
     def estimate_cost(self, sql: str) -> CostEstimate | None:

@@ -147,7 +147,14 @@ below, and `docs/MULTI_SOURCE_GUIDE.md` for how to configure each source.
   own existing functions. Not called by `agent/nodes.py` or any route in
   this increment; the acceptance criterion it targets ("a new engine
   needs no AI-layer changes") already held before this module existed,
-  per that doc's own honest framing.
+  per that doc's own honest framing. **Prompt 04** (`04_SQL_SERVER_
+  ADAPTER_CONTRACT.md`) found and fixed the one place that zero-logic
+  claim wasn't quite true: `execute_readonly` now applies
+  `agent.sql_validator.qualify_table_schema` first, exactly like
+  `execute_sql_node`/`POST /execute` already do — without it, a
+  schema-qualified connection (this project's own real `HrAutomationDb`
+  example, see the Python-3.14-gotchas note above) would have silently
+  failed every query through this still-unwired adapter.
 - `embeddings/` — `schema_indexer.py`'s `build_index(tables, db_name, ...)`
   takes already-introspected `TableSchemaInfo` objects (not a file, not an
   engine) and embeds them into **that database's own Chroma collection**
