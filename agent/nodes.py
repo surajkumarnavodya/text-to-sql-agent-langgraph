@@ -716,6 +716,14 @@ def plan_query_node(state: AgentState) -> dict[str, Any]:
     response `agent.llm_client._parse_plan_response` couldn't parse as a
     JSON array of strings -- logging it and proceeding with `query_plan =
     None`, never as a reason the question itself can't be answered.
+
+    Also threads `state["retrieved_context"]` through (Prompt 07,
+    `07_RELATIONSHIP_INTELLIGENCE_CONTRACT.md`) -- already populated by
+    `retrieve_business_context_node`, which runs immediately before this
+    node (see `agent/graph.py`). `generate_query_plan_from_llm` only ever
+    renders the `relationship`-type entries from it (real *and* candidate
+    -- see `agent.llm_client._build_plan_relationship_block`); every
+    other chunk type is ignored for planning specifically.
     """
     settings = get_settings()
     complexity_signals = state.get("complexity_signals") or []
@@ -731,7 +739,11 @@ def plan_query_node(state: AgentState) -> dict[str, Any]:
     schema_context = state.get("schema_context_text", "")
     try:
         plan = generate_query_plan_from_llm(
-            question, schema_context, settings, model=state.get("selected_model")
+            question,
+            schema_context,
+            settings,
+            model=state.get("selected_model"),
+            retrieved_context=state.get("retrieved_context"),
         )
     except OllamaUnavailableError as exc:
         logger.warning("[plan_query] LLM call failed, proceeding without a plan: %s", exc)

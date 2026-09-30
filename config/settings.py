@@ -1534,6 +1534,29 @@ class Settings(BaseSettings):
     retrieval_documentation_chunk_overlap_chars: int = Field(default=200, ge=0)
     retrieval_knowledge_dir: Path = Path("./data/knowledge")
 
+    # Prompt 07 (07_RELATIONSHIP_INTELLIGENCE_CONTRACT.md):
+    # db.relationship_inference's candidate-FK inference. True by default --
+    # the structural pass (name convention/type compatibility/target
+    # uniqueness) never issues a query, so it's the same cost class as
+    # relationship_chunks_from_schema itself. A candidate below
+    # relationship_inference_min_confidence is dropped outright, never just
+    # sorted last (see infer_relationships's own docstring for why). Every
+    # resulting chunk is tagged AI_INFERENCE and rendered with an explicit
+    # "CANDIDATE relationship... inferred, not confirmed" opening -- never
+    # silently indistinguishable from a real, declared foreign key.
+    enable_relationship_inference: bool = True
+    relationship_inference_min_confidence: float = Field(default=0.6, ge=0.0, le=1.0)
+    # The second, data-driven refinement pass (null-fraction + bounded
+    # value-overlap sampling) -- False by default, since unlike the
+    # structural pass above it does issue one small, bounded query per
+    # candidate (see db.relationship_inference.verify_candidates_with_data's
+    # own docstring for the exact bound). Mirrors enable_media_search/
+    # enable_document_rag's "off by default because it has a real,
+    # non-trivial cost" posture, not enable_query_planning's "on by default
+    # because it's compute-only" one.
+    enable_relationship_data_verification: bool = False
+    relationship_data_verification_sample_size: int = Field(default=200, gt=0)
+
     api_auth_token: SecretStr | None = None
     environment: Literal["development", "production"] = "development"
     oidc_issuer: str | None = None

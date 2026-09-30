@@ -400,9 +400,10 @@ class TestPlanQueryNode:
     def test_calls_llm_and_stores_plan_for_a_complex_question(self, monkeypatch):
         captured = {}
 
-        def _capture(question, schema_context, settings, model=None):
+        def _capture(question, schema_context, settings, model=None, retrieved_context=None):
             captured["question"] = question
             captured["schema_context"] = schema_context
+            captured["retrieved_context"] = retrieved_context
             return ["Group by region and year", "Use ROW_NUMBER() partitioned by region"]
 
         monkeypatch.setattr("agent.nodes.generate_query_plan_from_llm", _capture)
@@ -411,10 +412,12 @@ class TestPlanQueryNode:
             "question": "top 3 products per region",
             "schema_context_text": "CREATE TABLE sales (...)",
             "complexity_signals": ["top_n_per_group"],
+            "retrieved_context": [{"chunk_type": "relationship", "text": "Relationship: ..."}],
         }
         result = plan_query_node(state)
 
         assert captured["question"] == "top 3 products per region"
+        assert captured["retrieved_context"] == state["retrieved_context"]
         assert result["status"] == "generating"
         assert result["query_plan"] == [
             "Group by region and year",

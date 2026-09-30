@@ -144,6 +144,16 @@ below, and `docs/MULTI_SOURCE_GUIDE.md` for how to configure each source.
   .tables.TABLE_ROWS`/`ALL_TABLES.NUM_ROWS` depending on `DB_TYPE`) —
   deliberately never a `SELECT COUNT(*)`, and off by default so every
   existing caller's per-refresh cost is unchanged unless it opts in.
+  **Prompt 07** (`07_RELATIONSHIP_INTELLIGENCE_CONTRACT.md`) added
+  `TableSchemaInfo.unique_constraints` (from `Inspector
+  .get_unique_constraints`, same cost class as PK/FK) and
+  `relationship_inference.py` (new) — infers candidate FK-shaped
+  relationships sqlglot never declared, from structural signals only by
+  default (name convention, type compatibility, target-column
+  uniqueness — no query) plus an explicitly opt-in, bounded data-driven
+  refinement (`verify_candidates_with_data`, null-fraction + sampled
+  value-overlap, never a full scan). See "Relationship & schema
+  intelligence" below.
   `execution.py` owns read-only
   SQL execution mechanics (`execute_readonly_sql` — background-thread
   timeout enforcement plus a `fetchmany()` row cap), shared by
@@ -217,6 +227,17 @@ below, and `docs/MULTI_SOURCE_GUIDE.md` for how to configure each source.
   driven by `scripts/ingest_schema.py`/`scripts/rebuild_index.py`).
   Deliberately reuses `embeddings.schema_indexer.get_chroma_client`'s
   cached `PersistentClient` rather than a second vector database.
+  **Prompt 07** (`07_RELATIONSHIP_INTELLIGENCE_CONTRACT.md`) added
+  `chunking.inferred_relationship_chunks_from_schema` — same
+  `ChunkType.RELATIONSHIP` a real, declared FK's chunk uses, but every
+  inferred one's *text* (never just `extra`, which the LLM never sees)
+  opens with "CANDIDATE relationship (NOT a declared foreign key —
+  inferred, not confirmed...", unmistakably distinct wherever the two are
+  retrieved together. `ingestion.build_schema_chunks` calls it by
+  default (`Settings.enable_relationship_inference`, structural-only,
+  no query); `run_ingestion` additionally runs the opt-in, data-verified
+  pass when it has a live engine (see "Relationship & schema
+  intelligence" below).
 - `agent/` — LangGraph nodes live in `nodes.py`, one function per node, each
   taking and returning `AgentState` (defined in `state.py`). `graph.py`
   wires them together and compiles the graph. `sql_validator.py` is the
@@ -641,6 +662,61 @@ terms, metric definitions, curated SQL examples, and documentation —
   "adventureworks" sample database), but the business definitions/
   synonyms/formulas themselves are illustrative demonstration content, not
   reviewed production documentation — replace before relying on it.
+
+### Relationship & schema intelligence (inferred candidate FKs)
+`db/relationship_inference.py` (Prompt 07,
+`07_RELATIONSHIP_INTELLIGENCE_CONTRACT.md`) infers candidate foreign-key-
+shaped relationships a database never declared — a real, declared FK
+(`db.schema_introspection.ForeignKeyInfo`) is a `DATABASE_FACT`; this is
+the opposite kind of claim, always tagged
+`agent.provenance.DataTruthLevel.AI_INFERENCE` (the vocabulary Prompt 02
+built and nothing had consumed yet) and never silently promoted to
+confirmed (rule 10).
+
+- **Structural inference, on by default, zero queries**
+  (`infer_relationships`): a candidate needs a real name-similarity
+  signal (exact column-name match, or the `{target_table}+Key/Id/Code`
+  naming convention) *and* type-compatible columns *and* a target column
+  that's actually the target table's PK or a single-column unique
+  constraint (`TableSchemaInfo.unique_constraints`, also new this
+  prompt) — any one missing is an outright rejection, not a lower score.
+  This is what keeps a type-compatible-but-unrelated column (a
+  "misleading name") or a mismatched-type column from ever being
+  proposed, and what keeps a many-to-many junction table from ever
+  producing a *direct* candidate between the two tables it actually
+  bridges (only junction→each-side candidates are proposed, both
+  correctly `many_to_one`). A column already part of a declared FK is
+  never re-proposed — nothing to infer, it's already a fact.
+- **Opt-in, bounded data verification** (`verify_candidates_with_data`,
+  `Settings.enable_relationship_data_verification`, default `False`):
+  refines a candidate's confidence with a small, bounded sample of real
+  data (never a full scan — `fetchmany()`-bounded, the same established
+  mechanism `db/value_sampling.py` already uses, not a second
+  implementation of it) — null fraction of the source column, and what
+  fraction of sampled non-NULL source values are actually found in the
+  target column. Only runs from `retrieval.ingestion.run_ingestion` when
+  it has a live engine (never for a caller that passes pre-built
+  `tables` in directly, e.g. every test).
+- **Surfaced the same way as everything else in `retrieval/`** — one
+  more `ChunkType.RELATIONSHIP` chunk per candidate
+  (`retrieval.chunking.inferred_relationship_chunks_from_schema`), but
+  its own *text* (not just `extra`, which the LLM never sees) opens with
+  "CANDIDATE relationship (NOT a declared foreign key — inferred, not
+  confirmed...", unmistakable wherever it's retrieved alongside a real
+  relationship chunk.
+- **Fed to planning, not just generation** — before this prompt,
+  `agent.llm_client.generate_query_plan_from_llm` only ever saw
+  `question`+`schema_context`; relationship-type retrieved context
+  (real *and* candidate) never reached it at all. `plan_query_node` now
+  threads `state["retrieved_context"]` through
+  (`_build_plan_relationship_block`), filtered to relationship-type
+  entries only — every other business-context chunk type stays
+  generation-only.
+- **No promotion path exists** — there is no UI/API in this codebase for
+  a human to mark a candidate "confirmed." `CONFIRMED_BUSINESS_TRUTH`
+  for a relationship stays exactly what it is for everything else in
+  this vocabulary: a declared FK, or a future human-review workflow this
+  prompt does not invent.
 
 ### Multi-database auto-routing
 `DB_CONNECTIONS` in `.env` can name more than one database

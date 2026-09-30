@@ -285,6 +285,63 @@ class TestIntrospectSchemaColumnMetadata:
         assert "DEFAULT 'pending'" in orders.ddl
 
 
+class TestIntrospectSchemaUniqueConstraints:
+    """Prompt 07 (`07_RELATIONSHIP_INTELLIGENCE_CONTRACT.md`):
+    `TableSchemaInfo.unique_constraints` -- catalog-only, same cost class
+    as the existing PK/FK calls. This is what `db/relationship_inference
+    .py` checks to decide whether a column is a *legal* FK target."""
+
+    def test_captures_unique_constraints(self, monkeypatch):
+        inspector = _mock_inspector()
+        inspector.get_unique_constraints.side_effect = lambda table_name, schema=None: {
+            "orders": [],
+            "customers": [{"name": "uq_email", "column_names": ["email"]}],
+        }[table_name]
+        monkeypatch.setattr("db.schema_introspection.inspect", lambda engine: inspector)
+
+        tables = introspect_schema(engine=MagicMock())
+        customers = next(t for t in tables if t.table_name == "customers")
+        orders = next(t for t in tables if t.table_name == "orders")
+
+        assert customers.unique_constraints == (("email",),)
+        assert orders.unique_constraints == ()
+
+    def test_multi_column_unique_constraint_is_captured_as_one_tuple(self, monkeypatch):
+        inspector = _mock_inspector()
+        inspector.get_unique_constraints.side_effect = lambda table_name, schema=None: {
+            "orders": [{"name": "uq_composite", "column_names": ["order_id", "customer_id"]}],
+            "customers": [],
+        }[table_name]
+        monkeypatch.setattr("db.schema_introspection.inspect", lambda engine: inspector)
+
+        tables = introspect_schema(engine=MagicMock())
+        orders = next(t for t in tables if t.table_name == "orders")
+
+        assert orders.unique_constraints == (("order_id", "customer_id"),)
+
+    def test_views_skip_unique_constraint_reflection(self, monkeypatch):
+        inspector = _mock_inspector()
+        inspector.get_view_names.return_value = ["customer_summary"]
+        inspector.get_columns.side_effect = lambda table_name, schema=None: {
+            "orders": [{"name": "order_id", "type": "INTEGER", "nullable": False}],
+            "customers": [{"name": "customer_id", "type": "INTEGER", "nullable": False}],
+            "customer_summary": [{"name": "customer_id", "type": "INTEGER", "nullable": True}],
+        }[table_name]
+
+        def _raise_if_called_for_view(table_name, schema=None):
+            if table_name == "customer_summary":
+                raise AssertionError("must not be called for a view")
+            return []
+
+        inspector.get_unique_constraints.side_effect = _raise_if_called_for_view
+        monkeypatch.setattr("db.schema_introspection.inspect", lambda engine: inspector)
+
+        tables = introspect_schema(engine=MagicMock())
+        view = next(t for t in tables if t.table_name == "customer_summary")
+
+        assert view.unique_constraints == ()
+
+
 class TestIntrospectSchemaPerObjectFailureIsolation:
     """Prompt 06: one table/view's own introspection failing (a
     permissions issue, a dialect quirk) must not abort discovery for

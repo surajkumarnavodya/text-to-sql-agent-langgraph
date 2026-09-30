@@ -12,6 +12,7 @@ from retrieval.chunking import (
     column_chunks_from_schema,
     documentation_chunks_from_text,
     glossary_chunks_from_yaml,
+    inferred_relationship_chunks_from_schema,
     load_documentation_files,
     metric_chunks_from_yaml,
     relationship_chunks_from_schema,
@@ -20,6 +21,8 @@ from retrieval.chunking import (
 )
 from retrieval.models import ChunkType, Sensitivity, compute_content_hash, make_chunk_id
 
+from agent.provenance import DataTruthLevel
+from db.relationship_inference import InferredRelationship, RelationshipEvidence
 from db.schema_introspection import ColumnInfo, ForeignKeyInfo, TableSchemaInfo
 
 
@@ -173,6 +176,75 @@ class TestRelationshipChunks:
         chunk = chunks[0]
         assert "Join condition" in chunk.text
         assert "Recommended direction" in chunk.text
+
+
+def _sample_candidate(**overrides) -> InferredRelationship:
+    base = dict(
+        source_table="FactSales",
+        source_columns=("CustomerKey",),
+        target_table="DimCustomer",
+        target_columns=("CustomerKey",),
+        relationship_type="many_to_one",
+        confidence=0.925,
+        evidence=(
+            RelationshipEvidence(
+                "name_similarity", 0.85, "column name follows the FK naming convention"
+            ),
+            RelationshipEvidence("type_compatibility", 1.0, "both integer-family types"),
+            RelationshipEvidence("target_uniqueness", 1.0, "target column is the primary key"),
+        ),
+    )
+    base.update(overrides)
+    return InferredRelationship(**base)
+
+
+class TestInferredRelationshipChunks:
+    """Prompt 07: an inferred candidate must be unmistakably distinct from
+    a real, declared relationship's chunk -- rule 10's 'never silently
+    promote inference to confirmed truth' lives in the chunk *text* here,
+    since `extra` is never rendered into the LLM prompt (see
+    `retrieval.models.Chunk`'s own docstring)."""
+
+    def test_one_chunk_per_candidate(self):
+        chunks = inferred_relationship_chunks_from_schema(
+            [_sample_candidate()], "default", "fake-model", 32
+        )
+        assert len(chunks) == 1
+        assert chunks[0].chunk_type == ChunkType.RELATIONSHIP
+
+    def test_text_unmistakably_flags_it_as_an_unconfirmed_candidate(self):
+        chunk = inferred_relationship_chunks_from_schema(
+            [_sample_candidate()], "default", "fake-model", 32
+        )[0]
+        assert chunk.text.startswith("CANDIDATE relationship")
+        assert "NOT a declared foreign key" in chunk.text
+        assert "inferred, not confirmed" in chunk.text
+        assert "0.93" in chunk.text or "0.92" in chunk.text  # confidence rendered
+
+    def test_extra_carries_confidence_evidence_and_truth_level(self):
+        chunk = inferred_relationship_chunks_from_schema(
+            [_sample_candidate()], "default", "fake-model", 32
+        )[0]
+        assert chunk.extra["evidence_level"] == "inferred"
+        assert chunk.extra["truth_level"] == DataTruthLevel.AI_INFERENCE.value
+        assert chunk.extra["confidence"] == 0.925
+        assert len(chunk.extra["evidence"]) == 3
+        assert chunk.extra["evidence"][0]["signal"] == "name_similarity"
+
+    def test_object_name_is_prefixed_to_avoid_colliding_with_a_real_relationship(self):
+        real_chunk = relationship_chunks_from_schema(_sample_tables(), "default", "fake-model", 32)
+        candidate = _sample_candidate(source_table="FactSales", target_table="DimProduct")
+        inferred_chunk = inferred_relationship_chunks_from_schema(
+            [candidate], "default", "fake-model", 32
+        )[0]
+        assert inferred_chunk.chunk_id not in {c.chunk_id for c in real_chunk}
+
+    def test_join_condition_and_direction_are_rendered(self):
+        chunk = inferred_relationship_chunks_from_schema(
+            [_sample_candidate()], "default", "fake-model", 32
+        )[0]
+        assert "FactSales.CustomerKey = DimCustomer.CustomerKey" in chunk.text
+        assert "many-to-one" in chunk.text
 
 
 class TestGlossaryChunks:

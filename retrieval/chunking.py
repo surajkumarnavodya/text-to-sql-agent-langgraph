@@ -28,6 +28,7 @@ import yaml
 
 from config.sensitive_columns import SensitivityTier
 from config.table_descriptions import TableDescription
+from db.relationship_inference import InferredRelationship
 from db.schema_introspection import TableSchemaInfo
 from retrieval.models import Chunk, ChunkType, Sensitivity, compute_content_hash, make_chunk_id
 from security.sanitization import normalize_text
@@ -270,6 +271,89 @@ def relationship_chunks_from_schema(
                     },
                 )
             )
+    return chunks
+
+
+def inferred_relationship_chunks_from_schema(
+    candidates: list[InferredRelationship],
+    database_id: str,
+    embedding_model: str,
+    embedding_dimensions: int,
+    schema_name: str | None = None,
+) -> list[Chunk]:
+    """One `relationship`-type chunk per inferred (never declared)
+    candidate -- Prompt 07 (`07_RELATIONSHIP_INTELLIGENCE_CONTRACT.md`).
+
+    Deliberately the same `ChunkType.RELATIONSHIP` a real, declared FK
+    uses (`relationship_chunks_from_schema` above), not a second type --
+    both are retrieved the same way, scored the same way, and shown under
+    the same "Additional join/relationship hints" label
+    (`agent.llm_client._BUSINESS_CONTEXT_TYPE_LABELS`). What keeps rule
+    10 ("never silently promote an inference to confirmed truth") true is
+    the chunk's own *text*, not a separate type or a field the LLM never
+    sees (`extra` isn't rendered into the prompt -- see `retrieval.models
+    .Chunk`'s own docstring): every inferred chunk's text opens with
+    "CANDIDATE relationship (NOT a declared foreign key -- inferred, not
+    confirmed", unmistakably distinct from a real relationship chunk's
+    "Relationship: ..." opening, wherever the two are mixed together in
+    the same retrieved/rendered group.
+
+    `object_name` is prefixed `candidate:` specifically so a chunk ID
+    here can never collide with a real relationship's chunk ID for the
+    same source/target/columns -- in practice this never happens anyway
+    (`db.relationship_inference.infer_relationships` already excludes any
+    column that's part of a declared FK), but the prefix makes that
+    non-collision structural rather than incidental.
+    """
+    chunks: list[Chunk] = []
+    for candidate in candidates:
+        source_cols = ", ".join(candidate.source_columns)
+        target_cols = ", ".join(candidate.target_columns)
+        join_condition = " AND ".join(
+            f"{candidate.source_table}.{sc} = {candidate.target_table}.{tc}"
+            for sc, tc in zip(candidate.source_columns, candidate.target_columns, strict=True)
+        )
+        evidence_summary = "; ".join(f"{e.signal}: {e.detail}" for e in candidate.evidence)
+        object_name = f"candidate:{candidate.source_table}->{candidate.target_table}({source_cols})"
+        text = (
+            f"CANDIDATE relationship (NOT a declared foreign key -- inferred, not "
+            f"confirmed; confidence {candidate.confidence:.2f}): {candidate.source_table} "
+            f"may reference {candidate.target_table} via ({source_cols}) -> ({target_cols}). "
+            f"Suggested join condition: {join_condition}. "
+            f"Suggested direction: {candidate.relationship_type.replace('_', '-')}, "
+            f"{candidate.source_table} as the referencing side. "
+            f"Evidence: {evidence_summary}. "
+            f"Verify this actually makes sense for the question before relying on it -- "
+            f"it was inferred from schema/data signals, not declared by the database."
+        )
+        chunks.append(
+            _make_chunk(
+                chunk_type=ChunkType.RELATIONSHIP,
+                text=text,
+                database_id=database_id,
+                object_name=object_name,
+                embedding_model=embedding_model,
+                embedding_dimensions=embedding_dimensions,
+                schema_name=schema_name,
+                table_name=candidate.source_table,
+                source_id=object_name,
+                extra={
+                    "source_table": candidate.source_table,
+                    "source_columns": list(candidate.source_columns),
+                    "target_table": candidate.target_table,
+                    "target_columns": list(candidate.target_columns),
+                    "relationship_type": candidate.relationship_type,
+                    "join_condition": join_condition,
+                    "evidence_level": "inferred",
+                    "truth_level": candidate.truth_level.value,
+                    "confidence": candidate.confidence,
+                    "evidence": [
+                        {"signal": e.signal, "score": e.score, "detail": e.detail}
+                        for e in candidate.evidence
+                    ],
+                },
+            )
+        )
     return chunks
 
 

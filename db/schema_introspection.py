@@ -104,6 +104,16 @@ class TableSchemaInfo:
     default off, so every existing caller's per-refresh cost is unchanged
     unless it asks for this). Never embedded into `ddl`/the LLM prompt --
     discovery/onboarding metadata only.
+
+    `unique_constraints` (Prompt 07,
+    `07_RELATIONSHIP_INTELLIGENCE_CONTRACT.md`): each entry is one unique
+    constraint's column names, from `Inspector.get_unique_constraints` --
+    catalog-only, same cost class as the existing PK/FK calls. This is what
+    `db/relationship_inference.py` checks to decide whether a column is
+    even a *legal* foreign-key target (a real FK's target is always a
+    primary key or a unique constraint) -- a bare index is not the same
+    guarantee (a non-unique index allows duplicates), so this is
+    deliberately not folded together with a future "indexes" field.
     """
 
     table_name: str
@@ -112,6 +122,7 @@ class TableSchemaInfo:
     ddl: str
     is_view: bool = False
     row_count_estimate: int | None = None
+    unique_constraints: tuple[tuple[str, ...], ...] = ()
 
 
 def _sanitize_identifier(value: str) -> str:
@@ -271,8 +282,9 @@ def _introspect_one(
     )
 
     foreign_keys: tuple[ForeignKeyInfo, ...] = ()
+    unique_constraints: tuple[tuple[str, ...], ...] = ()
     if not is_view:
-        # Views don't carry their own FK constraints either.
+        # Views don't carry their own FK/unique constraints either.
         foreign_keys = tuple(
             ForeignKeyInfo(
                 constrained_columns=tuple(fk["constrained_columns"]),
@@ -281,6 +293,11 @@ def _introspect_one(
             )
             for fk in inspector.get_foreign_keys(name, schema=schema)
             if fk.get("constrained_columns") and fk.get("referred_table")
+        )
+        unique_constraints = tuple(
+            tuple(uc["column_names"])
+            for uc in inspector.get_unique_constraints(name, schema=schema)
+            if uc.get("column_names")
         )
 
     ddl = render_ddl(name, columns, foreign_keys, is_view=is_view)
@@ -296,6 +313,7 @@ def _introspect_one(
         ddl=ddl,
         is_view=is_view,
         row_count_estimate=row_count_estimate,
+        unique_constraints=unique_constraints,
     )
 
 

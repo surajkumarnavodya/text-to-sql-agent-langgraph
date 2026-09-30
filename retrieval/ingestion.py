@@ -30,14 +30,20 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from config.sensitive_columns import load_sensitive_columns
-from config.settings import Settings
+from config.settings import Settings, get_settings
 from config.table_descriptions import load_table_descriptions
 from db.connection import get_connection, get_read_only_engine
+from db.relationship_inference import (
+    InferredRelationship,
+    infer_relationships,
+    verify_candidates_with_data,
+)
 from db.schema_introspection import TableSchemaInfo, introspect_schema
 from retrieval.chunking import (
     column_chunks_from_schema,
     documentation_chunks_from_text,
     glossary_chunks_from_yaml,
+    inferred_relationship_chunks_from_schema,
     load_documentation_files,
     metric_chunks_from_yaml,
     relationship_chunks_from_schema,
@@ -82,14 +88,26 @@ def build_schema_chunks(
     embedding_model: str,
     embedding_dimensions: int,
     schema_name: str | None = None,
+    *,
+    settings: Settings | None = None,
+    relationship_candidates: list[InferredRelationship] | None = None,
 ) -> list[Chunk]:
     """Table + column + relationship chunks from already-introspected tables.
 
     Takes `tables` rather than an engine -- same reasoning
     `embeddings.schema_indexer.build_index` gives for its own signature:
     keeps this function (and its tests) independent of a real database
+    connection. The one exception is `relationship_candidates` (Prompt 07)
+    -- when the caller has already computed data-verified candidates
+    (`run_ingestion`, when it has both a live `engine` and
+    `enable_relationship_data_verification=True`), passing them here
+    avoids recomputing structural-only candidates and losing that
+    refinement; when omitted (the default, and every existing caller's
+    behavior), candidates are computed here from `tables` alone --
+    structural only, still no query, still fully testable without a
     connection.
     """
+    settings = settings or get_settings()
     descriptions = load_table_descriptions()
     sensitive_columns = load_sensitive_columns()
     column_notes = {name: desc.column_notes for name, desc in descriptions.items()}
@@ -116,6 +134,19 @@ def build_schema_chunks(
             tables, database_id, embedding_model, embedding_dimensions, schema_name
         )
     )
+    if settings.enable_relationship_inference:
+        candidates = (
+            relationship_candidates
+            if relationship_candidates is not None
+            else infer_relationships(
+                tables, min_confidence=settings.relationship_inference_min_confidence
+            )
+        )
+        chunks.extend(
+            inferred_relationship_chunks_from_schema(
+                candidates, database_id, embedding_model, embedding_dimensions, schema_name
+            )
+        )
     return chunks
 
 
@@ -253,6 +284,7 @@ def run_ingestion(
     store.create_collection_if_missing(database_id)
 
     schema_name: str | None = None
+    engine = None
     if tables is None:
         connection_config = get_connection(settings, database_id)
         schema_name = connection_config.db_schema
@@ -262,8 +294,34 @@ def run_ingestion(
     knowledge_dir = settings.retrieval_knowledge_dir
     discovered_records = _count_discovered_records(tables, knowledge_dir)
 
+    # Prompt 07 (07_RELATIONSHIP_INTELLIGENCE_CONTRACT.md): the data-driven
+    # verification pass needs a live engine, which only exists here when
+    # `tables` was live-introspected above (never for a caller -- mainly
+    # tests -- that passed pre-built `tables` in directly). Structural-only
+    # inference (build_schema_chunks's own default) still applies either
+    # way; this only adds the optional refinement on top when both the
+    # engine and the opt-in flag are available.
+    relationship_candidates: list[InferredRelationship] | None = None
+    if engine is not None and settings.enable_relationship_inference:
+        relationship_candidates = infer_relationships(
+            tables, min_confidence=settings.relationship_inference_min_confidence
+        )
+        if settings.enable_relationship_data_verification:
+            relationship_candidates = verify_candidates_with_data(
+                relationship_candidates,
+                engine,
+                schema=schema_name,
+                sample_size=settings.relationship_data_verification_sample_size,
+            )
+
     chunks = build_schema_chunks(
-        tables, database_id, provider.model_name, provider.dimensions, schema_name
+        tables,
+        database_id,
+        provider.model_name,
+        provider.dimensions,
+        schema_name,
+        settings=settings,
+        relationship_candidates=relationship_candidates,
     )
     chunks.extend(
         build_knowledge_chunks(
