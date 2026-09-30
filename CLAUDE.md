@@ -1727,3 +1727,24 @@ rediscover:
   `docs/vector-retrieval-design.md` §13 and
   `docs/authentication-and-password-policy.md`'s own "Not implemented"
   notes respectively.
+
+## Never touch (secrets, migrations, generated/derived files)
+
+Only touch these when a task is specifically about them — never as a
+side effect of an unrelated change:
+
+- **Connection strings / secrets**: `.env` (real, populated secrets —
+  `DB_PASSWORD`, `RAG_STORE_CONNECTION_STRING`, `WEB_SEARCH_API_KEY`, JWT
+  keys, etc.) — gitignored, never read into a commit, log line, or
+  response. `.env.example` is the template and is safe to edit.
+  `.secrets.baseline` (detect-secrets) is tool-generated — regenerate via
+  the tool, never hand-edit.
+- **Migrations**: `identity/migrations/` (Alembic — the only real
+  migrations in this repo). Never hand-edit an already-applied migration;
+  add a new one via `alembic revision`.
+- **Generated/derived files** (all rebuilt by their own command — never
+  hand-edited): `embeddings/.chroma/` (`scripts/build_embeddings.py`),
+  `frontend/dist/` (`npm run build`), `frontend/node_modules/`/any
+  `node_modules/`, `.venv/`, `__pycache__/`, `.mypy_cache/`,
+  `.ruff_cache/`, `.pytest_cache/`, `.vs/` (Visual Studio cache),
+  `media_library/` (media-search index artifacts).

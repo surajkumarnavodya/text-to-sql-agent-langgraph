@@ -1,0 +1,26 @@
+{
+  "permissions": {
+    "deny": [
+      "Read(bin/**)",
+      "Read(obj/**)",
+      "Read(.vs/**)",
+      "Read(packages/**)",
+      "Read(node_modules/**)",
+      "Read(frontend/node_modules/**)",
+      "Read(dist/**)",
+      "Read(frontend/dist/**)",
+      "Read(**/*.dll)",
+      "Read(**/*.pdb)",
+      "Read(**/*.min.js)",
+      "Read(**/*.log)",
+      "Read(**/*.bak)",
+      "Read(**/*.mdf)",
+      "Read(**/*.ldf)",
+      "Read(**/*.bacpac)",
+      "Read(**/*.zip)",
+      "Read(**/*.7z)",
+      "Read(**/*.tar.gz)",
+      "Read(**/*.dump)"
+    ]
+  }
+}
