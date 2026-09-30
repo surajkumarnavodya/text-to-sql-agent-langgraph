@@ -441,6 +441,17 @@ equivalent) also exist (`api/main.py`, `api/documents.py`, `api/media.py`)
 — not yet given their own subsection here; see each module's own
 docstrings for the authoritative contract in the meantime.
 
+**Feedback** (`api/main.py`, both require `Permission.GOLDEN_EXAMPLE_WRITE`):
+`POST /feedback/golden-example` records a human-approved (question, SQL)
+pair for future few-shot retrieval — the same call the dashboard's
+thumbs-up widget makes once a "Confirm and Run" result is confirmed
+correct. `POST /feedback/message` is the general-purpose counterpart: a
+like/dislike (plus an optional comment) on *any* assistant answer — SQL,
+document/policy RAG, web, or media — stored separately
+(`feedback/store.py`) and purely additive to the golden-example store
+above, never a replacement for it. See `CLAUDE.md`'s "Golden-dataset
+feedback loop" section.
+
 `GET /metrics/performance` (`Permission.ADMIN_CONFIG`, same gate as
 `POST /schema/refresh`) returns a live rollup of per-LangGraph-stage
 timing across recent `/ask` requests — `observability.metrics`, see

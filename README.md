@@ -386,7 +386,8 @@ malware-scanned (if configured), and processed server-side, and the model
 genuinely sees its content — a vision model's description or an OCR
 fallback for images, extracted text for documents — via a dedicated
 LangGraph subgraph (see "Known limitations" below and `CLAUDE.md`'s "Chat
-attachments" section). The image editor's own "AI-guided editing" panel
+attachments, image actions, and their security hardening" section). The
+image editor's own "AI-guided editing" panel
 (natural-language-prompted generative edits — "remove the selected
 object," "replace the sky") is also real, provider-backed editing now
 (IMA Studio, off by default via `ENABLE_IMAGE_EDITING`), not a stub — see
@@ -440,10 +441,13 @@ connectivity and reverse-proxy placement.
 | See the live, browser-verified root-cause investigation of reported Settings/search/New-Chat/image-attachment issues | [`docs/functional-ui-audit.md`](docs/functional-ui-audit.md) |
 | Understand exactly how the Settings modal's overlay/focus/keyboard behavior works | [`docs/settings-modal.md`](docs/settings-modal.md) |
 | Understand the New Chat lazy-persistence flow and its duplicate-creation safeguards | [`docs/new-chat-flow.md`](docs/new-chat-flow.md) |
-| See the historical record of the image-attachment gap this project closed (superseded — see `CLAUDE.md`'s "Chat attachments" section for the current pipeline) | [`docs/image-attachment-flow.md`](docs/image-attachment-flow.md) |
+| See the historical record of the image-attachment gap this project closed (superseded — see `CLAUDE.md`'s "Chat attachments, image actions, and their security hardening" section for the current pipeline) | [`docs/image-attachment-flow.md`](docs/image-attachment-flow.md) |
 | See a point-in-time production-UI checklist and what it found | [`docs/production-ui-checklist.md`](docs/production-ui-checklist.md) |
 | Understand the root cause of the dark-mode Settings-modal transparency bug and its fix | [`docs/settings-modal-visual-bug.md`](docs/settings-modal-visual-bug.md) |
 | Understand the generic Tool/MCP abstraction (`agent/tools/`) — what it wraps, why the orchestrator doesn't call it yet | [`docs/TOOLS.md`](docs/TOOLS.md) |
+| Share a conversation (invite-only or "anyone with the link") — RBAC/ABAC model, token lifecycle, snapshot rules | [`docs/SHARING_SECURITY.md`](docs/SHARING_SECURITY.md) |
+| Understand what's suitable for multi-instance deployment today vs. not (bounded `/ask` concurrency, identity-keyed rate limits, trusted-proxy IPs) and the measured load-test baseline | [`docs/ENTERPRISE_SCALABILITY_SECURITY_ASSESSMENT.md`](docs/ENTERPRISE_SCALABILITY_SECURITY_ASSESSMENT.md), [`docs/SCALE_BASELINE.md`](docs/SCALE_BASELINE.md) |
+| See what this app actually logs/emits today (correlation IDs, per-stage timing, health checks) with no monitoring-stack dependency | [`docs/OBSERVABILITY.md`](docs/OBSERVABILITY.md) |
 | See the full platform-transformation discovery/assessment/roadmap this and other recent passes were scoped from | [`docs/PLATFORM_TRANSFORMATION_ASSESSMENT.md`](docs/PLATFORM_TRANSFORMATION_ASSESSMENT.md), [`docs/DEEP_FEATURE_PERFORMANCE_ASSESSMENT.md`](docs/DEEP_FEATURE_PERFORMANCE_ASSESSMENT.md) |
 | See the live performance-metrics rollup (`GET /metrics/performance`) | [`docs/API.md`](docs/API.md) |
 | Check production readiness before deploying | [`docs/PRODUCTION_CHECKLIST.md`](docs/PRODUCTION_CHECKLIST.md), [`docs/PRODUCTION_READINESS_REPORT.md`](docs/PRODUCTION_READINESS_REPORT.md) |
@@ -578,7 +582,8 @@ any of this security work and remains a separate, equally real gap.
   real, not frontend-only** — `POST /attachments/upload` validates,
   malware-scans (if configured), stores, and processes each file, and
   `POST /ask`'s `attachment_ids` gives the model actual access to them via
-  a dedicated LangGraph subgraph (see `CLAUDE.md`'s "Chat attachments"
+  a dedicated LangGraph subgraph (see `CLAUDE.md`'s "Chat attachments,
+  image actions, and their security hardening"
   section). **Describing an image's visual content requires a vision-
   capable Ollama model** (`MEDIA_VISION_MODEL`, e.g. `llava` — blank by
   default); with no vision model configured, an attached image still isn't

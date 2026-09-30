@@ -132,6 +132,8 @@ integration continues to work unchanged.
 | `DB_SCHEMA` | *(database default)* | Restrict introspection (and what the LLM sees) to one schema. |
 | `DB_CONNECTION_STRING` | — | Full SQLAlchemy connection string, used as-is instead of the discrete fields above if set. Also `SecretStr`-wrapped. |
 | `DB_ODBC_DRIVER` | `ODBC Driver 17 for SQL Server` | Only used for `DB_TYPE=mssql` — must match a driver actually installed (`odbcinst -j` / Windows ODBC Data Sources). |
+| `DB_POOL_SIZE` | `10` | `QueuePool`'s `pool_size` for every configured database's engine (`db/connection.py::_cached_engine`). Raise once more than a handful of callers query the same database at once — each held connection is one `execute_sql_node`/`POST /execute` call in flight. |
+| `DB_MAX_OVERFLOW` | `20` | `QueuePool`'s `max_overflow` for the same engine — the burst ceiling above `DB_POOL_SIZE` before a caller waits for a connection. |
 
 ### Multiple databases (optional)
 
@@ -165,6 +167,7 @@ checks all of them too.
 | `LLM_MAX_TOKENS` | `1024` | Max tokens the LLM may generate per SQL-generation call. |
 | `INSIGHT_MAX_TOKENS` | `120` | Max tokens for the post-query plain-English insight sentence. |
 | `MAX_QUESTION_LENGTH` | `500` | Max accepted character length of a typed question (`agent/input_guard.py`). |
+| `MAX_CONVERSATION_HISTORY_TURNS` | `20` | Max prior turns from a caller-supplied `conversation_history` that are ever processed — older turns beyond this count are dropped (`agent/input_guard.py::sanitize_conversation_history`). |
 
 ## Agentic query planning + plan-conformance self-correction
 
@@ -320,6 +323,7 @@ for how the router/subgraphs work internally.
 | `RAG_CHUNK_SIZE` | `1200` | Target chunk length (characters) when splitting an ingested PDF's text. |
 | `RAG_CHUNK_OVERLAP` | `150` | Character overlap between consecutive chunks. |
 | `RAG_EMBEDDING_MODEL_NAME` | *(blank = reuse `EMBEDDING_MODEL_NAME`)* | Embedding model for document/policy chunks, if it needs to differ from schema retrieval's. |
+| `MAX_DOCUMENT_PAGES` | `2000` | Upper bound on one uploaded PDF's page count, enforced before extracting text from any page — closes a decompression-bomb-shaped gap `MAX_DOCUMENT_UPLOAD_MB` alone doesn't (a PDF's on-disk size says little about how many pages it takes to extract). |
 
 ### Live web search
 
