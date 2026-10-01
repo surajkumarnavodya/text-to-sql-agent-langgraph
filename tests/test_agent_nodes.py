@@ -31,11 +31,13 @@ from agent.nodes import (
     plan_query_node,
     retrieve_golden_examples_node,
     retrieve_schema_node,
+    review_metric_conformance_node,
     review_sql_node,
     route_after_classification,
     route_after_cost_estimate,
     route_after_execution,
     route_after_generation,
+    route_after_metric_conformance,
     route_after_review,
     route_after_validation,
     validate_sql_node,
@@ -725,6 +727,199 @@ class TestReviewSqlNode:
         assert result["attempt_history"][0]["will_retry"] is True
 
 
+class TestReviewMetricConformanceNode:
+    """Prompt 10 (`10_GOVERNED_METRICS_CONTRACT.md`) -- mirrors
+    `TestReviewSqlNode`'s exact coverage shape, for governing metrics
+    instead of a query plan."""
+
+    def test_skips_llm_call_when_no_governing_metrics(self, monkeypatch):
+        def _fail(*args, **kwargs):
+            raise AssertionError("should not call the LLM when there's no governing metric")
+
+        monkeypatch.setattr("agent.nodes.review_sql_against_metrics_from_llm", _fail)
+
+        # Key omitted entirely -- the real shape a LangGraph node that
+        # never set it produces (TypedDict total=False); .get() returns
+        # None either way, same as an explicit empty list below.
+        state: AgentState = {"sql": "SELECT * FROM customers", "retry_count": 0}
+        result = review_metric_conformance_node(state)
+
+        assert result["metric_conformance_passed"] is None
+        assert result["metric_conformance_feedback"] is None
+        assert result["status"] == "validating"
+
+    def test_skips_llm_call_when_governing_metrics_is_empty(self, monkeypatch):
+        def _fail(*args, **kwargs):
+            raise AssertionError("should not call the LLM when governing_metrics is empty")
+
+        monkeypatch.setattr("agent.nodes.review_sql_against_metrics_from_llm", _fail)
+
+        state: AgentState = {
+            "sql": "SELECT * FROM customers",
+            "retry_count": 0,
+            "governing_metrics": [],
+        }
+        result = review_metric_conformance_node(state)
+
+        assert result["status"] == "validating"
+
+    def test_skips_llm_call_when_feature_disabled(self, monkeypatch):
+        def _fail(*args, **kwargs):
+            raise AssertionError("should not call the LLM when the feature is disabled")
+
+        monkeypatch.setattr("agent.nodes.review_sql_against_metrics_from_llm", _fail)
+        settings = Settings(
+            ollama_host="http://localhost:11434",
+            ollama_model="llama3.1:8b",
+            ollama_request_timeout_seconds=60,
+            db_type="postgresql",
+            db_host="db.example.com",
+            db_port=None,
+            db_name="mydb",
+            db_user="reader",
+            db_password=SecretStr("secret"),
+            db_connection_string=None,
+            db_schema=None,
+            db_odbc_driver="ODBC Driver 17 for SQL Server",
+            chroma_persist_dir=Path("/tmp/chroma"),
+            chroma_collection_name="schema_ddl",
+            embedding_model_name="all-MiniLM-L6-v2",
+            schema_top_k=4,
+            max_retries=3,
+            complex_query_max_retry_bonus=2,
+            max_result_rows=1000,
+            query_timeout_seconds=15,
+            llm_max_tokens=1024,
+            insight_max_tokens=120,
+            max_question_length=500,
+            question_rate_limit_per_minute=10,
+            llm_call_rate_limit_per_minute=20,
+            cost_estimation_enabled=True,
+            cost_estimation_timeout_seconds=3,
+            cost_moderate_row_threshold=50_000,
+            cost_high_row_threshold=1_000_000,
+            log_level="INFO",
+            log_redaction_level="standard",
+            enable_metric_conformance_review=False,
+        )
+        monkeypatch.setattr("agent.nodes.get_settings", lambda: settings)
+
+        state: AgentState = {
+            "sql": "SELECT SUM(amount) FROM sales",
+            "retry_count": 0,
+            "governing_metrics": [{"business_name": "AOV", "approved_expression": "x / y"}],
+        }
+        result = review_metric_conformance_node(state)
+
+        assert result["status"] == "validating"
+
+    def test_pass_verdict_advances_to_validating(self, monkeypatch):
+        monkeypatch.setattr(
+            "agent.nodes.review_sql_against_metrics_from_llm", lambda *a, **k: (True, None)
+        )
+
+        state: AgentState = {
+            "sql": "SELECT SUM(SalesAmount) / COUNT(DISTINCT SalesOrderNumber) FROM t",
+            "retry_count": 0,
+            "governing_metrics": [
+                {
+                    "business_name": "Average Order Value",
+                    "approved_expression": "SUM(SalesAmount) / COUNT(DISTINCT SalesOrderNumber)",
+                }
+            ],
+        }
+        result = review_metric_conformance_node(state)
+
+        assert result["metric_conformance_passed"] is True
+        assert result["metric_conformance_feedback"] is None
+        assert result["status"] == "validating"
+
+    def test_fail_verdict_retries_via_generate_sql_when_budget_remains(self, monkeypatch):
+        monkeypatch.setattr(
+            "agent.nodes.review_sql_against_metrics_from_llm",
+            lambda *a, **k: (
+                False,
+                "Average Order Value: computed SUM(SalesAmount)/COUNT(*) instead of the "
+                "approved COUNT(DISTINCT SalesOrderNumber).",
+            ),
+        )
+
+        state: AgentState = {
+            "sql": "SELECT SUM(SalesAmount) / COUNT(*) FROM t",
+            "retry_count": 0,
+            "governing_metrics": [
+                {"business_name": "Average Order Value", "approved_expression": "x / y"}
+            ],
+        }
+        result = review_metric_conformance_node(state)
+
+        assert result["status"] == "generating"
+        assert result["metric_conformance_passed"] is False
+        assert "Average Order Value" in result["metric_conformance_feedback"]
+        assert result["last_error_category"] == "metric_definition_not_used"
+        assert result["attempt_history"][0]["outcome"] == "metric_definition_not_used"
+        assert result["attempt_history"][0]["will_retry"] is True
+        assert result["retry_count"] == 1
+        assert "Metric conformance" in result["error_history"][0]
+
+    def test_fail_verdict_fails_when_retries_exhausted(self, monkeypatch):
+        monkeypatch.setattr(
+            "agent.nodes.review_sql_against_metrics_from_llm",
+            lambda *a, **k: (False, "Still not using the approved expression."),
+        )
+
+        state: AgentState = {
+            "sql": "SELECT SUM(SalesAmount) / COUNT(*) FROM t",
+            "retry_count": 3,  # == default max_retries
+            "governing_metrics": [
+                {"business_name": "Average Order Value", "approved_expression": "x / y"}
+            ],
+        }
+        result = review_metric_conformance_node(state)
+
+        assert result["status"] == "failed"
+        assert result["attempt_history"][0]["will_retry"] is False
+        assert result["failure_explanation"] is not None
+
+    def test_fails_open_when_ollama_unavailable(self, monkeypatch):
+        def _raise(*a, **k):
+            raise OllamaUnavailableError("connection refused")
+
+        monkeypatch.setattr("agent.nodes.review_sql_against_metrics_from_llm", _raise)
+
+        state: AgentState = {
+            "sql": "SELECT SUM(SalesAmount) / COUNT(*) FROM t",
+            "retry_count": 0,
+            "governing_metrics": [
+                {"business_name": "Average Order Value", "approved_expression": "x / y"}
+            ],
+        }
+        result = review_metric_conformance_node(state)
+
+        assert result["metric_conformance_passed"] is True
+        assert result["metric_conformance_feedback"] is None
+        assert result["status"] == "validating"
+
+    def test_respects_state_max_retries_override(self, monkeypatch):
+        monkeypatch.setattr(
+            "agent.nodes.review_sql_against_metrics_from_llm",
+            lambda *a, **k: (False, "still wrong"),
+        )
+
+        state: AgentState = {
+            "sql": "SELECT SUM(SalesAmount) / COUNT(*) FROM t",
+            "retry_count": 3,  # == default max_retries, but not this state's budget
+            "governing_metrics": [
+                {"business_name": "Average Order Value", "approved_expression": "x / y"}
+            ],
+            "max_retries": 5,
+        }
+        result = review_metric_conformance_node(state)
+
+        assert result["status"] == "generating"
+        assert result["attempt_history"][0]["will_retry"] is True
+
+
 class TestValidateSqlNode:
     def test_valid_sql_advances_to_executing(self):
         state: AgentState = {
@@ -1352,10 +1547,21 @@ class TestRoutingFunctions:
 
     @pytest.mark.parametrize(
         "status,expected",
-        [("validating", "validate_sql"), ("failed", "failed"), ("generating", "generate_sql")],
+        [
+            ("validating", "review_metric_conformance"),
+            ("failed", "failed"),
+            ("generating", "generate_sql"),
+        ],
     )
     def test_route_after_review(self, status, expected):
         assert route_after_review({"status": status}) == expected
+
+    @pytest.mark.parametrize(
+        "status,expected",
+        [("validating", "validate_sql"), ("failed", "failed"), ("generating", "generate_sql")],
+    )
+    def test_route_after_metric_conformance(self, status, expected):
+        assert route_after_metric_conformance({"status": status}) == expected
 
     @pytest.mark.parametrize(
         "status,expected",

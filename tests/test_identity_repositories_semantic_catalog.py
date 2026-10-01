@@ -15,6 +15,7 @@ from identity.repositories.semantic_catalog import (
     InvalidCatalogStatusTransitionError,
     create_entry,
     entry_to_snapshot,
+    find_conflicting_published_entries,
     get_entry_by_id,
     list_entries,
     list_versions_for_concept_key,
@@ -232,7 +233,14 @@ class TestPublishAndSupersede:
 
 class TestEntryToSnapshot:
     def test_snapshot_round_trips_every_field(self, db_session: Session):
-        entry = _create(db_session)
+        entry = _create(
+            db_session,
+            approved_expression="SUM(Amount)",
+            source_tables=["FactSales"],
+            filters=["Region"],
+            dimensions=["Region", "ProductCategory"],
+            aggregation="SUM",
+        )
         snapshot = entry_to_snapshot(entry)
         assert snapshot.tenant_id == "tenant-a"
         assert snapshot.database_id == "db1"
@@ -245,3 +253,128 @@ class TestEntryToSnapshot:
         assert snapshot.status == CatalogStatus.DRAFT
         assert snapshot.owner == "alice"
         assert snapshot.version == 1
+        assert snapshot.approved_expression == "SUM(Amount)"
+        assert snapshot.source_tables == ("FactSales",)
+        assert snapshot.filters == ("Region",)
+        assert snapshot.dimensions == ("Region", "ProductCategory")
+        assert snapshot.aggregation == "SUM"
+
+    def test_governed_metric_fields_default_to_empty(self, db_session: Session):
+        entry = _create(db_session)
+        snapshot = entry_to_snapshot(entry)
+        assert snapshot.approved_expression is None
+        assert snapshot.source_tables == ()
+        assert snapshot.filters == ()
+        assert snapshot.dimensions == ()
+        assert snapshot.aggregation is None
+
+
+class TestFindConflictingPublishedEntries:
+    def _publish(self, session: Session, entry) -> None:
+        mark_reviewed(session, entry, reviewed_by_user_id=_REVIEWER)
+        publish_entry(session, entry, published_by_user_id=_PUBLISHER)
+
+    def test_no_conflict_when_no_other_published_entry_shares_a_name_or_synonym(
+        self, db_session: Session
+    ):
+        conflicts = find_conflicting_published_entries(
+            db_session,
+            tenant_id="tenant-a",
+            database_id="db1",
+            concept_type="metric",
+            business_name="Average Order Value",
+            synonyms=["AOV"],
+            exclude_concept_key="aov",
+        )
+        assert conflicts == []
+
+    def test_detects_a_different_concept_key_sharing_a_synonym(self, db_session: Session):
+        existing = _create(
+            db_session, concept_key="clv", business_name="Customer Lifetime Value", synonyms=["CLV"]
+        )
+        self._publish(db_session, existing)
+
+        conflicts = find_conflicting_published_entries(
+            db_session,
+            tenant_id="tenant-a",
+            database_id="db1",
+            concept_type="metric",
+            business_name="Cumulative Lifetime Value (alt definition)",
+            synonyms=["CLV"],
+            exclude_concept_key="clv-alt",
+        )
+        assert [c.concept_key for c in conflicts] == ["clv"]
+
+    def test_detects_a_different_concept_key_sharing_a_business_name_case_insensitively(
+        self, db_session: Session
+    ):
+        existing = _create(db_session, concept_key="revenue", business_name="Revenue", synonyms=[])
+        self._publish(db_session, existing)
+
+        conflicts = find_conflicting_published_entries(
+            db_session,
+            tenant_id="tenant-a",
+            database_id="db1",
+            concept_type="metric",
+            business_name="REVENUE",
+            synonyms=[],
+            exclude_concept_key="revenue-v2",
+        )
+        assert [c.concept_key for c in conflicts] == ["revenue"]
+
+    def test_the_same_concept_key_is_never_reported_as_its_own_conflict(self, db_session: Session):
+        existing = _create(db_session, concept_key="clv")
+        self._publish(db_session, existing)
+
+        conflicts = find_conflicting_published_entries(
+            db_session,
+            tenant_id="tenant-a",
+            database_id="db1",
+            concept_type="metric",
+            business_name=existing.business_name,
+            synonyms=list(existing.synonyms),
+            exclude_concept_key="clv",
+        )
+        assert conflicts == []
+
+    def test_a_draft_or_reviewed_entry_never_counts_as_a_conflict(self, db_session: Session):
+        draft = _create(
+            db_session, concept_key="clv-draft", business_name="Customer Lifetime Value"
+        )
+        reviewed = _create(
+            db_session, concept_key="clv-reviewed", business_name="Customer Lifetime Value"
+        )
+        mark_reviewed(db_session, reviewed, reviewed_by_user_id=_REVIEWER)
+
+        conflicts = find_conflicting_published_entries(
+            db_session,
+            tenant_id="tenant-a",
+            database_id="db1",
+            concept_type="metric",
+            business_name="Customer Lifetime Value",
+            synonyms=[],
+            exclude_concept_key="clv-new",
+        )
+        assert conflicts == []
+        assert draft.status == "draft"
+        assert reviewed.status == "reviewed"
+
+    def test_scoped_to_tenant_database_and_concept_type(self, db_session: Session):
+        same_name_other_tenant = _create(
+            db_session,
+            tenant_id="tenant-b",
+            concept_key="clv",
+            business_name="Customer Lifetime Value",
+        )
+        self._publish(db_session, same_name_other_tenant)
+
+        conflicts = find_conflicting_published_entries(
+            db_session,
+            tenant_id="tenant-a",
+            database_id="db1",
+            concept_type="metric",
+            business_name="Customer Lifetime Value",
+            synonyms=[],
+            exclude_concept_key="clv-new",
+        )
+        assert conflicts == []

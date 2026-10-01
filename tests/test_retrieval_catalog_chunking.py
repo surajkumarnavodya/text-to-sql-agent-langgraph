@@ -66,6 +66,7 @@ class TestBusinessConceptChunkShape:
         chunk = business_concept_chunk_from_catalog_entry(_snapshot(), "minilm", 384)
         assert chunk.extra["concept_type"] == "metric"
         assert chunk.extra["concept_key"] == "clv"
+        assert chunk.extra["business_name"] == "Customer Lifetime Value"
         assert chunk.extra["status"] == "published"
         assert chunk.extra["confidence"] == 0.95
         assert chunk.extra["owner"] == "alice"
@@ -74,6 +75,49 @@ class TestBusinessConceptChunkShape:
         assert chunk.extra["evidence"] == [
             {"signal": "manual", "score": 1.0, "detail": "authored by analyst"}
         ]
+
+    def test_extra_carries_the_governed_metric_fields(self):
+        snapshot = _snapshot(
+            approved_expression="SUM(SalesAmount) / COUNT(DISTINCT SalesOrderNumber)",
+            aggregation="derived ratio",
+            source_tables=("FactSales",),
+            filters=("Region",),
+            dimensions=("Region", "ProductCategory"),
+        )
+        chunk = business_concept_chunk_from_catalog_entry(snapshot, "minilm", 384)
+        assert chunk.extra["approved_expression"] == (
+            "SUM(SalesAmount) / COUNT(DISTINCT SalesOrderNumber)"
+        )
+        assert chunk.extra["aggregation"] == "derived ratio"
+        assert chunk.extra["source_tables"] == ["FactSales"]
+        assert chunk.extra["filters"] == ["Region"]
+        assert chunk.extra["dimensions"] == ["Region", "ProductCategory"]
+
+    def test_text_renders_the_approved_expression_and_governed_metric_fields(self):
+        snapshot = _snapshot(
+            approved_expression="SUM(SalesAmount) / COUNT(DISTINCT SalesOrderNumber)",
+            aggregation="derived ratio",
+            source_tables=("FactSales",),
+            filters=("Region",),
+            dimensions=("Region", "ProductCategory"),
+        )
+        chunk = business_concept_chunk_from_catalog_entry(snapshot, "minilm", 384)
+        assert "Approved expression: SUM(SalesAmount) / COUNT(DISTINCT SalesOrderNumber)" in (
+            chunk.text
+        )
+        assert "Aggregation: derived ratio." in chunk.text
+        assert "Source tables: FactSales." in chunk.text
+        assert "Common filters: Region." in chunk.text
+        assert "Allowed breakdown dimensions: Region, ProductCategory." in chunk.text
+
+    def test_a_non_metric_entry_renders_no_governed_metric_lines(self):
+        snapshot = _snapshot(concept_type=CatalogConceptType.ENTITY, concept_key="customer")
+        chunk = business_concept_chunk_from_catalog_entry(snapshot, "minilm", 384)
+        assert "Approved expression" not in chunk.text
+        assert "Aggregation:" not in chunk.text
+        assert chunk.extra["approved_expression"] is None
+        assert chunk.extra["aggregation"] is None
+        assert chunk.extra["source_tables"] == []
 
     def test_tags_are_the_synonyms(self):
         chunk = business_concept_chunk_from_catalog_entry(_snapshot(), "minilm", 384)

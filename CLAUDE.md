@@ -247,7 +247,11 @@ below, and `docs/MULTI_SOURCE_GUIDE.md` for how to configure each source.
   `api/semantic_catalog.py`'s publish route, reusing the exact same
   `EmbeddingProvider`/`VectorStore` primitives `run_ingestion` itself
   uses — never a second ingestion pipeline. See "Tenant-aware semantic
-  catalog" below.
+  catalog" below. **Prompt 10** (`10_GOVERNED_METRICS_CONTRACT.md`) added
+  `retriever.extract_governing_metrics(items)` — filters already-
+  retrieved `BUSINESS_CONCEPT` chunks (zero new query) down to
+  `METRIC`-typed ones, feeding `AgentState["governing_metrics"]`. See
+  "Governed metrics, dimensions & semantic contracts" below.
 - `agent/` — LangGraph nodes live in `nodes.py`, one function per node, each
   taking and returning `AgentState` (defined in `state.py`). `graph.py`
   wires them together and compiles the graph. `sql_validator.py` is the
@@ -266,7 +270,14 @@ below, and `docs/MULTI_SOURCE_GUIDE.md` for how to configure each source.
   planning/review gate (`detect_complexity_signals`/`compute_max_retries`,
   see "Agentic query planning + plan-conformance self-correction" below) —
   a cheap regex heuristic, no LLM call, computed once by `run_agent()` per
-  question.
+  question. **Prompt 10** (`10_GOVERNED_METRICS_CONTRACT.md`) added
+  `review_metric_conformance_node` (between `review_sql` and
+  `validate_sql`) — gated on `AgentState["governing_metrics"]` being
+  non-empty, **independent** of `complexity_signals`/`query_plan`'s own
+  gate (a simple KPI question like "what's our revenue?" has no
+  complexity signal at all, but can still have a governing metric to
+  enforce). See "Governed metrics, dimensions & semantic contracts"
+  below.
 - `agent/orchestrator/` — the multi-source router, one level up from
   `agent/`'s own SQL-only graph, never the other way around: `nodes.py`
   (`router_node`/`classify_sources` — LLM classification only when 2+
@@ -1815,6 +1826,57 @@ call, not just `generate_sql_node`'s.
 
 **Read [`09_SEMANTIC_CATALOG_CONTRACT.md`](09_SEMANTIC_CATALOG_CONTRACT.md)**
 for the full inspection findings, every new module's design, the 91-test
+testing summary, and the security/tenant-isolation/performance review.
+
+### Governed metrics, dimensions & semantic contracts (Prompt 10)
+Extends the semantic catalog above with five fields that make a
+`METRIC`-type entry *governing*, not merely descriptive —
+`approved_expression`/`source_tables`/`filters`/`dimensions`/
+`aggregation` (`semantic.catalog.CatalogEntrySnapshot`, `identity.models
+.SemanticCatalogEntry`) — and gives it real behavioral teeth: "confirmed
+definitions take precedence over LLM-generated definitions," the
+acceptance criterion being "equivalent KPI questions consistently use
+the governed metric definition."
+
+**Invariants that must not regress:**
+- **A governing metric reaches the SQL-generation prompt as a mandatory
+  instruction, not an advisory hint.** `retrieval.retriever
+  .extract_governing_metrics` filters already-retrieved
+  `BUSINESS_CONCEPT` chunks (zero new query) down to `METRIC`-typed ones
+  into `AgentState["governing_metrics"]`; `agent.llm_client
+  ._build_mandatory_metrics_block` renders them as a "you MUST use
+  exactly this approved expression" block — still framed as DATA, never
+  instructions, extending `_build_plan_block`'s existing imperative-but-
+  injection-safe precedent, never `_build_business_context_block`'s
+  purely-advisory one. Deterministic: the same governing metric always
+  produces byte-identical guidance regardless of the question's own
+  phrasing (verified directly in `tests/test_llm_client_metric
+  _conformance.py`) — this is the literal mechanism satisfying the
+  acceptance criterion.
+- **Enforcement, not just a stronger hint.** New `agent.nodes.review_
+  metric_conformance_node`, wired into the graph as `review_sql →
+  review_metric_conformance → validate_sql` — a pure pass-through
+  (zero LLM call) whenever `governing_metrics` is empty or
+  `Settings.enable_metric_conformance_review` is off, mirroring
+  `review_sql_node`'s identical skip/retry/give-up shape otherwise
+  (same `retry_count`/`max_retries` budget, a new
+  `last_error_category="metric_definition_not_used"`). **Deliberately
+  not a `agent.sql_validator` safety check** — an LLM-judged accuracy
+  aid (two expressions can be equivalent without being AST-identical),
+  kept structurally separate from the deterministic, fail-closed
+  security validator per master rule 5.
+- **Conflict detection is non-blocking.** `identity.repositories
+  .semantic_catalog.find_conflicting_published_entries` scans PUBLISHED
+  rows in the same `(tenant_id, database_id, concept_type)` scope for a
+  *different* `concept_key` sharing a business name/synonym, run at both
+  create and publish time, surfaced via `CatalogEntryOut
+  .conflicting_entry_ids`/`conflicting_entry_names` and logged via
+  `security.audit_log.log_security_event` — never a rejection (this
+  codebase's standing "surface ambiguity, never auto-resolve it"
+  posture).
+
+**Read [`10_GOVERNED_METRICS_CONTRACT.md`](10_GOVERNED_METRICS_CONTRACT.md)**
+for the full inspection findings, every new module's design, the 50-test
 testing summary, and the security/tenant-isolation/performance review.
 
 ## How to run

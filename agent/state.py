@@ -313,6 +313,19 @@ class AgentState(TypedDict, total=False):
     # the same role agent.state.DatabaseSelection.scores_by_db plays for
     # multi-database routing.
     retrieval_metadata: dict
+    # Set by retrieve_business_context_node alongside retrieved_context --
+    # Prompt 10 (10_GOVERNED_METRICS_CONTRACT.md): the subset of
+    # retrieved_context that is specifically a PUBLISHED, METRIC-typed
+    # governed catalog entry (retrieval.retriever.extract_governing_
+    # metrics), i.e. a CONFIRMED_BUSINESS_TRUTH definition that must take
+    # precedence over anything generate_sql would otherwise invent for a
+    # named KPI. Empty list (not None) when no governing metric matched
+    # this question -- the common case. Reused unchanged across every
+    # generate_sql retry, exactly like retrieved_context itself. Injected
+    # into generate_sql's prompt via agent.llm_client
+    # ._build_mandatory_metrics_block and checked against the generated
+    # SQL by review_metric_conformance_node below.
+    governing_metrics: list[dict]
 
     # Set by plan_query_node, which runs between retrieve_schema and
     # generate_sql -- an ordered list of concrete steps the model judged
@@ -338,6 +351,19 @@ class AgentState(TypedDict, total=False):
     # error is (error_history/last_error_category). None when review passed
     # or didn't run.
     plan_review_feedback: str | None
+
+    # Set by review_metric_conformance_node (Prompt 10,
+    # 10_GOVERNED_METRICS_CONTRACT.md), only when governing_metrics is
+    # non-empty and Settings.enable_metric_conformance_review is True
+    # (nothing to check against / disabled otherwise) -- whether the LLM
+    # judged the just-generated SQL to actually use every governing
+    # metric's approved expression, mirroring plan_review_passed exactly.
+    # None means the check didn't run.
+    metric_conformance_passed: bool | None
+    # The reviewer's critique when metric_conformance_passed is False --
+    # fed back into the next generate_sql attempt the same way
+    # plan_review_feedback is. None when it passed or didn't run.
+    metric_conformance_feedback: str | None
 
     # Set by generate_sql
     sql: str | None

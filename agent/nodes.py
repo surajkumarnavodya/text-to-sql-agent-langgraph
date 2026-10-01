@@ -24,7 +24,7 @@ import time
 from collections.abc import Callable
 from typing import Any
 
-from retrieval.retriever import retrieve_business_context
+from retrieval.retriever import extract_governing_metrics, retrieve_business_context
 from sqlalchemy.exc import SQLAlchemyError
 
 from agent.authz import Permission, has_role_permission
@@ -47,6 +47,7 @@ from agent.llm_client import (
     generate_insight_from_llm,
     generate_query_plan_from_llm,
     generate_sql_from_llm,
+    review_sql_against_metrics_from_llm,
     review_sql_against_plan_from_llm,
 )
 from agent.rate_limit import LLM_CALL_LIMIT_MESSAGE, get_llm_call_limiter
@@ -648,6 +649,13 @@ def retrieve_business_context_node(state: AgentState) -> dict[str, Any]:
     (`plan_query_node`, `generate_sql_node`) can see the *complete* set of
     retrieved context in one place.
 
+    Also extracts `state["governing_metrics"]` (Prompt 10,
+    `10_GOVERNED_METRICS_CONTRACT.md`) from the same already-retrieved
+    result via `retrieval.retriever.extract_governing_metrics` -- no
+    second query, just a filter over chunks already judged relevant to
+    this question. Consumed by `generate_sql_node` (mandatory-use prompt
+    block) and `review_metric_conformance_node` (enforcement).
+
     This is an accuracy aid, never a gate: `retrieval.retriever
     .retrieve_business_context` already never raises (see that function's
     own fail-open contract), so the `except Exception` here is
@@ -676,13 +684,17 @@ def retrieve_business_context_node(state: AgentState) -> dict[str, Any]:
             "retrieval_sources": [],
             "retrieval_warnings": [f"Business-context retrieval failed unexpectedly: {exc}"],
             "retrieval_metadata": {},
+            "governing_metrics": [],
             "status": "generating",
         }
 
+    governing_metrics = extract_governing_metrics(result.items)
     logger.info(
-        "[retrieve_business_context] database=%r retrieved %d chunk(s), warnings=%s",
+        "[retrieve_business_context] database=%r retrieved %d chunk(s), "
+        "governing_metrics=%d, warnings=%s",
         db_name,
         len(result.items),
+        len(governing_metrics),
         result.warnings,
     )
     return {
@@ -691,6 +703,7 @@ def retrieve_business_context_node(state: AgentState) -> dict[str, Any]:
         "retrieval_sources": result.sources,
         "retrieval_warnings": result.warnings,
         "retrieval_metadata": result.metadata,
+        "governing_metrics": governing_metrics,
         "status": "generating",
     }
 
@@ -834,6 +847,7 @@ def generate_sql_node(state: AgentState) -> dict[str, Any]:
             query_plan=state.get("query_plan"),
             golden_examples=state.get("golden_examples"),
             retrieved_context=state.get("retrieved_context"),
+            governing_metrics=state.get("governing_metrics"),
             model=state.get("selected_model"),
         )
     except OffTopicQuestionError as exc:
@@ -959,6 +973,112 @@ def review_sql_node(state: AgentState) -> dict[str, Any]:
     if not can_retry:
         update["failure_explanation"] = _give_up_explanation(
             state, f"Gave up after {attempt_number} attempts. Last error (plan review): {feedback}"
+        )
+    return update
+
+
+@_timed_node("review_metric_conformance")
+def review_metric_conformance_node(state: AgentState) -> dict[str, Any]:
+    """Checks the just-generated SQL against every governing (PUBLISHED)
+    metric definition retrieved for this question -- Prompt 10
+    (`10_GOVERNED_METRICS_CONTRACT.md`): the enforcement half of
+    "confirmed definitions take precedence over LLM-generated
+    definitions."
+
+    Runs between `review_sql` and `validate_sql` (see `agent/graph.py`).
+    Structurally identical to `review_sql_node` immediately above --
+    only makes an LLM call when `state["governing_metrics"]` is
+    non-empty **and** `Settings.enable_metric_conformance_review` is
+    True; skips straight through (zero cost, `status="validating"`
+    either way) otherwise, which is the overwhelming common case for a
+    question that names no governed KPI. Independent of `query_plan`'s
+    own gate -- a simple question like "what's our revenue?" has no
+    `agent.complexity` signal at all, but can still have a governing
+    metric to enforce.
+
+    A "FAIL" verdict is treated exactly like `review_sql_node`'s own
+    plan-conformance failure: the reviewer's critique becomes this
+    attempt's error feedback for the next `generate_sql` call, sharing
+    the same `retry_count`/`state["max_retries"]` budget as every other
+    retryable failure category.
+
+    Fails open on any review failure -- an unreachable Ollama server, or
+    an unparseable verdict -- treated as a pass, the same philosophy
+    `review_sql_node` already follows: this is an accuracy aid, not a
+    deterministic security control (see `agent/llm_client.py`'s own
+    "metric-conformance review" section docstring for why this is
+    deliberately never folded into `agent.sql_validator`'s fail-closed
+    safety checks).
+    """
+    settings = get_settings()
+    governing_metrics = state.get("governing_metrics")
+    sql = state.get("sql") or ""
+    attempt_number = state.get("retry_count", 0) + 1
+
+    if not governing_metrics or not settings.enable_metric_conformance_review:
+        return {
+            "metric_conformance_passed": None,
+            "metric_conformance_feedback": None,
+            "status": "validating",
+        }
+
+    try:
+        passed, feedback = review_sql_against_metrics_from_llm(
+            governing_metrics, sql, settings, model=state.get("selected_model")
+        )
+    except OllamaUnavailableError as exc:
+        logger.warning(
+            "[review_metric_conformance] attempt %d: LLM call failed, treating as a pass: %s",
+            attempt_number,
+            exc,
+        )
+        return {
+            "metric_conformance_passed": True,
+            "metric_conformance_feedback": None,
+            "status": "validating",
+        }
+
+    if passed:
+        logger.info("[review_metric_conformance] attempt %d: metrics satisfied", attempt_number)
+        return {
+            "metric_conformance_passed": True,
+            "metric_conformance_feedback": None,
+            "status": "validating",
+        }
+
+    retry_count = state.get("retry_count", 0)
+    max_retries = _effective_max_retries(state, settings)
+    can_retry = retry_count < max_retries
+    logger.warning(
+        "[review_metric_conformance] attempt %d: metric not honored (retry %d/%d, "
+        "will_retry=%s): %s",
+        attempt_number,
+        retry_count,
+        max_retries,
+        can_retry,
+        feedback,
+    )
+    record: AttemptRecord = {
+        "attempt": attempt_number,
+        "sql": sql,
+        "outcome": "metric_definition_not_used",
+        "error": feedback,
+        "will_retry": can_retry,
+    }
+    update: dict[str, Any] = {
+        "metric_conformance_passed": False,
+        "metric_conformance_feedback": feedback,
+        "error_history": [f"Metric conformance: {feedback}"],
+        "attempt_history": [record],
+        "last_error_category": "metric_definition_not_used",
+        "retry_count": retry_count + 1,
+        "status": "generating" if can_retry else "failed",
+    }
+    if not can_retry:
+        update["failure_explanation"] = _give_up_explanation(
+            state,
+            f"Gave up after {attempt_number} attempts. Last error (metric conformance): "
+            f"{feedback}",
         )
     return update
 
@@ -1590,14 +1710,35 @@ def route_after_generation(state: AgentState) -> str:
 
 
 def route_after_review(state: AgentState) -> str:
-    """Conditional edge after review_sql: validate, retry, or give up.
+    """Conditional edge after review_sql: metric conformance, retry, or give up.
 
     Mirrors `route_after_validation`'s shape: "validating" (review passed,
     or was skipped entirely because `state["query_plan"]` was empty/None)
-    proceeds to `validate_sql`; "failed" (a FAIL verdict with the retry
-    budget exhausted) ends the run; anything else (a FAIL verdict with
-    retries remaining) loops back to `generate_sql` with the reviewer's
-    critique now in `error_history`.
+    proceeds to `review_metric_conformance` (Prompt 10,
+    `10_GOVERNED_METRICS_CONTRACT.md` -- itself a pure pass-through to
+    `validate_sql` when no governing metric applies, so an ordinary
+    question's path is functionally unchanged); "failed" (a FAIL verdict
+    with the retry budget exhausted) ends the run; anything else (a FAIL
+    verdict with retries remaining) loops back to `generate_sql` with the
+    reviewer's critique now in `error_history`.
+    """
+    status = state.get("status")
+    if status == "validating":
+        return "review_metric_conformance"
+    if status == "failed":
+        return "failed"
+    return "generate_sql"
+
+
+def route_after_metric_conformance(state: AgentState) -> str:
+    """Conditional edge after review_metric_conformance: validate, retry, or give up.
+
+    Mirrors `route_after_review`'s shape exactly -- "validating" (check
+    passed, or was skipped because `state["governing_metrics"]` was empty
+    or the feature is disabled) proceeds to `validate_sql`; "failed" (a
+    FAIL verdict with the retry budget exhausted) ends the run; anything
+    else (a FAIL verdict with retries remaining) loops back to
+    `generate_sql` with the reviewer's critique now in `error_history`.
     """
     status = state.get("status")
     if status == "validating":

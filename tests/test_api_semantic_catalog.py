@@ -145,6 +145,11 @@ def _create_entry_payload(**overrides) -> dict:
         "synonyms": ["CLV"],
         "owner": "alice",
         "confidence": 0.9,
+        "approved_expression": "SUM(Amount)",
+        "source_tables": ["FactSales"],
+        "filters": ["Region"],
+        "dimensions": ["Region", "ProductCategory"],
+        "aggregation": "SUM",
     }
     payload.update(overrides)
     return payload
@@ -377,3 +382,162 @@ class TestListEntries:
         tokens = _register(client, "plain2@tenant-a.example.com")
         response = client.get("/semantic-catalog/entries", headers=_headers(tokens))
         assert response.status_code == 403
+
+
+class TestGovernedMetricFields:
+    """Prompt 10 (`10_GOVERNED_METRICS_CONTRACT.md`)'s new fields round-
+    trip through create/get/publish, and reach the mandatory-use prompt
+    mechanism's underlying data correctly."""
+
+    def test_create_and_get_round_trip_the_governed_fields(self, client: TestClient):
+        admin_tokens = _register(client, "admin10@tenant-a.example.com", role="admin")
+        admin_headers = _headers(admin_tokens)
+        entry = _create_entry(client, admin_headers)
+
+        assert entry["approved_expression"] == "SUM(Amount)"
+        assert entry["source_tables"] == ["FactSales"]
+        assert entry["filters"] == ["Region"]
+        assert entry["dimensions"] == ["Region", "ProductCategory"]
+        assert entry["aggregation"] == "SUM"
+
+        get_response = client.get(f"/semantic-catalog/entries/{entry['id']}", headers=admin_headers)
+        assert get_response.status_code == 200
+        assert get_response.json()["approved_expression"] == "SUM(Amount)"
+
+    def test_published_chunk_carries_the_approved_expression(
+        self, client: TestClient, _retrieval_fakes: InMemoryVectorStore
+    ):
+        admin_tokens = _register(client, "admin11@tenant-a.example.com", role="admin")
+        admin_headers = _headers(admin_tokens)
+        analyst_tokens = _register(client, "analyst7@tenant-a.example.com", role="analyst")
+        analyst_headers = _headers(analyst_tokens)
+
+        entry = _create_entry(client, admin_headers)
+        client.post(
+            f"/semantic-catalog/entries/{entry['id']}/review", json={}, headers=analyst_headers
+        )
+        client.post(f"/semantic-catalog/entries/{entry['id']}/publish", headers=admin_headers)
+
+        results = _retrieval_fakes.similarity_search("db1", [0.0] * 32, top_k=10)
+        assert len(results) == 1
+        assert results[0].chunk.extra["approved_expression"] == "SUM(Amount)"
+        assert results[0].chunk.extra["aggregation"] == "SUM"
+
+    def test_default_payload_leaves_governed_fields_empty_for_a_non_metric_entry(
+        self, client: TestClient
+    ):
+        admin_tokens = _register(client, "admin12@tenant-a.example.com", role="admin")
+        admin_headers = _headers(admin_tokens)
+        entry = _create_entry(
+            client,
+            admin_headers,
+            concept_type="entity",
+            concept_key="customer",
+            business_name="Customer",
+            approved_expression=None,
+            source_tables=[],
+            filters=[],
+            dimensions=[],
+            aggregation=None,
+        )
+        assert entry["approved_expression"] is None
+        assert entry["source_tables"] == []
+        assert entry["aggregation"] is None
+
+
+class TestConflictDetection:
+    def test_create_surfaces_no_conflict_when_nothing_published_yet(self, client: TestClient):
+        admin_tokens = _register(client, "admin13@tenant-a.example.com", role="admin")
+        admin_headers = _headers(admin_tokens)
+        entry = _create_entry(client, admin_headers)
+        assert entry["conflicting_entry_ids"] == []
+        assert entry["conflicting_entry_names"] == []
+
+    def test_create_surfaces_a_conflict_with_an_already_published_entry(self, client: TestClient):
+        admin_tokens = _register(client, "admin14@tenant-a.example.com", role="admin")
+        admin_headers = _headers(admin_tokens)
+        analyst_tokens = _register(client, "analyst8@tenant-a.example.com", role="analyst")
+        analyst_headers = _headers(analyst_tokens)
+
+        existing = _create_entry(client, admin_headers, concept_key="clv")
+        client.post(
+            f"/semantic-catalog/entries/{existing['id']}/review", json={}, headers=analyst_headers
+        )
+        client.post(f"/semantic-catalog/entries/{existing['id']}/publish", headers=admin_headers)
+
+        conflicting = _create_entry(
+            client,
+            admin_headers,
+            concept_key="clv-alt",
+            business_name="Customer Lifetime Value (alt definition)",
+        )
+        assert conflicting["conflicting_entry_ids"] == [existing["id"]]
+        assert conflicting["conflicting_entry_names"] == ["Customer Lifetime Value"]
+
+    def test_conflict_detection_never_blocks_creation(self, client: TestClient):
+        """Non-blocking by design -- the new entry is still created with
+        a 200, never a 409/422, even with a detected conflict."""
+        admin_tokens = _register(client, "admin15@tenant-a.example.com", role="admin")
+        admin_headers = _headers(admin_tokens)
+        analyst_tokens = _register(client, "analyst9@tenant-a.example.com", role="analyst")
+        analyst_headers = _headers(analyst_tokens)
+
+        existing = _create_entry(client, admin_headers, concept_key="clv")
+        client.post(
+            f"/semantic-catalog/entries/{existing['id']}/review", json={}, headers=analyst_headers
+        )
+        client.post(f"/semantic-catalog/entries/{existing['id']}/publish", headers=admin_headers)
+
+        response = client.post(
+            "/semantic-catalog/entries",
+            json=_create_entry_payload(concept_key="clv-alt"),
+            headers=admin_headers,
+        )
+        assert response.status_code == 200
+
+    def test_publish_also_surfaces_a_conflict(self, client: TestClient):
+        admin_tokens = _register(client, "admin16@tenant-a.example.com", role="admin")
+        admin_headers = _headers(admin_tokens)
+        analyst_tokens = _register(client, "analyst10@tenant-a.example.com", role="analyst")
+        analyst_headers = _headers(analyst_tokens)
+
+        existing = _create_entry(client, admin_headers, concept_key="clv")
+        client.post(
+            f"/semantic-catalog/entries/{existing['id']}/review", json={}, headers=analyst_headers
+        )
+        client.post(f"/semantic-catalog/entries/{existing['id']}/publish", headers=admin_headers)
+
+        conflicting = _create_entry(
+            client,
+            admin_headers,
+            concept_key="clv-alt",
+            business_name="Customer Lifetime Value (alt definition)",
+        )
+        client.post(
+            f"/semantic-catalog/entries/{conflicting['id']}/review",
+            json={},
+            headers=analyst_headers,
+        )
+        publish_response = client.post(
+            f"/semantic-catalog/entries/{conflicting['id']}/publish", headers=admin_headers
+        )
+        assert publish_response.status_code == 200
+        assert publish_response.json()["conflicting_entry_ids"] == [existing["id"]]
+
+    def test_a_cross_tenant_entry_is_never_reported_as_a_conflict(self, client: TestClient):
+        tenant_a_tokens = _register(client, "admin17@tenant-a.example.com", role="admin")
+        tenant_a_analyst = _register(client, "analyst11@tenant-a.example.com", role="analyst")
+        tenant_b_tokens = _register(client, "admin18@tenant-b.example.com", role="admin")
+
+        existing = _create_entry(client, _headers(tenant_a_tokens), concept_key="clv")
+        client.post(
+            f"/semantic-catalog/entries/{existing['id']}/review",
+            json={},
+            headers=_headers(tenant_a_analyst),
+        )
+        client.post(
+            f"/semantic-catalog/entries/{existing['id']}/publish", headers=_headers(tenant_a_tokens)
+        )
+
+        other_tenant_entry = _create_entry(client, _headers(tenant_b_tokens), concept_key="clv-alt")
+        assert other_tenant_entry["conflicting_entry_ids"] == []

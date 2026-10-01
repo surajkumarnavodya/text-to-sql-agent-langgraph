@@ -119,3 +119,37 @@ cases:
     expected_tables: [FactInternetSales]
     expected_sql: "SELECT SUM(SalesAmount) FROM FactInternetSales"
     notes: "The terse-keyword-question counterpart to easy_agg cases -- same underlying query shape, minimal wording."
+
+  - id: metric_consistency_aov_phrasing_one
+    question: "What's our average order value?"
+    database: AdventureWorksDW2025
+    difficulty: real_world
+    category: metric_consistency
+    expected_tables: [FactInternetSales]
+    expected_sql: >-
+      SELECT SUM(SalesAmount) / COUNT(DISTINCT SalesOrderNumber) FROM FactInternetSales
+    notes: >-
+      Prompt 10 (10_GOVERNED_METRICS_CONTRACT.md): the governed "average
+      order value" metric's own approved expression
+      (data/knowledge/metrics.yaml), phrased the ordinary business way.
+      Paired with metric_consistency_aov_phrasing_two below -- both cases
+      carry the *identical* expected_sql; this framework scores each
+      individually (no cross-case equivalence evaluator exists, a named,
+      disclosed gap -- see that contract doc), but a correct, governed-
+      metric-aware agent should pass both the same way regardless of
+      phrasing.
+
+  - id: metric_consistency_aov_phrasing_two
+    question: "What is the AOV for our internet sales channel?"
+    database: AdventureWorksDW2025
+    difficulty: real_world
+    category: metric_consistency
+    expected_tables: [FactInternetSales]
+    expected_sql: >-
+      SELECT SUM(SalesAmount) / COUNT(DISTINCT SalesOrderNumber) FROM FactInternetSales
+    notes: >-
+      Same governed metric as metric_consistency_aov_phrasing_one, named
+      by its common abbreviation ("AOV") instead of the full business
+      name -- exercises `semantic.catalog`'s synonym matching
+      (CatalogEntrySnapshot.synonyms) reaching the same approved
+      expression regardless of which name the question uses.

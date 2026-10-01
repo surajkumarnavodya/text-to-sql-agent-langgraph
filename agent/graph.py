@@ -1,20 +1,31 @@
 """Wires the agent nodes into a compiled LangGraph state machine.
 
-    sanitize_input -> classify_followup -> retrieve_schema -> retrieve_golden_examples -> plan_query -> generate_sql -+-> review_sql -+-> validate_sql -+-> estimate_cost -+-> execute_sql -+-> generate_insight -> END
-         |                    |                    ^                                                                  |               ^                |                  ^                 |                |
-         |                    |                    +----------------------------------(retry, up to max_retries)------+----------------+---(retry, high    |               |
-         |                    |                                                                                       |                                   cost only)      +--(retry, only  |
-         |                    +-> END (needs_clarification, ambiguous)                                                |                                                        on a missing_  |
-         |                                                                                                             +-> END (rejected --                                     reference       |
-         +-> END (rejected -- too_long/empty/injection_detected/off_topic)                                                OffTopicQuestionError backstop)                       error)
+    sanitize_input -> classify_followup -> retrieve_schema -> retrieve_golden_examples -> plan_query -> generate_sql -+-> review_sql -+-> review_metric_conformance -+-> validate_sql -+-> estimate_cost -+-> execute_sql -+-> generate_insight -> END
+         |                    |                    ^                                                                  |               ^                              |                 ^                |                  ^                 |                |
+         |                    |                    +----------------------------------(retry, up to max_retries)------+---------------+------------------------------+-----------------+---(retry, high    |               |
+         |                    |                                                                                       |                                                                                    cost only)      +--(retry, only  |
+         |                    +-> END (needs_clarification, ambiguous)                                                |                                                                                                        on a missing_  |
+         |                                                                                                             +-> END (rejected --                                                                                         reference       |
+         +-> END (rejected -- too_long/empty/injection_detected/off_topic)                                                OffTopicQuestionError backstop)                                                                           error)
 
 The retry budget itself ("max_retries" in the diagram above) is not always
 `Settings.max_retries` -- `run_agent()` computes an effective, possibly
 larger budget once per question via `agent.complexity.compute_max_retries`
 and stores it in `state["max_retries"]`, which every retry-vs-give-up check
-(`review_sql_node`/`validate_sql_node`/`estimate_query_cost_node`/
-`execute_sql_node`) reads instead of the raw setting. See
-`agent/complexity.py`'s module docstring.
+(`review_sql_node`/`review_metric_conformance_node`/`validate_sql_node`/
+`estimate_query_cost_node`/`execute_sql_node`) reads instead of the raw
+setting. See `agent/complexity.py`'s module docstring.
+
+`review_metric_conformance` (between `review_sql` and `validate_sql`,
+Prompt 10, `10_GOVERNED_METRICS_CONTRACT.md`) checks the generated SQL
+against every governing (PUBLISHED) metric definition
+`retrieve_business_context` surfaced for this question
+(`state["governing_metrics"]`) -- a pure pass-through, zero added
+latency, whenever there's no governing metric to check against (the
+overwhelming common case) or `Settings.enable_metric_conformance_review`
+is off. A FAIL shares the identical retry-budget machinery
+`review_sql_node` already uses. See `agent.nodes
+.review_metric_conformance_node`.
 
 `retrieve_golden_examples` (between `retrieve_schema` and `plan_query`) looks
 up human-approved (question, SQL) pairs a user previously saved via the UI's
@@ -44,8 +55,8 @@ state-visible warning (`retrieval_warnings`), never a reason a question
 can't be answered. See `agent.nodes.retrieve_business_context_node`.
 
 `plan_query` (between `retrieve_business_context` and `generate_sql`) and `review_sql`
-(between `generate_sql` and `validate_sql`) are the agentic query-
-decomposition + plan-conformance self-correction pair: `plan_query_node`
+(between `generate_sql` and `review_metric_conformance`) are the agentic
+query-decomposition + plan-conformance self-correction pair: `plan_query_node`
 makes an up-front LLM call that breaks a *non-trivial* question (one that
 matched an `agent.complexity` signal) into an ordered plan, which is then
 injected into `generate_sql`'s own prompt; `review_sql_node` makes a second
@@ -132,11 +143,13 @@ from agent.nodes import (
     retrieve_business_context_node,
     retrieve_golden_examples_node,
     retrieve_schema_node,
+    review_metric_conformance_node,
     review_sql_node,
     route_after_classification,
     route_after_cost_estimate,
     route_after_execution,
     route_after_generation,
+    route_after_metric_conformance,
     route_after_review,
     route_after_sanitization,
     route_after_validation,
@@ -159,13 +172,14 @@ def build_graph():
     never on the compiled graph object itself -- so building it once and
     reusing it (the same `functools`-based singleton pattern already used
     for `config.settings.get_settings()` and `db.connection._cached_engine`)
-    is safe and avoids re-wiring all eleven nodes on every single question.
+    is safe and avoids re-wiring all thirteen nodes on every single question.
     Graph *shape* never depends on `Settings` (`retrieve_golden_examples`/
-    `plan_query`/`review_sql`
-    are pass-throughs, not conditionally-omitted nodes, when planning is
-    off -- see this module's docstring), so there's no per-settings cache
-    key to worry about; like every other process-lifetime singleton here, a
-    config change that would matter takes a process restart.
+    `plan_query`/`review_sql`/`review_metric_conformance`
+    are pass-throughs, not conditionally-omitted nodes, when planning/
+    metric-conformance review is off -- see this module's docstring), so
+    there's no per-settings cache key to worry about; like every other
+    process-lifetime singleton here, a config change that would matter
+    takes a process restart.
 
     Returns:
         A compiled LangGraph graph exposing `.invoke(state)`.
@@ -180,6 +194,7 @@ def build_graph():
     graph.add_node("plan_query", plan_query_node)
     graph.add_node("generate_sql", generate_sql_node)
     graph.add_node("review_sql", review_sql_node)
+    graph.add_node("review_metric_conformance", review_metric_conformance_node)
     graph.add_node("validate_sql", validate_sql_node)
     graph.add_node("estimate_cost", estimate_query_cost_node)
     graph.add_node("execute_sql", execute_sql_node)
@@ -219,6 +234,15 @@ def build_graph():
     graph.add_conditional_edges(
         "review_sql",
         route_after_review,
+        {
+            "review_metric_conformance": "review_metric_conformance",
+            "generate_sql": "generate_sql",
+            "failed": END,
+        },
+    )
+    graph.add_conditional_edges(
+        "review_metric_conformance",
+        route_after_metric_conformance,
         {
             "validate_sql": "validate_sql",
             "generate_sql": "generate_sql",
@@ -383,16 +407,17 @@ def run_agent(
     # not automatically related to this graph's *own* retry budget
     # (effective_max_retries above) -- a real, reproduced bug: a worst-case
     # retry sequence (an execute_sql "missing_reference" retry loops all the
-    # way back to retrieve_schema -- an 8-node cycle: retrieve_schema,
-    # retrieve_golden_examples, plan_query, generate_sql, review_sql,
-    # validate_sql, estimate_cost, execute_sql) can exceed 25 total steps
-    # well before effective_max_retries is exhausted -- e.g. the 10-step
-    # initial pass plus just two such retries is already 26 steps. When that
-    # happened, LangGraph raised an uncaught GraphRecursionError instead of
-    # the graph reaching its own intended terminal "failed" state, which
+    # way back to retrieve_schema -- a 10-node cycle: retrieve_schema,
+    # retrieve_golden_examples, retrieve_business_context, plan_query,
+    # generate_sql, review_sql, review_metric_conformance, validate_sql,
+    # estimate_cost, execute_sql) can exceed 25 total steps well before
+    # effective_max_retries is exhausted -- e.g. the ~12-step initial pass
+    # plus just two such retries already exceeds that. When that happened,
+    # LangGraph raised an uncaught GraphRecursionError instead of the
+    # graph reaching its own intended terminal "failed" state, which
     # surfaced to callers as an unhandled 500 rather than a normal failure
     # response. Sized generously for the worst-case (every retry being the
-    # 8-node missing_reference cycle) plus headroom, scaled to this
+    # 10-node missing_reference cycle) plus headroom, scaled to this
     # question's actual effective_max_retries (which can itself be raised
     # above the base Settings.max_retries by agent.complexity's adaptive
     # bonus) so a future config change can't reintroduce this.

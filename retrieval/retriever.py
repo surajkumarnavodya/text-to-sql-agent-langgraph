@@ -83,6 +83,48 @@ class RetrievalResult:
         return not self.items
 
 
+def extract_governing_metrics(items: list[ScoredChunk]) -> list[dict[str, Any]]:
+    """Filters already-retrieved chunks down to **governing metrics**
+    -- Prompt 10 (`10_GOVERNED_METRICS_CONTRACT.md`)'s "confirmed
+    definitions take precedence" mechanism.
+
+    Deliberately not a new vector query or a second matching pass:
+    whatever `retrieve_business_context`'s own similarity search +
+    rerank already judged relevant enough to return for this question
+    *is* the governing-metric set -- this function only picks the
+    `METRIC`-typed `business_concept` chunks back out of that already-
+    computed result. Every such chunk is already guaranteed `PUBLISHED`
+    (see `retrieval.chunking.business_concept_chunk_from_catalog_entry`'s
+    own docstring: only a published entry is ever rendered into a chunk
+    at all), so every dict this returns is `CONFIRMED_BUSINESS_TRUTH` by
+    construction, never an unreviewed draft.
+
+    Returns:
+        One plain dict per governing metric (`business_name`,
+        `approved_expression`, `aggregation`, `text` -- the chunk's own
+        self-contained rendering, reused directly rather than re-derived)
+        -- consumed by `agent.llm_client._build_mandatory_metrics_block`
+        and `review_sql_against_metrics_from_llm`. Empty for a question
+        with no governing metric, the common case.
+    """
+    governing: list[dict[str, Any]] = []
+    for item in items:
+        chunk = item.chunk
+        if chunk.chunk_type != ChunkType.BUSINESS_CONCEPT:
+            continue
+        if chunk.extra.get("concept_type") != "metric":
+            continue
+        governing.append(
+            {
+                "business_name": chunk.extra.get("business_name") or chunk.source_id,
+                "approved_expression": chunk.extra.get("approved_expression"),
+                "aggregation": chunk.extra.get("aggregation"),
+                "text": chunk.text,
+            }
+        )
+    return governing
+
+
 def _per_type_top_k(settings: Settings) -> dict[ChunkType, int]:
     return {
         ChunkType.TABLE: settings.retrieval_top_k_tables,

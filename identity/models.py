@@ -1106,6 +1106,16 @@ class SemanticCatalogEntry(Base):
     )
     owner: Mapped[str] = mapped_column(String(200), nullable=True)
     version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    # Prompt 10 (10_GOVERNED_METRICS_CONTRACT.md): what makes a METRIC
+    # entry *governing* rather than merely descriptive -- see
+    # `semantic.catalog.CatalogEntrySnapshot`'s own docstring for why
+    # `approved_expression`/`source_tables` are deliberately separate
+    # fields from `technical_name`/`keys` above, not a reuse of either.
+    approved_expression: Mapped[str] = mapped_column(Text, nullable=True)
+    source_tables: Mapped[list] = mapped_column(_METADATA_JSON, nullable=False, default=list)
+    filters: Mapped[list] = mapped_column(_METADATA_JSON, nullable=False, default=list)
+    dimensions: Mapped[list] = mapped_column(_METADATA_JSON, nullable=False, default=list)
+    aggregation: Mapped[str] = mapped_column(String(100), nullable=True)
     supersedes_id: Mapped[uuid.UUID] = mapped_column(
         Uuid(as_uuid=True),
         ForeignKey("semantic_catalog_entries.id", ondelete="SET NULL"),

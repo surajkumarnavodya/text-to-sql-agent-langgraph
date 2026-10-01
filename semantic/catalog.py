@@ -124,6 +124,22 @@ class CatalogEntrySnapshot(BaseModel):
     `evidence` default to empty -- not every concept type populates every
     field (a `DOMAIN` entry typically has no `grain`/`keys`; a `METRIC`
     entry typically has no `relationships`).
+
+    `approved_expression`/`source_tables`/`filters`/`dimensions`/
+    `aggregation` (Prompt 10, `10_GOVERNED_METRICS_CONTRACT.md`) are the
+    fields that make a `METRIC`-type entry *governing*, not merely
+    descriptive: `approved_expression` is the authoritative SQL-
+    expression-shaped definition (e.g. `"SUM(SalesAmount) /
+    COUNT(DISTINCT SalesOrderNumber)"`) SQL generation must prefer over
+    anything it would otherwise invent (see `agent.llm_client
+    ._build_mandatory_metrics_block` and `agent.nodes
+    .review_metric_conformance_node`) -- deliberately a separate field
+    from `technical_name` (a short label, e.g. a column/table name for
+    non-metric concepts) rather than overloading it. `source_tables` is
+    deliberately distinct from `keys` (join/identifier keys, not "which
+    tables this metric reads"). Every one of these five defaults to
+    empty/`None` for a non-metric concept type -- not every concept type
+    populates them, same convention as the Prompt-09 fields above.
     """
 
     model_config = ConfigDict(frozen=True)
@@ -148,6 +164,11 @@ class CatalogEntrySnapshot(BaseModel):
     status: CatalogStatus
     owner: str | None = None
     version: int = 1
+    approved_expression: str | None = None
+    source_tables: tuple[str, ...] = ()
+    filters: tuple[str, ...] = ()
+    dimensions: tuple[str, ...] = ()
+    aggregation: str | None = None
 
     @property
     def truth_level(self) -> DataTruthLevel:
@@ -168,6 +189,13 @@ def metric_definition_from_snapshot(snapshot: CatalogEntrySnapshot) -> MetricDef
     docstring names), `DRAFT`/`REVIEWED` -> `DRAFT` (neither is live yet),
     `SUPERSEDED` -> `DEPRECATED` (retired, still resolvable for historical
     queries -- `MetricStatus.DEPRECATED`'s own documented meaning).
+
+    **Prompt 10** (`10_GOVERNED_METRICS_CONTRACT.md`): `formula`/
+    `aggregation`/`valid_filters`/`source_tables` now map from the
+    snapshot's own real `approved_expression`/`aggregation`/`filters`/
+    `source_tables` fields -- Prompt 09's version of this function had
+    nothing real to put there and hard-coded them empty; those fields
+    didn't exist on the catalog yet.
     """
     if snapshot.concept_type != CatalogConceptType.METRIC:
         return None
@@ -180,11 +208,11 @@ def metric_definition_from_snapshot(snapshot: CatalogEntrySnapshot) -> MetricDef
     return MetricDefinition(
         name=snapshot.business_name,
         definition=snapshot.description,
-        formula=snapshot.technical_name or "",
-        aggregation="",
+        formula=snapshot.approved_expression or "",
+        aggregation=snapshot.aggregation or "",
         grain=snapshot.grain or "",
-        valid_filters=(),
-        source_tables=tuple(snapshot.keys),
+        valid_filters=snapshot.filters,
+        source_tables=snapshot.source_tables,
         source_columns=(),
         time_period_interpretation="",
         tags=snapshot.synonyms,

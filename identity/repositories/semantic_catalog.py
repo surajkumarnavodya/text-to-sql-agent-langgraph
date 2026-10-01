@@ -87,12 +87,23 @@ def create_entry(
     confidence: float,
     owner: str | None,
     created_by_user_id: uuid.UUID | None,
+    approved_expression: str | None = None,
+    source_tables: list[str] | None = None,
+    filters: list[str] | None = None,
+    dimensions: list[str] | None = None,
+    aggregation: str | None = None,
 ) -> SemanticCatalogEntry:
     """Creates one new `"draft"` version of `concept_key` -- version `1`
     for a brand-new concept, or the next version if one already exists
     (e.g. editing a previously `"published"` entry always creates a new
     draft row rather than mutating that published row -- see
-    `identity.models.SemanticCatalogEntry`'s own docstring)."""
+    `identity.models.SemanticCatalogEntry`'s own docstring).
+
+    `approved_expression`/`source_tables`/`filters`/`dimensions`/
+    `aggregation` (Prompt 10, `10_GOVERNED_METRICS_CONTRACT.md`) default
+    to `None`/empty -- meaningful for a `METRIC`-type entry, left unset
+    for every other `concept_type`.
+    """
     version = next_version_for_concept_key(
         session,
         tenant_id=tenant_id,
@@ -121,6 +132,11 @@ def create_entry(
         owner=owner,
         version=version,
         created_by_user_id=created_by_user_id,
+        approved_expression=approved_expression,
+        source_tables=source_tables or [],
+        filters=filters or [],
+        dimensions=dimensions or [],
+        aggregation=aggregation,
     )
     session.add(entry)
     session.commit()
@@ -276,6 +292,60 @@ def publish_entry(
     return entry, previous_published
 
 
+def find_conflicting_published_entries(
+    session: Session,
+    *,
+    tenant_id: str,
+    database_id: str,
+    concept_type: str,
+    business_name: str,
+    synonyms: list[str],
+    exclude_concept_key: str,
+) -> list[SemanticCatalogEntry]:
+    """Finds every **other** `"published"` entry in this `(tenant_id,
+    database_id, concept_type)` scope whose `business_name`/`synonyms`
+    case-insensitively overlap with the given ones -- Prompt 10
+    (`10_GOVERNED_METRICS_CONTRACT.md`)'s conflict-detection requirement:
+    two different `concept_key`s both claiming the same business term
+    (e.g. two "revenue" metrics with different formulas).
+
+    Deliberately a plain Python-side set comparison over an already-
+    scoped, already-small row set -- not a cross-dialect JSON-
+    containment SQL query (SQLite/Postgres don't agree on one), and this
+    scope is bounded by construction (one tenant's one database's one
+    concept type's published entries, typically a handful).
+
+    Never blocks anything -- the caller (`api/semantic_catalog.py`)
+    surfaces the result for human review (this codebase's standing
+    "surface ambiguity, never auto-resolve it" posture, same as
+    `onboarding/semantic_inference.py`'s own ambiguity flag), it never
+    becomes a rejection on its own.
+    """
+    candidate_terms = {term.strip().lower() for term in (business_name, *synonyms) if term.strip()}
+    if not candidate_terms:
+        return []
+
+    published_entries = session.scalars(
+        select(SemanticCatalogEntry)
+        .where(SemanticCatalogEntry.tenant_id == tenant_id)
+        .where(SemanticCatalogEntry.database_id == database_id)
+        .where(SemanticCatalogEntry.concept_type == concept_type)
+        .where(SemanticCatalogEntry.status == "published")
+        .where(SemanticCatalogEntry.concept_key != exclude_concept_key)
+    )
+
+    conflicts: list[SemanticCatalogEntry] = []
+    for candidate in published_entries:
+        other_terms = {
+            term.strip().lower()
+            for term in (candidate.business_name, *(candidate.synonyms or ()))
+            if term.strip()
+        }
+        if candidate_terms & other_terms:
+            conflicts.append(candidate)
+    return conflicts
+
+
 def entry_to_snapshot(entry: SemanticCatalogEntry) -> CatalogEntrySnapshot:
     """Converts a real ORM row into the ORM-independent `CatalogEntrySnapshot`
     shape `retrieval/`/`semantic/metrics.py` consume -- see
@@ -302,4 +372,9 @@ def entry_to_snapshot(entry: SemanticCatalogEntry) -> CatalogEntrySnapshot:
         status=CatalogStatus(entry.status),
         owner=entry.owner,
         version=entry.version,
+        approved_expression=entry.approved_expression,
+        source_tables=tuple(entry.source_tables or ()),
+        filters=tuple(entry.filters or ()),
+        dimensions=tuple(entry.dimensions or ()),
+        aggregation=entry.aggregation,
     )

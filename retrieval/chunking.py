@@ -543,12 +543,22 @@ def business_concept_chunk_from_catalog_entry(
     lines = [f"{snapshot.concept_type.value.title()}: {snapshot.business_name}."]
     if snapshot.technical_name:
         lines.append(f"Technical name: {snapshot.technical_name}.")
+    if snapshot.approved_expression:
+        lines.append(f"Approved expression: {snapshot.approved_expression}")
+    if snapshot.aggregation:
+        lines.append(f"Aggregation: {snapshot.aggregation}.")
     if snapshot.description:
         lines.append(f"Description: {normalize_text(snapshot.description)}")
     if snapshot.grain:
         lines.append(f"Grain: {snapshot.grain}.")
     if snapshot.keys:
         lines.append(f"Keys: {', '.join(snapshot.keys)}.")
+    if snapshot.source_tables:
+        lines.append(f"Source tables: {', '.join(snapshot.source_tables)}.")
+    if snapshot.filters:
+        lines.append(f"Common filters: {', '.join(snapshot.filters)}.")
+    if snapshot.dimensions:
+        lines.append(f"Allowed breakdown dimensions: {', '.join(snapshot.dimensions)}.")
     if snapshot.relationships:
         rel_lines = [
             f"{r.get('related_concept_key', '?')} ({r.get('relationship_type', 'related to')})"
@@ -579,12 +589,18 @@ def business_concept_chunk_from_catalog_entry(
         extra={
             "concept_type": snapshot.concept_type.value,
             "concept_key": snapshot.concept_key,
+            "business_name": snapshot.business_name,
             "status": snapshot.status.value,
             "confidence": snapshot.confidence,
             "evidence": list(snapshot.evidence),
             "owner": snapshot.owner,
             "version": snapshot.version,
             "truth_level": snapshot.truth_level.value,
+            "approved_expression": snapshot.approved_expression,
+            "aggregation": snapshot.aggregation,
+            "source_tables": list(snapshot.source_tables),
+            "filters": list(snapshot.filters),
+            "dimensions": list(snapshot.dimensions),
         },
     )
 

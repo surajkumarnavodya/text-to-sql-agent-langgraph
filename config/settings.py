@@ -1475,6 +1475,14 @@ class Settings(BaseSettings):
     enable_query_planning: bool = True
     query_plan_max_tokens: int = Field(default=300, gt=0)
     sql_review_max_tokens: int = Field(default=200, gt=0)
+    # Prompt 10 (10_GOVERNED_METRICS_CONTRACT.md): gates
+    # agent.nodes.review_metric_conformance_node's LLM call. True by
+    # default -- the node is already a pure pass-through with zero cost
+    # whenever a question's retrieved context contains no governing
+    # (PUBLISHED) metric, the overwhelming common case, so this flag exists
+    # purely as an operator escape hatch, not because the feature is risky
+    # on by default.
+    enable_metric_conformance_review: bool = True
     enable_golden_examples: bool = True
     golden_examples_top_k: int = Field(default=3, gt=0)
     golden_examples_min_similarity: float = Field(default=0.75, ge=0.0, le=1.0)

@@ -79,6 +79,35 @@ class TestValidStatusTransitions:
         assert VALID_STATUS_TRANSITIONS[CatalogStatus.SUPERSEDED] == frozenset()
 
 
+class TestCatalogEntrySnapshotGovernedMetricFields:
+    """Prompt 10 (`10_GOVERNED_METRICS_CONTRACT.md`)'s new fields."""
+
+    def test_defaults_are_empty_for_a_non_metric_entry(self):
+        snapshot = _snapshot(concept_type=CatalogConceptType.ENTITY)
+        assert snapshot.approved_expression is None
+        assert snapshot.source_tables == ()
+        assert snapshot.filters == ()
+        assert snapshot.dimensions == ()
+        assert snapshot.aggregation is None
+
+    def test_a_metric_entry_can_carry_every_governed_field(self):
+        snapshot = _snapshot(
+            concept_type=CatalogConceptType.METRIC,
+            approved_expression="SUM(SalesAmount) / COUNT(DISTINCT SalesOrderNumber)",
+            source_tables=("FactInternetSales",),
+            filters=("OrderDateKey", "Region"),
+            dimensions=("Region", "ProductCategory"),
+            aggregation="derived ratio",
+        )
+        assert snapshot.approved_expression == (
+            "SUM(SalesAmount) / COUNT(DISTINCT SalesOrderNumber)"
+        )
+        assert snapshot.source_tables == ("FactInternetSales",)
+        assert snapshot.filters == ("OrderDateKey", "Region")
+        assert snapshot.dimensions == ("Region", "ProductCategory")
+        assert snapshot.aggregation == "derived ratio"
+
+
 class TestMetricDefinitionFromSnapshot:
     def test_non_metric_concept_type_returns_none(self):
         snapshot = _snapshot(concept_type=CatalogConceptType.ENTITY)
@@ -89,14 +118,19 @@ class TestMetricDefinitionFromSnapshot:
             concept_type=CatalogConceptType.METRIC,
             concept_key="clv",
             business_name="Customer Lifetime Value",
-            technical_name="SUM(Amount)",
             description="Total historical revenue per customer",
             grain="one row per customer",
-            keys=("CustomerId",),
             synonyms=("CLV",),
             owner="alice",
             version=3,
             status=CatalogStatus.PUBLISHED,
+            # Prompt 10 (10_GOVERNED_METRICS_CONTRACT.md) fields -- these,
+            # not `technical_name`/`keys`, are what `formula`/
+            # `source_tables`/`aggregation`/`valid_filters` now map from.
+            approved_expression="SUM(Amount)",
+            source_tables=("FactSales",),
+            filters=("Region",),
+            aggregation="SUM",
         )
         definition = metric_definition_from_snapshot(snapshot)
         assert definition is not None
@@ -104,10 +138,28 @@ class TestMetricDefinitionFromSnapshot:
         assert definition.formula == "SUM(Amount)"
         assert definition.definition == "Total historical revenue per customer"
         assert definition.grain == "one row per customer"
-        assert definition.source_tables == ("CustomerId",)
+        assert definition.source_tables == ("FactSales",)
+        assert definition.valid_filters == ("Region",)
+        assert definition.aggregation == "SUM"
         assert definition.tags == ("CLV",)
         assert definition.owner == "alice"
         assert definition.version == 3
+
+    def test_metric_with_no_approved_expression_maps_to_an_empty_formula(self):
+        """A METRIC-type entry that hasn't had its governed fields filled
+        in yet (e.g. still mid-authoring) bridges cleanly to an empty,
+        never a stale/wrong, formula -- never falls back to an unrelated
+        field like `technical_name`."""
+        snapshot = _snapshot(
+            concept_type=CatalogConceptType.METRIC,
+            concept_key="clv",
+            technical_name="SUM(Amount)",  # deliberately NOT the formula source
+        )
+        definition = metric_definition_from_snapshot(snapshot)
+        assert definition is not None
+        assert definition.formula == ""
+        assert definition.source_tables == ()
+        assert definition.valid_filters == ()
 
     def test_status_mapping_published_to_approved(self):
         snapshot = _snapshot(concept_type=CatalogConceptType.METRIC, status=CatalogStatus.PUBLISHED)

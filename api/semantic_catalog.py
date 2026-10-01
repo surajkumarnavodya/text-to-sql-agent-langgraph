@@ -20,6 +20,21 @@ is logged and surfaced to the caller as a non-fatal `sync_warning` on the
 response, the same "retrieval is best-effort, never a hard gate"
 philosophy `retrieval.retriever.retrieve_business_context`'s own
 fail-open contract already establishes elsewhere in this codebase.
+
+**Conflict detection (Prompt 10, `10_GOVERNED_METRICS_CONTRACT.md`) is
+non-blocking.** `create`/`publish` both run `identity.repositories
+.semantic_catalog.find_conflicting_published_entries` and surface the
+result as `CatalogEntryOut.conflicting_entry_ids`/`conflicting_entry_
+names` -- never a rejection (this codebase's standing "surface ambiguity
+to a human, never auto-resolve it" posture, same as `onboarding
+/semantic_inference.py`'s own ambiguity flag). A non-empty result is also
+logged via `security.audit_log.log_security_event` (the existing
+structured-observability hook every other security-relevant event in
+this codebase already uses). `get`/`list`/`update`/`review`/`request-
+changes` never recompute this -- it's a point-in-time check against the
+catalog as it stood at create/publish time, not a live property of the
+entry itself, so those routes' `CatalogEntryOut.conflicting_entry_ids`
+is always empty.
 """
 
 from __future__ import annotations
@@ -33,6 +48,7 @@ from identity.rbac import Permission
 from identity.repositories.semantic_catalog import (
     InvalidCatalogStatusTransitionError,
     entry_to_snapshot,
+    find_conflicting_published_entries,
     get_entry_by_id,
     list_entries,
     list_versions_for_concept_key,
@@ -70,6 +86,7 @@ from api.semantic_catalog_schemas import (
     UpdateCatalogEntryRequest,
 )
 from config.settings import get_settings
+from security.audit_log import log_security_event
 from security.redaction import redact_secrets
 from security.tenancy import resolve_actor_tenant_id
 
@@ -115,8 +132,11 @@ def _authorize(
         raise _forbidden()
 
 
-def _entry_out(entry: SemanticCatalogEntry) -> CatalogEntryOut:
+def _entry_out(
+    entry: SemanticCatalogEntry, conflicts: list[SemanticCatalogEntry] | None = None
+) -> CatalogEntryOut:
     snapshot = entry_to_snapshot(entry)
+    conflicts = conflicts or []
     return CatalogEntryOut(
         id=entry.id,
         tenant_id=entry.tenant_id,
@@ -145,7 +165,41 @@ def _entry_out(entry: SemanticCatalogEntry) -> CatalogEntryOut:
         published_at=entry.published_at,
         created_at=entry.created_at,
         updated_at=entry.updated_at,
+        approved_expression=entry.approved_expression,
+        source_tables=list(entry.source_tables or []),
+        filters=list(entry.filters or []),
+        dimensions=list(entry.dimensions or []),
+        aggregation=entry.aggregation,
+        conflicting_entry_ids=[c.id for c in conflicts],
+        conflicting_entry_names=[c.business_name for c in conflicts],
     )
+
+
+def _check_conflicts(session: Session, entry: SemanticCatalogEntry) -> list[SemanticCatalogEntry]:
+    """Runs `find_conflicting_published_entries` for `entry` and logs a
+    structured security event when it finds anything -- the one place
+    both `create`/`publish` route through, so the check and its logging
+    can never drift apart between the two call sites."""
+    conflicts = find_conflicting_published_entries(
+        session,
+        tenant_id=entry.tenant_id,
+        database_id=entry.database_id,
+        concept_type=entry.concept_type,
+        business_name=entry.business_name,
+        synonyms=list(entry.synonyms or []),
+        exclude_concept_key=entry.concept_key,
+    )
+    if conflicts:
+        log_security_event(
+            "semantic_catalog_conflict_detected",
+            "warning",
+            "A new/published semantic-catalog entry shares a business name or synonym "
+            "with another already-published entry of a different concept_key.",
+            entry_id=str(entry.id),
+            concept_key=entry.concept_key,
+            conflicting_concept_keys=[c.concept_key for c in conflicts],
+        )
+    return conflicts
 
 
 @router.post("/entries", response_model=CatalogEntryOut)
@@ -182,8 +236,14 @@ def create_catalog_entry(
         confidence=payload.confidence,
         owner=payload.owner,
         created_by_user_id=user.id,
+        approved_expression=payload.approved_expression,
+        source_tables=payload.source_tables,
+        filters=payload.filters,
+        dimensions=payload.dimensions,
+        aggregation=payload.aggregation,
     )
-    return _entry_out(entry)
+    conflicts = _check_conflicts(session, entry)
+    return _entry_out(entry, conflicts)
 
 
 @router.get("/entries", response_model=list[CatalogEntryOut])
@@ -343,4 +403,5 @@ def publish_catalog_entry(
         # dedicated backfill path -- a known, disclosed limitation, see
         # `09_SEMANTIC_CATALOG_CONTRACT.md`).
 
-    return _entry_out(published)
+    conflicts = _check_conflicts(session, published)
+    return _entry_out(published, conflicts)

@@ -90,6 +90,15 @@ KNOWN_CATEGORIES: frozenset[str] = frozenset(
         # those metrics real data to compute over.
         "null_handling",
         "cost_estimation",
+        # Prompt 10 (10_GOVERNED_METRICS_CONTRACT.md): differently-worded
+        # KPI questions each individually scored against the same
+        # governed metric's own approved expression as `expected_sql`.
+        # Deliberately NOT a cross-case equivalence check -- this
+        # framework has no such mechanism (see that contract doc's own
+        # "known limitations" for why building one was out of scope) --
+        # each case here is graded exactly like every other case, on its
+        # own expected_sql match.
+        "metric_consistency",
     }
 )
 

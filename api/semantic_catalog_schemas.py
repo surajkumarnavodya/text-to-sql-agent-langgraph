@@ -35,6 +35,13 @@ class CreateCatalogEntryRequest(BaseModel):
     evidence: list[dict[str, Any]] = Field(default_factory=list)
     confidence: float = Field(default=1.0, ge=0.0, le=1.0)
     owner: str | None = Field(default=None, max_length=200)
+    # Prompt 10 (10_GOVERNED_METRICS_CONTRACT.md): meaningful for a
+    # `concept_type == "metric"` entry, left unset for every other type.
+    approved_expression: str | None = Field(default=None, max_length=4000)
+    source_tables: list[str] = Field(default_factory=list)
+    filters: list[str] = Field(default_factory=list)
+    dimensions: list[str] = Field(default_factory=list)
+    aggregation: str | None = Field(default=None, max_length=100)
 
 
 class UpdateCatalogEntryRequest(BaseModel):
@@ -57,6 +64,11 @@ class UpdateCatalogEntryRequest(BaseModel):
     evidence: list[dict[str, Any]] | None = None
     confidence: float | None = Field(default=None, ge=0.0, le=1.0)
     owner: str | None = Field(default=None, max_length=200)
+    approved_expression: str | None = Field(default=None, max_length=4000)
+    source_tables: list[str] | None = None
+    filters: list[str] | None = None
+    dimensions: list[str] | None = None
+    aggregation: str | None = Field(default=None, max_length=100)
 
 
 class ReviewDecisionRequest(BaseModel):
@@ -95,3 +107,17 @@ class CatalogEntryOut(BaseModel):
     published_at: datetime | None
     created_at: datetime
     updated_at: datetime
+    approved_expression: str | None
+    source_tables: list[str]
+    filters: list[str]
+    dimensions: list[str]
+    aggregation: str | None
+    # Prompt 10 (10_GOVERNED_METRICS_CONTRACT.md): non-blocking conflict
+    # detection -- empty unless another PUBLISHED entry in this entry's
+    # own (tenant, database, concept_type) scope shares a business
+    # name/synonym. Always computed on create/publish, never on a plain
+    # GET (see api/semantic_catalog.py for why -- it's a point-in-time
+    # check against the catalog as it stood at that moment, not a live
+    # property of the entry itself).
+    conflicting_entry_ids: list[uuid.UUID] = Field(default_factory=list)
+    conflicting_entry_names: list[str] = Field(default_factory=list)
