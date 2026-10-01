@@ -398,22 +398,34 @@ below, and `docs/MULTI_SOURCE_GUIDE.md` for how to configure each source.
   declarative) and the *only* real (Alembic) migrations anywhere in this
   codebase — see `identity/__init__.py`'s own docstring for why this is a
   deliberate exception to the rest of the codebase's "raw SQLAlchemy Core +
-  idempotent `ensure_schema()`" convention. `models.py` (14 tables:
-  accounts/RBAC, sessions/tokens, and `Conversation`/`Prompt`/`AiOutput`
-  for chat history), `security.py` (Argon2id hashing, JWT issue/validate,
+  idempotent `ensure_schema()`" convention. `models.py` (22 tables:
+  accounts/RBAC, sessions/tokens, `Conversation`/`Prompt`/`AiOutput`
+  for chat history, and — **Prompt 08**
+  (`08_ONBOARDING_ENGINE_CONTRACT.md`) — `OnboardingJob`/
+  `OnboardingReviewItem`/`OnboardingArtifact`, see "Client-database
+  onboarding engine" below), `security.py` (Argon2id hashing, JWT issue/validate,
   opaque refresh tokens), `password_policy.py` + `display_name.py`
   (mandatory-display-name + password-strength validation — see
   `docs/authentication-and-password-policy.md`), `repositories/` (one
   module per aggregate: `users.py`, `sessions.py`, `tokens.py`,
   `signin_events.py`, `history.py` — the chat-history repository, see
-  "Universal server-side chat history" below), `rbac.py` (granular
-  permission codes bridging into `agent/authz.py`'s own base role names),
+  "Universal server-side chat history" below; `onboarding.py` — Prompt 08's
+  own plain CRUD for the three tables above, zero authorization logic,
+  mirroring `repositories/shares.py`'s own identical split), `rbac.py`
+  (granular permission codes bridging into `agent/authz.py`'s own base
+  role names — Prompt 08 added `ONBOARDING_MANAGE`/`ONBOARDING_REVIEW`),
   `migrations/` (Alembic, `identity/alembic.ini` — run via `alembic -c
   identity/alembic.ini upgrade head`). Tests against this package use a
   real in-memory SQLite engine (`Base.metadata.create_all`), never a mock
   of the ORM — production always runs against PostgreSQL
   (`AUTH_DATABASE_URL`), a dedicated database, never one of
   `DB_CONNECTIONS`.
+- `onboarding/` (Prompt 08, `08_ONBOARDING_ENGINE_CONTRACT.md`) — the
+  client-database onboarding engine: profiling, PII detection, semantic
+  inference, SME review, and a draft semantic contract for a database the
+  platform operator is not the SME of. See "Client-database onboarding
+  engine" below for the full design; `api/onboarding.py` is its REST
+  surface.
 - `api/` — `main.py`'s FastAPI app is the REST surface every UI action
   goes through, and (once `frontend/dist` exists) also the process that
   serves the React dashboard itself. A `lifespan` context manager warms
@@ -443,7 +455,10 @@ below, and `docs/MULTI_SOURCE_GUIDE.md` for how to configure each source.
   longer fully stateless, though only conditionally, per-caller.
   `api/chat_history.py` (`GET/POST/PATCH/DELETE /conversations`, `GET/POST
   /conversations/{id}/messages`, `GET /chat/search`) is the read/manage
-  surface for that same data.
+  surface for that same data. `api/onboarding.py` (Prompt 08,
+  `08_ONBOARDING_ENGINE_CONTRACT.md`) is the REST surface for the
+  client-database onboarding engine — 10 routes under `/onboarding`; see
+  "Client-database onboarding engine" below.
 - `scripts/` — standalone entry points: `test_db_connection.py` (verify
   `.env` before booting anything else — prints pass/fail, DB version, table
   count, or a classified readable error, per configured database),
@@ -1627,6 +1642,76 @@ this path prefix.
 **Read [`docs/SHARING_SECURITY.md`](docs/SHARING_SECURITY.md)** (also
 summarized in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md#10-secure-conversation-sharing))
 for the full data model, token lifecycle, and API surface.
+
+### Client-database onboarding engine (`onboarding/`, Prompt 08)
+Automates onboarding a client database when the platform operator is not
+the subject-matter expert: discovery (Prompt 06, unchanged) → relationship
+inference (Prompt 07, unchanged) → profiling → PII detection → semantic
+inference/ambiguity detection → SME review → semantic contract → golden
+questions → a pre-publish evaluation smoke test. The literal mechanism
+behind the acceptance criterion "technical onboarding is automated and
+ambiguous business meaning is routed to SME review" is
+`onboarding.semantic_inference.infer_semantic_labels`'s `is_ambiguous`
+flag: a column's best-scoring semantic-role candidate below an absolute
+confidence floor, or not clearly ahead of its runner-up, becomes an
+`OnboardingReviewItem` an SME must confirm or reject — never silently
+promoted (master-contract rule 10).
+
+**Invariants that must not regress:**
+- **No connection secret is ever persisted.** `identity.models
+  .OnboardingJob` has no password field at all — a connection secret is
+  supplied fresh per API call (`CreateOnboardingJobRequest`/
+  `RunDiscoveryRequest`/`PublishJobRequest`'s own `db_password`), used
+  immediately to build a throwaway `Engine`
+  (`create_engine(build_connection_url(config), pool_pre_ping=True)`,
+  disposed in a `finally` block), and discarded. This deliberately
+  bypasses `db.connection`'s process-wide cached-engine pool, whose own
+  docstring assumes "a handful" of configured connections — an
+  assumption onboarding's dynamic, many-distinct-candidate-databases-
+  over-time use case would violate.
+- **No background worker, therefore no automatic resume.** A job stuck
+  mid-`"discovering"`/`"publishing"` because its own API call crashed is
+  only recoverable via `POST /onboarding/jobs/{id}/retry`, which requires
+  a fresh call (and fresh credentials) to actually resume — the
+  deliberate, disclosed cost of never storing a password.
+- **PII/relationship data-verification sampling are two *separate*
+  opt-in flags** (`Settings.enable_pii_data_verification`/
+  `enable_relationship_data_verification`), per this prompt's own
+  "minimize sensitive sampling" requirement — an operator can opt into
+  relationship value-overlap sampling (never PII-shaped) without also
+  sampling columns already name-flagged as likely PII. Neither ever
+  returns, logs, or stores a raw sampled value — only an aggregate
+  match-rate float ever leaves `onboarding.pii_detection
+  .verify_pii_with_data`.
+- **Golden questions are template-based, never LLM-generated**
+  (`onboarding/golden_questions.py`, master-contract rule 5) — 4 fixed
+  shapes (count/aggregate_by_category/top_n/join_count), each carrying a
+  deterministically-generated `candidate_sql` alongside its NL text, so
+  `onboarding/evaluation.py` can smoke-test it through the *exact* same
+  two gates every other SQL in this codebase passes through
+  (`agent.sql_validator.validate_sql`/`enforce_row_limit`, then
+  `db.execution.execute_readonly_sql`) — explicitly not `eval/`'s own
+  execution-accuracy benchmark (no gold answer exists yet for a
+  brand-new database).
+- **Publishing requires every review item already decided.**
+  `onboarding.jobs.publish_job` raises `OnboardingJobError` (and marks
+  the job `"failed"`) if any item is still `"pending"` — an undecided
+  PII/relationship/semantic claim reaching a published artifact would be
+  exactly the "silently promoted inference" rule 10 forbids.
+  `onboarding.semantic_contract.build_semantic_contract` only ever
+  includes `"confirmed"` items; a `"rejected"` item contributes nothing,
+  not even a trace.
+- **Tenant isolation mirrors `identity.share_policy` exactly** —
+  `OnboardingJob.tenant_id` + `onboarding.policy
+  .authorize_onboarding_action` (deny-by-default, cross-tenant denial
+  checked before any RBAC branch, mapped to the same 404 a genuinely
+  nonexistent job would get — anti-enumeration, not a distinguishable
+  403). `ONBOARDING_MANAGE` (create/discover/publish/cancel/retry) is
+  `_ADMIN`-only; `ONBOARDING_REVIEW` (deciding items) is `_ANALYST`+.
+
+**Read [`08_ONBOARDING_ENGINE_CONTRACT.md`](08_ONBOARDING_ENGINE_CONTRACT.md)**
+for the full inspection findings, every new module's design, the 116-test
+testing summary, and the security/tenant-isolation/performance review.
 
 ## How to run
 

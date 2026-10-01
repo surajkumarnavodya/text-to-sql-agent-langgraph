@@ -76,6 +76,7 @@ from api.identity_auth import router as identity_auth_router
 from api.media import router as media_router
 from api.media_library import router as media_library_router
 from api.media_search import router as media_search_router
+from api.onboarding import router as onboarding_router
 from api.rate_limit import enforce_api_action_rate_limit
 from api.schemas import (
     AskRequest,
@@ -368,6 +369,7 @@ app.include_router(media_library_router)
 app.include_router(identity_auth_router)
 app.include_router(chat_history_router)
 app.include_router(shares_router)
+app.include_router(onboarding_router)
 
 # No-op when Settings.cors_allowed_origins is empty (the default) -- a
 # same-origin deployment (the built React app served by this same FastAPI

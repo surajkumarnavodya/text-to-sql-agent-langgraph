@@ -1557,6 +1557,17 @@ class Settings(BaseSettings):
     enable_relationship_data_verification: bool = False
     relationship_data_verification_sample_size: int = Field(default=200, gt=0)
 
+    # Prompt 08 (08_ONBOARDING_ENGINE_CONTRACT.md): the onboarding
+    # engine's own opt-in, bounded data-verification pass for PII
+    # detection (onboarding.pii_detection.verify_pii_with_data) -- same
+    # "off by default, real per-candidate query cost" posture as
+    # enable_relationship_data_verification above, and per this prompt's
+    # own explicit "minimize sensitive sampling" requirement: name-based
+    # detection (always on, zero queries) is the default; this is a
+    # second, separate opt-in for the data-touching refinement.
+    enable_pii_data_verification: bool = False
+    pii_data_verification_sample_size: int = Field(default=100, gt=0)
+
     api_auth_token: SecretStr | None = None
     environment: Literal["development", "production"] = "development"
     oidc_issuer: str | None = None

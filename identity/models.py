@@ -5,12 +5,15 @@ module docstring for why an ORM + real (Alembic) migrations are used here
 specifically, rather than the raw-Core-plus-idempotent-`ensure_schema()`
 convention every other DB-backed module in this repo follows.
 
-19 tables, matching the schema this feature was specified against
+22 tables, matching the schema this feature was specified against
 (14 from the original build, plus `external_identities` added 2026-09-28
 for Google sign-in, plus `conversation_shares`/`share_members`/
 `share_links`/`share_audit_events` added 2026-09-28 for secure
-conversation sharing -- see those four models' own docstrings and
-`identity/share_policy.py`'s module docstring for the full design):
+conversation sharing, plus `onboarding_jobs`/`onboarding_review_items`/
+`onboarding_artifacts` added 2026-10-01 for the client-database
+onboarding engine -- see those models' own docstrings,
+`identity/share_policy.py`'s module docstring, and `onboarding/policy.py`'s
+module docstring for the full designs):
 
 - `users` / `roles` / `permissions` / `user_roles` / `role_permissions` --
   accounts and RBAC. `roles.name` is deliberately seeded with the same
@@ -829,3 +832,184 @@ class ShareAuditEvent(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False, index=True
     )
+
+
+class OnboardingJob(Base):
+    """One client-database onboarding run -- Prompt 08
+    (`08_ONBOARDING_ENGINE_CONTRACT.md`): discover -> profile -> classify
+    PII -> infer semantics -> SME review -> build semantic contract ->
+    generate golden questions -> evaluate -> publish, for a database not
+    yet wired into `DB_CONNECTIONS`/`.env`.
+
+    **Never stores a connection secret.** `db_type`/`db_host`/`db_port`/
+    `db_name`/`db_user`/`db_schema` are persisted for audit/display only
+    -- the actual password is supplied fresh on every API call that needs
+    a live connection (`POST .../discover`, `POST .../publish`) and is
+    never written to this row, a log line, or anywhere else. See
+    `onboarding/jobs.py`'s own module docstring for the honest tradeoff
+    this is: no fire-and-forget background worker that can silently
+    resume a stage requiring a live connection without the caller
+    supplying the secret again.
+
+    `tenant_id` follows the exact scoped, forward-compatible pattern
+    `ConversationShare.tenant_id` already established (see that model's
+    own docstring) -- this app remains deliberately single-tenant
+    platform-wide; only this table's own rows carry a real `tenant_id`
+    with a real ABAC tenant-match check (`onboarding.policy
+    .authorize_onboarding_action`).
+
+    `discovery_summary` is a small, non-secret JSON rollup (table/view/
+    column counts, relationship-candidate count, PII-flag count) for a
+    cheap status display -- the full discovered detail lives in
+    `OnboardingReviewItem`/`OnboardingArtifact` rows, not duplicated here.
+    """
+
+    __tablename__ = "onboarding_jobs"
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    tenant_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    created_by_user_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    database_label: Mapped[str] = mapped_column(String(200), nullable=False)
+    db_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    db_host: Mapped[str] = mapped_column(String(255), nullable=True)
+    db_port: Mapped[int] = mapped_column(Integer, nullable=True)
+    db_name: Mapped[str] = mapped_column(String(200), nullable=True)
+    db_user: Mapped[str] = mapped_column(String(200), nullable=True)
+    db_schema: Mapped[str] = mapped_column(String(200), nullable=True)
+    status: Mapped[str] = mapped_column(
+        Enum(
+            "pending",
+            "discovering",
+            "awaiting_review",
+            "publishing",
+            "published",
+            "failed",
+            "cancelled",
+            name="onboarding_job_status",
+            native_enum=False,
+            validate_strings=True,
+        ),
+        nullable=False,
+        default="pending",
+    )
+    current_stage: Mapped[str] = mapped_column(String(64), nullable=True)
+    error_message: Mapped[str] = mapped_column(Text, nullable=True)
+    retry_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    discovery_summary: Mapped[dict] = mapped_column(_METADATA_JSON, nullable=True)
+    # Optimistic concurrency, same contract as `ConversationShare.version`.
+    version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    created_at: Mapped[datetime] = _created_at()
+    updated_at: Mapped[datetime] = _updated_at()
+
+    review_items: Mapped[list[OnboardingReviewItem]] = relationship(
+        back_populates="job", cascade="all, delete-orphan"
+    )
+    artifacts: Mapped[list[OnboardingArtifact]] = relationship(
+        back_populates="job", cascade="all, delete-orphan"
+    )
+
+
+class OnboardingReviewItem(Base):
+    """One SME-decidable item surfaced during discovery -- an inferred PII
+    classification, an inferred/candidate relationship, a semantic label
+    flagged ambiguous, or a candidate golden question. Every item starts
+    `"pending"`; `payload["truth_level"]` is always
+    `agent.provenance.DataTruthLevel.AI_INFERENCE.value` until an SME
+    decides it (see `onboarding/policy.py`) -- this table is the SME
+    review queue the acceptance criterion ("ambiguous business meaning is
+    routed to SME review") names directly.
+
+    `is_ambiguous` is set by `onboarding/semantic_inference.py`'s own
+    ambiguity detection (low confidence, or more than one plausible
+    label tied) -- an item can be surfaced for review without being
+    ambiguous (e.g. a high-confidence PII match still needs a human
+    sign-off before being written into `config/sensitive_columns.yaml`),
+    but every *ambiguous* item is always surfaced.
+    """
+
+    __tablename__ = "onboarding_review_items"
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    job_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("onboarding_jobs.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    item_type: Mapped[str] = mapped_column(
+        Enum(
+            "pii_classification",
+            "relationship",
+            "semantic_label",
+            "golden_question",
+            name="onboarding_review_item_type",
+            native_enum=False,
+            validate_strings=True,
+        ),
+        nullable=False,
+    )
+    table_name: Mapped[str] = mapped_column(String(200), nullable=True)
+    column_name: Mapped[str] = mapped_column(String(200), nullable=True)
+    subject: Mapped[str] = mapped_column(String(500), nullable=False)
+    payload: Mapped[dict] = mapped_column(_METADATA_JSON, nullable=False)
+    confidence: Mapped[float] = mapped_column(Float, nullable=False)
+    is_ambiguous: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    decision: Mapped[str] = mapped_column(
+        Enum(
+            "pending",
+            "confirmed",
+            "rejected",
+            name="onboarding_review_decision",
+            native_enum=False,
+            validate_strings=True,
+        ),
+        nullable=False,
+        default="pending",
+    )
+    decided_by_user_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    decided_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=True)
+    decision_notes: Mapped[str] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = _created_at()
+
+    job: Mapped[OnboardingJob] = relationship(back_populates="review_items")
+
+
+class OnboardingArtifact(Base):
+    """One produced artifact of a job -- a draft/final semantic contract
+    (`config/table_descriptions.yaml`/`config/sensitive_columns.yaml`-
+    shaped content built only from `"confirmed"` review items), the
+    generated golden-question set, or an evaluation report. Versioned
+    (`version`) rather than overwritten in place, so a job's full history
+    of artifact revisions stays inspectable -- `onboarding/jobs.py` always
+    inserts a new row rather than mutating an existing one.
+    """
+
+    __tablename__ = "onboarding_artifacts"
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    job_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("onboarding_jobs.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    artifact_type: Mapped[str] = mapped_column(
+        Enum(
+            "semantic_contract",
+            "golden_questions",
+            "evaluation_report",
+            name="onboarding_artifact_type",
+            native_enum=False,
+            validate_strings=True,
+        ),
+        nullable=False,
+    )
+    content: Mapped[dict] = mapped_column(_METADATA_JSON, nullable=False)
+    version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    created_at: Mapped[datetime] = _created_at()
+
+    job: Mapped[OnboardingJob] = relationship(back_populates="artifacts")

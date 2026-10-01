@@ -64,6 +64,8 @@ class Permission(str, Enum):
     RAG_QUERY = "rag.query"
     TEXT_TO_SQL_QUERY = "text_to_sql.query"
     ADMIN_DASHBOARD_READ = "admin.dashboard.read"
+    ONBOARDING_MANAGE = "onboarding.manage"
+    ONBOARDING_REVIEW = "onboarding.review"
 
 
 #: Every permission's seed description, for the `permissions` table.
@@ -99,6 +101,14 @@ SEED_PERMISSIONS: tuple[tuple[Permission, str], ...] = (
     (Permission.RAG_QUERY, "Query document/policy RAG sources."),
     (Permission.TEXT_TO_SQL_QUERY, "Use the text-to-SQL feature."),
     (Permission.ADMIN_DASHBOARD_READ, "View the admin dashboard / usage analytics."),
+    (
+        Permission.ONBOARDING_MANAGE,
+        "Create, run, retry, cancel, and publish client-database onboarding jobs.",
+    ),
+    (
+        Permission.ONBOARDING_REVIEW,
+        "Decide (confirm/reject) an onboarding job's SME review items.",
+    ),
 )
 
 _OWN_RESOURCE_PERMISSIONS: frozenset[Permission] = frozenset(
@@ -139,7 +149,10 @@ _VIEWER: frozenset[Permission] = _OWN_RESOURCE_PERMISSIONS | {
     Permission.SHARES_VIEW,
 }
 _USER: frozenset[Permission] = _VIEWER | {Permission.TEXT_TO_SQL_QUERY}
-_ANALYST: frozenset[Permission] = _USER | {Permission.RAG_QUERY}
+# ONBOARDING_REVIEW (SME sign-off on an inferred PII/relationship/semantic-
+# label/golden-question claim) sits at the analyst tier -- a subject-matter
+# reviewer needs domain judgment, not full user/account administration.
+_ANALYST: frozenset[Permission] = _USER | {Permission.RAG_QUERY, Permission.ONBOARDING_REVIEW}
 _ADMIN: frozenset[Permission] = _ANALYST | {
     Permission.USERS_READ,
     Permission.USERS_CREATE,
@@ -151,6 +164,11 @@ _ADMIN: frozenset[Permission] = _ANALYST | {
     Permission.PROMPTS_READ_ANY,
     Permission.OUTPUTS_READ_ANY,
     Permission.ADMIN_DASHBOARD_READ,
+    # ONBOARDING_MANAGE (creating a job and testing a live connection with
+    # caller-supplied credentials, running discovery/profiling against a
+    # real database, publishing) is an admin-tier action, not an analyst
+    # one -- unlike ONBOARDING_REVIEW, it isn't a domain-judgment call.
+    Permission.ONBOARDING_MANAGE,
 }
 # A read-focused compliance/oversight role -- can review any user's audit
 # trail and the admin dashboard, but cannot create/edit/deactivate users or
