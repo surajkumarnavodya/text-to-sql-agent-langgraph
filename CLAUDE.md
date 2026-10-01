@@ -237,7 +237,17 @@ below, and `docs/MULTI_SOURCE_GUIDE.md` for how to configure each source.
   default (`Settings.enable_relationship_inference`, structural-only,
   no query); `run_ingestion` additionally runs the opt-in, data-verified
   pass when it has a live engine (see "Relationship & schema
-  intelligence" below).
+  intelligence" below). **Prompt 09** (`09_SEMANTIC_CATALOG_CONTRACT.md`)
+  added an 8th type, `ChunkType.BUSINESS_CONCEPT` —
+  `chunking.business_concept_chunk_from_catalog_entry` renders a
+  **published** `semantic.catalog.CatalogEntrySnapshot` into a chunk (a
+  draft/reviewed one never reaches this function);
+  `ingestion.sync_catalog_entry_to_vector_store` embeds+upserts it (and
+  deletes a just-superseded version's own chunk) synchronously from
+  `api/semantic_catalog.py`'s publish route, reusing the exact same
+  `EmbeddingProvider`/`VectorStore` primitives `run_ingestion` itself
+  uses — never a second ingestion pipeline. See "Tenant-aware semantic
+  catalog" below.
 - `agent/` — LangGraph nodes live in `nodes.py`, one function per node, each
   taking and returning `AgentState` (defined in `state.py`). `graph.py`
   wires them together and compiles the graph. `sql_validator.py` is the
@@ -292,7 +302,14 @@ below, and `docs/MULTI_SOURCE_GUIDE.md` for how to configure each source.
   retrieval, deliberately not a reuse of `retrieval.models.ChunkType
   .METRIC`. Same "additive, not wired into any live route yet" posture as
   `agent/tools/` above — see `02_TARGET_ARCHITECTURE.md` for the full
-  design and its explicit "stubbed today, wired later" table.
+  design and its explicit "stubbed today, wired later" table. **Prompt 09**
+  (`09_SEMANTIC_CATALOG_CONTRACT.md`) closed that table's two named
+  metric-specific gaps for good, plus a materially broader scope: `semantic
+  /catalog.py`'s `CatalogEntrySnapshot`/`CatalogStatus` (a real, persisted,
+  tenant-aware draft→reviewed→published→superseded business-concept
+  catalog — entities/metrics/dimensions/domains, not metrics alone) and
+  `semantic/catalog_policy.py`'s RBAC+ABAC. See "Tenant-aware semantic
+  catalog" below.
 - `rag/` — document/policy agentic RAG, one implementation shared by both
   the "documents" and "policies" collections (parameterized by collection
   name, not two near-duplicate modules): `store.py` (SQL Server native
@@ -398,12 +415,16 @@ below, and `docs/MULTI_SOURCE_GUIDE.md` for how to configure each source.
   declarative) and the *only* real (Alembic) migrations anywhere in this
   codebase — see `identity/__init__.py`'s own docstring for why this is a
   deliberate exception to the rest of the codebase's "raw SQLAlchemy Core +
-  idempotent `ensure_schema()`" convention. `models.py` (22 tables:
+  idempotent `ensure_schema()`" convention. `models.py` (23 tables:
   accounts/RBAC, sessions/tokens, `Conversation`/`Prompt`/`AiOutput`
-  for chat history, and — **Prompt 08**
-  (`08_ONBOARDING_ENGINE_CONTRACT.md`) — `OnboardingJob`/
-  `OnboardingReviewItem`/`OnboardingArtifact`, see "Client-database
-  onboarding engine" below), `security.py` (Argon2id hashing, JWT issue/validate,
+  for chat history, **Prompt 08**
+  (`08_ONBOARDING_ENGINE_CONTRACT.md`)'s `OnboardingJob`/
+  `OnboardingReviewItem`/`OnboardingArtifact` (see "Client-database
+  onboarding engine" below), and **Prompt 09**
+  (`09_SEMANTIC_CATALOG_CONTRACT.md`)'s `SemanticCatalogEntry` — one row
+  per **version** of one governed business concept, never mutated in
+  place once published (see "Tenant-aware semantic catalog" below)),
+  `security.py` (Argon2id hashing, JWT issue/validate,
   opaque refresh tokens), `password_policy.py` + `display_name.py`
   (mandatory-display-name + password-strength validation — see
   `docs/authentication-and-password-policy.md`), `repositories/` (one
@@ -411,9 +432,12 @@ below, and `docs/MULTI_SOURCE_GUIDE.md` for how to configure each source.
   `signin_events.py`, `history.py` — the chat-history repository, see
   "Universal server-side chat history" below; `onboarding.py` — Prompt 08's
   own plain CRUD for the three tables above, zero authorization logic,
-  mirroring `repositories/shares.py`'s own identical split), `rbac.py`
+  mirroring `repositories/shares.py`'s own identical split; `semantic_catalog.py`
+  — Prompt 09's identical-shape CRUD for `SemanticCatalogEntry`,
+  including version/supersession bookkeeping), `rbac.py`
   (granular permission codes bridging into `agent/authz.py`'s own base
-  role names — Prompt 08 added `ONBOARDING_MANAGE`/`ONBOARDING_REVIEW`),
+  role names — Prompt 08 added `ONBOARDING_MANAGE`/`ONBOARDING_REVIEW`,
+  Prompt 09 added `CATALOG_MANAGE`/`CATALOG_REVIEW`),
   `migrations/` (Alembic, `identity/alembic.ini` — run via `alembic -c
   identity/alembic.ini upgrade head`). Tests against this package use a
   real in-memory SQLite engine (`Base.metadata.create_all`), never a mock
@@ -426,6 +450,14 @@ below, and `docs/MULTI_SOURCE_GUIDE.md` for how to configure each source.
   platform operator is not the SME of. See "Client-database onboarding
   engine" below for the full design; `api/onboarding.py` is its REST
   surface.
+- `semantic/catalog.py`/`catalog_policy.py` (Prompt 09,
+  `09_SEMANTIC_CATALOG_CONTRACT.md`) — the tenant-aware, draft→reviewed→
+  published→superseded governed semantic catalog connecting technical
+  metadata to business meaning (entities/metrics/dimensions/domains).
+  See "Tenant-aware semantic catalog" below for the full design;
+  `api/semantic_catalog.py` is its REST surface, `identity.models
+  .SemanticCatalogEntry`/`identity.repositories.semantic_catalog` its
+  persistence.
 - `api/` — `main.py`'s FastAPI app is the REST surface every UI action
   goes through, and (once `frontend/dist` exists) also the process that
   serves the React dashboard itself. A `lifespan` context manager warms
@@ -458,7 +490,10 @@ below, and `docs/MULTI_SOURCE_GUIDE.md` for how to configure each source.
   surface for that same data. `api/onboarding.py` (Prompt 08,
   `08_ONBOARDING_ENGINE_CONTRACT.md`) is the REST surface for the
   client-database onboarding engine — 10 routes under `/onboarding`; see
-  "Client-database onboarding engine" below.
+  "Client-database onboarding engine" below. `api/semantic_catalog.py`
+  (Prompt 09, `09_SEMANTIC_CATALOG_CONTRACT.md`) is the REST surface for
+  the tenant-aware semantic catalog — 8 routes under `/semantic-catalog`;
+  see "Tenant-aware semantic catalog" below.
 - `scripts/` — standalone entry points: `test_db_connection.py` (verify
   `.env` before booting anything else — prints pass/fail, DB version, table
   count, or a classified readable error, per configured database),
@@ -1711,6 +1746,75 @@ promoted (master-contract rule 10).
 
 **Read [`08_ONBOARDING_ENGINE_CONTRACT.md`](08_ONBOARDING_ENGINE_CONTRACT.md)**
 for the full inspection findings, every new module's design, the 116-test
+testing summary, and the security/tenant-isolation/performance review.
+
+### Tenant-aware semantic catalog (`semantic/catalog.py`, Prompt 09)
+A governed, persisted, tenant-scoped catalog connecting technical
+metadata to business meaning — names, descriptions, grain, keys,
+relationships, domains, metrics, dimensions, synonyms, business rules,
+examples, evidence, confidence, status, owner, version — with a real
+`draft → reviewed → published → superseded` review workflow
+(`semantic.catalog.CatalogStatus`). The acceptance criterion ("natural-
+language planning can retrieve business concepts rather than relying
+only on raw schema names") is satisfied by integrating directly into the
+*existing* `retrieval/` pipeline rather than building a second one: a new
+`ChunkType.BUSINESS_CONCEPT` + a new `agent.llm_client
+._build_plan_business_concept_block` feeding `plan_query_node`'s own LLM
+call, not just `generate_sql_node`'s.
+
+**Invariants that must not regress:**
+- **Only a `PUBLISHED` entry is ever rendered into a retrieval chunk.**
+  `retrieval.chunking.business_concept_chunk_from_catalog_entry`/
+  `retrieval.ingestion.sync_catalog_entry_to_vector_store` are only ever
+  called from `api/semantic_catalog.py`'s publish route — a `DRAFT`/
+  `REVIEWED` entry structurally never reaches the LLM's prompt, which is
+  what makes master-contract rule 10 ("never silently convert AI
+  inference into confirmed business truth") true by construction here,
+  not by a runtime check that could be forgotten. `semantic.catalog
+  .status_to_truth_level` maps this onto `agent.provenance
+  .DataTruthLevel` directly (draft/reviewed/superseded →
+  `AI_INFERENCE`, published → `CONFIRMED_BUSINESS_TRUTH`).
+- **One row per version, never mutated in place once published.**
+  `identity.models.SemanticCatalogEntry` fuses `OnboardingArtifact`'s
+  append-only versioning with `semantic.metrics.MetricDefinition
+  .supersedes`'s chain: editing a published entry always creates a new
+  `DRAFT` row (a new `version` for the same `concept_key`); publishing it
+  flips the *previous* published row to `SUPERSEDED` and sets this new
+  row's `supersedes_id` — a concept's full version history stays
+  inspectable, never overwritten. `semantic.catalog
+  .VALID_STATUS_TRANSITIONS` is the single source of truth for which
+  transition is legal, checked by both `identity/repositories
+  /semantic_catalog.py` (defense in depth) and `api/semantic_catalog.py`
+  (the user-facing 409).
+- **A vector-store sync failure on publish never rolls back the already-
+  committed status change** — the identity DB remains authoritative; the
+  failure is logged and surfaced as a non-fatal condition, the same
+  "retrieval is best-effort, never a hard gate" philosophy `retrieval
+  .retriever.retrieve_business_context`'s own fail-open contract already
+  establishes elsewhere. See `09_SEMANTIC_CATALOG_CONTRACT.md`'s own
+  known-limitations section for the disclosed resync gap this leaves.
+- **Deliberately a new `ChunkType`, not a reuse of `GLOSSARY`/`METRIC`**
+  — a governed catalog entry carries structured governance fields
+  (status/owner/confidence/evidence/version) a hand-authored YAML
+  glossary/metric chunk never does; conflating the two under one type
+  would make them indistinguishable during rerank/labeling. The existing
+  `semantic/metrics.py`'s `MetricDefinition`/`MetricRegistry` is reused,
+  not duplicated, for `METRIC`-type catalog entries specifically:
+  `semantic.catalog.build_metric_registry_from_catalog` converts
+  published metric entries into real `MetricDefinition`s
+  (`status=APPROVED`) via `YamlMetricRegistry`'s own existing
+  constructor — closing `02_TARGET_ARCHITECTURE.md` §5's long-named gap
+  "a real approval-workflow/CRUD surface sets `owner`/`APPROVED`."
+- **Tenant isolation mirrors `onboarding.policy` exactly** —
+  `SemanticCatalogEntry.tenant_id` + `semantic.catalog_policy
+  .authorize_catalog_action` (deny-by-default, cross-tenant denial
+  checked before any RBAC branch, mapped to the same 404 a genuinely
+  nonexistent entry would get — anti-enumeration, not a distinguishable
+  403). `CATALOG_MANAGE` (create/edit-draft/publish) is `_ADMIN`-only;
+  `CATALOG_REVIEW` (review/request-changes) is `_ANALYST`+.
+
+**Read [`09_SEMANTIC_CATALOG_CONTRACT.md`](09_SEMANTIC_CATALOG_CONTRACT.md)**
+for the full inspection findings, every new module's design, the 91-test
 testing summary, and the security/tenant-isolation/performance review.
 
 ## How to run

@@ -1521,6 +1521,9 @@ class Settings(BaseSettings):
     retrieval_top_k_metrics: int = Field(default=3, ge=0)
     retrieval_top_k_sql_examples: int = Field(default=3, ge=0)
     retrieval_top_k_documentation: int = Field(default=3, ge=0)
+    # Prompt 09 (09_SEMANTIC_CATALOG_CONTRACT.md): governed, SME-published
+    # semantic-catalog entries (retrieval.models.ChunkType.BUSINESS_CONCEPT).
+    retrieval_top_k_business_concepts: int = Field(default=3, ge=0)
     retrieval_similarity_threshold: float = Field(default=0.3, ge=0.0, le=1.0)
     retrieval_max_context_chars: int = Field(default=6000, gt=0)
     retrieval_max_context_tokens: int = Field(default=1500, gt=0)

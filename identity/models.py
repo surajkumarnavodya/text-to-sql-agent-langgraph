@@ -5,15 +5,17 @@ module docstring for why an ORM + real (Alembic) migrations are used here
 specifically, rather than the raw-Core-plus-idempotent-`ensure_schema()`
 convention every other DB-backed module in this repo follows.
 
-22 tables, matching the schema this feature was specified against
+23 tables, matching the schema this feature was specified against
 (14 from the original build, plus `external_identities` added 2026-09-28
 for Google sign-in, plus `conversation_shares`/`share_members`/
 `share_links`/`share_audit_events` added 2026-09-28 for secure
 conversation sharing, plus `onboarding_jobs`/`onboarding_review_items`/
 `onboarding_artifacts` added 2026-10-01 for the client-database
-onboarding engine -- see those models' own docstrings,
-`identity/share_policy.py`'s module docstring, and `onboarding/policy.py`'s
-module docstring for the full designs):
+onboarding engine, plus `semantic_catalog_entries` added 2026-10-01 for
+the tenant-aware semantic catalog -- see those models' own docstrings,
+`identity/share_policy.py`'s module docstring, `onboarding/policy.py`'s
+module docstring, and `semantic/catalog_policy.py`'s module docstring
+for the full designs):
 
 - `users` / `roles` / `permissions` / `user_roles` / `role_permissions` --
   accounts and RBAC. `roles.name` is deliberately seeded with the same
@@ -1013,3 +1015,113 @@ class OnboardingArtifact(Base):
     created_at: Mapped[datetime] = _created_at()
 
     job: Mapped[OnboardingJob] = relationship(back_populates="artifacts")
+
+
+class SemanticCatalogEntry(Base):
+    """One **version** of one governed business concept -- Prompt 09
+    (`09_SEMANTIC_CATALOG_CONTRACT.md`): a tenant-scoped, versioned
+    catalog connecting technical metadata to business meaning (names,
+    descriptions, grain, keys, relationships, domains, metrics,
+    dimensions, synonyms, business rules, examples), with a real
+    draft -> reviewed -> published -> superseded review workflow (see
+    `semantic.catalog.CatalogStatus`).
+
+    **One row per version, never mutated in place once published** --
+    the direct fusion of `OnboardingArtifact`'s append-only versioning
+    with `semantic.metrics.MetricDefinition.supersedes`'s chain: editing
+    a published entry always creates a brand-new `DRAFT` row (a new
+    `version` for the same `concept_key`), and publishing it flips the
+    *previous* published row (if any) to `SUPERSEDED` and sets this new
+    row's `supersedes_id` -- a concept's full version history stays
+    inspectable, never overwritten. A `DRAFT` row is the one exception:
+    it is mutable in place (`identity.repositories.semantic_catalog
+    .update_draft_entry`) since nothing downstream depends on
+    unpublished content yet.
+
+    `concept_key` is the stable identifier grouping every version of
+    "the same" concept (e.g. `"customer_lifetime_value"`) -- unique only
+    together with `(tenant_id, database_id, concept_type, version)`, not
+    on its own.
+
+    `tenant_id` follows the exact scoped, forward-compatible pattern
+    `OnboardingJob.tenant_id`/`ConversationShare.tenant_id` already
+    established (see either model's own docstring) -- this app remains
+    deliberately single-tenant platform-wide; only this table's own rows
+    carry a real `tenant_id` with a real ABAC tenant-match check
+    (`semantic.catalog_policy.authorize_catalog_action`).
+
+    **Only a `PUBLISHED` row is ever rendered into a retrieval chunk**
+    (`retrieval.chunking.business_concept_chunk_from_catalog_entry`,
+    called only from the publish API route) -- a `DRAFT`/`REVIEWED` row
+    structurally never reaches the LLM's prompt, which is what makes
+    master-contract rule 10 ("never silently convert AI inference into
+    confirmed business truth") true by construction here, not by a
+    runtime check that could be forgotten.
+    """
+
+    __tablename__ = "semantic_catalog_entries"
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    tenant_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    database_id: Mapped[str] = mapped_column(String(200), nullable=False, index=True)
+    concept_type: Mapped[str] = mapped_column(
+        Enum(
+            "entity",
+            "metric",
+            "dimension",
+            "domain",
+            name="semantic_catalog_concept_type",
+            native_enum=False,
+            validate_strings=True,
+        ),
+        nullable=False,
+        index=True,
+    )
+    concept_key: Mapped[str] = mapped_column(String(200), nullable=False, index=True)
+    business_name: Mapped[str] = mapped_column(String(200), nullable=False)
+    technical_name: Mapped[str] = mapped_column(String(200), nullable=True)
+    description: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    grain: Mapped[str] = mapped_column(String(500), nullable=True)
+    keys: Mapped[list] = mapped_column(_METADATA_JSON, nullable=False, default=list)
+    relationships: Mapped[list] = mapped_column(_METADATA_JSON, nullable=False, default=list)
+    domain: Mapped[str] = mapped_column(String(200), nullable=True)
+    synonyms: Mapped[list] = mapped_column(_METADATA_JSON, nullable=False, default=list)
+    business_rules: Mapped[list] = mapped_column(_METADATA_JSON, nullable=False, default=list)
+    examples: Mapped[list] = mapped_column(_METADATA_JSON, nullable=False, default=list)
+    evidence: Mapped[list] = mapped_column(_METADATA_JSON, nullable=False, default=list)
+    confidence: Mapped[float] = mapped_column(Float, nullable=False, default=1.0)
+    status: Mapped[str] = mapped_column(
+        Enum(
+            "draft",
+            "reviewed",
+            "published",
+            "superseded",
+            name="semantic_catalog_status",
+            native_enum=False,
+            validate_strings=True,
+        ),
+        nullable=False,
+        default="draft",
+        index=True,
+    )
+    owner: Mapped[str] = mapped_column(String(200), nullable=True)
+    version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    supersedes_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("semantic_catalog_entries.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    created_by_user_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    reviewed_by_user_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    reviewed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=True)
+    review_notes: Mapped[str] = mapped_column(Text, nullable=True)
+    published_by_user_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    published_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = _created_at()
+    updated_at: Mapped[datetime] = _updated_at()

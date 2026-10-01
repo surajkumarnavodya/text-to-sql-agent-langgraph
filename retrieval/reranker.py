@@ -50,6 +50,11 @@ from retrieval.models import ChunkType, ScoredChunk
 # open-ended/background type, so it's weighted lowest.
 _TYPE_PRIORITY: dict[ChunkType, float] = {
     ChunkType.METRIC: 1.0,
+    # Governed, SME-reviewed-and-published content -- ranks alongside
+    # relationship/glossary tier (see `ChunkType.BUSINESS_CONCEPT`'s own
+    # docstring for why this is a distinct type from METRIC/GLOSSARY,
+    # not a priority judgment that it's more or less useful than either).
+    ChunkType.BUSINESS_CONCEPT: 0.95,
     ChunkType.RELATIONSHIP: 0.95,
     ChunkType.GLOSSARY: 0.9,
     ChunkType.SQL_EXAMPLE: 0.85,

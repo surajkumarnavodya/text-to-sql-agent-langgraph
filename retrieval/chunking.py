@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Any
 
 import yaml
+from semantic.catalog import CatalogEntrySnapshot
 
 from config.sensitive_columns import SensitivityTier
 from config.table_descriptions import TableDescription
@@ -511,6 +512,81 @@ def metric_chunks_from_yaml(
             )
         )
     return chunks
+
+
+def business_concept_chunk_from_catalog_entry(
+    snapshot: CatalogEntrySnapshot,
+    embedding_model: str,
+    embedding_dimensions: int,
+) -> Chunk:
+    """`business_concept`-type chunk from one governed semantic-catalog
+    entry -- Prompt 09 (`09_SEMANTIC_CATALOG_CONTRACT.md`).
+
+    **Caller must only ever invoke this with a `status == PUBLISHED`
+    snapshot.** This function itself performs no status check -- the
+    actual, structural enforcement of "a draft/reviewed entry never
+    reaches retrieval" is that `retrieval.ingestion
+    .sync_catalog_entry_to_vector_store` (the only real caller, from
+    `api/semantic_catalog.py`'s publish route) is itself only ever
+    invoked on publish, never on create/review. Mirrors every other
+    builder in this module (one concept, one chunk, never split).
+
+    `chunk_id` is made unique per **version** (via `snapshot.version`,
+    threaded through to `make_chunk_id`) -- publishing a new version of
+    an already-published concept always produces a brand-new chunk id,
+    never overwriting the version it supersedes; the caller is
+    responsible for deleting the superseded version's own chunk id
+    (`retrieval.ingestion.sync_catalog_entry_to_vector_store`'s
+    `superseded_chunk_id` parameter).
+    """
+    object_name = f"{snapshot.concept_type.value}:{snapshot.concept_key}"
+    lines = [f"{snapshot.concept_type.value.title()}: {snapshot.business_name}."]
+    if snapshot.technical_name:
+        lines.append(f"Technical name: {snapshot.technical_name}.")
+    if snapshot.description:
+        lines.append(f"Description: {normalize_text(snapshot.description)}")
+    if snapshot.grain:
+        lines.append(f"Grain: {snapshot.grain}.")
+    if snapshot.keys:
+        lines.append(f"Keys: {', '.join(snapshot.keys)}.")
+    if snapshot.relationships:
+        rel_lines = [
+            f"{r.get('related_concept_key', '?')} ({r.get('relationship_type', 'related to')})"
+            for r in snapshot.relationships
+        ]
+        lines.append(f"Related concepts: {', '.join(rel_lines)}.")
+    if snapshot.domain:
+        lines.append(f"Domain: {snapshot.domain}.")
+    if snapshot.synonyms:
+        lines.append(f"Also known as: {', '.join(snapshot.synonyms)}.")
+    if snapshot.business_rules:
+        lines.append("Business rules: " + "; ".join(snapshot.business_rules) + ".")
+    if snapshot.examples:
+        lines.append("Examples: " + "; ".join(snapshot.examples))
+    text = "\n".join(lines)
+
+    return _make_chunk(
+        chunk_type=ChunkType.BUSINESS_CONCEPT,
+        text=text,
+        database_id=snapshot.database_id,
+        object_name=object_name,
+        embedding_model=embedding_model,
+        embedding_dimensions=embedding_dimensions,
+        table_name=snapshot.technical_name,
+        source_id=f"semantic_catalog:{snapshot.tenant_id}:{object_name}",
+        version=snapshot.version,
+        tags=snapshot.synonyms,
+        extra={
+            "concept_type": snapshot.concept_type.value,
+            "concept_key": snapshot.concept_key,
+            "status": snapshot.status.value,
+            "confidence": snapshot.confidence,
+            "evidence": list(snapshot.evidence),
+            "owner": snapshot.owner,
+            "version": snapshot.version,
+            "truth_level": snapshot.truth_level.value,
+        },
+    )
 
 
 def sql_example_chunks_from_yaml(

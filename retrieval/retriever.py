@@ -92,6 +92,7 @@ def _per_type_top_k(settings: Settings) -> dict[ChunkType, int]:
         ChunkType.METRIC: settings.retrieval_top_k_metrics,
         ChunkType.SQL_EXAMPLE: settings.retrieval_top_k_sql_examples,
         ChunkType.DOCUMENTATION: settings.retrieval_top_k_documentation,
+        ChunkType.BUSINESS_CONCEPT: settings.retrieval_top_k_business_concepts,
     }
 
 

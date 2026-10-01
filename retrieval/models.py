@@ -32,12 +32,24 @@ from pydantic import BaseModel, ConfigDict, Field
 
 
 class ChunkType(str, Enum):
-    """The seven typed-chunk categories this package retrieves.
+    """The typed-chunk categories this package retrieves.
 
     Deliberately a closed set (not a free-form string) -- `retriever.py`'s
     per-type top-k limits and `reranker.py`'s type-priority weighting both
     key off of this, and an unrecognized type would silently fall through
     both.
+
+    `BUSINESS_CONCEPT` (Prompt 09, `09_SEMANTIC_CATALOG_CONTRACT.md`) is
+    deliberately additive, not a reuse of `GLOSSARY`/`METRIC` -- a
+    governed semantic-catalog entry carries structured governance fields
+    (status/owner/confidence/evidence/version) a hand-authored YAML
+    glossary/metric chunk never does, and conflating the two under one
+    type would make them indistinguishable during rerank/labeling (the
+    same reasoning `02_TARGET_ARCHITECTURE.md` already gives for keeping
+    `semantic/metrics.py` separate from `ChunkType.METRIC`). See
+    `retrieval.chunking.business_concept_chunk_from_catalog_entry`'s own
+    docstring for the hard rule that only a **published** catalog entry
+    is ever converted into one of these.
     """
 
     TABLE = "table"
@@ -47,6 +59,7 @@ class ChunkType(str, Enum):
     METRIC = "metric"
     SQL_EXAMPLE = "sql_example"
     DOCUMENTATION = "documentation"
+    BUSINESS_CONCEPT = "business_concept"
 
 
 class Sensitivity(str, Enum):

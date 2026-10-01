@@ -111,6 +111,7 @@ from api.schemas import (
     TableOut,
     TablesResponse,
 )
+from api.semantic_catalog import router as semantic_catalog_router
 from api.shares import router as shares_router
 from api.voice import router as voice_router
 from config.settings import ConfigurationError, Settings, configure_logging, get_settings
@@ -370,6 +371,7 @@ app.include_router(identity_auth_router)
 app.include_router(chat_history_router)
 app.include_router(shares_router)
 app.include_router(onboarding_router)
+app.include_router(semantic_catalog_router)
 
 # No-op when Settings.cors_allowed_origins is empty (the default) -- a
 # same-origin deployment (the built React app served by this same FastAPI

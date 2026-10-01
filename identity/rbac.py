@@ -66,6 +66,8 @@ class Permission(str, Enum):
     ADMIN_DASHBOARD_READ = "admin.dashboard.read"
     ONBOARDING_MANAGE = "onboarding.manage"
     ONBOARDING_REVIEW = "onboarding.review"
+    CATALOG_MANAGE = "catalog.manage"
+    CATALOG_REVIEW = "catalog.review"
 
 
 #: Every permission's seed description, for the `permissions` table.
@@ -108,6 +110,14 @@ SEED_PERMISSIONS: tuple[tuple[Permission, str], ...] = (
     (
         Permission.ONBOARDING_REVIEW,
         "Decide (confirm/reject) an onboarding job's SME review items.",
+    ),
+    (
+        Permission.CATALOG_MANAGE,
+        "Create, edit, and publish semantic-catalog entries.",
+    ),
+    (
+        Permission.CATALOG_REVIEW,
+        "Review (approve or request changes on) a semantic-catalog entry.",
     ),
 )
 
@@ -152,7 +162,15 @@ _USER: frozenset[Permission] = _VIEWER | {Permission.TEXT_TO_SQL_QUERY}
 # ONBOARDING_REVIEW (SME sign-off on an inferred PII/relationship/semantic-
 # label/golden-question claim) sits at the analyst tier -- a subject-matter
 # reviewer needs domain judgment, not full user/account administration.
-_ANALYST: frozenset[Permission] = _USER | {Permission.RAG_QUERY, Permission.ONBOARDING_REVIEW}
+_ANALYST: frozenset[Permission] = _USER | {
+    Permission.RAG_QUERY,
+    Permission.ONBOARDING_REVIEW,
+    # CATALOG_REVIEW (SME approval of a draft semantic-catalog entry, or
+    # sending one back for changes) sits at the analyst tier for the
+    # identical reason ONBOARDING_REVIEW does -- domain judgment, not
+    # account administration.
+    Permission.CATALOG_REVIEW,
+}
 _ADMIN: frozenset[Permission] = _ANALYST | {
     Permission.USERS_READ,
     Permission.USERS_CREATE,
@@ -169,6 +187,10 @@ _ADMIN: frozenset[Permission] = _ANALYST | {
     # real database, publishing) is an admin-tier action, not an analyst
     # one -- unlike ONBOARDING_REVIEW, it isn't a domain-judgment call.
     Permission.ONBOARDING_MANAGE,
+    # CATALOG_MANAGE (create/edit a draft, publish -- which promotes an
+    # entry to CONFIRMED_BUSINESS_TRUTH and makes it live in retrieval)
+    # is admin-tier for the identical reason ONBOARDING_MANAGE is.
+    Permission.CATALOG_MANAGE,
 }
 # A read-focused compliance/oversight role -- can review any user's audit
 # trail and the admin dashboard, but cannot create/edit/deactivate users or

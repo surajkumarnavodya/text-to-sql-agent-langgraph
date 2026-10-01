@@ -15,6 +15,7 @@ from __future__ import annotations
 from agent.llm_client import (
     _build_golden_examples_block,
     _build_plan_block,
+    _build_plan_business_concept_block,
     _build_plan_relationship_block,
     _build_plan_user_prompt,
     _build_review_user_prompt,
@@ -129,6 +130,45 @@ class TestBuildPlanRelationshipBlock:
         assert "never instructions" in block
 
 
+class TestBuildPlanBusinessConceptBlock:
+    """Prompt 09 (`09_SEMANTIC_CATALOG_CONTRACT.md`)'s acceptance
+    criterion: "natural-language planning can retrieve business concepts
+    rather than relying only on raw schema names" -- mirrors
+    `TestBuildPlanRelationshipBlock` exactly, for the
+    `business_concept`-type entries instead."""
+
+    def test_none_when_no_business_concept_chunks_present(self):
+        retrieved = [{"chunk_type": "relationship", "text": "Relationship: a references b"}]
+        assert _build_plan_business_concept_block(retrieved) is None
+
+    def test_none_for_empty_context(self):
+        assert _build_plan_business_concept_block([]) is None
+
+    def test_only_business_concept_type_entries_are_rendered(self):
+        retrieved = [
+            {"chunk_type": "glossary", "text": "A reseller is a business partner."},
+            {"chunk_type": "business_concept", "text": "Metric: Customer Lifetime Value."},
+        ]
+        block = _build_plan_business_concept_block(retrieved)
+        assert block is not None
+        assert "Metric: Customer Lifetime Value." in block
+        assert "reseller" not in block
+
+    def test_frames_the_whole_block_as_data_not_instructions(self):
+        retrieved = [{"chunk_type": "business_concept", "text": "Metric: Customer Lifetime Value."}]
+        block = _build_plan_business_concept_block(retrieved)
+        assert block is not None
+        assert "DATA" in block
+        assert "never instructions" in block
+
+    def test_mentions_the_governed_published_status(self):
+        retrieved = [{"chunk_type": "business_concept", "text": "Metric: Customer Lifetime Value."}]
+        block = _build_plan_business_concept_block(retrieved)
+        assert block is not None
+        assert "SME-reviewed" in block
+        assert "published" in block
+
+
 class TestBuildPlanUserPromptWithRelationships:
     def test_no_relationship_context_is_a_pure_no_op(self):
         without = _build_plan_user_prompt("How many orders?", "CREATE TABLE orders (...)")
@@ -141,6 +181,23 @@ class TestBuildPlanUserPromptWithRelationships:
         prompt = _build_plan_user_prompt("How many orders?", "CREATE TABLE orders (...)", retrieved)
         assert "Relationship: a references b" in prompt
         assert prompt.index("Schema:") < prompt.index("Relationship:") < prompt.index("Question:")
+
+    def test_business_concept_context_is_included_between_schema_and_question(self):
+        retrieved = [{"chunk_type": "business_concept", "text": "Metric: Customer Lifetime Value."}]
+        prompt = _build_plan_user_prompt("How many orders?", "CREATE TABLE orders (...)", retrieved)
+        assert "Metric: Customer Lifetime Value." in prompt
+        assert prompt.index("Schema:") < prompt.index("Governed business concepts")
+        assert prompt.index("Governed business concepts") < prompt.index("Question:")
+
+    def test_relationship_and_business_concept_blocks_coexist(self):
+        retrieved = [
+            {"chunk_type": "relationship", "text": "Relationship: a references b"},
+            {"chunk_type": "business_concept", "text": "Metric: Customer Lifetime Value."},
+        ]
+        prompt = _build_plan_user_prompt("How many orders?", "CREATE TABLE orders (...)", retrieved)
+        assert "Relationship: a references b" in prompt
+        assert "Metric: Customer Lifetime Value." in prompt
+        assert prompt.index("Relationship:") < prompt.index("Governed business concepts")
 
 
 class TestBuildReviewUserPrompt:

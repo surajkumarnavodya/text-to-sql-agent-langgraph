@@ -29,6 +29,8 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from semantic.catalog import CatalogEntrySnapshot
+
 from config.sensitive_columns import load_sensitive_columns
 from config.settings import Settings, get_settings
 from config.table_descriptions import load_table_descriptions
@@ -40,6 +42,7 @@ from db.relationship_inference import (
 )
 from db.schema_introspection import TableSchemaInfo, introspect_schema
 from retrieval.chunking import (
+    business_concept_chunk_from_catalog_entry,
     column_chunks_from_schema,
     documentation_chunks_from_text,
     glossary_chunks_from_yaml,
@@ -56,7 +59,7 @@ from retrieval.embeddings import (
     get_embedding_provider,
     validate_dimensions,
 )
-from retrieval.models import Chunk
+from retrieval.models import Chunk, ChunkType, make_chunk_id
 from retrieval.vector_store import VectorStore, VectorStoreError, get_vector_store
 
 logger = logging.getLogger(__name__)
@@ -460,4 +463,88 @@ def rebuild_collection(
         vector_store=store,
         embedding_provider=embedding_provider,
         tables=tables,
+    )
+
+
+def sync_catalog_entry_to_vector_store(
+    snapshot: CatalogEntrySnapshot,
+    settings: Settings,
+    *,
+    superseded_chunk_id: str | None = None,
+    vector_store: VectorStore | None = None,
+    embedding_provider: EmbeddingProvider | None = None,
+) -> Chunk:
+    """Publishes one governed semantic-catalog entry into retrieval --
+    Prompt 09 (`09_SEMANTIC_CATALOG_CONTRACT.md`).
+
+    Called synchronously from `api/semantic_catalog.py`'s publish route
+    (never from a batch/cron step) so a newly-published concept is
+    searchable immediately, with zero new embedding/upsert logic of its
+    own -- reuses exactly the same `EmbeddingProvider`/`VectorStore`
+    primitives `run_ingestion` above already uses. **Must only ever be
+    called with a `snapshot.status == PUBLISHED` snapshot** -- the
+    caller's responsibility (see `retrieval.chunking
+    .business_concept_chunk_from_catalog_entry`'s own docstring for why
+    this function places no status check of its own).
+
+    Args:
+        snapshot: The just-published entry.
+        settings: Application settings.
+        superseded_chunk_id: The `Chunk.chunk_id` of the version this
+            publish just superseded (`identity.repositories
+            .semantic_catalog.publish_entry`'s own returned prior-
+            published row, rendered into a chunk id the same way this
+            function renders the new one) -- removed from the vector
+            store so a stale, superseded version is never still
+            retrievable alongside its replacement. `None` for a
+            concept's first-ever published version.
+        vector_store: Optional override (mainly for tests).
+        embedding_provider: Optional override (mainly for tests).
+
+    Returns:
+        The `Chunk` that was upserted.
+
+    Raises:
+        EmbeddingError: if embedding the chunk's text fails.
+        VectorStoreError: if the upsert/delete itself fails.
+    """
+    provider = embedding_provider or get_embedding_provider(settings)
+    store = vector_store or get_vector_store(settings)
+    store.create_collection_if_missing(snapshot.database_id)
+
+    chunk = business_concept_chunk_from_catalog_entry(
+        snapshot, provider.model_name, provider.dimensions
+    )
+    vector = provider.embed_text(chunk.text)
+    store.upsert_documents(snapshot.database_id, [chunk], [vector])
+
+    if superseded_chunk_id is not None:
+        store.delete_by_ids(snapshot.database_id, [superseded_chunk_id])
+
+    logger.info(
+        "[ingestion] synced catalog entry chunk_id=%s database=%r concept=%s:%s v%d "
+        "(superseded_chunk_id=%s)",
+        chunk.chunk_id,
+        snapshot.database_id,
+        snapshot.concept_type.value,
+        snapshot.concept_key,
+        snapshot.version,
+        superseded_chunk_id,
+    )
+    return chunk
+
+
+def business_concept_chunk_id_for_snapshot(snapshot: CatalogEntrySnapshot) -> str:
+    """The exact `Chunk.chunk_id` `business_concept_chunk_from_catalog_entry`
+    would produce for `snapshot` -- used by callers (`api/semantic_catalog
+    .py`'s publish route) that need a *superseded* entry's chunk id to
+    pass as `sync_catalog_entry_to_vector_store`'s `superseded_chunk_id`
+    without re-deriving `make_chunk_id`'s argument order themselves."""
+    return make_chunk_id(
+        snapshot.database_id,
+        None,
+        f"{snapshot.concept_type.value}:{snapshot.concept_key}",
+        ChunkType.BUSINESS_CONCEPT,
+        None,
+        snapshot.version,
     )
