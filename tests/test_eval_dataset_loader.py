@@ -131,6 +131,50 @@ class TestLoadBenchmark:
         dataset = load_benchmark(tmp_path)
         assert dataset.standalone_cases[0].alternative_sql == ("SELECT 1 AS x", "SELECT 1 AS y")
 
+    def test_expected_intent_and_expect_ambiguity_are_parsed(self, tmp_path: Path):
+        """Prompt 11 (`11_ANALYTICAL_INTENT_CONTRACT.md`) -- these two
+        optional fields must actually reach `BenchmarkCase`, not be
+        silently dropped by `_parse_case`'s explicit field mapping (a
+        real risk this loader's style creates: a new `BenchmarkCase`
+        field needs an explicit `raw.get(...)` line here too)."""
+        _write(
+            tmp_path,
+            "a.yaml",
+            """
+            cases:
+              - id: c1
+                question: "What was our best selling product?"
+                database: d
+                difficulty: real_world
+                category: ambiguous_wording
+                expected_intent: ranking
+                expect_ambiguity: true
+            """,
+        )
+        dataset = load_benchmark(tmp_path)
+        case = dataset.standalone_cases[0]
+        assert case.expected_intent == "ranking"
+        assert case.expect_ambiguity is True
+
+    def test_expected_intent_and_expect_ambiguity_default_when_omitted(self, tmp_path: Path):
+        _write(
+            tmp_path,
+            "a.yaml",
+            """
+            cases:
+              - id: c1
+                question: q1
+                database: d
+                difficulty: easy
+                category: aggregation
+                expected_sql: "SELECT 1"
+            """,
+        )
+        dataset = load_benchmark(tmp_path)
+        case = dataset.standalone_cases[0]
+        assert case.expected_intent is None
+        assert case.expect_ambiguity is False
+
 
 class TestLoadFollowupCases:
     def test_loads_a_valid_followup_case(self, tmp_path: Path):

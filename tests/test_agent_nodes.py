@@ -23,6 +23,7 @@ from sqlalchemy.exc import SQLAlchemyError
 
 from agent.exceptions import OllamaUnavailableError, SchemaRetrievalError
 from agent.nodes import (
+    classify_analytical_intent_node,
     classify_followup_node,
     estimate_query_cost_node,
     execute_sql_node,
@@ -357,6 +358,95 @@ class TestRetrieveGoldenExamplesNode:
         assert captured["db_name"] == "default"
 
 
+class TestClassifyAnalyticalIntentNode:
+    def test_skips_llm_call_when_classification_disabled(self, monkeypatch, _mock_settings):
+        monkeypatch.setattr(
+            "agent.nodes.get_settings",
+            lambda: Settings(**{**_mock_settings.__dict__, "enable_intent_classification": False}),
+        )
+
+        def _fail(*args, **kwargs):
+            raise AssertionError("should not call the LLM when enable_intent_classification=False")
+
+        monkeypatch.setattr("agent.nodes.generate_analytical_intent_from_llm", _fail)
+
+        state: AgentState = {"question": "What is our revenue trend?"}
+        result = classify_analytical_intent_node(state)
+
+        assert result["analytical_intent"] is None
+        assert result["status"] == "generating"
+
+    def test_runs_even_without_any_complexity_signal(self, monkeypatch):
+        """Unlike `plan_query_node`, this node runs on *every* question --
+        it is not gated by `agent.complexity`'s signals."""
+        classification = {"intent": "lookup", "confidence": 0.95}
+        monkeypatch.setattr(
+            "agent.nodes.generate_analytical_intent_from_llm", lambda *a, **k: classification
+        )
+
+        state: AgentState = {"question": "How many customers are there?"}
+        result = classify_analytical_intent_node(state)
+
+        assert result["analytical_intent"] == classification
+        assert result["status"] == "generating"
+
+    def test_successful_classification_is_stored_as_a_plain_dict(self, monkeypatch):
+        captured = {}
+        classification = {
+            "intent": "trend",
+            "confidence": 0.8,
+            "ambiguity_flags": [],
+        }
+
+        def _capture(
+            question, settings, model=None, retrieved_context=None, governing_metrics=None
+        ):
+            captured["question"] = question
+            captured["retrieved_context"] = retrieved_context
+            captured["governing_metrics"] = governing_metrics
+            return classification
+
+        monkeypatch.setattr("agent.nodes.generate_analytical_intent_from_llm", _capture)
+
+        state: AgentState = {
+            "question": "revenue trend over time",
+            "retrieved_context": [{"chunk_type": "relationship", "text": "..."}],
+            "governing_metrics": [{"business_name": "Revenue"}],
+        }
+        result = classify_analytical_intent_node(state)
+
+        assert captured["question"] == "revenue trend over time"
+        assert captured["retrieved_context"] == state["retrieved_context"]
+        assert captured["governing_metrics"] == state["governing_metrics"]
+        assert isinstance(result["analytical_intent"], dict)
+        assert result["analytical_intent"] == classification
+        assert result["status"] == "generating"
+
+    def test_fails_open_on_unreachable_ollama_never_a_terminal_status(self, monkeypatch):
+        def _raise(*args, **kwargs):
+            raise OllamaUnavailableError("connection refused")
+
+        monkeypatch.setattr("agent.nodes.generate_analytical_intent_from_llm", _raise)
+
+        state: AgentState = {"question": "What is our revenue trend?"}
+        result = classify_analytical_intent_node(state)
+
+        assert result["analytical_intent"] is None
+        assert result["status"] == "generating"
+
+    def test_fails_open_on_unparseable_response_never_a_terminal_status(self, monkeypatch):
+        """`generate_analytical_intent_from_llm` itself already returns
+        `None` for an unparseable response (never raises) -- this node
+        simply stores whatever it returns."""
+        monkeypatch.setattr("agent.nodes.generate_analytical_intent_from_llm", lambda *a, **k: None)
+
+        state: AgentState = {"question": "gibberish question"}
+        result = classify_analytical_intent_node(state)
+
+        assert result["analytical_intent"] is None
+        assert result["status"] == "generating"
+
+
 class TestPlanQueryNode:
     def test_skips_llm_call_when_no_complexity_signals(self, monkeypatch):
         """The overwhelming common case: a plain question makes zero
@@ -402,7 +492,14 @@ class TestPlanQueryNode:
     def test_calls_llm_and_stores_plan_for_a_complex_question(self, monkeypatch):
         captured = {}
 
-        def _capture(question, schema_context, settings, model=None, retrieved_context=None):
+        def _capture(
+            question,
+            schema_context,
+            settings,
+            model=None,
+            retrieved_context=None,
+            analytical_intent=None,
+        ):
             captured["question"] = question
             captured["schema_context"] = schema_context
             captured["retrieved_context"] = retrieved_context
@@ -441,6 +538,120 @@ class TestPlanQueryNode:
 
         assert result["query_plan"] is None
         assert result["status"] == "generating"
+
+    def test_intent_alone_triggers_planning_with_zero_complexity_signals(self, monkeypatch):
+        """Prompt 11 (`11_ANALYTICAL_INTENT_CONTRACT.md`)'s acceptance-
+        criterion proof: a TREND classification alone -- no
+        `agent.complexity` signal at all -- still triggers the planning
+        LLM call."""
+        monkeypatch.setattr(
+            "agent.nodes.generate_query_plan_from_llm", lambda *a, **k: ["Group by month"]
+        )
+
+        state: AgentState = {
+            "question": "What is our revenue trend?",
+            "schema_context_text": "CREATE TABLE sales (...)",
+            "complexity_signals": [],
+            "analytical_intent": {"intent": "trend", "confidence": 0.9, "ambiguity_flags": []},
+        }
+        result = plan_query_node(state)
+
+        assert result["query_plan"] == ["Group by month"]
+        assert result["status"] == "generating"
+
+    def test_lookup_intent_with_no_signals_or_ambiguity_still_skips_planning(self, monkeypatch):
+        """The explicit preserved-fallback-behavior regression test: a
+        LOOKUP classification (excluded from `_INTENT_TYPES_IMPLYING_
+        PLANNING`) with zero complexity signals and no ambiguity flags
+        must still skip the LLM call, exactly like before this node
+        existed."""
+
+        def _fail(*args, **kwargs):
+            raise AssertionError("should not call the LLM for a plain LOOKUP question")
+
+        monkeypatch.setattr("agent.nodes.generate_query_plan_from_llm", _fail)
+
+        state: AgentState = {
+            "question": "How many customers do we have?",
+            "schema_context_text": "CREATE TABLE customers (...)",
+            "complexity_signals": [],
+            "analytical_intent": {"intent": "lookup", "confidence": 0.95, "ambiguity_flags": []},
+        }
+        result = plan_query_node(state)
+
+        assert result["query_plan"] is None
+        assert result["status"] == "generating"
+
+    def test_ambiguity_flags_alone_trigger_planning_even_for_lookup(self, monkeypatch):
+        """Non-empty `ambiguity_flags` widens the gate regardless of which
+        intent was guessed -- even LOOKUP, which is otherwise excluded."""
+        monkeypatch.setattr(
+            "agent.nodes.generate_query_plan_from_llm", lambda *a, **k: ["Resolve ambiguity"]
+        )
+
+        state: AgentState = {
+            "question": "What was our best selling product?",
+            "schema_context_text": "CREATE TABLE sales (...)",
+            "complexity_signals": [],
+            "analytical_intent": {
+                "intent": "lookup",
+                "confidence": 0.6,
+                "ambiguity_flags": ["'best selling' could mean revenue or unit count"],
+            },
+        }
+        result = plan_query_node(state)
+
+        assert result["query_plan"] == ["Resolve ambiguity"]
+        assert result["status"] == "generating"
+
+    def test_none_analytical_intent_reduces_to_pre_prompt_11_behavior(self, monkeypatch):
+        """When classification is disabled/unreachable/unparseable,
+        `analytical_intent` is `None` and the gate reduces to exactly
+        `complexity_signals` alone -- byte-identical to this node's
+        behavior before Prompt 11 existed."""
+
+        def _fail(*args, **kwargs):
+            raise AssertionError("should not call the LLM when analytical_intent is None")
+
+        monkeypatch.setattr("agent.nodes.generate_query_plan_from_llm", _fail)
+
+        state: AgentState = {
+            "question": "How many customers do we have?",
+            "schema_context_text": "CREATE TABLE customers (...)",
+            "complexity_signals": [],
+            "analytical_intent": None,
+        }
+        result = plan_query_node(state)
+
+        assert result["query_plan"] is None
+        assert result["status"] == "generating"
+
+    def test_threads_analytical_intent_into_the_plan_call(self, monkeypatch):
+        captured = {}
+
+        def _capture(
+            question,
+            schema_context,
+            settings,
+            model=None,
+            retrieved_context=None,
+            analytical_intent=None,
+        ):
+            captured["analytical_intent"] = analytical_intent
+            return ["step"]
+
+        monkeypatch.setattr("agent.nodes.generate_query_plan_from_llm", _capture)
+
+        classification = {"intent": "comparison", "confidence": 0.7, "ambiguity_flags": []}
+        state: AgentState = {
+            "question": "compare this quarter to last quarter",
+            "schema_context_text": "CREATE TABLE sales (...)",
+            "complexity_signals": [],
+            "analytical_intent": classification,
+        }
+        plan_query_node(state)
+
+        assert captured["analytical_intent"] == classification
 
 
 class TestGenerateSqlNode:

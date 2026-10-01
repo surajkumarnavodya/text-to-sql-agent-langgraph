@@ -22,6 +22,7 @@ from eval.evaluators import (
     compute_complexity_score,
     compute_overall_pass,
     evaluate_column_selection,
+    evaluate_intent_classification,
     evaluate_result_set,
     evaluate_retrieval,
     evaluate_security,
@@ -97,6 +98,7 @@ def _build_case_run_result(
 ) -> CaseRunResult:
     sql = state.get("sql")
     cost_estimate = state.get("cost_estimate")
+    analytical_intent = state.get("analytical_intent")
     run = CaseRunResult(
         case_id=case_id,
         question=question,
@@ -124,6 +126,8 @@ def _build_case_run_result(
         complexity_score=compute_complexity_score(sql, dialect),
         prompt_tokens=prompt_tokens if saw_tokens else None,
         completion_tokens=completion_tokens if saw_tokens else None,
+        observed_intent=analytical_intent.get("intent") if analytical_intent else None,
+        observed_ambiguity_flags=list((analytical_intent or {}).get("ambiguity_flags") or []),
     )
     return run
 
@@ -149,6 +153,8 @@ def _grade(
         )
     else:
         run.security_correct = evaluate_security(run, case)
+
+    run.intent_classification_correct = evaluate_intent_classification(run, case)
 
     run.overall_pass = compute_overall_pass(run, case)
     if not run.overall_pass:

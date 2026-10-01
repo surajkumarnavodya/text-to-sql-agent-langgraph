@@ -92,6 +92,8 @@ def _parse_case(raw: dict, source_file: Path) -> BenchmarkCase:
         max_rows=raw.get("max_rows"),
         expect_readable_result=bool(raw.get("expect_readable_result", False)),
         expect_grounded_insight=bool(raw.get("expect_grounded_insight", False)),
+        expected_intent=raw.get("expected_intent"),
+        expect_ambiguity=bool(raw.get("expect_ambiguity", False)),
         notes=raw.get("notes", ""),
     )
 

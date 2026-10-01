@@ -458,6 +458,44 @@ def evaluate_security(run: CaseRunResult, case: BenchmarkCase | FollowUpTurn) ->
     return ok
 
 
+def evaluate_intent_classification(
+    run: CaseRunResult, case: BenchmarkCase | FollowUpTurn
+) -> bool | None:
+    """True/False for a case that hand-labels an `expected_intent`/
+    `expect_ambiguity` hint; `None` otherwise ("not applicable to this
+    case") -- Prompt 11 (`11_ANALYTICAL_INTENT_CONTRACT.md`).
+
+    **Diagnostic only, exactly like `evaluate_sql_exact_match` above --
+    never used to compute `overall_pass`.** A question still "succeeds"
+    on result-set correctness regardless of whether the classifier's own
+    label happened to match a hand-authored hint; this is a separate,
+    secondary signal for tracking classification accuracy over time, not
+    a gate.
+
+    `expected_intent`/`expect_ambiguity` only exist on `BenchmarkCase`
+    today (see that dataclass's own docstring) -- `getattr` with a
+    default mirrors `evaluate_security`'s own handling of
+    `expect_rejection_reason` above, so a `FollowUpTurn` (which has
+    neither field) simply resolves to "not applicable" rather than an
+    `AttributeError`.
+
+    Checks both independently and ANDs them: a case that labels only one
+    of the two is still fully checked on that one dimension, but a case
+    labeling both must get both right to pass.
+    """
+    expected_intent = getattr(case, "expected_intent", None)
+    expect_ambiguity = getattr(case, "expect_ambiguity", False)
+    if expected_intent is None and not expect_ambiguity:
+        return None
+
+    ok = True
+    if expected_intent is not None:
+        ok = ok and run.observed_intent == expected_intent
+    if expect_ambiguity:
+        ok = ok and bool(run.observed_ambiguity_flags)
+    return ok
+
+
 # ---------------------------------------------------------------------------
 # Overall pass/fail + failure classification
 # ---------------------------------------------------------------------------

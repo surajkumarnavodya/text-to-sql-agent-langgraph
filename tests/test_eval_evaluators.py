@@ -12,6 +12,7 @@ from eval.evaluators import (
     compute_complexity_score,
     compute_overall_pass,
     evaluate_column_selection,
+    evaluate_intent_classification,
     evaluate_result_set,
     evaluate_retrieval,
     evaluate_security,
@@ -251,7 +252,68 @@ class TestEvaluateSecurity:
         assert evaluate_security(run, case) is None
 
 
+class TestEvaluateIntentClassification:
+    """Prompt 11 (`11_ANALYTICAL_INTENT_CONTRACT.md`) -- diagnostic only,
+    mirroring `TestEvaluateSqlExactMatch`'s "never gates overall_pass"
+    posture (see `TestComputeOverallPass` below, which never references
+    this verdict)."""
+
+    def test_no_hint_at_all_is_not_applicable(self):
+        case = _case()
+        run = _run(observed_intent="trend")
+        assert evaluate_intent_classification(run, case) is None
+
+    def test_matching_expected_intent_passes(self):
+        case = _case(expected_intent="trend")
+        run = _run(observed_intent="trend")
+        assert evaluate_intent_classification(run, case) is True
+
+    def test_mismatched_expected_intent_fails(self):
+        case = _case(expected_intent="trend")
+        run = _run(observed_intent="lookup")
+        assert evaluate_intent_classification(run, case) is False
+
+    def test_no_observed_intent_fails_a_case_that_expects_one(self):
+        """Classification disabled/unreachable/unparseable for this run
+        -- a labeled case still fails, since the comparison is against
+        `None`, never silently skipped."""
+        case = _case(expected_intent="trend")
+        run = _run(observed_intent=None)
+        assert evaluate_intent_classification(run, case) is False
+
+    def test_expect_ambiguity_true_with_flags_passes(self):
+        case = _case(expect_ambiguity=True)
+        run = _run(observed_ambiguity_flags=["'best selling' is ambiguous"])
+        assert evaluate_intent_classification(run, case) is True
+
+    def test_expect_ambiguity_true_with_no_flags_fails(self):
+        case = _case(expect_ambiguity=True)
+        run = _run(observed_ambiguity_flags=[])
+        assert evaluate_intent_classification(run, case) is False
+
+    def test_both_hints_must_both_pass(self):
+        case = _case(expected_intent="comparison", expect_ambiguity=True)
+        run = _run(observed_intent="comparison", observed_ambiguity_flags=["unclear"])
+        assert evaluate_intent_classification(run, case) is True
+
+        run_wrong_intent = _run(observed_intent="trend", observed_ambiguity_flags=["unclear"])
+        assert evaluate_intent_classification(run_wrong_intent, case) is False
+
+        run_no_ambiguity = _run(observed_intent="comparison", observed_ambiguity_flags=[])
+        assert evaluate_intent_classification(run_no_ambiguity, case) is False
+
+
 class TestComputeOverallPass:
+    def test_intent_classification_correct_never_gates_overall_pass(self):
+        """Diagnostic only, exactly like `sql_exact_match` -- a wrong
+        intent classification must never fail an otherwise-correct
+        result-set match."""
+        case = _case(expected_sql="SELECT 1", expected_intent="trend")
+        run = _run(final_status="succeeded")
+        run.result_set_correct = True
+        run.intent_classification_correct = False
+        assert compute_overall_pass(run, case) is True
+
     def test_adversarial_case_uses_security_correct(self):
         case = _case(expected_behavior="reject_off_topic", security_classification="adversarial")
         run = _run(final_status="rejected")

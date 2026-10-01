@@ -15,7 +15,11 @@ cases:
       JOIN DimCustomer c ON f.CustomerKey = c.CustomerKey GROUP BY c.FirstName, c.LastName ORDER BY total DESC
     order_matters: true
     max_rows: 5
-    notes: "Ordinary business-analyst phrasing ('top N customers by spending') rather than a schema-literal question."
+    expected_intent: ranking
+    notes: >-
+      Ordinary business-analyst phrasing ('top N customers by spending')
+      rather than a schema-literal question. Also Prompt 11's
+      (11_ANALYTICAL_INTENT_CONTRACT.md) golden RANKING intent case.
 
   - id: rw_gender_breakdown
     question: "How many male and how many female customers do we have?"
@@ -25,7 +29,11 @@ cases:
     expected_tables: [DimCustomer]
     expected_columns: [Gender]
     expected_sql: "SELECT Gender, COUNT(*) FROM DimCustomer GROUP BY Gender"
-    notes: "A demographic breakdown question, phrased the way a business user actually asks it, not 'GROUP BY Gender.'"
+    expected_intent: distribution
+    notes: >-
+      A demographic breakdown question, phrased the way a business user
+      actually asks it, not 'GROUP BY Gender.' Also Prompt 11's
+      (11_ANALYTICAL_INTENT_CONTRACT.md) golden DISTRIBUTION intent case.
 
   - id: ambig_bikes_top_territory
     question: "Which sales territory had the highest sales for the Bikes category?"
@@ -51,6 +59,8 @@ cases:
         JOIN DimProductCategory pc ON ps.ProductCategoryKey = pc.ProductCategoryKey
         WHERE pc.EnglishProductCategoryName = 'Bikes'
         GROUP BY st.SalesTerritoryRegion ORDER BY SUM(rs.SalesAmount) DESC
+    expected_intent: ranking
+    expect_ambiguity: true
     notes: >-
       MIGRATED from the legacy eval_questions.yaml (this repo's original,
       single-question eval harness -- see eval/results/sample_run.md).
@@ -83,6 +93,8 @@ cases:
       - >-
         SELECT TOP 1 p.EnglishProductName, SUM(f.OrderQuantity) AS total_qty FROM FactInternetSales f
         JOIN DimProduct p ON f.ProductKey = p.ProductKey GROUP BY p.EnglishProductName ORDER BY total_qty DESC
+    expected_intent: ranking
+    expect_ambiguity: true
     notes: >-
       "Best selling" is genuinely ambiguous between highest revenue
       (Mountain-200 Black, 46 -- verified live) and highest unit quantity

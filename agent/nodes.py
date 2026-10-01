@@ -43,7 +43,9 @@ from agent.input_guard import (
     sanitize_conversation_history,
 )
 from agent.insight import is_insight_grounded, should_skip_insight, summarize_result
+from agent.intent import intent_implies_planning
 from agent.llm_client import (
+    generate_analytical_intent_from_llm,
     generate_insight_from_llm,
     generate_query_plan_from_llm,
     generate_sql_from_llm,
@@ -640,14 +642,15 @@ def retrieve_business_context_node(state: AgentState) -> dict[str, Any]:
     stores the ranked result for `generate_sql_node` to inject as an
     additional, clearly-labeled prompt block.
 
-    Runs between `retrieve_golden_examples` and `plan_query` (see
-    `agent/graph.py`): by this point `state["selected_database"]` is
+    Runs between `retrieve_golden_examples` and `classify_analytical_intent`
+    (see `agent/graph.py`): by this point `state["selected_database"]` is
     already resolved (needed to pick the right collection), and this node's
     own output has no bearing on golden-example retrieval or query planning,
     so the ordering relative to those two doesn't matter functionally --
     placed here so every downstream prompt-building step
-    (`plan_query_node`, `generate_sql_node`) can see the *complete* set of
-    retrieved context in one place.
+    (`classify_analytical_intent_node`, `plan_query_node`,
+    `generate_sql_node`) can see the *complete* set of retrieved context in
+    one place.
 
     Also extracts `state["governing_metrics"]` (Prompt 10,
     `10_GOVERNED_METRICS_CONTRACT.md`) from the same already-retrieved
@@ -708,22 +711,86 @@ def retrieve_business_context_node(state: AgentState) -> dict[str, Any]:
     }
 
 
+@_timed_node("classify_analytical_intent")
+def classify_analytical_intent_node(state: AgentState) -> dict[str, Any]:
+    """Classifies what *kind* of analytical question this is -- Prompt 11
+    (`11_ANALYTICAL_INTENT_CONTRACT.md`) -- before any SQL is generated.
+
+    Runs between `retrieve_business_context` and `plan_query` (see
+    `agent/graph.py`), on **every** question when `Settings
+    .enable_intent_classification` is True (the default) -- unlike
+    `plan_query_node`'s own LLM call, which only fires for a
+    complexity-flagged question, this one is meant to be foundational
+    (per the prompt's own "before SQL generation" framing), so it is not
+    gated by `agent.complexity`'s signals.
+
+    Fails open exactly like `plan_query_node`: a disabled flag, an
+    unreachable Ollama server, or an unparseable response all resolve to
+    `state["analytical_intent"] = None`, logged but never a reason the
+    question can't be answered, and never a terminal status.
+
+    **Why this cannot bypass authorization or the existing fallback
+    behavior, by construction:** `Permission.ASK` is already enforced by
+    a FastAPI dependency before `run_agent`/the graph are even built --
+    this node runs deep inside an already-authorized request, and never
+    itself reads or writes `caller_roles`, `max_retries`, or any field
+    `validate_sql_node`'s own restricted-column authorization check
+    reads. Its only consumer is `plan_query_node`'s gate/prompt (see that
+    node's docstring) -- when `analytical_intent` is `None` for any
+    reason, that gate reduces to exactly `agent.complexity`'s signals
+    alone, byte-identical to this node's pre-Prompt-11 behavior.
+    """
+    settings = get_settings()
+    if not settings.enable_intent_classification:
+        logger.info("[classify_analytical_intent] skipped (enable_intent_classification=False)")
+        return {"analytical_intent": None, "status": "generating"}
+
+    question = state["question"]
+    try:
+        classification = generate_analytical_intent_from_llm(
+            question,
+            settings,
+            model=state.get("selected_model"),
+            retrieved_context=state.get("retrieved_context"),
+            governing_metrics=state.get("governing_metrics"),
+        )
+    except OllamaUnavailableError as exc:
+        logger.warning(
+            "[classify_analytical_intent] LLM call failed, proceeding without a "
+            "classification: %s",
+            exc,
+        )
+        return {"analytical_intent": None, "status": "generating"}
+
+    logger.info("[classify_analytical_intent] classification=%s", classification)
+    return {"analytical_intent": classification, "status": "generating"}
+
+
 @_timed_node("plan_query")
 def plan_query_node(state: AgentState) -> dict[str, Any]:
     """Produces an up-front, ordered plan for a question judged non-trivial.
 
-    Runs between `retrieve_schema` and `generate_sql` (see `agent/graph.py`),
-    but only makes an LLM call when both:
-      - `Settings.enable_query_planning` is True, and
+    Runs between `classify_analytical_intent` and `generate_sql` (see
+    `agent/graph.py`), but only makes an LLM call when
+    `Settings.enable_query_planning` is True AND at least one of:
       - `state["complexity_signals"]` -- computed once by `agent.graph.
         run_agent`, via `agent.complexity.detect_complexity_signals`, the
         same signals that drive the adaptive retry budget
-        (`Settings.complex_query_max_retry_bonus`) -- is non-empty.
+        (`Settings.complex_query_max_retry_bonus`) -- is non-empty; or
+      - (Prompt 11, `11_ANALYTICAL_INTENT_CONTRACT.md`)
+        `state["analytical_intent"]` classifies this question as a kind
+        that itself implies planning (`agent.intent
+        .intent_implies_planning`) -- e.g. TREND/COMPARISON/RANKING/...,
+        or any intent with non-empty `ambiguity_flags`.
 
     An ordinary question (the overwhelming common case) matches no
-    complexity signal and skips the LLM call entirely: `state["query_plan"]`
-    stays None and every downstream node behaves exactly as it did before
-    this node existed -- zero latency/cost impact on the common path.
+    complexity signal and no intent that implies planning, and skips the
+    LLM call entirely: `state["query_plan"]` stays None and every
+    downstream node behaves exactly as it did before this node existed --
+    zero latency/cost impact on the common path. When `analytical_intent`
+    is `None` (classification disabled, unreachable, or unparseable),
+    this gate reduces to exactly `complexity_signals` alone -- the
+    pre-Prompt-11 behavior, preserved by construction, not convention.
 
     Fails open on any planning failure -- an unreachable Ollama server, or a
     response `agent.llm_client._parse_plan_response` couldn't parse as a
@@ -732,19 +799,27 @@ def plan_query_node(state: AgentState) -> dict[str, Any]:
 
     Also threads `state["retrieved_context"]` through (Prompt 07,
     `07_RELATIONSHIP_INTELLIGENCE_CONTRACT.md`) -- already populated by
-    `retrieve_business_context_node`, which runs immediately before this
-    node (see `agent/graph.py`). `generate_query_plan_from_llm` only ever
-    renders the `relationship`-type entries from it (real *and* candidate
-    -- see `agent.llm_client._build_plan_relationship_block`); every
-    other chunk type is ignored for planning specifically.
+    `retrieve_business_context_node`, which runs before this node (see
+    `agent/graph.py`). `generate_query_plan_from_llm` only ever renders
+    the `relationship`-type entries from it (real *and* candidate -- see
+    `agent.llm_client._build_plan_relationship_block`); every other chunk
+    type is ignored for planning specifically. `state["analytical_intent"]`
+    (Prompt 11) is threaded the same way, rendered by
+    `agent.llm_client._build_plan_intent_block`.
     """
     settings = get_settings()
     complexity_signals = state.get("complexity_signals") or []
-    if not settings.enable_query_planning or not complexity_signals:
+    analytical_intent = state.get("analytical_intent")
+    intent_triggers_planning = analytical_intent is not None and intent_implies_planning(
+        analytical_intent
+    )
+    if not settings.enable_query_planning or not (complexity_signals or intent_triggers_planning):
         logger.info(
-            "[plan_query] skipped (enable_query_planning=%s complexity_signals=%s)",
+            "[plan_query] skipped (enable_query_planning=%s complexity_signals=%s "
+            "intent_triggers_planning=%s)",
             settings.enable_query_planning,
             complexity_signals,
+            intent_triggers_planning,
         )
         return {"query_plan": None, "status": "generating"}
 
@@ -757,12 +832,18 @@ def plan_query_node(state: AgentState) -> dict[str, Any]:
             settings,
             model=state.get("selected_model"),
             retrieved_context=state.get("retrieved_context"),
+            analytical_intent=analytical_intent,
         )
     except OllamaUnavailableError as exc:
         logger.warning("[plan_query] LLM call failed, proceeding without a plan: %s", exc)
         return {"query_plan": None, "status": "generating"}
 
-    logger.info("[plan_query] complexity_signals=%s plan=%s", complexity_signals, plan)
+    logger.info(
+        "[plan_query] complexity_signals=%s intent_triggers_planning=%s plan=%s",
+        complexity_signals,
+        intent_triggers_planning,
+        plan,
+    )
     return {"query_plan": plan, "status": "generating"}
 
 

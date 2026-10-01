@@ -815,6 +815,21 @@ class Settings(BaseSettings):
         sql_review_max_tokens: Max tokens the LLM may generate for the
             plan-conformance review verdict (`agent.nodes.review_sql_node`)
             -- "PASS" or a one-sentence "FAIL: <reason>", never more.
+        enable_intent_classification: Whether `agent.nodes
+            .classify_analytical_intent_node` makes a structured
+            analytical-intent classification call (LOOKUP/AGGREGATION/
+            TREND/.../RECOMMENDATION -- see `agent/intent.py`) for every
+            question. True by default. Runs on every question (unlike
+            `enable_query_planning`, gated by `agent.complexity`'s
+            signals) since classification is meant to be foundational;
+            its only effect downstream is to widen `plan_query_node`'s own
+            gate and enrich its prompt -- disabling this flag, or any
+            failure of the call itself, reproduces `plan_query_node`'s
+            exact pre-Prompt-11 behavior.
+        intent_classification_max_tokens: Max tokens the LLM may generate
+            for the intent classification JSON object -- deliberately
+            small and separate from `llm_max_tokens`, mirroring
+            `query_plan_max_tokens`'s reasoning.
         enable_golden_examples: Whether `agent.nodes
             .retrieve_golden_examples_node` looks up human-approved past
             (question, SQL) pairs (see `embeddings.golden_examples`) and
@@ -1483,6 +1498,16 @@ class Settings(BaseSettings):
     # purely as an operator escape hatch, not because the feature is risky
     # on by default.
     enable_metric_conformance_review: bool = True
+    # Prompt 11 (11_ANALYTICAL_INTENT_CONTRACT.md): gates
+    # agent.nodes.classify_analytical_intent_node's LLM call. Unlike
+    # enable_query_planning (only called for a complexity-flagged
+    # question), this one runs on *every* question when on -- intent
+    # classification is meant to be foundational, not an edge-case add-on.
+    # True by default; disabling it reproduces this node's pre-Prompt-11
+    # non-existence exactly (plan_query_node's gate collapses back to
+    # complexity_signals alone -- see that node's own docstring).
+    enable_intent_classification: bool = True
+    intent_classification_max_tokens: int = Field(default=250, gt=0)
     enable_golden_examples: bool = True
     golden_examples_top_k: int = Field(default=3, gt=0)
     golden_examples_min_similarity: float = Field(default=0.75, ge=0.0, le=1.0)

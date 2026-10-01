@@ -148,6 +148,19 @@ class BenchmarkCase:
     max_rows: int | None = None
     expect_readable_result: bool = False
     expect_grounded_insight: bool = False
+    # Prompt 11 (11_ANALYTICAL_INTENT_CONTRACT.md): optional, hand-labeled
+    # golden intent for `eval.evaluators.evaluate_intent_classification` to
+    # check `agent.nodes.classify_analytical_intent_node`'s real output
+    # against -- one of `agent.intent.AnalyticalIntentType`'s 13 values, as
+    # a plain string (not the enum itself, so this dataclass stays
+    # dependency-free of `agent/intent.py`, same posture every other field
+    # here already has toward the modules it indirectly checks).
+    # `expect_ambiguity` is the companion check for `ambiguity_flags`
+    # being non-empty. Neither field is required -- most cases simply
+    # don't label one, and evaluate_intent_classification returns None
+    # ("not applicable") for a case that doesn't.
+    expected_intent: str | None = None
+    expect_ambiguity: bool = False
     notes: str = ""
 
 
@@ -258,6 +271,16 @@ class CaseRunResult:
     prompt_tokens: int | None = None
     completion_tokens: int | None = None
 
+    # Prompt 11 (11_ANALYTICAL_INTENT_CONTRACT.md): the real
+    # `AgentState["analytical_intent"]` this case's run produced -- a
+    # plain string (`classification["intent"]`) and the raw
+    # `ambiguity_flags` list, or None/[] if classification didn't run or
+    # didn't produce a usable result. `eval.evaluators
+    # .evaluate_intent_classification` compares these against the case's
+    # own `expected_intent`/`expect_ambiguity` hints.
+    observed_intent: str | None = None
+    observed_ambiguity_flags: list[str] = field(default_factory=list)
+
     # Gold comparison (populated by eval.evaluators, using expected_sql
     # executed live -- see that module)
     gold_columns: list[str] | None = None
@@ -274,6 +297,7 @@ class CaseRunResult:
     column_recall: float | None = None
     structure_checks: dict[str, bool] = field(default_factory=dict)
     security_correct: bool | None = None
+    intent_classification_correct: bool | None = None
     overall_pass: bool = False
     failure_category: str | None = None
     error_detail: str | None = None

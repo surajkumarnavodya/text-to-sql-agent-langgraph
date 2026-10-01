@@ -172,13 +172,20 @@ class TestRetrievalNodeIntegration:
 
 class TestGraphStructure:
     def test_retrieve_business_context_is_wired_between_golden_examples_and_plan_query(self):
+        """Prompt 11 (`11_ANALYTICAL_INTENT_CONTRACT.md`) inserted
+        `classify_analytical_intent` between `retrieve_business_context` and
+        `plan_query` -- the two no longer connect directly, but the overall
+        ordering (business context resolved before planning) still holds.
+        """
         graph = build_graph()
         node_names = set(graph.get_graph().nodes.keys())
         assert "retrieve_business_context" in node_names
+        assert "classify_analytical_intent" in node_names
 
         edges = {(edge.source, edge.target) for edge in graph.get_graph().edges}
         assert ("retrieve_golden_examples", "retrieve_business_context") in edges
-        assert ("retrieve_business_context", "plan_query") in edges
+        assert ("retrieve_business_context", "classify_analytical_intent") in edges
+        assert ("classify_analytical_intent", "plan_query") in edges
 
     def test_existing_nodes_are_all_still_present(self):
         """Adding the new node must never remove an existing one."""
@@ -198,3 +205,27 @@ class TestGraphStructure:
             "generate_insight",
         ):
             assert expected in node_names
+
+    def test_classify_analytical_intent_has_no_conditional_routing(self):
+        """Prompt 11's analytical `ambiguity_flags` must NEVER short-
+        circuit the graph the way `classify_followup_node`'s own
+        conversational "ambiguous" classification does -- structurally
+        proven here: `classify_analytical_intent` has exactly one outgoing
+        edge (a straight `add_edge` to `plan_query`, never an
+        `add_conditional_edges` routing table with an `END` branch),
+        unlike `classify_followup`, which does have one.
+        """
+        graph = build_graph()
+        edges = list(graph.get_graph().edges)
+
+        intent_edges = [e for e in edges if e.source == "classify_analytical_intent"]
+        assert len(intent_edges) == 1
+        assert intent_edges[0].target == "plan_query"
+        assert intent_edges[0].conditional is False
+
+        followup_edges = [e for e in edges if e.source == "classify_followup"]
+        assert any(e.conditional for e in followup_edges), (
+            "classify_followup is expected to retain its own conditional "
+            "(possibly-END) routing -- this test only asserts "
+            "classify_analytical_intent does not share that shape."
+        )

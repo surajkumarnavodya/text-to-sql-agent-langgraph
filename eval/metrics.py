@@ -112,6 +112,11 @@ def compute_metrics(results: list[CaseRunResult]) -> dict[str, float | None]:
         "result_set_accuracy": _rate(accuracy_cases, lambda r: r.result_set_correct),
         "exact_sql_match": _rate(accuracy_cases, lambda r: r.sql_exact_match),
         "final_accuracy": _rate(accuracy_cases, lambda r: r.overall_pass),
+        # Prompt 11 (11_ANALYTICAL_INTENT_CONTRACT.md): diagnostic only,
+        # exactly like exact_sql_match above -- never folded into
+        # final_accuracy. None when no case in this run labeled an
+        # expected_intent/expect_ambiguity hint.
+        "intent_classification_accuracy": _rate(results, lambda r: r.intent_classification_correct),
         # 4-6: retrieval + column selection
         "schema_retrieval_recall": _mean(
             [r.retrieval_recall for r in accuracy_cases if r.retrieval_recall is not None]

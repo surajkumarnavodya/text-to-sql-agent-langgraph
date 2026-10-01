@@ -17,8 +17,11 @@ cases:
     expected_tables: [DimProduct]
     expected_columns: [EnglishProductName, Color]
     expected_sql: "SELECT EnglishProductName FROM DimProduct WHERE Color = 'Red'"
+    expected_intent: lookup
     notes: >-
       Single-table WHERE filter -- the baseline case for filter_correctness.
+      Also Prompt 11's (11_ANALYTICAL_INTENT_CONTRACT.md) golden LOOKUP
+      intent case: a plain filtered-row question, no aggregation/grouping.
 
   - id: easy_filter_red_count
     question: "How many products are the color red?"
@@ -71,7 +74,11 @@ cases:
     expected_tables: [DimProduct]
     expected_sql: "SELECT COUNT(*) FROM DimProduct"
     expect_readable_result: false
-    notes: "Baseline single-value aggregation, no grouping/filtering."
+    expected_intent: aggregation
+    notes: >-
+      Baseline single-value aggregation, no grouping/filtering. Also
+      Prompt 11's (11_ANALYTICAL_INTENT_CONTRACT.md) golden AGGREGATION
+      intent case.
 
   - id: easy_agg_avg_list_price
     question: "What is the average list price across all products?"

@@ -277,7 +277,12 @@ below, and `docs/MULTI_SOURCE_GUIDE.md` for how to configure each source.
   gate (a simple KPI question like "what's our revenue?" has no
   complexity signal at all, but can still have a governing metric to
   enforce). See "Governed metrics, dimensions & semantic contracts"
-  below.
+  below. **Prompt 11** (`11_ANALYTICAL_INTENT_CONTRACT.md`) added
+  `intent.py` (new) — the typed `AnalyticalIntentType`/
+  `AnalyticalIntentClassification`/`intent_implies_planning` contract —
+  and `classify_analytical_intent_node` (between `retrieve_business_context`
+  and `plan_query`, runs on every question, unlike the complexity-gated
+  nodes above). See "Analytical intent classification" below.
 - `agent/orchestrator/` — the multi-source router, one level up from
   `agent/`'s own SQL-only graph, never the other way around: `nodes.py`
   (`router_node`/`classify_sources` — LLM classification only when 2+
@@ -537,7 +542,13 @@ below, and `docs/MULTI_SOURCE_GUIDE.md` for how to configure each source.
   engine/dialect globally, same as before multi-database support existed.
   Routing the benchmark itself per-case is a known, deliberately
   out-of-scope follow-up (see the multi-database auto-routing design note
-  below).
+  below). **Prompt 11** (`11_ANALYTICAL_INTENT_CONTRACT.md`) added
+  `BenchmarkCase.expected_intent`/`expect_ambiguity` (optional, hand-
+  labeled golden-intent hints), `CaseRunResult.observed_intent`/
+  `observed_ambiguity_flags`/`intent_classification_correct`, and
+  `evaluators.evaluate_intent_classification`/`metrics.py`'s
+  `intent_classification_accuracy` — diagnostic only, exactly like
+  `sql_exact_match`, never folded into `overall_pass`/`final_accuracy`.
 - `tests/` — pytest, all fully mocked, no real DB or Ollama required.
   `conftest.py`'s autouse `_isolate_settings_from_real_environment` fixture
   strips every env var one of `Settings`'s fields could read before each
@@ -573,10 +584,13 @@ below, and `docs/MULTI_SOURCE_GUIDE.md` for how to configure each source.
 ## Key design decisions
 
 ### Self-correcting retry loop (LangGraph)
-The full graph (`agent/graph.py`) is twelve nodes:
+The full graph (`agent/graph.py`) is fourteen nodes (as of Prompt 11,
+`11_ANALYTICAL_INTENT_CONTRACT.md` — previously twelve, before Prompt
+10's `review_metric_conformance` and Prompt 11's `classify_analytical_intent`):
 `sanitize_input → classify_followup → retrieve_schema →
-retrieve_golden_examples → retrieve_business_context → plan_query →
-generate_sql → review_sql → validate_sql → estimate_cost → execute_sql →
+retrieve_golden_examples → retrieve_business_context →
+classify_analytical_intent → plan_query → generate_sql → review_sql →
+review_metric_conformance → validate_sql → estimate_cost → execute_sql →
 generate_insight`. On a review, validation, cost-estimate, or execution
 failure, a conditional edge routes back to `generate_sql` (or, for a
 "missing reference" execution error, back to `retrieve_schema`) with the
@@ -1878,6 +1892,67 @@ the governed metric definition."
 **Read [`10_GOVERNED_METRICS_CONTRACT.md`](10_GOVERNED_METRICS_CONTRACT.md)**
 for the full inspection findings, every new module's design, the 50-test
 testing summary, and the security/tenant-isolation/performance review.
+
+### Analytical intent classification (Prompt 11)
+`agent/intent.py` (new) classifies what *kind* of analytical question a
+question is — `AnalyticalIntentType`'s 13 categories (LOOKUP,
+AGGREGATION, TREND, COMPARISON, RANKING, DISTRIBUTION, SEGMENTATION,
+FUNNEL, COHORT, FORECAST, ANOMALY, ROOT_CAUSE, RECOMMENDATION) — the
+general classifier `02_TARGET_ARCHITECTURE.md` §2 named as missing back
+in Prompt 02 (distinct from `agent.followup.classify_followup`'s
+*conversational* standalone/followup/ambiguous judgment and
+`agent.complexity`'s narrow retry-budget trip-wires, neither of which
+this replaces). New `agent.nodes.classify_analytical_intent_node`, wired
+`retrieve_business_context → classify_analytical_intent → plan_query`,
+runs on **every** question (gated only by `Settings
+.enable_intent_classification`, default `True`) — unlike `plan_query_node`'s
+own complexity-gated call, since this is meant to be foundational.
+Always `AI_INFERENCE` (`agent.provenance.DataTruthLevel`), never
+confirmed, never itself a security/authorization control.
+
+**Invariants that must not regress:**
+- **Purely advisory to `plan_query_node`'s gate, never to the retry
+  budget.** `agent.complexity.compute_max_retries`/`state["complexity_signals"]`
+  are computed once in `run_agent()` *before* the graph is even built —
+  no node, including this one, can retroactively widen `max_retries`.
+  `plan_query_node`'s gate became `enable_query_planning and
+  (complexity_signals or intent_implies_planning(analytical_intent))` —
+  reading `agent.intent._INTENT_TYPES_IMPLYING_PLANNING` (every intent
+  except LOOKUP/AGGREGATION) via that one helper, never re-derived. When
+  `analytical_intent` is `None` (disabled, unreachable Ollama, or
+  unparseable), this reduces to exactly `complexity_signals` alone —
+  byte-identical to this node's pre-Prompt-11 behavior, preserved by
+  construction.
+- **Never short-circuits the graph.** Structurally distinct from
+  `classify_followup_node`'s own *conversational* "ambiguous"
+  classification (the one path in this codebase allowed to end the
+  graph early at `needs_clarification`) — `classify_analytical_intent`
+  has exactly one outgoing edge (a straight `add_edge`, never a
+  conditional routing table with an `END` branch), verified directly
+  (`tests/test_sql_agent_integration.py
+  ::test_classify_analytical_intent_has_no_conditional_routing`). A
+  non-empty `ambiguity_flags` only ever widens `plan_query_node`'s gate,
+  the same way any other planning-implying intent does.
+- **Cannot bypass authorization, by construction.** `Permission.ASK` is
+  enforced by a FastAPI dependency before `run_agent`/the graph are even
+  built; this node runs deep inside an already-authorized request and
+  never reads/writes `caller_roles` or any field `validate_sql_node`'s
+  restricted-column gate reads.
+- **`metric_candidates` (raw, unconfirmed phrases from the question's own
+  text) is never conflated with `AgentState["governing_metrics"]`
+  (Prompt 10's already-governed, `CONFIRMED_BUSINESS_TRUTH` set)** — two
+  deliberately separate truth-level concepts, per master rules 9/10.
+- **Eval harness coverage is diagnostic only** — `eval.evaluators
+  .evaluate_intent_classification`/the new `intent_classification_accuracy`
+  metric never feed `compute_overall_pass`/`final_accuracy`, exactly
+  like `sql_exact_match`'s own long-standing posture.
+
+**Read [`11_ANALYTICAL_INTENT_CONTRACT.md`](11_ANALYTICAL_INTENT_CONTRACT.md)**
+for the full inspection findings, the ~102-test testing summary, the
+structural "never short-circuits/never bypasses authorization" proof,
+and why no new live-verified TREND/COMPARISON benchmark case was added
+in this pass (a disclosed, environment-specific DB-access limitation,
+not an oversight).
 
 ## How to run
 

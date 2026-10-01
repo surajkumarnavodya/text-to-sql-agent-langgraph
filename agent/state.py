@@ -327,6 +327,32 @@ class AgentState(TypedDict, total=False):
     # SQL by review_metric_conformance_node below.
     governing_metrics: list[dict]
 
+    # Set by classify_analytical_intent_node (Prompt 11,
+    # 11_ANALYTICAL_INTENT_CONTRACT.md), which runs between
+    # retrieve_business_context and plan_query, on every question
+    # (unlike query_plan below, which is gated by agent.complexity's
+    # signals) -- a structured judgment of what *kind* of analytical
+    # question this is (agent.intent.AnalyticalIntentType), with
+    # confidence, metric/dimension/filter candidates, a time requirement,
+    # a comparison description, an expected result shape, and ambiguity
+    # flags. Always a plain dict (agent.intent
+    # .AnalyticalIntentClassification.model_dump()'s output, matching this
+    # TypedDict's established "plain dicts, not model instances"
+    # convention for retrieved_context/query_plan-shaped fields), never
+    # the pydantic model itself. None when Settings
+    # .enable_intent_classification is False, Ollama is unreachable, or
+    # the response was unparseable -- a fail-open contract identical to
+    # query_plan's own, and the thing that makes "existing fallback
+    # behavior is preserved" true by construction: plan_query_node's gate
+    # degrades to exactly agent.complexity's signals alone whenever this
+    # is None. Always AI_INFERENCE (see agent.provenance.DataTruthLevel)
+    # -- never promoted, and never itself a security/authorization
+    # control (see classify_analytical_intent_node's own docstring).
+    # metric_candidates here is a *different*, unconfirmed thing from
+    # governing_metrics above -- raw phrases pulled from the question's
+    # own text, never conflated with that CONFIRMED_BUSINESS_TRUTH set.
+    analytical_intent: dict | None
+
     # Set by plan_query_node, which runs between retrieve_schema and
     # generate_sql -- an ordered list of concrete steps the model judged
     # necessary to answer the question (grouping, metrics, filters, whether

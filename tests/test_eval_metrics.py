@@ -83,6 +83,31 @@ class TestComputeMetrics:
         assert metrics["join_correctness"] is not None
         assert 0.0 <= metrics["join_correctness"] <= 1.0
 
+    def test_intent_classification_accuracy_is_none_when_no_case_labeled_a_hint(self):
+        """Prompt 11 (`11_ANALYTICAL_INTENT_CONTRACT.md`) -- diagnostic
+        only, same 'None means not measured' contract as join_correctness
+        above."""
+        results = [_passing_case()]
+        metrics = compute_metrics(results)
+        assert metrics["intent_classification_accuracy"] is None
+
+    def test_intent_classification_accuracy_reflects_labeled_cases_only(self):
+        labeled_correct = _passing_case(case_id="a")
+        labeled_correct.intent_classification_correct = True
+        labeled_wrong = _passing_case(case_id="b")
+        labeled_wrong.intent_classification_correct = False
+        unlabeled = _passing_case(case_id="c")
+        metrics = compute_metrics([labeled_correct, labeled_wrong, unlabeled])
+        assert metrics["intent_classification_accuracy"] == 0.5
+
+    def test_intent_classification_accuracy_never_affects_final_accuracy(self):
+        """Diagnostic only -- never folded into final_accuracy, exactly
+        like exact_sql_match."""
+        case_with_wrong_intent = _passing_case(case_id="a")
+        case_with_wrong_intent.intent_classification_correct = False
+        metrics = compute_metrics([case_with_wrong_intent])
+        assert metrics["final_accuracy"] == 1.0
+
 
 class TestComputeBreakdown:
     def test_groups_by_category(self):

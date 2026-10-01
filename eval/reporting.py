@@ -22,6 +22,7 @@ _METRIC_LABELS: dict[str, str] = {
     "result_set_accuracy": "Result-set accuracy",
     "exact_sql_match": "Exact SQL match (diagnostic only)",
     "final_accuracy": "Final accuracy",
+    "intent_classification_accuracy": "Intent classification accuracy (diagnostic only)",
     "schema_retrieval_recall": "Schema retrieval recall",
     "relevant_table_precision": "Relevant-table precision",
     "column_selection_accuracy": "Column selection accuracy",
