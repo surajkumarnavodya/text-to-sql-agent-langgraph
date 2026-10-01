@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import {
+  computeHistogramBins,
   getChartTypeOptions,
   inferColumnRoles,
   prepareChart,
@@ -175,6 +176,38 @@ describe('getChartTypeOptions', () => {
     expect(nonTable.every((o) => !o.enabled)).toBe(true)
     expect(options.find((o) => o.type === 'table')!.enabled).toBe(true)
   })
+
+  it('enables histogram for a single numeric column with enough rows', () => {
+    const rows = [[10], [20], [15], [30], [25]]
+    const columns = roles(['order_value'], rows)
+    const options = getChartTypeOptions(columns, rows)
+    const histogram = options.find((o) => o.type === 'histogram')!
+    expect(histogram.enabled).toBe(true)
+  })
+
+  it('disables histogram for a single numeric column with too few rows', () => {
+    const rows = [[10], [20], [15]]
+    const columns = roles(['order_value'], rows)
+    const options = getChartTypeOptions(columns, rows)
+    const histogram = options.find((o) => o.type === 'histogram')!
+    expect(histogram.enabled).toBe(false)
+    expect(histogram.reason).toMatch(/at least 5 rows/i)
+  })
+
+  it('disables histogram when a category column is also present', () => {
+    const rows = [
+      ['East', 10],
+      ['West', 20],
+      ['North', 15],
+      ['South', 30],
+      ['Central', 25],
+    ]
+    const columns = roles(['region', 'order_value'], rows)
+    const options = getChartTypeOptions(columns, rows)
+    const histogram = options.find((o) => o.type === 'histogram')!
+    expect(histogram.enabled).toBe(false)
+    expect(histogram.reason).toMatch(/exactly one numeric column/i)
+  })
 })
 
 describe('recommendChart', () => {
@@ -250,6 +283,52 @@ describe('recommendChart', () => {
     })
     expect(result?.type).toBe('bar')
     expect(result?.series.xColumn).toBe('region')
+  })
+
+  it('recommends histogram for a single numeric column with enough rows', () => {
+    const rows = [[10], [20], [15], [30], [25]]
+    const columns = roles(['order_value'], rows)
+    const result = recommendChart(columns, rows)
+    expect(result?.type).toBe('histogram')
+    expect(result?.series.xColumn).toBeNull()
+    expect(result?.series.yColumns).toEqual(['order_value'])
+  })
+})
+
+describe('computeHistogramBins', () => {
+  it('returns an empty array for no values', () => {
+    expect(computeHistogramBins([])).toEqual([])
+  })
+
+  it('returns a single bucket holding every value when all values are identical', () => {
+    const bins = computeHistogramBins([5, 5, 5, 5])
+    expect(bins).toHaveLength(1)
+    expect(bins[0].count).toBe(4)
+  })
+
+  it('buckets a known range into Sturges-rule buckets, every value accounted for', () => {
+    const values = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+    const bins = computeHistogramBins(values)
+    expect(bins).toHaveLength(5)
+    expect(bins.reduce((sum, b) => sum + b.count, 0)).toBe(values.length)
+    // The maximum value is clamped into the last bucket, never dropped or
+    // pushed into a phantom bucket past the end.
+    expect(bins[bins.length - 1].count).toBeGreaterThan(0)
+  })
+
+  it('clamps bucket count into the [5, 20] range for a large dataset', () => {
+    const values = Array.from({ length: 500 }, (_, i) => i)
+    const bins = computeHistogramBins(values)
+    expect(bins.length).toBeGreaterThanOrEqual(5)
+    expect(bins.length).toBeLessThanOrEqual(20)
+    expect(bins.reduce((sum, b) => sum + b.count, 0)).toBe(values.length)
+  })
+
+  it('labels each bucket with a numeric range', () => {
+    const bins = computeHistogramBins([0, 1, 2, 3, 4, 5, 6, 7, 8, 9])
+    for (const bin of bins) {
+      expect(bin.label).toMatch(/–/) // en dash range separator
+    }
   })
 })
 
@@ -389,5 +468,19 @@ describe('prepareChart', () => {
     )
     expect(prepared?.datasets[0].datasetType).toBe('bar')
     expect(prepared?.datasets[1].datasetType).toBe('line')
+  })
+
+  it('builds a histogram via the same bar chartJsType path, no new rendering code needed', () => {
+    const histColumns = roles(['order_value'], [[10], [20], [15], [30], [25]])
+    const histRows = [[10], [20], [15], [30], [25]]
+    const prepared = prepareChart(
+      histColumns,
+      histRows,
+      baseOptions({ chartType: 'histogram', series: { xColumn: null, yColumns: ['order_value'], groupColumn: null } }),
+    )
+    expect(prepared?.chartJsType).toBe('bar')
+    const counts = prepared?.datasets[0].data as number[]
+    expect(counts.reduce((sum, n) => sum + n, 0)).toBe(5)
+    expect(prepared?.yTitle).toBe('Count')
   })
 })

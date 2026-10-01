@@ -680,6 +680,60 @@ class ChartRecommendationOut(BaseModel):
     y_column: str | None = None
 
 
+class ChartFieldOut(BaseModel):
+    """Mirrors `analytics.visualization.ChartField`."""
+
+    model_config = ConfigDict(frozen=True)
+
+    column: str
+    role: str
+    aggregation: str | None = None
+    format: str = "plain"
+
+
+class ChartSortOut(BaseModel):
+    """Mirrors `analytics.visualization.ChartSort`."""
+
+    model_config = ConfigDict(frozen=True)
+
+    column: str
+    direction: str
+
+
+class AccessibilityMetadataOut(BaseModel):
+    """Mirrors `analytics.visualization.AccessibilityMetadata`."""
+
+    model_config = ConfigDict(frozen=True)
+
+    alt_text: str
+    summary: str
+
+
+class VisualizationSpecOut(BaseModel):
+    """Mirrors `analytics.visualization.ChartSpec` -- a richer, additive
+    sibling to `ChartRecommendationOut` above (chart type, fields/roles,
+    inferred aggregation/format, title, sort, a deterministic top-N limit,
+    and non-empty accessibility metadata). Deliberately NOT consumed by
+    `frontend/src/lib/chartEngine.ts`'s own seed-selection in this pass --
+    `chart_recommendation`/`column_types` keep powering today's chart
+    picker completely unchanged (see that module's own "must not regress"
+    invariant in CLAUDE.md); this is parallel, additive API surface for a
+    future wiring pass."""
+
+    model_config = ConfigDict(frozen=True)
+
+    chart_type: str
+    title: str
+    fields: tuple[ChartFieldOut, ...]
+    sort: ChartSortOut | None = None
+    limit: int | None = None
+    is_downsampled: bool = False
+    notices: tuple[str, ...] = ()
+    accessibility: AccessibilityMetadataOut
+    reason: str
+    engine_version: str
+
+
 class ExecuteResponse(BaseModel):
     model_config = ConfigDict(frozen=True)
 
@@ -719,6 +773,17 @@ class ExecuteResponse(BaseModel):
             "result may be missing rows beyond that cap. The UI must show a "
             "visible notice (and a chart, if the user requests one, must "
             "disclose it only reflects the returned/possibly-truncated rows)."
+        ),
+    )
+    visualization_spec: VisualizationSpecOut | None = Field(
+        default=None,
+        description=(
+            "A fuller deterministic chart specification (analytics.visualization"
+            ".build_chart_spec) -- chart type, fields/roles, inferred aggregation/"
+            "format, title, sort, a top-N limit, and accessibility metadata. "
+            "Additive and parallel to chart_recommendation/column_types above, "
+            "which remain the client's actual chart-picker seed; not yet "
+            "consumed by the frontend."
         ),
     )
     error: str | None = None

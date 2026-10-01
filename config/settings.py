@@ -893,6 +893,22 @@ class Settings(BaseSettings):
             the total change to be returned as a contributor, the
             configurable half of "no root cause is stated without
             supporting evidence."
+        visualization_default_top_n: `analytics.visualization
+            .build_chart_spec`'s deterministic row cap for a bar/line/map
+            spec -- mirrors `frontend/src/lib/chartEngine.ts`'s own
+            hardcoded default exactly.
+        enable_box_plot_charts: Whether `analytics.visualization
+            .build_chart_spec` may recommend `ChartType.BOX`. False by
+            default -- `frontend/src/lib/chartEngine.ts` has no
+            box-and-whisker rendering capability today; a distribution
+            is recommended as `ChartType.HISTOGRAM` instead (genuinely
+            renderable) until a future prompt adds one.
+        enable_map_charts: Whether `analytics.visualization
+            .build_chart_spec` may recommend `ChartType.MAP`. False by
+            default -- `frontend/src/lib/chartEngine.ts` has no map
+            rendering capability today; geography-shaped data is
+            recommended as `ChartType.BAR` instead until a future prompt
+            adds one.
         enable_golden_examples: Whether `agent.nodes
             .retrieve_golden_examples_node` looks up human-approved past
             (question, SQL) pairs (see `embeddings.golden_examples`) and
@@ -1642,6 +1658,25 @@ class Settings(BaseSettings):
     # literal "no root cause is stated without supporting evidence"
     # acceptance criterion's configurable threshold.
     root_cause_min_contribution_percent: float = Field(default=10.0, gt=0)
+    # Prompt 15 (15_VISUALIZATION_ENGINE_CONTRACT.md): analytics.visualization
+    # .build_chart_spec's own tunables. visualization_default_top_n mirrors
+    # frontend/src/lib/chartEngine.ts's own hardcoded `rows.length > 20 ? 20
+    # : null` default exactly, so the backend's seed and the frontend's own
+    # final-authority default stay consistent even though the frontend
+    # remains free to override it per chart. enable_box_plot_charts/
+    # enable_map_charts default False -- disclosed, not a feature flag for
+    # something already built: frontend/src/lib/chartEngine.ts has no
+    # box-and-whisker or map rendering capability today (and this prompt
+    # deliberately does not add a new charting library/plugin to get one),
+    # so build_chart_spec never actually recommends ChartType.BOX/.MAP while
+    # these are off -- a distribution falls back to histogram (genuinely
+    # implemented) and geography falls back to bar. Flipping either flag on
+    # ahead of a real rendering capability existing would make this module
+    # recommend a chart type nothing can render, which is exactly what this
+    # prompt's own acceptance criterion forbids.
+    visualization_default_top_n: int = Field(default=20, gt=0)
+    enable_box_plot_charts: bool = False
+    enable_map_charts: bool = False
     enable_golden_examples: bool = True
     golden_examples_top_k: int = Field(default=3, gt=0)
     golden_examples_min_similarity: float = Field(default=0.75, ge=0.0, le=1.0)

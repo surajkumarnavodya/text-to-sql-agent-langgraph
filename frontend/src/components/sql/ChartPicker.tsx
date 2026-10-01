@@ -23,6 +23,7 @@ const ICONS: Record<ChartTypeId, typeof BarChart2> = {
   doughnut: PieChart,
   scatter: ScatterChart,
   mixed: BarChart2,
+  histogram: BarChart2,
   table: Table2,
 }
 

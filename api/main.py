@@ -43,6 +43,9 @@ from sqlalchemy.exc import SQLAlchemyError
 # (unlike running as an installed package).
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from analytics.engine import compute_analytics_result
+from analytics.visualization import build_chart_spec
+
 from agent.authz import Permission
 from agent.exceptions import AgentError
 from agent.graph import build_graph
@@ -79,11 +82,14 @@ from api.media_search import router as media_search_router
 from api.onboarding import router as onboarding_router
 from api.rate_limit import enforce_api_action_rate_limit
 from api.schemas import (
+    AccessibilityMetadataOut,
     AskRequest,
     AskResponse,
     AttachmentResultOut,
     AttemptRecordOut,
+    ChartFieldOut,
     ChartRecommendationOut,
+    ChartSortOut,
     CitationOut,
     ColumnOut,
     ComponentHealth,
@@ -110,6 +116,7 @@ from api.schemas import (
     StageMetricOut,
     TableOut,
     TablesResponse,
+    VisualizationSpecOut,
 )
 from api.semantic_catalog import router as semantic_catalog_router
 from api.shares import router as shares_router
@@ -1338,6 +1345,52 @@ def execute(
     column_types: dict[str, str] = dict(classify_columns(result_df)) if not result_df.empty else {}
     recommendation = recommend_chart(result_df, column_types)
 
+    # Prompt 15: a fuller, deterministic visualization spec -- additive and
+    # parallel to chart_recommendation/column_types above, which remain the
+    # frontend's actual chart-picker seed (see analytics.visualization's own
+    # "must not regress" docstring). Fails open exactly like
+    # agent.nodes.compute_analytics_node's identical try/except -- an
+    # accuracy aid must never block a successful "Confirm and Run".
+    visualization_spec_out: VisualizationSpecOut | None = None
+    try:
+        analytics_result = compute_analytics_result(columns, rows, settings) if rows else None
+        chart_spec = build_chart_spec(
+            columns, rows, column_types, analytics_result=analytics_result, settings=settings
+        )
+        if chart_spec is not None:
+            visualization_spec_out = VisualizationSpecOut(
+                chart_type=chart_spec.chart_type.value,
+                title=chart_spec.title,
+                fields=tuple(
+                    ChartFieldOut(
+                        column=f.column,
+                        role=f.role.value,
+                        aggregation=f.aggregation,
+                        format=f.format,
+                    )
+                    for f in chart_spec.fields
+                ),
+                sort=(
+                    ChartSortOut(column=chart_spec.sort.column, direction=chart_spec.sort.direction)
+                    if chart_spec.sort is not None
+                    else None
+                ),
+                limit=chart_spec.limit,
+                is_downsampled=chart_spec.is_downsampled,
+                notices=chart_spec.notices,
+                accessibility=AccessibilityMetadataOut(
+                    alt_text=chart_spec.accessibility.alt_text,
+                    summary=chart_spec.accessibility.summary,
+                ),
+                reason=chart_spec.reason,
+                engine_version=chart_spec.engine_version,
+            )
+    except Exception as exc:  # noqa: BLE001 - an accuracy aid must never block the run
+        logger.warning(
+            "[execute] visualization spec computation failed, proceeding without: %s", exc
+        )
+        visualization_spec_out = None
+
     execute_response = ExecuteResponse(
         status="succeeded",
         database=database_name,
@@ -1350,6 +1403,7 @@ def execute(
         chart_recommendation=(
             ChartRecommendationOut(**recommendation) if recommendation is not None else None
         ),
+        visualization_spec=visualization_spec_out,
         # Best-effort signal, not a real "is there more data" answer -- see
         # ExecuteResponse.truncated's own docstring for why this app never
         # runs a separate COUNT(*) query to know the true total.

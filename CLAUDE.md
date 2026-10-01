@@ -1404,9 +1404,9 @@ page reload or a reloaded-from-server past conversation turn (same
 disclosed limitation as "Universal server-side chat history" above).
 
 **Read [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md#14-sql-result-charting)**
-for the full engine design (11 chart types, the NL follow-up chart-switch
-detector, the jsdom/Chart.js test-infrastructure fix) and current test
-coverage.
+for the full engine design (12 chart types as of Prompt 15's histogram
+addition below, the NL follow-up chart-switch detector, the jsdom/
+Chart.js test-infrastructure fix) and current test coverage.
 
 ### AI Data Analyst depth — trend/variance/outlier detection (`agent/insight.py`)
 `ResultSummary` gained three deterministic fields —
@@ -2179,6 +2179,98 @@ Prompt 02, continued by Prompt 13 for the live insight prompt.
 **Read [`14_ANOMALY_ROOT_CAUSE_CONTRACT.md`](14_ANOMALY_ROOT_CAUSE_CONTRACT.md)**
 for the full inspection findings, every new module's design, the
 testing summary, and the security/tenant-isolation/performance review.
+
+### Visualization & analytical presentation engine (Prompt 15)
+`analytics/visualization.py` (new) is a deterministic, no-LLM, no-I/O
+chart-specification builder: `build_chart_spec(columns, rows,
+column_types, analytics_result=None, settings=None) -> ChartSpec | None`
+maps a raw SQL result's shape to a full specification (chart type,
+fields/roles, inferred aggregation/format, title, sort, a top-N limit,
+and always-non-empty accessibility metadata) — closing three gaps the
+pre-existing frontend `frontend/src/lib/chartEngine.ts` had no mapping
+for at all: single-numeric-column distributions, box-and-whisker
+summaries, and geography. **Deliberately additive to, never a
+replacement for, `agent.result_charting.classify_columns`/
+`recommend_chart`** — those stay completely untouched;
+`ExecuteResponse.chart_recommendation`/`column_types` keep powering
+`chartEngine.ts`'s own seed-selection exactly as before (see "Optional,
+opt-in SQL result charting" above — that section's own "must not
+regress" invariant is unmodified by this prompt). `build_chart_spec`
+takes `column_types` as an input rather than re-inferring it, so there is
+exactly one numeric/date/text classification in this codebase, not two.
+
+**The histogram-vs-box/map resolution**: this app's chosen charting
+stack (Chart.js, no plugins) can't render a true box-and-whisker plot or
+a map, and "do not introduce duplicate chart libraries" says not to add
+one casually. A histogram, though, is just a bar chart of binned counts
+— genuinely implemented on both sides (`analytics.visualization`'s own
+binning logic for the spec; `chartEngine.ts`'s new `computeHistogramBins`
++ a `histogram` → `chartJsType: 'bar'` branch in `prepareChart`, reusing
+the exact same rendering path `bar`/`bar-horizontal`/`bar-stacked`
+already use — zero new UI component code). `ChartType.BOX`/`.MAP` are
+real, always-computed, detected concepts in the backend's own taxonomy
+(`detect_geography_columns` tags geo_region/geo_latitude/geo_longitude
+columns unconditionally) but gated behind two new, off-by-default
+`Settings` flags (`enable_box_plot_charts`/`enable_map_charts`) — so the
+engine never actually *recommends* an unrenderable type today; a
+distribution falls back to `HISTOGRAM` and a geography breakdown falls
+back to `BAR`. **`'box'`/`'map'` were deliberately NOT added to the
+frontend's own `ChartTypeId`** — unlike histogram there's no
+achievable-without-a-new-library rendering path for either yet, and a
+permanently-disabled frontend type would be dead code, not a feature.
+
+**Invariants that must not regress:**
+- **`visualization_spec` (`ExecuteResponse`'s new field, from
+  `api/main.py`'s `/execute` handler) is additive and NOT wired into
+  `chartEngine.ts`'s own seed-selection in this pass** —
+  `chart_recommendation`/`column_types` remain the frontend's actual
+  chart-picker seed; `visualization_spec` is parallel API surface a
+  future prompt can have the frontend start consuming, the same
+  "compute + test + expose via API, defer the deepest UI wiring" posture
+  Prompt 13/14's own analytics surfaces already used.
+- **A computation failure here can never fail `/execute`'s response** —
+  wrapped in the identical try/except-log-and-degrade-to-`None` shape
+  `agent.nodes.compute_analytics_node` already established; an accuracy/
+  presentation aid is never a reason a successful "Confirm and Run"
+  fails.
+- **Accessibility text is never empty** — reuses a real, already-
+  computed `analytics.engine.AnalyticsResult`'s own grounded
+  `RANKING`/`GROWTH`/`COLUMN_SUMMARY` claim text when one is passed in
+  (verified live: a real ranking query's spec carried `analytics.engine`'s
+  own claim text verbatim inside its `accessibility.alt_text`), falling
+  back to a generic, deterministic description otherwise.
+- **Title generation never double-prefixes an aggregation word already
+  present in a column's own name** (e.g. `"TotalRevenue"` must render as
+  `"Total Revenue"`, never `"Total Total Revenue"`) — a real bug found
+  during direct smoke-testing before any test was written, fixed by
+  `_label_with_aggregation_prefix`'s shared-tokenizer membership check,
+  now a locked-in regression test.
+- **The frontend histogram validity rule requires no co-present text/date
+  column, matching the backend's own identical rule** — a real bug (the
+  validity rule initially only checked the numeric-column count, not
+  whether a category column was *also* present, contradicting its own
+  disclosed reason text) found by the extended test suite itself, not a
+  design review, and fixed before merge.
+
+**A genuine, disclosed, pre-existing limitation surfaced by live
+testing, not introduced by this prompt**: a SQL Server `decimal` column
+comes back from `pyodbc` as Python `decimal.Decimal`, which gives the
+result `DataFrame` an `object` dtype — `agent.result_charting
+.classify_columns` (untouched by this prompt) classifies that as
+`"text"`, not `"numeric"`. Since `build_chart_spec` deliberately reuses
+`column_types` rather than re-inferring it, an uncast `decimal`-typed
+single-numeric-column result gets no chart spec at all today (`None`),
+not a wrong one — identically true of the pre-existing
+`chart_recommendation` path, which this prompt's design explicitly keeps
+untouched.
+
+**Read [`15_VISUALIZATION_ENGINE_CONTRACT.md`](15_VISUALIZATION_ENGINE_CONTRACT.md)**
+for the full inspection findings, every new module's design, the
+testing summary (30 new backend + frontend test cases, full suites
+rerun clean — 3088 backend / 287 frontend, zero regressions), the two
+real bugs found and fixed (the title double-prefix, the frontend
+histogram validity rule and its `ChartPicker.tsx` icon-map crash), and
+the security/tenant-isolation/performance review.
 
 ## How to run
 

@@ -36,6 +36,7 @@ export type ChartTypeId =
   | 'doughnut'
   | 'scatter'
   | 'mixed'
+  | 'histogram'
   | 'table'
 
 export const ALL_CHART_TYPES: ChartTypeId[] = [
@@ -49,6 +50,7 @@ export const ALL_CHART_TYPES: ChartTypeId[] = [
   'doughnut',
   'scatter',
   'mixed',
+  'histogram',
   'table',
 ]
 
@@ -196,6 +198,17 @@ const PIE_MAX_CATEGORIES = 8
 // ratio, one series would be visually flattened to a near-flat line, which
 // is exactly the misleading-chart shape this feature must prevent.
 const MIXED_SCALE_RATIO_LIMIT = 10
+
+// A distribution needs at least this many points for binning to be
+// meaningful -- mirrors analytics.visualization.build_chart_spec's own
+// identical minimum (_MIN_ROWS_FOR_HISTOGRAM) on the backend, kept
+// consistent rather than re-derived.
+const MIN_ROWS_FOR_HISTOGRAM = 5
+// Sturges' rule (ceil(log2(n) + 1)), clamped to a readable range -- too
+// few buckets loses the shape of the distribution, too many produces bars
+// too thin to read.
+const MIN_HISTOGRAM_BUCKETS = 5
+const MAX_HISTOGRAM_BUCKETS = 20
 
 function columnsByRole(columns: ColumnInfo[], role: ColumnRole): ColumnInfo[] {
   return columns.filter((c) => c.role === role)
@@ -389,6 +402,32 @@ export function getChartTypeOptions(
       : { type: 'mixed', enabled: true, reason: 'Compares two measures of similar scale together.' },
   )
 
+  // histogram -- exactly one numeric column and NO category/date column
+  // (binning computes its own x-axis purely from the numeric values) plus
+  // enough rows for the bucketing to be meaningful. Mirrors
+  // analytics.visualization.build_chart_spec's own identical rule (that
+  // module's single-numeric branch is only reached once its date/text
+  // branches have already been ruled out).
+  if (numericCols.length !== 1 || textCols.length > 0 || dateCols.length > 0) {
+    options.push({
+      type: 'histogram',
+      enabled: false,
+      reason: 'Needs exactly one numeric column (no category or date column).',
+    })
+  } else if (rowCount < MIN_ROWS_FOR_HISTOGRAM) {
+    options.push({
+      type: 'histogram',
+      enabled: false,
+      reason: `Needs at least ${MIN_ROWS_FOR_HISTOGRAM} rows for a meaningful distribution.`,
+    })
+  } else {
+    options.push({
+      type: 'histogram',
+      enabled: true,
+      reason: 'Shows the distribution (shape and spread) of a single numeric column.',
+    })
+  }
+
   return options
 }
 
@@ -404,7 +443,9 @@ export function defaultSeriesForType(type: ChartTypeId, columns: ColumnInfo[]): 
   const categoryOrDate = columns.filter((c) => c.role !== 'numeric')
   const axisColumn = (dateFirst ?? categoryOrDate[0])?.name ?? null
 
-  if (type === 'kpi') {
+  if (type === 'kpi' || type === 'histogram') {
+    // histogram, like kpi, has no x-axis column -- binning computes its
+    // own x-axis from the single numeric column's own values.
     return { xColumn: null, yColumns: numeric.slice(0, 1).map((c) => c.name), groupColumn: null }
   }
   if (type === 'scatter') {
@@ -514,6 +555,15 @@ export function recommendChart(
     }
   }
 
+  const histogram = tryType('histogram')
+  if (histogram) {
+    return {
+      type: 'histogram',
+      reason: histogram.reason,
+      series: { xColumn: null, yColumns: [numericCols[0].name], groupColumn: null },
+    }
+  }
+
   return null
 }
 
@@ -553,6 +603,43 @@ export function resolveChartColors(): string[] {
   })
 }
 
+/** Bins `values` into a deterministic number of equal-width buckets
+ * (Sturges' rule, clamped to [MIN_HISTOGRAM_BUCKETS, MAX_HISTOGRAM_BUCKETS])
+ * and returns each bucket's label (its numeric range) and count. A
+ * histogram is just a bar chart of these counts -- no new charting
+ * library needed, reusing Chart.js's existing 'bar' rendering path
+ * exactly like bar/bar-horizontal/bar-stacked already do. */
+export function computeHistogramBins(values: number[]): { label: string; count: number }[] {
+  if (values.length === 0) return []
+  const min = Math.min(...values)
+  const max = Math.max(...values)
+  if (min === max) {
+    return [{ label: formatNumber(min, 'plain'), count: values.length }]
+  }
+  const bucketCount = Math.min(
+    MAX_HISTOGRAM_BUCKETS,
+    Math.max(MIN_HISTOGRAM_BUCKETS, Math.ceil(Math.log2(values.length) + 1)),
+  )
+  const binWidth = (max - min) / bucketCount
+  const counts = new Array(bucketCount).fill(0)
+  for (const value of values) {
+    // The maximum value would otherwise land one bucket past the end
+    // (floor((max - min) / binWidth) === bucketCount) -- clamp it into
+    // the last bucket instead, which is the inclusive-upper-bound
+    // convention every histogram implementation uses.
+    const index = Math.min(bucketCount - 1, Math.max(0, Math.floor((value - min) / binWidth)))
+    counts[index] += 1
+  }
+  return counts.map((count, i) => {
+    const rangeStart = min + i * binWidth
+    const rangeEnd = min + (i + 1) * binWidth
+    return {
+      label: `${formatNumber(rangeStart, 'plain')}–${formatNumber(rangeEnd, 'plain')}`,
+      count,
+    }
+  })
+}
+
 /** Builds the Chart.js-ready shape for one chart configuration, applying
  * (and disclosing, via `notices`) any sort/top-N/date-grouping transforms
  * the user requested. Returns `null` if the requested type/column
@@ -589,6 +676,25 @@ export function prepareChart(
       datasets: [{ label: `${series.yColumns[0]} vs ${series.xColumn}`, data: points, color: colors[0] }],
       xTitle: series.xColumn ?? '',
       yTitle: series.yColumns[0],
+      notices,
+    }
+  }
+
+  // --- histogram: bin the single numeric column's own values, no x-axis
+  // column needed (see computeHistogramBins's own docstring) ---
+  if (options.chartType === 'histogram') {
+    const yIndex = columnNames.indexOf(series.yColumns[0])
+    if (yIndex === -1) return null
+    const values = rows
+      .map((row) => Number(row[yIndex]))
+      .filter((n) => Number.isFinite(n))
+    const bins = computeHistogramBins(values)
+    return {
+      chartJsType: 'bar',
+      labels: bins.map((b) => b.label),
+      datasets: [{ label: series.yColumns[0], data: bins.map((b) => b.count), color: colors[0] }],
+      xTitle: series.yColumns[0],
+      yTitle: 'Count',
       notices,
     }
   }
@@ -715,5 +821,6 @@ export const CHART_TYPE_LABELS: Record<ChartTypeId, string> = {
   doughnut: 'Doughnut',
   scatter: 'Scatter',
   mixed: 'Mixed bar + line',
+  histogram: 'Histogram',
   table: 'Table only',
 }
