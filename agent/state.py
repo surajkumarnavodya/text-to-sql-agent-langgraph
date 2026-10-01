@@ -353,6 +353,47 @@ class AgentState(TypedDict, total=False):
     # own text, never conflated with that CONFIRMED_BUSINESS_TRUTH set.
     analytical_intent: dict | None
 
+    # Set by build_analytical_plan_node (Prompt 12,
+    # 12_ANALYTICAL_PLANNING_CONTRACT.md), which runs between
+    # classify_analytical_intent and plan_query -- a structured,
+    # DETERMINISTICALLY RE-VERIFIED breakdown of what the eventual SQL
+    # must compute (metric(s), dimensions, filters, time range, grain,
+    # comparison, ranking, sort, limit, required database capabilities --
+    # see agent.analytical_plan.AnalyticalPlan), or None. Always a plain
+    # dict (AnalyticalPlan.model_dump()'s output, matching this
+    # TypedDict's established "plain dicts, not model instances"
+    # convention), never the pydantic model itself. None whenever
+    # Settings.enable_analytical_planning is False, plan_query_node's own
+    # gate (complexity_signals or intent_triggers_planning) doesn't fire,
+    # Ollama is unreachable, the response is unparseable, OR --
+    # critically, unlike every other advisory field on this state --
+    # agent.plan_validator.validate_plan found any violation at all (an
+    # unknown table/column, no FK-declared relationship path between the
+    # plan's own tables, a restricted column the caller may not view, an
+    # infeasible time range, or a database-capability mismatch): an
+    # invalid plan is discarded entirely, never partially trusted, and
+    # this falls back to plan_query_node's unmodified pre-Prompt-12
+    # free-text planning (see that node's own docstring for the exact
+    # three-tier fallback: validated structured plan -> free-text
+    # query_plan -> direct generation). Reused unchanged across every
+    # generate_sql retry for this question (only recomputed if
+    # retrieve_schema itself reruns), exactly like query_plan below --
+    # injected into generate_sql's prompt via agent.llm_client
+    # ._build_analytical_plan_block, which supersedes query_plan's own
+    # generic block when this is set (query_plan is still populated
+    # alongside it, via agent.analytical_plan.render_plan_as_steps, so
+    # review_sql_node's existing plan-conformance check keeps working
+    # unmodified against a plan now known to be deterministically valid).
+    analytical_plan: dict | None
+    # Observability only -- the violations agent.plan_validator
+    # .validate_plan found when a candidate plan was rejected (see
+    # agent.plan_validator.PlanViolation), or None when no plan was built
+    # at all, a plan passed validation outright, or Ollama/parsing failed
+    # before validation ever ran. Never read by any node's own logic,
+    # purely for logging/debugging a planning decision -- the same role
+    # retrieval_metadata plays for business-context retrieval above.
+    analytical_plan_violations: list[dict] | None
+
     # Set by plan_query_node, which runs between retrieve_schema and
     # generate_sql -- an ordered list of concrete steps the model judged
     # necessary to answer the question (grouping, metrics, filters, whether

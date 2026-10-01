@@ -830,6 +830,28 @@ class Settings(BaseSettings):
             for the intent classification JSON object -- deliberately
             small and separate from `llm_max_tokens`, mirroring
             `query_plan_max_tokens`'s reasoning.
+        enable_analytical_planning: Whether `agent.nodes
+            .build_analytical_plan_node` makes a structured-plan LLM call
+            for a question `plan_query_node`'s own gate (complexity
+            signals or an intent that implies planning) judges non-
+            trivial. True by default -- the node is a pure pass-through
+            with zero cost for the overwhelming common case this gate
+            doesn't fire for. A plan this produces is never trusted at
+            face value: `agent.plan_validator.validate_plan`
+            deterministically re-verifies every table/column/
+            relationship/capability claim before it's ever shown to
+            `generate_sql`; a plan that fails validation (or this flag
+            being False, or an unreachable Ollama server, or an
+            unparseable response) falls back to exactly
+            `plan_query_node`'s pre-Prompt-12 free-text planning, byte-
+            identical non-existence. See `12_ANALYTICAL_PLANNING_
+            CONTRACT.md`.
+        analytical_plan_max_tokens: Max tokens the LLM may generate for the
+            structured analytical-plan JSON object -- deliberately small
+            and separate from `llm_max_tokens`/`query_plan_max_tokens`,
+            mirroring the same reasoning (a structured plan is more
+            verbose than a plain string-array plan, hence the larger
+            default than `query_plan_max_tokens`'s).
         enable_golden_examples: Whether `agent.nodes
             .retrieve_golden_examples_node` looks up human-approved past
             (question, SQL) pairs (see `embeddings.golden_examples`) and
@@ -1508,6 +1530,20 @@ class Settings(BaseSettings):
     # complexity_signals alone -- see that node's own docstring).
     enable_intent_classification: bool = True
     intent_classification_max_tokens: int = Field(default=250, gt=0)
+    # Prompt 12 (12_ANALYTICAL_PLANNING_CONTRACT.md): gates
+    # agent.nodes.build_analytical_plan_node's LLM call -- same trigger
+    # shape as enable_query_planning (a complexity-flagged or
+    # intent-implies-planning question only, never every question), and
+    # the same "operator escape hatch, not a risk flag" posture
+    # enable_metric_conformance_review's own comment gives: the node is
+    # already a pure pass-through whenever its own gate doesn't fire.
+    # False (or an unreachable Ollama server, or a plan that fails
+    # agent.plan_validator.validate_plan) all collapse to exactly
+    # plan_query_node's pre-Prompt-12 free-text-planning behavior -- see
+    # build_analytical_plan_node's own docstring for the full three-tier
+    # fallback this flag is the first tier's switch for.
+    enable_analytical_planning: bool = True
+    analytical_plan_max_tokens: int = Field(default=400, gt=0)
     enable_golden_examples: bool = True
     golden_examples_top_k: int = Field(default=3, gt=0)
     golden_examples_min_similarity: float = Field(default=0.75, ge=0.0, le=1.0)

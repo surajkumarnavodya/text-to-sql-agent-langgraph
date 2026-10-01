@@ -1,6 +1,6 @@
 """Wires the agent nodes into a compiled LangGraph state machine.
 
-    sanitize_input -> classify_followup -> retrieve_schema -> retrieve_golden_examples -> retrieve_business_context -> classify_analytical_intent -> plan_query -> generate_sql -+-> review_sql -+-> review_metric_conformance -+-> validate_sql -+-> estimate_cost -+-> execute_sql -+-> generate_insight -> END
+    sanitize_input -> classify_followup -> retrieve_schema -> retrieve_golden_examples -> retrieve_business_context -> classify_analytical_intent -> build_analytical_plan -> plan_query -> generate_sql -+-> review_sql -+-> review_metric_conformance -+-> validate_sql -+-> estimate_cost -+-> execute_sql -+-> generate_insight -> END
          |                    |                    ^                                                                  |               ^                              |                 ^                |                  ^                 |                |
          |                    |                    +----------------------------------(retry, up to max_retries)------+---------------+------------------------------+-----------------+---(retry, high    |               |
          |                    |                                                                                       |                                                                                    cost only)      +--(retry, only  |
@@ -55,20 +55,42 @@ state-visible warning (`retrieval_warnings`), never a reason a question
 can't be answered. See `agent.nodes.retrieve_business_context_node`.
 
 `classify_analytical_intent` (between `retrieve_business_context` and
-`plan_query`, Prompt 11, `11_ANALYTICAL_INTENT_CONTRACT.md`) classifies
-what *kind* of analytical question this is (LOOKUP/AGGREGATION/TREND/
-COMPARISON/RANKING/.../RECOMMENDATION -- see `agent/intent.py`), on
+`build_analytical_plan`, Prompt 11, `11_ANALYTICAL_INTENT_CONTRACT.md`)
+classifies what *kind* of analytical question this is (LOOKUP/AGGREGATION/
+TREND/COMPARISON/RANKING/.../RECOMMENDATION -- see `agent/intent.py`), on
 *every* question when `Settings.enable_intent_classification` is on
 (unlike `plan_query` below, gated by `agent.complexity`'s signals) --
 fails open (an unreachable Ollama server or an unparseable response)
 to `state["analytical_intent"] = None`, never a reason a question can't
-be answered. Its only consumer is `plan_query_node`'s own gate/prompt
-(see below) -- it is purely advisory, additive to `agent.complexity`'s
-own trip-wires, never a replacement for them, and never touches
-authorization or the retry budget. See `agent.nodes
-.classify_analytical_intent_node`.
+be answered. Its consumers are `build_analytical_plan_node`'s and
+`plan_query_node`'s shared gate/prompt (see below) -- it is purely
+advisory, additive to `agent.complexity`'s own trip-wires, never a
+replacement for them, and never touches authorization or the retry
+budget. See `agent.nodes.classify_analytical_intent_node`.
 
-`plan_query` (between `classify_analytical_intent` and `generate_sql`) and `review_sql`
+`build_analytical_plan` (between `classify_analytical_intent` and
+`plan_query`, Prompt 12, `12_ANALYTICAL_PLANNING_CONTRACT.md`) is the
+**first tier** of a three-tier planning fallback: for a question the
+exact same gate below judges non-trivial, it makes an LLM call producing
+a structured `agent.analytical_plan.AnalyticalPlan` (metric(s),
+dimensions, filters, time range, grain, comparison, ranking, sort,
+limit, required database capabilities), then **deterministically
+re-verifies every claim it makes** (`agent.plan_validator.validate_plan`
+-- table/column existence, FK-declared relationship paths, sensitive-
+column policy + caller authorization, time feasibility, target-database
+capability support) before ever showing it to `generate_sql`. A plan
+that fails validation is discarded in full, not partially trusted --
+`state["analytical_plan"]` stays `None` and the question falls through
+to tier two (`plan_query`'s own free-text planning, completely
+unmodified) exactly as it would have before this node existed. On
+success, also renders the validated plan into `state["query_plan"]`
+(`agent.analytical_plan.render_plan_as_steps`) so `review_sql_node`'s
+existing plan-conformance check keeps working unmodified against it,
+rather than adding a second review node. Gated by `Settings
+.enable_analytical_planning` on top of the shared trigger below. See
+`agent.nodes.build_analytical_plan_node` for the full reasoning.
+
+`plan_query` (between `build_analytical_plan` and `generate_sql`) and `review_sql`
 (between `generate_sql` and `review_metric_conformance`) are the agentic
 query-decomposition + plan-conformance self-correction pair: `plan_query_node`
 makes an up-front LLM call that breaks a *non-trivial* question -- one that
@@ -82,9 +104,12 @@ looping back to `generate_sql` with a targeted critique (sharing the same
 are a pure pass-through -- no LLM call, zero added latency -- for the
 overwhelming common case of a question that matched no complexity signal
 and no intent implying planning, or when `Settings.enable_query_planning`
-is off. See `agent.nodes.plan_query_node`/`review_sql_node` for the full
-reasoning, including the fail-open behavior on an unreachable Ollama
-server or an unparseable plan/verdict.
+is off. `plan_query_node` additionally skips its own LLM call (but stays a
+pass-through either way) whenever `build_analytical_plan` already produced
+a validated structured plan for this question -- see
+`agent.nodes.plan_query_node`/`review_sql_node` for the full reasoning,
+including the fail-open behavior on an unreachable Ollama server or an
+unparseable plan/verdict.
 
 Three failure shapes never loop back at all and go straight to END: a
 validator SAFETY_VIOLATION_TYPES rejection and a `generate_sql` llm_error
@@ -150,6 +175,7 @@ from langgraph.graph import END, StateGraph
 
 from agent.complexity import compute_max_retries
 from agent.nodes import (
+    build_analytical_plan_node,
     classify_analytical_intent_node,
     classify_followup_node,
     estimate_query_cost_node,
@@ -189,12 +215,12 @@ def build_graph():
     never on the compiled graph object itself -- so building it once and
     reusing it (the same `functools`-based singleton pattern already used
     for `config.settings.get_settings()` and `db.connection._cached_engine`)
-    is safe and avoids re-wiring all fourteen nodes on every single question.
+    is safe and avoids re-wiring all fifteen nodes on every single question.
     Graph *shape* never depends on `Settings` (`retrieve_golden_examples`/
-    `classify_analytical_intent`/`plan_query`/`review_sql`/
-    `review_metric_conformance` are pass-throughs, not conditionally-omitted
-    nodes, when their respective flag is off -- see this module's
-    docstring), so
+    `classify_analytical_intent`/`build_analytical_plan`/`plan_query`/
+    `review_sql`/`review_metric_conformance` are pass-throughs, not
+    conditionally-omitted nodes, when their respective flag is off -- see
+    this module's docstring), so
     there's no per-settings cache key to worry about; like every other
     process-lifetime singleton here, a config change that would matter
     takes a process restart.
@@ -210,6 +236,7 @@ def build_graph():
     graph.add_node("retrieve_golden_examples", retrieve_golden_examples_node)
     graph.add_node("retrieve_business_context", retrieve_business_context_node)
     graph.add_node("classify_analytical_intent", classify_analytical_intent_node)
+    graph.add_node("build_analytical_plan", build_analytical_plan_node)
     graph.add_node("plan_query", plan_query_node)
     graph.add_node("generate_sql", generate_sql_node)
     graph.add_node("review_sql", review_sql_node)
@@ -239,7 +266,8 @@ def build_graph():
     graph.add_edge("retrieve_schema", "retrieve_golden_examples")
     graph.add_edge("retrieve_golden_examples", "retrieve_business_context")
     graph.add_edge("retrieve_business_context", "classify_analytical_intent")
-    graph.add_edge("classify_analytical_intent", "plan_query")
+    graph.add_edge("classify_analytical_intent", "build_analytical_plan")
+    graph.add_edge("build_analytical_plan", "plan_query")
     graph.add_edge("plan_query", "generate_sql")
     graph.add_conditional_edges(
         "generate_sql",
@@ -406,6 +434,8 @@ def run_agent(
         "retrieval_metadata": {},
         "governing_metrics": [],
         "analytical_intent": None,
+        "analytical_plan": None,
+        "analytical_plan_violations": None,
         "query_plan": None,
         "plan_review_passed": None,
         "plan_review_feedback": None,
@@ -429,12 +459,13 @@ def run_agent(
     # not automatically related to this graph's *own* retry budget
     # (effective_max_retries above) -- a real, reproduced bug: a worst-case
     # retry sequence (an execute_sql "missing_reference" retry loops all the
-    # way back to retrieve_schema -- an 11-node cycle: retrieve_schema,
+    # way back to retrieve_schema -- a 12-node cycle: retrieve_schema,
     # retrieve_golden_examples, retrieve_business_context,
-    # classify_analytical_intent, plan_query, generate_sql, review_sql,
-    # review_metric_conformance, validate_sql, estimate_cost, execute_sql)
+    # classify_analytical_intent, build_analytical_plan, plan_query,
+    # generate_sql, review_sql, review_metric_conformance, validate_sql,
+    # estimate_cost, execute_sql)
     # can exceed 25 total steps well before
-    # effective_max_retries is exhausted -- e.g. the ~13-step initial pass
+    # effective_max_retries is exhausted -- e.g. the ~14-step initial pass
     # plus just two such retries already exceeds that. When that happened,
     # LangGraph raised an uncaught GraphRecursionError instead of the
     # graph reaching its own intended terminal "failed" state, which

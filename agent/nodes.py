@@ -27,6 +27,7 @@ from typing import Any
 from retrieval.retriever import extract_governing_metrics, retrieve_business_context
 from sqlalchemy.exc import SQLAlchemyError
 
+from agent.analytical_plan import AnalyticalPlan, render_plan_as_steps
 from agent.authz import Permission, has_role_permission
 from agent.error_classification import ExecutionErrorCategory, classify_execution_error
 from agent.exceptions import (
@@ -46,12 +47,14 @@ from agent.insight import is_insight_grounded, should_skip_insight, summarize_re
 from agent.intent import intent_implies_planning
 from agent.llm_client import (
     generate_analytical_intent_from_llm,
+    generate_analytical_plan_from_llm,
     generate_insight_from_llm,
     generate_query_plan_from_llm,
     generate_sql_from_llm,
     review_sql_against_metrics_from_llm,
     review_sql_against_plan_from_llm,
 )
+from agent.plan_validator import validate_plan
 from agent.rate_limit import LLM_CALL_LIMIT_MESSAGE, get_llm_call_limiter
 from agent.sql_validator import (
     SAFETY_VIOLATION_TYPES,
@@ -77,6 +80,7 @@ from config.table_descriptions import apply_table_description, load_table_descri
 from db.connection import get_connection, get_read_only_engine, get_sqlglot_dialect
 from db.execution import execute_readonly_sql
 from db.query_cost import MODERATE_COST_NOTICE, estimate_query_cost, high_cost_error_message
+from db.schema_introspection import extract_ddl_column_names
 from embeddings.golden_examples import retrieve_golden_examples
 from embeddings.retriever import retrieve_relevant_schema, select_database
 from security.audit_log import log_security_event
@@ -195,25 +199,15 @@ _INVALID_IDENTIFIER_PATTERNS = (
 _MIN_SUGGESTION_LENGTH = 4
 
 
-def _extract_column_names(ddl: str) -> list[str]:
-    """Pulls column names out of one table's synthesized DDL text.
-
-    Relies only on `db.schema_introspection.render_ddl`'s consistent
-    one-column-per-line rendering (`    ColumnName TYPE ...,`) -- takes the
-    first whitespace-separated token of each body line, skipping the
-    `CREATE TABLE`/closing-paren lines and `FOREIGN KEY (...)`/
-    `PRIMARY KEY (...)` table-level constraint lines (which would otherwise
-    contribute "FOREIGN"/"PRIMARY" as false column names).
-    """
-    names = []
-    for line in ddl.splitlines():
-        stripped = line.strip().rstrip(",")
-        if not stripped or stripped.startswith(("CREATE TABLE", "FOREIGN KEY", "PRIMARY KEY", ")")):
-            continue
-        first_token = stripped.split(None, 1)[0]
-        if first_token.isidentifier():
-            names.append(first_token)
-    return names
+# Re-bound to the shared implementation in `db.schema_introspection` (Prompt
+# 12, `12_ANALYTICAL_PLANNING_CONTRACT.md`) -- `agent.plan_validator` now
+# needs the identical DDL-column-name extraction `_suggest_correct_column`
+# below already relied on, so the one implementation moved there rather than
+# being duplicated. Kept under this module's original private name (not a
+# plain `from ... import extract_ddl_column_names` at call sites) so the
+# diff below stays minimal and `_suggest_correct_column`'s own docstring
+# references keep working unchanged.
+_extract_column_names = extract_ddl_column_names
 
 
 def _suggest_correct_column(
@@ -766,31 +760,171 @@ def classify_analytical_intent_node(state: AgentState) -> dict[str, Any]:
     return {"analytical_intent": classification, "status": "generating"}
 
 
+def _planning_gate(state: AgentState, settings) -> tuple[bool, list[str], bool]:
+    """Shared trigger condition for both `build_analytical_plan_node` and
+    `plan_query_node` -- a question gets *either* planning path (never
+    neither-then-both) exactly when `Settings.enable_query_planning` is
+    True AND at least one of `state["complexity_signals"]` is non-empty or
+    `state["analytical_intent"]` implies planning (see `agent.intent
+    .intent_implies_planning`). Factored out so the two nodes can never
+    silently drift apart on what counts as "non-trivial" -- see Prompt 12
+    (`12_ANALYTICAL_PLANNING_CONTRACT.md`).
+
+    Returns:
+        `(should_plan, complexity_signals, intent_triggers_planning)`.
+    """
+    complexity_signals = state.get("complexity_signals") or []
+    analytical_intent = state.get("analytical_intent")
+    intent_triggers_planning = analytical_intent is not None and intent_implies_planning(
+        analytical_intent
+    )
+    should_plan = settings.enable_query_planning and bool(
+        complexity_signals or intent_triggers_planning
+    )
+    return should_plan, complexity_signals, intent_triggers_planning
+
+
+@_timed_node("build_analytical_plan")
+def build_analytical_plan_node(state: AgentState) -> dict[str, Any]:
+    """Produces and deterministically re-verifies a structured
+    `AnalyticalPlan` for a question judged non-trivial -- Prompt 12
+    (`12_ANALYTICAL_PLANNING_CONTRACT.md`).
+
+    Runs between `classify_analytical_intent` and `plan_query` (see
+    `agent/graph.py`), gated by the exact same trigger `plan_query_node`
+    itself uses (`_planning_gate` above) AND `Settings
+    .enable_analytical_planning` -- so a question that skips planning
+    entirely today (the overwhelming common case: no complexity signal,
+    no planning-implying intent) still skips this node's LLM call too,
+    zero added latency, byte-identical to pre-Prompt-12 behavior.
+
+    This is the **first tier** of a three-tier fallback:
+      1. A validated structured plan (this node) -- when `agent
+         .llm_client.generate_analytical_plan_from_llm` returns a parseable
+         plan AND `agent.plan_validator.validate_plan` finds zero
+         violations against the real retrieved schema, governed metrics,
+         sensitive-column policy, caller permissions, and the target
+         database's dialect capabilities.
+      2. `plan_query_node`'s existing free-text plan -- runs normally
+         (unmodified) whenever this node leaves `state["analytical_plan"]`
+         as `None`, for *any* reason: the gate didn't fire, the feature
+         flag is off, Ollama was unreachable, the response was
+         unparseable, or -- unlike every other advisory node in this
+         graph -- the plan was syntactically fine but failed deterministic
+         validation. An invalid plan is never partially trusted; it is
+         discarded in full (see `agent.plan_validator.validate_plan`'s own
+         docstring for why this is still "fails open," not a security
+         bypass: the real, fail-closed gates -- `validate_sql_node`'s
+         restricted-column check chief among them -- are completely
+         unmodified and still run regardless).
+      3. Direct generation -- when neither planning node ever fires.
+
+    On success, also sets `state["query_plan"]` (rendered from the same
+    validated plan via `agent.analytical_plan.render_plan_as_steps`) so
+    `review_sql_node`'s existing plan-conformance LLM review keeps working
+    unmodified against a plan now known to be deterministically valid,
+    rather than adding a second review node (master-contract rule 3).
+    """
+    settings = get_settings()
+    should_plan, complexity_signals, intent_triggers_planning = _planning_gate(state, settings)
+    if not settings.enable_analytical_planning or not should_plan:
+        logger.info(
+            "[build_analytical_plan] skipped (enable_analytical_planning=%s "
+            "enable_query_planning=%s complexity_signals=%s intent_triggers_planning=%s)",
+            settings.enable_analytical_planning,
+            settings.enable_query_planning,
+            complexity_signals,
+            intent_triggers_planning,
+        )
+        return {"analytical_plan": None, "analytical_plan_violations": None, "status": "generating"}
+
+    question = state["question"]
+    schema_context = state.get("schema_context_text", "")
+    try:
+        raw_plan = generate_analytical_plan_from_llm(
+            question,
+            schema_context,
+            settings,
+            model=state.get("selected_model"),
+            retrieved_context=state.get("retrieved_context"),
+            analytical_intent=state.get("analytical_intent"),
+            governing_metrics=state.get("governing_metrics"),
+        )
+    except OllamaUnavailableError as exc:
+        logger.warning(
+            "[build_analytical_plan] LLM call failed, falling back to free-text planning: %s", exc
+        )
+        return {"analytical_plan": None, "analytical_plan_violations": None, "status": "generating"}
+
+    if raw_plan is None:
+        logger.warning("[build_analytical_plan] model response was unparseable, falling back")
+        return {"analytical_plan": None, "analytical_plan_violations": None, "status": "generating"}
+
+    db_config = get_connection(settings, _selected_db_name(state))
+    result = validate_plan(
+        AnalyticalPlan.model_validate(raw_plan),
+        state.get("schema_tables", []),
+        state.get("governing_metrics"),
+        state.get("caller_roles", ()),
+        db_config.db_type,
+    )
+    if not result.is_valid:
+        violations = [v.model_dump(mode="json") for v in result.violations]
+        logger.warning(
+            "[build_analytical_plan] candidate plan failed validation, falling back: %s",
+            violations,
+        )
+        return {
+            "analytical_plan": None,
+            "analytical_plan_violations": violations,
+            "status": "generating",
+        }
+
+    plan_model = AnalyticalPlan.model_validate(raw_plan)
+    rendered_steps = render_plan_as_steps(plan_model)
+    logger.info(
+        "[build_analytical_plan] validated plan accepted: metrics=%d dimensions=%d filters=%d",
+        len(plan_model.metrics),
+        len(plan_model.dimensions),
+        len(plan_model.filters),
+    )
+    return {
+        "analytical_plan": raw_plan,
+        "analytical_plan_violations": None,
+        "query_plan": rendered_steps,
+        "status": "generating",
+    }
+
+
 @_timed_node("plan_query")
 def plan_query_node(state: AgentState) -> dict[str, Any]:
     """Produces an up-front, ordered plan for a question judged non-trivial.
 
-    Runs between `classify_analytical_intent` and `generate_sql` (see
-    `agent/graph.py`), but only makes an LLM call when
-    `Settings.enable_query_planning` is True AND at least one of:
-      - `state["complexity_signals"]` -- computed once by `agent.graph.
-        run_agent`, via `agent.complexity.detect_complexity_signals`, the
-        same signals that drive the adaptive retry budget
-        (`Settings.complex_query_max_retry_bonus`) -- is non-empty; or
-      - (Prompt 11, `11_ANALYTICAL_INTENT_CONTRACT.md`)
-        `state["analytical_intent"]` classifies this question as a kind
-        that itself implies planning (`agent.intent
-        .intent_implies_planning`) -- e.g. TREND/COMPARISON/RANKING/...,
-        or any intent with non-empty `ambiguity_flags`.
+    Runs between `build_analytical_plan` and `generate_sql` (see
+    `agent/graph.py`), but only makes an LLM call when the shared
+    `_planning_gate` fires (`Settings.enable_query_planning` is True AND
+    at least one of `state["complexity_signals"]` is non-empty or
+    `state["analytical_intent"]` implies planning -- see `agent.intent
+    .intent_implies_planning`) **AND** `state["analytical_plan"]` is still
+    `None` -- i.e. `build_analytical_plan_node` (Prompt 12,
+    `12_ANALYTICAL_PLANNING_CONTRACT.md`) didn't already produce a
+    validated structured plan for this exact question. This is the
+    "preserve direct Text-to-SQL fallback" requirement in practice: this
+    node's own logic is completely unmodified from its pre-Prompt-12
+    shape, it just no longer redundantly re-plans (a second LLM call for
+    the same purpose) when a *better*, deterministically-verified plan
+    already exists.
 
     An ordinary question (the overwhelming common case) matches no
     complexity signal and no intent that implies planning, and skips the
-    LLM call entirely: `state["query_plan"]` stays None and every
-    downstream node behaves exactly as it did before this node existed --
-    zero latency/cost impact on the common path. When `analytical_intent`
-    is `None` (classification disabled, unreachable, or unparseable),
-    this gate reduces to exactly `complexity_signals` alone -- the
-    pre-Prompt-11 behavior, preserved by construction, not convention.
+    LLM call entirely: `state["query_plan"]` stays None (unless
+    `build_analytical_plan_node` already set it from a validated plan) and
+    every downstream node behaves exactly as it did before this node
+    existed -- zero latency/cost impact on the common path. When
+    `analytical_intent` is `None` (classification disabled, unreachable,
+    or unparseable), this gate reduces to exactly `complexity_signals`
+    alone -- the pre-Prompt-11 behavior, preserved by construction, not
+    convention.
 
     Fails open on any planning failure -- an unreachable Ollama server, or a
     response `agent.llm_client._parse_plan_response` couldn't parse as a
@@ -808,12 +942,14 @@ def plan_query_node(state: AgentState) -> dict[str, Any]:
     `agent.llm_client._build_plan_intent_block`.
     """
     settings = get_settings()
-    complexity_signals = state.get("complexity_signals") or []
-    analytical_intent = state.get("analytical_intent")
-    intent_triggers_planning = analytical_intent is not None and intent_implies_planning(
-        analytical_intent
-    )
-    if not settings.enable_query_planning or not (complexity_signals or intent_triggers_planning):
+    should_plan, complexity_signals, intent_triggers_planning = _planning_gate(state, settings)
+    if state.get("analytical_plan"):
+        logger.info(
+            "[plan_query] skipped (a validated structured analytical_plan already exists "
+            "for this question)"
+        )
+        return {"status": "generating"}
+    if not should_plan:
         logger.info(
             "[plan_query] skipped (enable_query_planning=%s complexity_signals=%s "
             "intent_triggers_planning=%s)",
@@ -832,7 +968,7 @@ def plan_query_node(state: AgentState) -> dict[str, Any]:
             settings,
             model=state.get("selected_model"),
             retrieved_context=state.get("retrieved_context"),
-            analytical_intent=analytical_intent,
+            analytical_intent=state.get("analytical_intent"),
         )
     except OllamaUnavailableError as exc:
         logger.warning("[plan_query] LLM call failed, proceeding without a plan: %s", exc)
@@ -929,6 +1065,7 @@ def generate_sql_node(state: AgentState) -> dict[str, Any]:
             golden_examples=state.get("golden_examples"),
             retrieved_context=state.get("retrieved_context"),
             governing_metrics=state.get("governing_metrics"),
+            analytical_plan=state.get("analytical_plan"),
             model=state.get("selected_model"),
         )
     except OffTopicQuestionError as exc:

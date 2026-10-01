@@ -17,12 +17,14 @@ not a test fixture) -- validate_sql_node's row-limit rendering
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any, cast
 
 import pytest
 from sqlalchemy.exc import SQLAlchemyError
 
 from agent.exceptions import OllamaUnavailableError, SchemaRetrievalError
 from agent.nodes import (
+    build_analytical_plan_node,
     classify_analytical_intent_node,
     classify_followup_node,
     estimate_query_cost_node,
@@ -447,7 +449,196 @@ class TestClassifyAnalyticalIntentNode:
         assert result["status"] == "generating"
 
 
+_PLAN_NODE_SCHEMA_TABLES: list[TableSchema] = [
+    TableSchema(
+        table_name="Sales",
+        ddl=(
+            "CREATE TABLE Sales (\n"
+            "    SalesId INT PRIMARY KEY,\n"
+            "    Amount DECIMAL NOT NULL,\n"
+            "    OrderDate DATETIME NOT NULL,\n"
+            "    CustomerKey INT NOT NULL,\n"
+            "    FOREIGN KEY (CustomerKey) REFERENCES Customer (CustomerKey)\n"
+            ");"
+        ),
+        similarity_score=1.0,
+    ),
+    TableSchema(
+        table_name="Customer",
+        ddl=(
+            "CREATE TABLE Customer (\n"
+            "    CustomerKey INT PRIMARY KEY,\n"
+            "    Region NVARCHAR(50) NOT NULL\n"
+            ");"
+        ),
+        similarity_score=1.0,
+    ),
+]
+
+_VALID_RAW_PLAN = {
+    "metrics": [{"name": "revenue", "table": "Sales", "column": "Amount", "aggregation": "sum"}],
+    "dimensions": [{"name": "region", "table": "Customer", "column": "Region"}],
+}
+
+_INVALID_RAW_PLAN = {
+    "metrics": [
+        {"name": "revenue", "table": "Sales", "column": "NotAColumn", "aggregation": "sum"}
+    ],
+}
+
+
+class TestBuildAnalyticalPlanNode:
+    def _state(self, **overrides: Any) -> AgentState:
+        base: dict[str, Any] = {
+            "question": "What is our revenue by region?",
+            "schema_context_text": "CREATE TABLE Sales (...)",
+            "schema_tables": _PLAN_NODE_SCHEMA_TABLES,
+            "selected_database": "default",
+            "complexity_signals": ["top_n_per_group"],
+            "caller_roles": (),
+            "governing_metrics": [],
+        }
+        base.update(overrides)
+        return cast(AgentState, base)
+
+    def test_skips_llm_call_when_no_complexity_signals_or_planning_intent(self, monkeypatch):
+        def _fail(*args, **kwargs):
+            raise AssertionError("should not call the LLM for a simple question")
+
+        monkeypatch.setattr("agent.nodes.generate_analytical_plan_from_llm", _fail)
+
+        result = build_analytical_plan_node(self._state(complexity_signals=[]))
+
+        assert result["analytical_plan"] is None
+        assert result["analytical_plan_violations"] is None
+        assert result["status"] == "generating"
+
+    def test_skips_llm_call_when_analytical_planning_disabled(self, monkeypatch, _mock_settings):
+        monkeypatch.setattr(
+            "agent.nodes.get_settings",
+            lambda: Settings(**{**_mock_settings.__dict__, "enable_analytical_planning": False}),
+        )
+
+        def _fail(*args, **kwargs):
+            raise AssertionError("should not call the LLM when enable_analytical_planning=False")
+
+        monkeypatch.setattr("agent.nodes.generate_analytical_plan_from_llm", _fail)
+
+        result = build_analytical_plan_node(self._state())
+
+        assert result["analytical_plan"] is None
+        assert result["status"] == "generating"
+
+    def test_validated_plan_is_stored_and_rendered_into_query_plan(self, monkeypatch):
+        monkeypatch.setattr(
+            "agent.nodes.generate_analytical_plan_from_llm", lambda *a, **k: dict(_VALID_RAW_PLAN)
+        )
+
+        result = build_analytical_plan_node(self._state())
+
+        assert result["analytical_plan"] is not None
+        assert result["analytical_plan"]["metrics"][0]["name"] == "revenue"
+        assert result["analytical_plan_violations"] is None
+        assert result["query_plan"]  # rendered steps, non-empty
+        assert any("Sales.Amount" in step for step in result["query_plan"])
+        assert result["status"] == "generating"
+
+    def test_plan_that_fails_deterministic_validation_falls_back_to_none(self, monkeypatch):
+        """The literal 'preserve direct Text-to-SQL fallback' requirement:
+        a syntactically fine but deterministically-invalid plan (an
+        unknown column here) is discarded in full, never partially
+        trusted."""
+        monkeypatch.setattr(
+            "agent.nodes.generate_analytical_plan_from_llm", lambda *a, **k: dict(_INVALID_RAW_PLAN)
+        )
+
+        result = build_analytical_plan_node(self._state())
+
+        assert result["analytical_plan"] is None
+        assert result["analytical_plan_violations"]
+        assert result["analytical_plan_violations"][0]["code"] == "unknown_column"
+        assert "query_plan" not in result
+        assert result["status"] == "generating"
+
+    def test_invalid_plan_falls_back_and_plan_query_node_then_runs_normally(self, monkeypatch):
+        """End-to-end proof of the three-tier fallback's middle tier: when
+        build_analytical_plan_node discards an invalid plan,
+        plan_query_node (fed the resulting state) runs exactly as it
+        would have before Prompt 12 existed."""
+        monkeypatch.setattr(
+            "agent.nodes.generate_analytical_plan_from_llm", lambda *a, **k: dict(_INVALID_RAW_PLAN)
+        )
+        first_result = build_analytical_plan_node(self._state())
+
+        monkeypatch.setattr(
+            "agent.nodes.generate_query_plan_from_llm", lambda *a, **k: ["Free-text fallback step"]
+        )
+        next_state = self._state()
+        next_state.update(first_result)
+        second_result = plan_query_node(next_state)
+
+        assert second_result["query_plan"] == ["Free-text fallback step"]
+
+    def test_fails_open_on_unreachable_ollama(self, monkeypatch):
+        def _raise(*args, **kwargs):
+            raise OllamaUnavailableError("connection refused")
+
+        monkeypatch.setattr("agent.nodes.generate_analytical_plan_from_llm", _raise)
+
+        result = build_analytical_plan_node(self._state())
+
+        assert result["analytical_plan"] is None
+        assert result["status"] == "generating"
+
+    def test_fails_open_on_unparseable_response(self, monkeypatch):
+        monkeypatch.setattr("agent.nodes.generate_analytical_plan_from_llm", lambda *a, **k: None)
+
+        result = build_analytical_plan_node(self._state())
+
+        assert result["analytical_plan"] is None
+        assert result["status"] == "generating"
+
+    def test_intent_alone_triggers_planning_with_zero_complexity_signals(self, monkeypatch):
+        monkeypatch.setattr(
+            "agent.nodes.generate_analytical_plan_from_llm", lambda *a, **k: dict(_VALID_RAW_PLAN)
+        )
+
+        state = self._state(
+            complexity_signals=[],
+            analytical_intent={"intent": "trend", "confidence": 0.9, "ambiguity_flags": []},
+        )
+        result = build_analytical_plan_node(state)
+
+        assert result["analytical_plan"] is not None
+
+
 class TestPlanQueryNode:
+    def test_skips_when_a_validated_analytical_plan_already_exists(self, monkeypatch):
+        """Prompt 12's own regression test: `build_analytical_plan_node`
+        already produced a validated structured plan for this question --
+        plan_query_node must not make a second, redundant free-text
+        planning LLM call."""
+
+        def _fail(*args, **kwargs):
+            raise AssertionError(
+                "should not call the free-text planner when a validated "
+                "analytical_plan already exists"
+            )
+
+        monkeypatch.setattr("agent.nodes.generate_query_plan_from_llm", _fail)
+
+        state: AgentState = {
+            "question": "top 3 products per region",
+            "schema_context_text": "CREATE TABLE sales (...)",
+            "complexity_signals": ["top_n_per_group"],
+            "analytical_plan": dict(_VALID_RAW_PLAN),
+            "query_plan": ["Compute revenue", "Group by region"],
+        }
+        result = plan_query_node(state)
+
+        assert result["status"] == "generating"
+        assert "query_plan" not in result  # pass-through: the existing value is left alone
+
     def test_skips_llm_call_when_no_complexity_signals(self, monkeypatch):
         """The overwhelming common case: a plain question makes zero
         planning calls, regardless of enable_query_planning."""

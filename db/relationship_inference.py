@@ -95,7 +95,13 @@ class InferredRelationship:
     truth_level: DataTruthLevel = DataTruthLevel.AI_INFERENCE
 
 
-def _type_family(type_str: str) -> str:
+def type_family(type_str: str) -> str:
+    """Classifies a column type string into a coarse family (`"integer"`,
+    `"text"`, `"decimal"`, `"datetime"`, `"boolean"`, `"uuid"`, or
+    `"other"`) -- public so `agent.plan_validator.validate_plan` (Prompt
+    12, `12_ANALYTICAL_PLANNING_CONTRACT.md`) can reuse the identical
+    classification this module already uses for structural FK-candidate
+    type-compatibility checking, rather than a second, drifting copy."""
     upper = type_str.upper()
     for family, keywords in _TYPE_FAMILY_KEYWORDS.items():
         if any(keyword in upper for keyword in keywords):
@@ -241,8 +247,8 @@ def _build_candidate(
         return None
 
     target_column = next(c for c in target_table.columns if c.name == target_column_name)
-    source_family = _type_family(source_column.type)
-    target_family = _type_family(target_column.type)
+    source_family = type_family(source_column.type)
+    target_family = type_family(target_column.type)
     if source_family == "other" or source_family != target_family:
         # Incompatible types -- a hard rejection, not a lower score: an FK
         # between mismatched type families couldn't work in practice.

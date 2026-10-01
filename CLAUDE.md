@@ -584,14 +584,16 @@ below, and `docs/MULTI_SOURCE_GUIDE.md` for how to configure each source.
 ## Key design decisions
 
 ### Self-correcting retry loop (LangGraph)
-The full graph (`agent/graph.py`) is fourteen nodes (as of Prompt 11,
-`11_ANALYTICAL_INTENT_CONTRACT.md` — previously twelve, before Prompt
-10's `review_metric_conformance` and Prompt 11's `classify_analytical_intent`):
+The full graph (`agent/graph.py`) is fifteen nodes (as of Prompt 12,
+`12_ANALYTICAL_PLANNING_CONTRACT.md` — previously fourteen, before that
+prompt's `build_analytical_plan`; before it, twelve, before Prompt 10's
+`review_metric_conformance` and Prompt 11's `classify_analytical_intent`):
 `sanitize_input → classify_followup → retrieve_schema →
 retrieve_golden_examples → retrieve_business_context →
-classify_analytical_intent → plan_query → generate_sql → review_sql →
-review_metric_conformance → validate_sql → estimate_cost → execute_sql →
-generate_insight`. On a review, validation, cost-estimate, or execution
+classify_analytical_intent → build_analytical_plan → plan_query →
+generate_sql → review_sql → review_metric_conformance → validate_sql →
+estimate_cost → execute_sql → generate_insight`. On a review, validation,
+cost-estimate, or execution
 failure, a conditional edge routes back to `generate_sql` (or, for a
 "missing reference" execution error, back to `retrieve_schema`) with the
 error message appended to state history, so the LLM sees what went wrong
@@ -1953,6 +1955,94 @@ structural "never short-circuits/never bypasses authorization" proof,
 and why no new live-verified TREND/COMPARISON benchmark case was added
 in this pass (a disclosed, environment-specific DB-access limitation,
 not an oversight).
+
+### Analytical planning layer (Prompt 12)
+`agent/analytical_plan.py` (new) is a typed, resolvable-to-real-schema
+`AnalyticalPlan` — metric(s)/dimensions/filters/time range/grain/
+comparison/ranking/sort/limit/required database capabilities — sitting
+between Prompt 11's intent *classification* and free-text SQL. The real
+gap this closes: the pre-existing free-text `query_plan: list[str]`
+(`agent.nodes.plan_query_node`) was only ever checked by a *second LLM
+call* (`review_sql_node`) — nothing deterministically verified a plan's
+own table/column/relationship/authorization/capability claims, the exact
+thing `agent.sql_validator.validate_sql` already does for generated SQL
+one layer later. New `agent.plan_validator.validate_plan` is that
+deterministic re-verification — a pure function (no I/O, no LLM call)
+checking metric/dimension existence against the already-retrieved
+schema, FK-declared relationship paths between the plan's own tables,
+`config.sensitive_columns`-classified restricted columns against caller
+permission (reusing `agent.authz.has_role_permission`, the identical
+check `validate_sql_node` already applies to generated SQL), time-range
+column type feasibility, and target-`DB_TYPE` capability support for a
+small, honestly-scoped set of SQL feature tags (window functions, CTEs,
+`PERCENTILE_CONT`, `STRING_AGG`, `ROLLUP`, `LAG`/`LEAD`).
+
+New `agent.nodes.build_analytical_plan_node`, wired
+`classify_analytical_intent → build_analytical_plan → plan_query` (two
+straight edges, no conditional routing), gated by the exact same
+trigger `plan_query_node` already used (`Settings.enable_query_planning`
+AND (`complexity_signals` or `intent_implies_planning`), now factored
+into a shared `_planning_gate` helper so the two nodes can never drift)
+plus `Settings.enable_analytical_planning` (default `True`). **This is
+the first tier of a three-tier fallback**: (1) a validated structured
+plan — only when the LLM call succeeds, the response parses, AND
+`validate_plan` finds zero violations; (2) `plan_query_node`'s existing
+free-text plan — runs completely unmodified whenever tier 1 leaves
+`state["analytical_plan"] = None`, **for any reason**, including a
+syntactically-fine-but-deterministically-invalid plan (discarded in
+full, never partially trusted — this is what makes "preserve direct
+Text-to-SQL fallback" true by construction, not convention); (3) direct
+generation, when neither planning node ever fires. On success, the
+validated plan is also rendered into `state["query_plan"]`
+(`agent.analytical_plan.render_plan_as_steps`) so `review_sql_node`'s
+existing plan-conformance LLM check keeps working unmodified against it
+— no second review node was added (master rule 3).
+
+**Invariants that must not regress:**
+- **An invalid plan is never partially trusted.** `validate_plan`
+  returns every violation found (not just the first); the moment
+  `is_valid` is `False`, the whole plan is discarded —
+  `state["analytical_plan"]` stays `None`, never a plan with "the valid
+  parts kept." Verified directly
+  (`tests/test_agent_nodes.py::TestBuildAnalyticalPlanNode
+  ::test_plan_that_fails_deterministic_validation_falls_back_to_none`
+  and `::test_invalid_plan_falls_back_and_plan_query_node_then_runs_normally`,
+  the latter proving tier 2 then runs exactly as it would have before
+  this prompt existed).
+- **Never short-circuits the graph.** Same structural proof pattern as
+  Prompt 11's own: `build_analytical_plan` has exactly one outgoing edge
+  (a straight `add_edge` to `plan_query`, never a conditional routing
+  table with an `END` branch) — verified directly
+  (`tests/test_sql_agent_integration.py
+  ::test_build_analytical_plan_has_no_conditional_routing`).
+- **Does not weaken or duplicate the real SQL-safety gate.**
+  `agent.sql_validator.validate_sql`'s safety-violation check and
+  `validate_sql_node`'s own restricted-column gate are completely
+  unmodified by this prompt and still run on every generated SQL
+  statement regardless of whether a plan was ever built, validated, or
+  rejected — `validate_plan` is strictly an earlier, additional,
+  non-load-bearing-for-security layer (master rule 5: never let an LLM
+  bypass a deterministic security control).
+- **Relationship-path checking is bounded, not a full graph search.**
+  Only `FOREIGN KEY (...) REFERENCES ...` edges parsed out of the
+  already-retrieved schema tables' own DDL text
+  (`db.schema_introspection.extract_ddl_foreign_key_targets`) are
+  considered — never a cross-schema search beyond what's already
+  retrieved, and never one of `db/relationship_inference.py`'s own
+  lower-confidence inferred candidates. A real join path through a table
+  that didn't make the top-k retrieved set is rejected
+  (`no_relationship_path`), a disclosed, bounded scope matching this
+  codebase's existing "the retrieved schema is generation's own sandbox"
+  posture.
+- **`plan_query_node`'s own logic is byte-identical to its pre-Prompt-12
+  shape** apart from one new early-return (skip, pass-through, when
+  `state["analytical_plan"]` already holds a validated plan) — verified
+  by the full pre-existing `TestPlanQueryNode` suite passing unchanged.
+
+**Read [`12_ANALYTICAL_PLANNING_CONTRACT.md`](12_ANALYTICAL_PLANNING_CONTRACT.md)**
+for the full inspection findings, every new module's design, the
+61-test testing summary, and the security/tenant-isolation/performance
+review.
 
 ## How to run
 

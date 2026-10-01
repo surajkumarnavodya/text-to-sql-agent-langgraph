@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import re
 from dataclasses import dataclass, replace
 
 from sqlalchemy import Engine, inspect
@@ -220,6 +221,70 @@ def render_ddl(
     lines.append(",\n".join(column_lines))
     lines.append(");")
     return "\n".join(lines)
+
+
+# One-column-per-line, 4-space-indented -- matches `render_ddl`'s own
+# rendering exactly. `FOREIGN KEY (...)`/`PRIMARY KEY (...)` table-level
+# constraint lines are skipped explicitly below rather than relying on
+# indentation alone, since both would otherwise match this same pattern as
+# a plausible-looking "column name" ("FOREIGN"/"PRIMARY").
+_DDL_COLUMN_LINE_RE = re.compile(r"^\s{4}(\w+)\s", re.MULTILINE)
+
+# `    FOREIGN KEY (col1, col2) REFERENCES TableName (col1, col2)` -- the
+# exact shape `render_ddl` emits above. Only the referred table name is
+# captured; the referenced/constrained column lists aren't needed by any
+# current caller (relationship-*path* existence, not column-level join
+# correctness, which `agent.sql_validator` already checks on the real
+# generated SQL).
+_DDL_FOREIGN_KEY_RE = re.compile(
+    r"FOREIGN KEY\s*\([^)]*\)\s*REFERENCES\s+(\S+)\s*\(", re.IGNORECASE
+)
+
+
+def extract_ddl_column_names(ddl: str) -> list[str]:
+    """Pulls column names out of one table's `render_ddl`-rendered DDL text.
+
+    Shared by `agent.nodes._suggest_correct_column` (a "did you mean"
+    suggestion when generated SQL references a missing column) and
+    `agent.plan_validator.validate_plan` (Prompt 12,
+    `12_ANALYTICAL_PLANNING_CONTRACT.md` -- checking that a structured
+    plan's metric/dimension/filter column references actually exist) --
+    one implementation, not two, per master-contract rule 2/3. Relies only
+    on `render_ddl`'s consistent one-column-per-line rendering; skips the
+    `CREATE TABLE`/closing-paren bookend lines and `FOREIGN KEY (...)`/
+    `PRIMARY KEY (...)` table-level constraint lines.
+    """
+    names = []
+    for line in ddl.splitlines():
+        stripped = line.strip().rstrip(",")
+        if not stripped or stripped.startswith(
+            ("CREATE TABLE", "CREATE VIEW", "FOREIGN KEY", "PRIMARY KEY", ")")
+        ):
+            continue
+        first_token = stripped.split(None, 1)[0]
+        if first_token.isidentifier():
+            names.append(first_token)
+    return names
+
+
+def extract_ddl_foreign_key_targets(ddl: str) -> list[str]:
+    """Pulls the *referred table* name out of every `FOREIGN KEY (...)
+    REFERENCES <table> (...)` line in one table's `render_ddl`-rendered DDL
+    text -- used by `agent.plan_validator.validate_plan` (Prompt 12) to
+    build a bounded join-path graph over the tables already retrieved for
+    this question.
+
+    Deliberately scoped to table names only (not the constrained/referred
+    column lists) -- relationship-*path* existence, not column-level join
+    correctness, which `agent.sql_validator` already checks on the real
+    generated SQL. A disclosed, bounded scope: this only sees FK edges
+    declared in DDL text already shown to the LLM for this question, never
+    a full cross-schema graph search or an inferred (non-FK) candidate
+    relationship (see `db/relationship_inference.py`) -- those are a
+    different, lower-confidence kind of claim this deterministic check
+    deliberately does not lean on.
+    """
+    return [match.group(1) for match in _DDL_FOREIGN_KEY_RE.finditer(ddl)]
 
 
 def _build_column_info(col: ReflectedColumn) -> ColumnInfo:

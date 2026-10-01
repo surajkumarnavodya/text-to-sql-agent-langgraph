@@ -174,18 +174,24 @@ class TestGraphStructure:
     def test_retrieve_business_context_is_wired_between_golden_examples_and_plan_query(self):
         """Prompt 11 (`11_ANALYTICAL_INTENT_CONTRACT.md`) inserted
         `classify_analytical_intent` between `retrieve_business_context` and
-        `plan_query` -- the two no longer connect directly, but the overall
-        ordering (business context resolved before planning) still holds.
+        `plan_query`; Prompt 12 (`12_ANALYTICAL_PLANNING_CONTRACT.md`)
+        further inserted `build_analytical_plan` between
+        `classify_analytical_intent` and `plan_query` -- none of these
+        connect directly to one another anymore, but the overall ordering
+        (business context -> intent -> structured plan -> free-text plan)
+        still holds.
         """
         graph = build_graph()
         node_names = set(graph.get_graph().nodes.keys())
         assert "retrieve_business_context" in node_names
         assert "classify_analytical_intent" in node_names
+        assert "build_analytical_plan" in node_names
 
         edges = {(edge.source, edge.target) for edge in graph.get_graph().edges}
         assert ("retrieve_golden_examples", "retrieve_business_context") in edges
         assert ("retrieve_business_context", "classify_analytical_intent") in edges
-        assert ("classify_analytical_intent", "plan_query") in edges
+        assert ("classify_analytical_intent", "build_analytical_plan") in edges
+        assert ("build_analytical_plan", "plan_query") in edges
 
     def test_existing_nodes_are_all_still_present(self):
         """Adding the new node must never remove an existing one."""
@@ -196,6 +202,7 @@ class TestGraphStructure:
             "classify_followup",
             "retrieve_schema",
             "retrieve_golden_examples",
+            "build_analytical_plan",
             "plan_query",
             "generate_sql",
             "review_sql",
@@ -211,7 +218,7 @@ class TestGraphStructure:
         circuit the graph the way `classify_followup_node`'s own
         conversational "ambiguous" classification does -- structurally
         proven here: `classify_analytical_intent` has exactly one outgoing
-        edge (a straight `add_edge` to `plan_query`, never an
+        edge (a straight `add_edge` to `build_analytical_plan`, never an
         `add_conditional_edges` routing table with an `END` branch),
         unlike `classify_followup`, which does have one.
         """
@@ -220,7 +227,7 @@ class TestGraphStructure:
 
         intent_edges = [e for e in edges if e.source == "classify_analytical_intent"]
         assert len(intent_edges) == 1
-        assert intent_edges[0].target == "plan_query"
+        assert intent_edges[0].target == "build_analytical_plan"
         assert intent_edges[0].conditional is False
 
         followup_edges = [e for e in edges if e.source == "classify_followup"]
@@ -229,3 +236,19 @@ class TestGraphStructure:
             "(possibly-END) routing -- this test only asserts "
             "classify_analytical_intent does not share that shape."
         )
+
+    def test_build_analytical_plan_has_no_conditional_routing(self):
+        """Prompt 12 (`12_ANALYTICAL_PLANNING_CONTRACT.md`): a rejected
+        (invalid) structured plan must fall back to free-text planning,
+        never short-circuit the graph -- structurally proven the same way
+        `classify_analytical_intent`'s own equivalent test is: exactly one
+        outgoing edge, a straight `add_edge` to `plan_query`, never a
+        conditional routing table with an `END` branch.
+        """
+        graph = build_graph()
+        edges = list(graph.get_graph().edges)
+
+        plan_edges = [e for e in edges if e.source == "build_analytical_plan"]
+        assert len(plan_edges) == 1
+        assert plan_edges[0].target == "plan_query"
+        assert plan_edges[0].conditional is False
