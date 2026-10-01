@@ -90,29 +90,28 @@ jobs:
         # merging in only genuinely new findings -- but it also always
         # rewrites FILE's own `generated_at` timestamp, so a naive `git
         # diff --exit-code .secrets.baseline` would fail on *every* run
-        # even with zero new secrets (verified locally this pass -- the
-        # first version of this step had exactly that bug). The Python
-        # snippet below compares both baselines with `generated_at`
-        # stripped, so this step only fails on an actual new finding
-        # (verified locally too: a planted fake PEM private key in a new
-        # file was correctly caught by this exact comparison).
+        # even with zero new secrets. The comparison used to live here as
+        # an inline `python -c "..."` with `generated_at` stripped from
+        # both sides -- moved to scripts/check_secrets_baseline.py (2026
+        # security remediation pass) after finding a real, deterministic
+        # bug in that inline form: its own remediation message named
+        # `` `detect-secrets audit .secrets.baseline` `` in backticks,
+        # which bash -- not Python -- treats as unconditional command
+        # substitution inside a double-quoted string, regardless of the
+        # Python-level `if` it textually sat inside. In practice this ran
+        # that interactive, TTY-expecting `audit` command as a subshell on
+        # every single invocation of this step and spliced its own output
+        # into the middle of the Python source, corrupting it into a
+        # syntax error -- reproduced locally via `bash -x`, which shows
+        # the substitution firing. See that script's own docstring for the
+        # full writeup. A plain `.py` file has no shell-quoting class of
+        # bug to begin with, which is why this isn't just an escaped-
+        # backtick patch in place.
         run: |
           pip install detect-secrets
           cp .secrets.baseline /tmp/baseline_before.json
           detect-secrets scan $(git ls-files) --baseline .secrets.baseline
-          python -c "
-          import json, sys
-          with open('/tmp/baseline_before.json') as f:
-              before = json.load(f)
-          with open('.secrets.baseline') as f:
-              after = json.load(f)
-          before.pop('generated_at', None)
-          after.pop('generated_at', None)
-          if before != after:
-              print('New, un-baselined finding(s) detected -- review with '
-                    '`detect-secrets audit .secrets.baseline` and commit the result.')
-              sys.exit(1)
-          "
+          python scripts/check_secrets_baseline.py /tmp/baseline_before.json
 
   test:
     runs-on: ubuntu-latest
