@@ -795,6 +795,7 @@ def _ask_response_from_state(
         retry_count=state.get("retry_count", 0),
         attempt_history=_attempt_records_out(state),
         insight=_redact_text(state.get("insight"), settings),
+        analytical_result=state.get("analytical_result"),
         cost_notice=state.get("cost_notice"),
         low_confidence_notice=_redact_text(state.get("low_confidence_notice"), settings),
         rejection_reason=state.get("rejection_reason"),

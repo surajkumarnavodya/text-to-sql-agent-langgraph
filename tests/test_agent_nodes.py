@@ -27,6 +27,7 @@ from agent.nodes import (
     build_analytical_plan_node,
     classify_analytical_intent_node,
     classify_followup_node,
+    compute_analytics_node,
     estimate_query_cost_node,
     execute_sql_node,
     generate_insight_node,
@@ -1819,6 +1820,95 @@ class TestExecuteSqlNode:
 
         assert result["status"] == "succeeded"
         assert result["low_confidence_notice"] is None
+
+
+class TestComputeAnalyticsNode:
+    """Prompt 13 (`13_ANALYTICAL_RESULT_ENGINE_CONTRACT.md`)."""
+
+    def test_skips_computation_when_disabled(self, monkeypatch, _mock_settings):
+        monkeypatch.setattr(
+            "agent.nodes.get_settings",
+            lambda: Settings(**{**_mock_settings.__dict__, "enable_analytics_engine": False}),
+        )
+
+        def _fail(*args, **kwargs):
+            raise AssertionError("should not compute anything when enable_analytics_engine=False")
+
+        monkeypatch.setattr("agent.nodes.compute_analytics_result", _fail)
+
+        state: AgentState = {
+            "result_columns": ["Category", "Revenue"],
+            "result_rows": [("Bikes", 100.0), ("Accessories", 50.0)],
+        }
+        result = compute_analytics_node(state)
+
+        assert result["analytical_result"] is None
+
+    def test_stores_a_real_result_on_a_successful_execution(self):
+        state: AgentState = {
+            "result_columns": ["Category", "Revenue"],
+            "result_rows": [("Bikes", 100.0), ("Accessories", 50.0), ("Clothing", 60.0)],
+        }
+
+        result = compute_analytics_node(state)
+
+        assert result["analytical_result"] is not None
+        assert result["analytical_result"]["shape"] == "categorical_aggregate"
+        assert result["analytical_result"]["row_count"] == 3
+        assert result["analytical_result"]["engine_version"]
+        assert len(result["analytical_result"]["findings"]) > 0
+
+    def test_empty_result_still_produces_a_result_not_a_crash(self):
+        state: AgentState = {"result_columns": ["n"], "result_rows": []}
+
+        result = compute_analytics_node(state)
+
+        assert result["analytical_result"]["shape"] == "empty"
+
+    def test_fails_open_on_unexpected_computation_error(self, monkeypatch):
+        def _raise(*args, **kwargs):
+            raise RuntimeError("unexpected boom")
+
+        monkeypatch.setattr("agent.nodes.compute_analytics_result", _raise)
+
+        state: AgentState = {
+            "result_columns": ["Category", "Revenue"],
+            "result_rows": [("Bikes", 100.0)],
+        }
+        result = compute_analytics_node(state)
+
+        assert result["analytical_result"] is None
+
+    def test_missing_result_fields_default_to_empty_without_crashing(self):
+        """A defensive case -- state with no result_columns/result_rows at
+        all (shouldn't happen given graph wiring, but this node must
+        still fail open rather than raise a KeyError)."""
+        result = compute_analytics_node({})
+        assert result["analytical_result"]["shape"] == "empty"
+
+    def test_runs_before_generate_insight_without_interfering_with_it(self, monkeypatch):
+        """Structural proof at the function-call level (the real graph
+        wiring is proven separately in tests/test_sql_agent_integration.py):
+        chaining compute_analytics_node's output into generate_insight_node
+        works exactly as it would pre-Prompt-13."""
+        monkeypatch.setattr(
+            "agent.nodes.generate_insight_from_llm", lambda *a, **k: "A short insight."
+        )
+        monkeypatch.setattr("agent.nodes.is_insight_grounded", lambda *a, **k: True)
+
+        state: AgentState = {
+            "question": "revenue by category",
+            "sql": "SELECT Category, SUM(Revenue) FROM t GROUP BY Category",
+            "result_columns": ["Category", "Revenue"],
+            "result_rows": [("Bikes", 100.0), ("Accessories", 50.0), ("Clothing", 60.0)],
+            "enable_insight": True,
+        }
+        analytics_update = compute_analytics_node(state)
+        state.update(analytics_update)
+        insight_update = generate_insight_node(state)
+
+        assert state["analytical_result"] is not None
+        assert insight_update["insight"] == "A short insight."
 
 
 class TestGenerateInsightNode:

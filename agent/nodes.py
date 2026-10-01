@@ -24,6 +24,7 @@ import time
 from collections.abc import Callable
 from typing import Any
 
+from analytics.engine import compute_analytics_result
 from retrieval.retriever import extract_governing_metrics, retrieve_business_context
 from sqlalchemy.exc import SQLAlchemyError
 
@@ -1813,6 +1814,59 @@ def execute_sql_node(state: AgentState) -> dict[str, Any]:
         "status": "succeeded",
         "low_confidence_notice": low_confidence_notice,
     }
+
+
+@_timed_node("compute_analytics")
+def compute_analytics_node(state: AgentState) -> dict[str, Any]:
+    """Computes the full deterministic statistical breakdown of a
+    successfully executed query result -- Prompt 13
+    (`13_ANALYTICAL_RESULT_ENGINE_CONTRACT.md`).
+
+    Only reachable from `execute_sql_node`'s success path, immediately
+    before `generate_insight` (see `agent/graph.py`) -- never runs on a
+    failed or needs-clarification run. Runs on **every** successful
+    execution when `Settings.enable_analytics_engine` is True (the
+    default) -- unlike `generate_insight_node` right after it, this has
+    no `enable_insight`-style gate: a pure, deterministic, zero-I/O
+    computation (no Ollama call, no extra query) has no narrative cost or
+    risk to skip on.
+
+    Delegates entirely to `analytics.engine.compute_analytics_result`
+    (this node owns none of the actual statistics) and stores the result
+    as a plain dict on `state["analytical_result"]`. Fails open on any
+    unexpected error -- logged, `state["analytical_result"]` stays
+    `None`, never a reason the question itself fails, the same posture
+    every other accuracy-aid node in this graph already takes.
+
+    **Deliberately does not feed `generate_insight_node`'s LLM prompt in
+    this pass** -- see `agent.state.AgentState.analytical_result`'s own
+    docstring for the full, disclosed reasoning (the live insight prompt
+    is benchmark-pinned). This node's output is computed, tested, and
+    surfaced (`AskResponse.analytical_result`) ahead of that separate
+    wiring decision.
+    """
+    settings = get_settings()
+    if not settings.enable_analytics_engine:
+        logger.info("[compute_analytics] skipped (enable_analytics_engine=False)")
+        return {"analytical_result": None}
+
+    columns = state.get("result_columns") or []
+    rows = state.get("result_rows") or []
+    try:
+        result = compute_analytics_result(columns, rows, settings)
+    except Exception as exc:  # noqa: BLE001 - an accuracy aid must never block the run
+        logger.warning(
+            "[compute_analytics] computation failed unexpectedly, proceeding without: %s", exc
+        )
+        return {"analytical_result": None}
+
+    logger.info(
+        "[compute_analytics] shape=%s findings=%d insufficient_data_reasons=%s",
+        result.shape,
+        len(result.findings),
+        result.insufficient_data_reasons,
+    )
+    return {"analytical_result": result.model_dump(mode="json")}
 
 
 @_timed_node("generate_insight")

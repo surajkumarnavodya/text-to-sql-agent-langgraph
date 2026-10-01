@@ -1,6 +1,6 @@
 """Wires the agent nodes into a compiled LangGraph state machine.
 
-    sanitize_input -> classify_followup -> retrieve_schema -> retrieve_golden_examples -> retrieve_business_context -> classify_analytical_intent -> build_analytical_plan -> plan_query -> generate_sql -+-> review_sql -+-> review_metric_conformance -+-> validate_sql -+-> estimate_cost -+-> execute_sql -+-> generate_insight -> END
+    sanitize_input -> classify_followup -> retrieve_schema -> retrieve_golden_examples -> retrieve_business_context -> classify_analytical_intent -> build_analytical_plan -> plan_query -> generate_sql -+-> review_sql -+-> review_metric_conformance -+-> validate_sql -+-> estimate_cost -+-> execute_sql -+-> compute_analytics -> generate_insight -> END
          |                    |                    ^                                                                  |               ^                              |                 ^                |                  ^                 |                |
          |                    |                    +----------------------------------(retry, up to max_retries)------+---------------+------------------------------+-----------------+---(retry, high    |               |
          |                    |                                                                                       |                                                                                    cost only)      +--(retry, only  |
@@ -154,6 +154,21 @@ limit from the question-submission one `api/main.py` enforces per client
 before `run_agent()` is even called; see `agent/rate_limit.py`'s docstring
 for why the retry loop specifically needs its own limiter.
 
+`compute_analytics` (between `execute_sql` and `generate_insight`, Prompt
+13, `13_ANALYTICAL_RESULT_ENGINE_CONTRACT.md`) is the Deterministic
+Analytical Result Engine: on every successful execution (gated only by
+`Settings.enable_analytics_engine`, no `enable_insight`-style skip, since
+this is a pure, zero-I/O computation with no narrative cost to gate on)
+it classifies the result's shape and computes the full statistic set
+`analytics.engine.compute_analytics_result` covers (row/null/distinct
+counts, min/max/mean/median/variance/stddev/percentiles, a full
+period-by-period growth series, a complete ranking, and both z-score and
+IQR outliers), storing it on `state["analytical_result"]`. Fails open on
+any unexpected error, the same posture every other accuracy-aid node
+here takes. Deliberately does **not** feed `generate_insight`'s own LLM
+prompt in this pass -- see `agent.nodes.compute_analytics_node`'s own
+docstring for the disclosed, benchmark-stability reason.
+
 `generate_insight` is the only node reachable from execute_sql's *success*
 path -- a failed, needs-clarification, or rejected run never generates one.
 It is a narrative layer only: see `agent.nodes.generate_insight_node` for
@@ -178,6 +193,7 @@ from agent.nodes import (
     build_analytical_plan_node,
     classify_analytical_intent_node,
     classify_followup_node,
+    compute_analytics_node,
     estimate_query_cost_node,
     execute_sql_node,
     generate_insight_node,
@@ -215,12 +231,12 @@ def build_graph():
     never on the compiled graph object itself -- so building it once and
     reusing it (the same `functools`-based singleton pattern already used
     for `config.settings.get_settings()` and `db.connection._cached_engine`)
-    is safe and avoids re-wiring all fifteen nodes on every single question.
+    is safe and avoids re-wiring all sixteen nodes on every single question.
     Graph *shape* never depends on `Settings` (`retrieve_golden_examples`/
     `classify_analytical_intent`/`build_analytical_plan`/`plan_query`/
-    `review_sql`/`review_metric_conformance` are pass-throughs, not
-    conditionally-omitted nodes, when their respective flag is off -- see
-    this module's docstring), so
+    `review_sql`/`review_metric_conformance`/`compute_analytics` are
+    pass-throughs, not conditionally-omitted nodes, when their respective
+    flag is off -- see this module's docstring), so
     there's no per-settings cache key to worry about; like every other
     process-lifetime singleton here, a config change that would matter
     takes a process restart.
@@ -244,6 +260,7 @@ def build_graph():
     graph.add_node("validate_sql", validate_sql_node)
     graph.add_node("estimate_cost", estimate_query_cost_node)
     graph.add_node("execute_sql", execute_sql_node)
+    graph.add_node("compute_analytics", compute_analytics_node)
     graph.add_node("generate_insight", generate_insight_node)
 
     graph.set_entry_point("sanitize_input")
@@ -320,12 +337,13 @@ def build_graph():
         "execute_sql",
         route_after_execution,
         {
-            "succeeded": "generate_insight",
+            "succeeded": "compute_analytics",
             "generate_sql": "generate_sql",
             "retrieve_schema": "retrieve_schema",
             "failed": END,
         },
     )
+    graph.add_edge("compute_analytics", "generate_insight")
     graph.add_edge("generate_insight", END)
 
     return graph.compile()
@@ -446,6 +464,7 @@ def run_agent(
         "cost_estimate": None,
         "cost_notice": None,
         "low_confidence_notice": None,
+        "analytical_result": None,
         "retry_count": 0,
         "max_retries": effective_max_retries,
         "complexity_signals": complexity_signals,
@@ -465,7 +484,7 @@ def run_agent(
     # generate_sql, review_sql, review_metric_conformance, validate_sql,
     # estimate_cost, execute_sql)
     # can exceed 25 total steps well before
-    # effective_max_retries is exhausted -- e.g. the ~14-step initial pass
+    # effective_max_retries is exhausted -- e.g. the ~15-step initial pass
     # plus just two such retries already exceeds that. When that happened,
     # LangGraph raised an uncaught GraphRecursionError instead of the
     # graph reaching its own intended terminal "failed" state, which

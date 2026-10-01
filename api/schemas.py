@@ -540,6 +540,20 @@ class AskResponse(BaseModel):
     retry_count: int = 0
     attempt_history: list[AttemptRecordOut] = Field(default_factory=list)
     insight: str | None = None
+    analytical_result: dict[str, Any] | None = Field(
+        default=None,
+        description=(
+            "The full deterministic statistical breakdown of the result "
+            "(analytics.models.AnalyticsResult.model_dump()'s shape -- row/null/distinct "
+            "counts, min/max/mean/median/variance/stddev/percentiles per column, a "
+            "period-by-period growth series, a ranking, and z-score/IQR outliers, all "
+            "DataTruthLevel.DATABASE_FACT) -- see agent.state.AgentState.analytical_result. "
+            "Not yet rendered by the chat UI or the insight narrative text; surfaced here "
+            "for a client that wants to build its own view on top of it. None when "
+            "Settings.enable_analytics_engine is off or the run didn't reach a successful "
+            "execution."
+        ),
+    )
     cost_notice: str | None = None
     low_confidence_notice: str | None = Field(
         default=None,

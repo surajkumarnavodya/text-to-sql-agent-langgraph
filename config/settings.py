@@ -852,6 +852,47 @@ class Settings(BaseSettings):
             mirroring the same reasoning (a structured plan is more
             verbose than a plain string-array plan, hence the larger
             default than `query_plan_max_tokens`'s).
+        enable_analytics_engine: Whether `agent.nodes
+            .compute_analytics_node` calls `analytics.engine
+            .compute_analytics_result` after a successful execution. True
+            by default -- unlike every other `enable_*` flag near it, this
+            one gates a pure, deterministic, zero-I/O computation (no
+            Ollama call), so there is no latency/cost reason to disable
+            it; it exists purely as an operator escape hatch. See
+            `13_ANALYTICAL_RESULT_ENGINE_CONTRACT.md`.
+        analytics_ranking_max_entries: Caps how many ranked entries
+            `analytics.engine.compute_analytics_result`'s ranking/
+            distribution finding includes for a high-cardinality
+            categorical/multidimensional result -- mirrors
+            `max_result_rows`'s own row-cap philosophy, applied to a
+            derived finding instead of the raw SQL result.
+        enable_anomaly_detection: Whether `analytics.engine
+            .compute_analytics_result` calls `analytics.anomaly
+            .detect_anomalies` for a TIME_SERIES result. True by default
+            -- a pure, deterministic, zero-I/O computation over a series
+            already computed, same posture as `enable_analytics_engine`.
+        anomaly_zscore_threshold: Population-stddev threshold the rolling
+            and (2+-occurrence) seasonal methods flag a point beyond.
+        anomaly_iqr_multiplier: The `k` in `[Q1 - k*IQR, Q3 + k*IQR]` the
+            whole-series IQR method fences against.
+        anomaly_percent_change_threshold: Point-over-point (and
+            single-occurrence seasonal) percent-change threshold.
+        anomaly_absolute_threshold: A flat delta threshold for the
+            `threshold` method -- `None` (off) by default, since there's
+            no safe generic default in an unknown metric's own unit;
+            an operator must opt in.
+        anomaly_rolling_window: How many prior points the rolling
+            z-score baseline uses.
+        anomaly_seasonal_period: The lag (e.g. `12` for year-over-year
+            monthly data) the seasonal method compares against -- `None`
+            (off) by default; evaluated only "where sufficient" (at
+            least one prior occurrence at that lag).
+        root_cause_min_contribution_percent: `analytics.root_cause
+            .investigate_root_cause`'s validation bar -- a dimension
+            value must explain at least this many percentage points of
+            the total change to be returned as a contributor, the
+            configurable half of "no root cause is stated without
+            supporting evidence."
         enable_golden_examples: Whether `agent.nodes
             .retrieve_golden_examples_node` looks up human-approved past
             (question, SQL) pairs (see `embeddings.golden_examples`) and
@@ -1544,6 +1585,63 @@ class Settings(BaseSettings):
     # fallback this flag is the first tier's switch for.
     enable_analytical_planning: bool = True
     analytical_plan_max_tokens: int = Field(default=400, gt=0)
+    # Prompt 13 (13_ANALYTICAL_RESULT_ENGINE_CONTRACT.md): gates
+    # agent.nodes.compute_analytics_node's call to
+    # analytics.engine.compute_analytics_result. Unlike every LLM-calling
+    # flag above, this one guards a pure, deterministic, zero-I/O
+    # computation (no Ollama call, no extra query) -- on by default for
+    # the same "operator escape hatch, not a risk flag" reason
+    # enable_metric_conformance_review's own comment gives, not because
+    # the computation itself is ever expensive. Runs on *every* successful
+    # execution when True (never gated by enable_insight -- deterministic
+    # calculation has no narrative cost/risk to skip on). False reproduces
+    # this node's pre-Prompt-13 non-existence exactly:
+    # state["analytical_result"] stays None and nothing downstream reads
+    # it yet (see agent.nodes.compute_analytics_node's own docstring).
+    enable_analytics_engine: bool = True
+    # Caps analytics.engine.compute_analytics_result's ranking/distribution
+    # output at this many entries (highest-value first) for a high-
+    # cardinality categorical/multidimensional result -- mirrors
+    # max_result_rows's own row-cap philosophy, applied to a derived
+    # finding instead of the raw SQL result.
+    analytics_ranking_max_entries: int = Field(default=50, gt=0)
+    # Prompt 14 (14_ANOMALY_ROOT_CAUSE_CONTRACT.md): gates
+    # analytics.engine.compute_analytics_result's call to
+    # analytics.anomaly.detect_anomalies for a TIME_SERIES result (over
+    # the same GrowthStat.points series already computed -- zero new
+    # query). Same "pure, deterministic, zero-I/O, operator escape hatch"
+    # posture as enable_analytics_engine right above. False reproduces
+    # this integration's pre-Prompt-14 non-existence exactly: no ANOMALY
+    # findings, nothing else in a TIME_SERIES result's output changes.
+    enable_anomaly_detection: bool = True
+    # The five anomaly-detection methods' own thresholds --
+    # analytics.anomaly.detect_anomalies evaluates whichever of these has
+    # enough history/configuration to run; see that module's own
+    # docstring for the exact algorithm per method.
+    anomaly_zscore_threshold: float = Field(default=2.0, gt=0)
+    anomaly_iqr_multiplier: float = Field(default=1.5, gt=0)
+    anomaly_percent_change_threshold: float = Field(default=20.0, gt=0)
+    # None (off) by default -- a flat absolute-delta threshold only makes
+    # sense once an operator sets it in the real unit of their own
+    # metric (dollars, order count, ...); there is no safe generic default.
+    anomaly_absolute_threshold: float | None = None
+    # How many prior points the rolling z-score baseline uses -- a point
+    # is only ever evaluated by this method once this many points precede
+    # it (see detect_anomalies's own insufficient_data_reasons for when
+    # that isn't yet true).
+    anomaly_rolling_window: int = Field(default=5, gt=1)
+    # None (off) by default -- e.g. 12 for monthly data compared
+    # year-over-year, 4 for quarterly. Only evaluated "where sufficient":
+    # at least one prior occurrence at this lag must exist, or the
+    # seasonal method is skipped entirely (recorded, not silently ignored).
+    anomaly_seasonal_period: int | None = None
+    # analytics.root_cause.investigate_root_cause's own validation bar
+    # (Prompt 14): a dimension value must explain at least this many
+    # percentage points of the total change between a baseline and a
+    # current period to be returned as a contributor at all -- the
+    # literal "no root cause is stated without supporting evidence"
+    # acceptance criterion's configurable threshold.
+    root_cause_min_contribution_percent: float = Field(default=10.0, gt=0)
     enable_golden_examples: bool = True
     golden_examples_top_k: int = Field(default=3, gt=0)
     golden_examples_min_similarity: float = Field(default=0.75, ge=0.0, le=1.0)

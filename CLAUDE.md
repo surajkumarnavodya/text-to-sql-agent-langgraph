@@ -2044,6 +2044,142 @@ for the full inspection findings, every new module's design, the
 61-test testing summary, and the security/tenant-isolation/performance
 review.
 
+### Deterministic Analytical Result Engine (Prompt 13)
+`analytics/engine.py` (new) is the actual deterministic calculator the
+pre-existing `analytics/` typed-findings boundary was always meant to
+front: `compute_analytics_result(columns, rows)` classifies a raw SQL
+result into one of six `ResultShape`s (`SCALAR`/`TIME_SERIES`/
+`CATEGORICAL_AGGREGATE`/`MULTIDIMENSIONAL`/`RAW_TABLE`/`EMPTY`) and
+computes the full stat set this requires: row/null/distinct counts,
+min/max/mean/median, variance/stddev, percentiles (p25-p99 via
+`statistics.quantiles`), a full period-by-period growth series (not just
+first-vs-last) with missing-period detection for year/year-month-shaped
+labels, a complete ranking with each entry's share-of-total percent
+(which doubles as the "distribution" requirement — one computation, not
+two), and both z-score and IQR outlier detection. Every finding carries
+its own `formula: str` and the whole result is stamped with
+`ANALYTICS_ENGINE_VERSION` — the literal "record formula/version
+metadata" requirement, and every finding is `DataTruthLevel.DATABASE_FACT`
+(`agent.provenance`) by construction, never an LLM's own claim.
+
+New `agent.nodes.compute_analytics_node`, wired
+`execute_sql --(succeeded)--> compute_analytics --> generate_insight`
+(straight edges only), gated by `Settings.enable_analytics_engine`
+(default `True`) — runs on **every** successful execution (unlike
+`generate_insight_node` right after it, a pure zero-I/O computation has
+no narrative cost to gate on), storing the result on
+`AgentState["analytical_result"]` and `AskResponse.analytical_result`.
+Fails open on any unexpected error, the same posture every accuracy-aid
+node in this graph already takes.
+
+**Invariants that must not regress:**
+- **`agent/insight.py` is completely untouched** — `summarize_result()`
+  and the live `_INSIGHT_SYSTEM_PROMPT`/`_build_insight_prompt` text stay
+  byte-identical (re-running `tests/test_insight.py` unmodified is the
+  proof), because that prompt's exact wording is what
+  `docs/EVALUATION_CURRENT.md`'s live-LLM benchmark numbers were measured
+  against — the identical reasoning that already kept
+  `trend`/`outliers`/`stddev` "computed but not wired into the live
+  prompt" (see "AI Data Analyst depth" above). `analytics/engine.py`
+  computes an independent, null-aware superset directly from `columns`/
+  `rows`, never by reusing or extending `summarize_result`'s own code.
+- **Null handling differs from `agent.insight.ColumnStat` by design**:
+  a column's numeric-ness here is judged from its *non-null* values
+  (nulls excluded from aggregates, counted via `null_count`) — unlike
+  `agent.insight`'s stricter "every row including nulls must be numeric"
+  rule. This deliberately lives only in the new, independent engine, not
+  back-ported to the pinned one.
+- **The live insight narrative prompt is NOT extended to use this
+  engine's output in this pass** — `state["analytical_result"]` is
+  computed, tested, and surfaced via `AskResponse` ahead of that
+  separate wiring decision, exactly the same deferral this codebase
+  already chose once for trend/outlier/stddev.
+- **`analytics/models.py`'s pre-existing shape is fully preserved** —
+  every new field/enum value is additive with a default, verified by
+  re-running `tests/test_analytics_provider.py`/the pre-existing part of
+  `tests/test_analytics_models.py` unmodified. The legacy
+  `AnalyticsFinding.outlier`/`variance_column` fields (set only by the
+  pre-existing `ResultSummaryAnalyticsProvider`) are untouched; the new
+  engine uses its own `outlier_detail`/`variance` fields instead.
+- **Missing-period detection is bounded** — only year and year-month
+  label shapes get gap detection; a full ISO date is recognized as
+  period-shaped for classification purposes but deliberately gets no gap
+  detection (the real reporting cadence isn't inferable from the label
+  alone). Multidimensional ranking is a flattened composite-key
+  breakdown, not true N-way pivot/cube analysis.
+
+**Read [`13_ANALYTICAL_RESULT_ENGINE_CONTRACT.md`](13_ANALYTICAL_RESULT_ENGINE_CONTRACT.md)**
+for the full inspection findings, every new module's design, the
+testing summary, and the security/tenant-isolation/performance review.
+
+### Anomaly detection & evidence-based root cause (Prompt 14)
+`analytics/anomaly.py` (new) is a general-purpose, configurable anomaly
+detector over a **chronological** series — distinct from Prompt 13's own
+categorical z-score/IQR outlier check, which looks at one static set of
+per-label totals with no time order. `detect_anomalies` scans a whole
+series against up to five independent methods: a flat absolute
+threshold (off by default — no safe generic unit), point-over-point
+percent change, a **rolling** (not global) z-score baseline, a
+whole-series IQR fence, and an opt-in seasonality-aware comparison
+("where sufficient" — only evaluated when at least one same-lag prior
+occurrence exists). A point can be flagged by several methods at once,
+each recorded separately with its own `formula`/`threshold_used`,
+never collapsed into one undifferentiated boolean. The **only** live
+integration: `analytics.engine.compute_analytics_result`'s `TIME_SERIES`
+branch feeds this module the exact same `GrowthStat.points` series it
+already computed (zero new queries), gated by `Settings
+.enable_anomaly_detection` (default `True`), appending one `ANOMALY`
+finding per flagged point to the same `AgentState["analytical_result"]`/
+`AskResponse.analytical_result` surface Prompt 13 built.
+
+`analytics/root_cause.py` (new) is an evidence-based contribution
+engine: given a current period's and a baseline period's raw rows (same
+columns, a dimension breakdown column or columns, and a value column),
+`investigate_root_cause` runs the prompt's own named flow — anomaly
+(magnitude) → baseline → dimension breakdown (reuses `analytics.engine
+.group_and_sum_by_label`, promoted from private to public for this
+reuse) → contribution → ranking → validation → evidence — as one
+function. **The acceptance criterion ("no root cause is stated without
+supporting evidence") is enforced structurally**: `RootCauseResult
+.contributors`/`.confidence` can never be populated unless at least one
+dimension value clears `Settings.root_cause_min_contribution_percent`
+(default `10.0`) in the validation step; `has_sufficient_evidence` is
+derived from `contributors` being non-empty, never set independently —
+verified live against real AdventureWorksDW2025 data (a genuine
+category/region breakdown correctly explained a real year-over-year
+drop with three validated contributors and a confidence of `0.65`, six
+smaller contributors correctly excluded as noise).
+
+**Invariant that must not regress — honest, disclosed scope split**:
+anomaly detection is **live-wired** (zero new queries needed — it only
+ever needs the one series already in hand); root-cause/contribution
+analysis is **not wired into any live LangGraph node** in this pass — it
+inherently needs *two* datasets (the anomalous period's breakdown and a
+baseline period's), and this application's pipeline generates exactly
+one SQL query per question today. `investigate_root_cause` is fully
+built, fully tested, and callable directly (by a script, a future route,
+or a future pipeline extension) — mirroring the exact "stubbed today,
+wired later" precedent `analytics/` itself already established in
+Prompt 02, continued by Prompt 13 for the live insight prompt.
+
+**Other invariants that must not regress:**
+- **A sustained linear trend can still be flagged by the rolling
+  z-score method** — a known, disclosed limitation (no detrending step),
+  not a false claim of trend-immunity; the rolling baseline still
+  recovers faster from a one-off spike than a global mean would (proven
+  directly in `tests/test_analytics_anomaly.py`).
+- **A zero-stddev same-lag seasonal history is correctly skipped, never
+  divided-by-zero** — identical philosophy to every other zero-stddev
+  guard already in `analytics/`.
+- **`analytics/models.py`'s pre-existing shape is fully preserved** —
+  every new field/enum value is additive with a default; re-running
+  `tests/test_analytics_provider.py`/`test_insight.py` unmodified proves
+  neither the legacy adapter nor the pinned insight module were touched.
+
+**Read [`14_ANOMALY_ROOT_CAUSE_CONTRACT.md`](14_ANOMALY_ROOT_CAUSE_CONTRACT.md)**
+for the full inspection findings, every new module's design, the
+testing summary, and the security/tenant-isolation/performance review.
+
 ## How to run
 
 See `README.md` for full setup. Short version:

@@ -477,6 +477,36 @@ class AgentState(TypedDict, total=False):
     # didn't succeed at all.
     low_confidence_notice: str | None
 
+    # Set by compute_analytics_node (Prompt 13,
+    # 13_ANALYTICAL_RESULT_ENGINE_CONTRACT.md), which runs between
+    # execute_sql and generate_insight, only after a successful execution
+    # -- a deterministic, full statistical breakdown of the result
+    # (analytics.engine.compute_analytics_result), covering whichever
+    # result shape it classified (scalar/time_series/categorical_
+    # aggregate/multidimensional/raw_table/empty): per-column count/null_
+    # count/distinct_count/min/max/mean/median/variance/stddev/
+    # percentiles, a full period-by-period growth series (time series
+    # only), a complete ranking with each entry's share-of-total percent
+    # (categorical/multidimensional only), and both z-score- and IQR-
+    # flagged outliers -- a strict superset of what `insight_summary`
+    # above covers, computed independently (never derived from it). Always
+    # a plain dict (analytics.models.AnalyticsResult.model_dump()'s
+    # output, matching this TypedDict's established "plain dicts, not
+    # model instances" convention), never the pydantic model itself. None
+    # when Settings.enable_analytics_engine is False or the computation
+    # raised unexpectedly (fails open, logged, never a reason a question
+    # fails -- see compute_analytics_node's own docstring). Every finding
+    # in it is DataTruthLevel.DATABASE_FACT (agent.provenance) -- pure
+    # arithmetic over the already-executed result, no LLM involved.
+    # Deliberately NOT read by generate_insight_node or
+    # agent.llm_client._build_insight_prompt in this prompt -- the live
+    # insight narrative prompt is benchmark-pinned (see CLAUDE.md) and
+    # stays untouched; this field is computed, tested, and surfaced
+    # (AskResponse.analytical_result) ahead of that wiring decision, the
+    # same deferral precedent `insight_summary`'s own trend/outliers/
+    # stddev fields already established before this prompt existed.
+    analytical_result: dict | None
+
     # Input, set once by the caller -- whether generate_insight_node should
     # even attempt an insight. True (the default) is normally low-risk and
     # high-value; the UI exposes this as a toggle so it can be turned off

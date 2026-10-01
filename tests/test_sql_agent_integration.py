@@ -209,6 +209,7 @@ class TestGraphStructure:
             "validate_sql",
             "estimate_cost",
             "execute_sql",
+            "compute_analytics",
             "generate_insight",
         ):
             assert expected in node_names
@@ -252,3 +253,26 @@ class TestGraphStructure:
         assert len(plan_edges) == 1
         assert plan_edges[0].target == "plan_query"
         assert plan_edges[0].conditional is False
+
+    def test_compute_analytics_sits_between_execute_sql_and_generate_insight(self):
+        """Prompt 13 (`13_ANALYTICAL_RESULT_ENGINE_CONTRACT.md`): the
+        deterministic analytics engine runs on execute_sql's `succeeded`
+        path, immediately before generate_insight -- a straight edge to
+        generate_insight (no conditional routing, no new `END` branch),
+        and execute_sql's own conditional-edge table now points its
+        `succeeded` outcome at compute_analytics instead of generate_insight
+        directly.
+        """
+        graph = build_graph()
+        node_names = set(graph.get_graph().nodes.keys())
+        assert "compute_analytics" in node_names
+
+        edges = {(edge.source, edge.target) for edge in graph.get_graph().edges}
+        assert ("execute_sql", "compute_analytics") in edges
+        assert ("compute_analytics", "generate_insight") in edges
+        assert ("execute_sql", "generate_insight") not in edges
+
+        analytics_edges = [e for e in graph.get_graph().edges if e.source == "compute_analytics"]
+        assert len(analytics_edges) == 1
+        assert analytics_edges[0].target == "generate_insight"
+        assert analytics_edges[0].conditional is False
