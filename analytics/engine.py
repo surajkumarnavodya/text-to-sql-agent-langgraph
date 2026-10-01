@@ -216,7 +216,7 @@ def classify_result_shape(columns: list[str], rows: list[tuple]) -> ResultShape:
     return ResultShape.CATEGORICAL_AGGREGATE
 
 
-def _expected_next_period(period_kind: str, value: str) -> str | None:
+def next_period_label(period_kind: str, value: str) -> str | None:
     """The next expected label after `value`, for `period_kind in
     ("year", "year_month")` only -- `"date"` is a recognized
     classification shape (see `classify_period_column`) but deliberately
@@ -224,6 +224,12 @@ def _expected_next_period(period_kind: str, value: str) -> str | None:
     (daily? weekly? month-end snapshots?) isn't inferrable from the label
     shape alone, and guessing wrong would produce a confidently incorrect
     "missing period" claim, worse than reporting none.
+
+    Public (Prompt 16, `16_FORECASTING_CONTRACT.md`) -- promoted from a
+    private `_expected_next_period` for `analytics.forecasting` to reuse
+    directly when synthesizing future period labels, the identical
+    "promote for cross-module reuse" precedent `detect_missing_periods`
+    right below already follows for the same prompt.
     """
     if period_kind == "year":
         return str(int(value) + 1)
@@ -237,22 +243,29 @@ def _expected_next_period(period_kind: str, value: str) -> str | None:
     return None
 
 
-def _detect_missing_periods(period_kind: str, labels: list[str]) -> tuple[str, ...]:
+def detect_missing_periods(period_kind: str, labels: list[str]) -> tuple[str, ...]:
     """Walks consecutive `labels` and reports every expected-but-absent
     step in between, bounded by `_MAX_MISSING_PERIOD_STEPS` per gap (a
     safety cap against a non-sequential/duplicate label column, not a
-    correctness guarantee -- see that constant's own docstring)."""
+    correctness guarantee -- see that constant's own docstring).
+
+    Public (Prompt 16, `16_FORECASTING_CONTRACT.md`) -- promoted from a
+    private `_detect_missing_periods`, the identical "promote for cross-
+    module reuse" precedent `group_and_sum_by_label` below already
+    established for Prompt 14 -- `analytics.forecasting` reuses this
+    directly rather than a second gap-detection implementation.
+    """
     if period_kind not in ("year", "year_month"):
         return ()
     missing: list[str] = []
     for current, actual_next in zip(labels, labels[1:], strict=False):
-        expected = _expected_next_period(period_kind, current)
+        expected = next_period_label(period_kind, current)
         steps = 0
         while (
             expected is not None and expected != actual_next and steps < _MAX_MISSING_PERIOD_STEPS
         ):
             missing.append(expected)
-            expected = _expected_next_period(period_kind, expected)
+            expected = next_period_label(period_kind, expected)
             steps += 1
     return tuple(missing)
 
@@ -446,7 +459,7 @@ def _compute_growth_stat(
         )
 
     period_kind = classify_period_column(labels)
-    missing_periods = _detect_missing_periods(period_kind, labels) if period_kind else ()
+    missing_periods = detect_missing_periods(period_kind, labels) if period_kind else ()
 
     return GrowthStat(
         label_column=label_column,

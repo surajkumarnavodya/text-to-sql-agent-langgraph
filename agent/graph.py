@@ -1,6 +1,6 @@
 """Wires the agent nodes into a compiled LangGraph state machine.
 
-    sanitize_input -> classify_followup -> retrieve_schema -> retrieve_golden_examples -> retrieve_business_context -> classify_analytical_intent -> build_analytical_plan -> plan_query -> generate_sql -+-> review_sql -+-> review_metric_conformance -+-> validate_sql -+-> estimate_cost -+-> execute_sql -+-> compute_analytics -> generate_insight -> END
+    sanitize_input -> classify_followup -> retrieve_schema -> retrieve_golden_examples -> retrieve_business_context -> classify_analytical_intent -> build_analytical_plan -> plan_query -> generate_sql -+-> review_sql -+-> review_metric_conformance -+-> validate_sql -+-> estimate_cost -+-> execute_sql -+-> compute_analytics -> generate_forecast -> generate_insight -> END
          |                    |                    ^                                                                  |               ^                              |                 ^                |                  ^                 |                |
          |                    |                    +----------------------------------(retry, up to max_retries)------+---------------+------------------------------+-----------------+---(retry, high    |               |
          |                    |                                                                                       |                                                                                    cost only)      +--(retry, only  |
@@ -169,6 +169,19 @@ here takes. Deliberately does **not** feed `generate_insight`'s own LLM
 prompt in this pass -- see `agent.nodes.compute_analytics_node`'s own
 docstring for the disclosed, benchmark-stability reason.
 
+`generate_forecast` (between `compute_analytics` and `generate_insight`,
+Prompt 16, `16_FORECASTING_CONTRACT.md`) forecasts future periods for a
+time-series-shaped result, but -- unlike `compute_analytics` right before
+it -- only when `classify_analytical_intent` already classified the
+question as `AnalyticalIntentType.FORECAST` (reusing that judgment, never
+re-classifying). Reuses the exact `GrowthStat.points` series
+`compute_analytics` already computed (zero new queries); a data-
+insufficient or untrusted-temporal-semantics series produces a normal,
+typed rejection rather than a guess. Gated by `Settings.enable_forecasting`
+on top of the intent check; a straight edge, never a conditional one, so
+this node can never short-circuit the graph. See `agent.nodes
+.generate_forecast_node`.
+
 `generate_insight` is the only node reachable from execute_sql's *success*
 path -- a failed, needs-clarification, or rejected run never generates one.
 It is a narrative layer only: see `agent.nodes.generate_insight_node` for
@@ -196,6 +209,7 @@ from agent.nodes import (
     compute_analytics_node,
     estimate_query_cost_node,
     execute_sql_node,
+    generate_forecast_node,
     generate_insight_node,
     generate_sql_node,
     plan_query_node,
@@ -231,12 +245,13 @@ def build_graph():
     never on the compiled graph object itself -- so building it once and
     reusing it (the same `functools`-based singleton pattern already used
     for `config.settings.get_settings()` and `db.connection._cached_engine`)
-    is safe and avoids re-wiring all sixteen nodes on every single question.
+    is safe and avoids re-wiring all seventeen nodes on every single question.
     Graph *shape* never depends on `Settings` (`retrieve_golden_examples`/
     `classify_analytical_intent`/`build_analytical_plan`/`plan_query`/
-    `review_sql`/`review_metric_conformance`/`compute_analytics` are
-    pass-throughs, not conditionally-omitted nodes, when their respective
-    flag is off -- see this module's docstring), so
+    `review_sql`/`review_metric_conformance`/`compute_analytics`/
+    `generate_forecast` are pass-throughs, not conditionally-omitted nodes,
+    when their respective flag (or, for `generate_forecast`, its intent
+    gate) doesn't fire -- see this module's docstring), so
     there's no per-settings cache key to worry about; like every other
     process-lifetime singleton here, a config change that would matter
     takes a process restart.
@@ -261,6 +276,7 @@ def build_graph():
     graph.add_node("estimate_cost", estimate_query_cost_node)
     graph.add_node("execute_sql", execute_sql_node)
     graph.add_node("compute_analytics", compute_analytics_node)
+    graph.add_node("generate_forecast", generate_forecast_node)
     graph.add_node("generate_insight", generate_insight_node)
 
     graph.set_entry_point("sanitize_input")
@@ -343,7 +359,8 @@ def build_graph():
             "failed": END,
         },
     )
-    graph.add_edge("compute_analytics", "generate_insight")
+    graph.add_edge("compute_analytics", "generate_forecast")
+    graph.add_edge("generate_forecast", "generate_insight")
     graph.add_edge("generate_insight", END)
 
     return graph.compile()
@@ -356,6 +373,7 @@ def run_agent(
     caller_roles: tuple[str, ...] = (),
     model: str | None = None,
     tenant_id: str | None = None,
+    forecast_horizon: int | None = None,
 ) -> AgentState:
     """Runs the full agent graph for a single natural-language question.
 
@@ -407,6 +425,17 @@ def run_agent(
             reads it yet -- see that field's own docstring in
             `agent/state.py` for why it exists ahead of any real
             enforcement.
+        forecast_horizon: How many future periods `generate_forecast_node`
+            should forecast, already validated against `Settings
+            .forecast_max_horizon` by `api/main.py`'s `/ask` handler
+            (`AskRequest.forecast_horizon`) before this function is ever
+            called -- the identical pattern `model` above already uses.
+            `None` (the default -- every caller before this field existed)
+            defers to `Settings.forecast_default_horizon`, resolved by
+            `analytics.forecasting.generate_forecast` itself. Stored in
+            `state["forecast_horizon"]`; only read when
+            `generate_forecast_node` actually attempts a forecast (see
+            that node's own docstring for the full gate).
     """
     settings = get_settings()
     effective_model = model or settings.ollama_model
@@ -465,6 +494,8 @@ def run_agent(
         "cost_notice": None,
         "low_confidence_notice": None,
         "analytical_result": None,
+        "forecast_horizon": forecast_horizon,
+        "forecast_result": None,
         "retry_count": 0,
         "max_retries": effective_max_retries,
         "complexity_signals": complexity_signals,

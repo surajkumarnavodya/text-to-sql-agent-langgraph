@@ -101,6 +101,19 @@ class AskRequest(BaseModel):
             "with HTTP 400, never silently substituted or passed through to Ollama as-is."
         ),
     )
+    forecast_horizon: int | None = Field(
+        default=None,
+        gt=0,
+        description=(
+            "How many future periods to forecast, only meaningful when this question is "
+            "classified as a FORECAST-intent question (see agent.intent.AnalyticalIntentType) "
+            "-- ignored otherwise. Omit to use the server-configured default "
+            "(Settings.forecast_default_horizon); every existing caller that predates this "
+            "field keeps working unchanged. Validated server-side against "
+            "Settings.forecast_max_horizon before this question is ever run -- a value above "
+            "that cap is rejected with HTTP 400, never silently clamped."
+        ),
+    )
 
 
 class AttemptRecordOut(BaseModel):
@@ -469,6 +482,77 @@ class MediaSearchRequest(BaseModel):
     media_type: Literal["image", "video", "any"] = "any"
 
 
+class ForecastPointOut(BaseModel):
+    """Mirrors `analytics.models.ForecastPoint`."""
+
+    model_config = ConfigDict(frozen=True)
+
+    period: str
+    forecast: float
+    lower_bound: float | None = None
+    upper_bound: float | None = None
+    horizon_step: int
+
+
+class ForecastEvaluationOut(BaseModel):
+    """Mirrors `analytics.models.ForecastEvaluation`."""
+
+    model_config = ConfigDict(frozen=True)
+
+    holdout_size: int
+    mae: float
+    rmse: float
+    mape: float | None = None
+    formula: str
+
+
+class ForecastModelMetadataOut(BaseModel):
+    """Mirrors `analytics.models.ForecastModelMetadata`."""
+
+    model_config = ConfigDict(frozen=True)
+
+    model: str
+    version: str
+    parameters: dict[str, Any]
+    training_window_start: str
+    training_window_end: str
+    training_point_count: int
+    period_kind: str
+    supports_interval: bool
+    confidence_level: float
+
+
+class ForecastResultOut(BaseModel):
+    """Mirrors `analytics.models.ForecastResult` -- Prompt 16
+    (`16_FORECASTING_CONTRACT.md`). Unlike `analytical_result` above (a raw
+    `dict[str, Any]`), this gets a fully typed response shape since a
+    forecast's structure is smaller and more directly client-relevant
+    (points to plot, a model name/horizon to label, limitations to
+    disclose) -- the same reasoning `VisualizationSpecOut` already applies
+    over `analytical_result`'s own raw-dict shortcut.
+
+    Always `truth_level == "ai_inference"` (`DataTruthLevel.AI_INFERENCE`)
+    -- a client must never render `points`/`summary` as if they were
+    confirmed fact; `limitations` is always non-empty for a `status="ok"`
+    result (Prompt 16's own "forecasts are explicitly represented as
+    estimates with limitations" acceptance criterion).
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    status: Literal["ok", "rejected"]
+    rejection_reasons: tuple[str, ...] = ()
+    horizon: int
+    model: ForecastModelMetadataOut | None = None
+    points: tuple[ForecastPointOut, ...] = ()
+    evaluation: ForecastEvaluationOut | None = None
+    candidate_evaluations: dict[str, ForecastEvaluationOut] = Field(default_factory=dict)
+    limitations: tuple[str, ...] = ()
+    truth_level: str
+    summary: str = ""
+    engine_version: str
+
+
 class ConversationExchangeOut(BaseModel):
     """Mirrors `agent.state.ConversationExchange` -- the specific prior turn
     a "followup" question was resolved against, for a client to render a
@@ -552,6 +636,18 @@ class AskResponse(BaseModel):
             "for a client that wants to build its own view on top of it. None when "
             "Settings.enable_analytics_engine is off or the run didn't reach a successful "
             "execution."
+        ),
+    )
+    forecast_result: ForecastResultOut | None = Field(
+        default=None,
+        description=(
+            "analytics.forecasting.generate_forecast's output -- set only when this question "
+            "was classified as a FORECAST-intent question (agent.intent.AnalyticalIntentType) "
+            "and Settings.enable_forecasting is on; None otherwise, including for every "
+            "question type that predates this field. A 'rejected' status means the result "
+            "wasn't a usable time series or didn't have enough history -- see "
+            "rejection_reasons. Always DataTruthLevel.AI_INFERENCE -- never render points/"
+            "summary as confirmed fact (see ForecastResultOut's own docstring)."
         ),
     )
     cost_notice: str | None = None

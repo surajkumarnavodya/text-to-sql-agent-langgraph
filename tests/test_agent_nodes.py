@@ -30,6 +30,7 @@ from agent.nodes import (
     compute_analytics_node,
     estimate_query_cost_node,
     execute_sql_node,
+    generate_forecast_node,
     generate_insight_node,
     generate_sql_node,
     plan_query_node,
@@ -1908,6 +1909,142 @@ class TestComputeAnalyticsNode:
         insight_update = generate_insight_node(state)
 
         assert state["analytical_result"] is not None
+        assert insight_update["insight"] == "A short insight."
+
+
+class TestGenerateForecastNode:
+    """Prompt 16 (`16_FORECASTING_CONTRACT.md`)."""
+
+    _TIME_SERIES_STATE: AgentState = {
+        "result_columns": ["OrderYear", "TotalSales"],
+        "result_rows": [
+            (2018, 100.0),
+            (2019, 120.0),
+            (2020, 90.0),
+            (2021, 150.0),
+            (2022, 180.0),
+        ],
+    }
+    _FORECAST_INTENT = {"intent": "forecast", "confidence": 0.9}
+
+    def _state_with_analytics(self) -> AgentState:
+        state: AgentState = dict(self._TIME_SERIES_STATE)  # type: ignore[assignment]
+        state.update(compute_analytics_node(state))
+        return state
+
+    def test_skips_when_disabled(self, monkeypatch, _mock_settings):
+        monkeypatch.setattr(
+            "agent.nodes.get_settings",
+            lambda: Settings(**{**_mock_settings.__dict__, "enable_forecasting": False}),
+        )
+
+        def _fail(*args, **kwargs):
+            raise AssertionError("should not forecast anything when enable_forecasting=False")
+
+        monkeypatch.setattr("agent.nodes.generate_forecast", _fail)
+
+        state = self._state_with_analytics()
+        state["analytical_intent"] = self._FORECAST_INTENT
+        result = generate_forecast_node(state)
+
+        assert result["forecast_result"] is None
+
+    def test_skips_when_intent_is_not_forecast(self):
+        state = self._state_with_analytics()
+        state["analytical_intent"] = {"intent": "aggregation", "confidence": 0.9}
+
+        result = generate_forecast_node(state)
+
+        assert result["forecast_result"] is None
+
+    def test_skips_when_no_analytical_intent_was_classified(self):
+        state = self._state_with_analytics()
+        state["analytical_intent"] = None
+
+        result = generate_forecast_node(state)
+
+        assert result["forecast_result"] is None
+
+    def test_produces_a_forecast_for_a_time_series_result_with_forecast_intent(self):
+        state = self._state_with_analytics()
+        state["analytical_intent"] = self._FORECAST_INTENT
+
+        result = generate_forecast_node(state)
+
+        assert result["forecast_result"] is not None
+        assert result["forecast_result"]["status"] == "ok"
+        assert len(result["forecast_result"]["points"]) > 0
+        assert result["forecast_result"]["truth_level"] == "ai_inference"
+        assert result["forecast_result"]["limitations"]
+
+    def test_respects_a_requested_horizon(self):
+        state = self._state_with_analytics()
+        state["analytical_intent"] = self._FORECAST_INTENT
+        state["forecast_horizon"] = 2
+
+        result = generate_forecast_node(state)
+
+        assert result["forecast_result"]["horizon"] == 2
+        assert len(result["forecast_result"]["points"]) == 2
+
+    def test_skips_when_result_is_not_a_recognized_time_series(self):
+        state: AgentState = {
+            "result_columns": ["Category", "Revenue"],
+            "result_rows": [("Bikes", 100.0), ("Accessories", 50.0)],
+        }
+        state.update(compute_analytics_node(state))
+        state["analytical_intent"] = self._FORECAST_INTENT
+
+        result = generate_forecast_node(state)
+
+        assert result["forecast_result"] is None
+
+    def test_a_rejected_forecast_is_still_stored_not_collapsed_to_none(self):
+        state: AgentState = {
+            "result_columns": ["OrderYear", "TotalSales"],
+            "result_rows": [(2018, 100.0), (2019, 120.0)],
+        }
+        state.update(compute_analytics_node(state))
+        state["analytical_intent"] = self._FORECAST_INTENT
+
+        result = generate_forecast_node(state)
+
+        assert result["forecast_result"] is not None
+        assert result["forecast_result"]["status"] == "rejected"
+        assert result["forecast_result"]["rejection_reasons"]
+
+    def test_fails_open_on_unexpected_computation_error(self, monkeypatch):
+        def _raise(*args, **kwargs):
+            raise RuntimeError("unexpected boom")
+
+        monkeypatch.setattr("agent.nodes.generate_forecast", _raise)
+
+        state = self._state_with_analytics()
+        state["analytical_intent"] = self._FORECAST_INTENT
+
+        result = generate_forecast_node(state)
+
+        assert result["forecast_result"] is None
+
+    def test_runs_before_generate_insight_without_interfering_with_it(self, monkeypatch):
+        """Structural proof at the function-call level (the real graph
+        wiring is proven separately in tests/test_sql_agent_integration.py)."""
+        monkeypatch.setattr(
+            "agent.nodes.generate_insight_from_llm", lambda *a, **k: "A short insight."
+        )
+        monkeypatch.setattr("agent.nodes.is_insight_grounded", lambda *a, **k: True)
+
+        state = self._state_with_analytics()
+        state["question"] = "forecast sales for the next 2 years"
+        state["sql"] = "SELECT OrderYear, SUM(TotalSales) FROM t GROUP BY OrderYear"
+        state["analytical_intent"] = self._FORECAST_INTENT
+        state["enable_insight"] = True
+
+        forecast_update = generate_forecast_node(state)
+        state.update(forecast_update)
+        insight_update = generate_insight_node(state)
+
+        assert state["forecast_result"] is not None
         assert insight_update["insight"] == "A short insight."
 
 

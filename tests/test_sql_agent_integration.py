@@ -210,6 +210,7 @@ class TestGraphStructure:
             "estimate_cost",
             "execute_sql",
             "compute_analytics",
+            "generate_forecast",
             "generate_insight",
         ):
             assert expected in node_names
@@ -254,14 +255,16 @@ class TestGraphStructure:
         assert plan_edges[0].target == "plan_query"
         assert plan_edges[0].conditional is False
 
-    def test_compute_analytics_sits_between_execute_sql_and_generate_insight(self):
+    def test_compute_analytics_sits_between_execute_sql_and_generate_forecast(self):
         """Prompt 13 (`13_ANALYTICAL_RESULT_ENGINE_CONTRACT.md`): the
         deterministic analytics engine runs on execute_sql's `succeeded`
-        path, immediately before generate_insight -- a straight edge to
-        generate_insight (no conditional routing, no new `END` branch),
-        and execute_sql's own conditional-edge table now points its
-        `succeeded` outcome at compute_analytics instead of generate_insight
-        directly.
+        path (no conditional routing, no new `END` branch), and
+        execute_sql's own conditional-edge table points its `succeeded`
+        outcome at compute_analytics instead of generate_insight directly.
+        Updated by Prompt 16 (`16_FORECASTING_CONTRACT.md`): compute_analytics
+        now feeds generate_forecast directly, not generate_insight -- see
+        `test_generate_forecast_sits_between_compute_analytics_and_generate_insight`
+        below for that link.
         """
         graph = build_graph()
         node_names = set(graph.get_graph().nodes.keys())
@@ -269,10 +272,32 @@ class TestGraphStructure:
 
         edges = {(edge.source, edge.target) for edge in graph.get_graph().edges}
         assert ("execute_sql", "compute_analytics") in edges
-        assert ("compute_analytics", "generate_insight") in edges
+        assert ("compute_analytics", "generate_forecast") in edges
         assert ("execute_sql", "generate_insight") not in edges
+        assert ("compute_analytics", "generate_insight") not in edges
 
         analytics_edges = [e for e in graph.get_graph().edges if e.source == "compute_analytics"]
         assert len(analytics_edges) == 1
-        assert analytics_edges[0].target == "generate_insight"
+        assert analytics_edges[0].target == "generate_forecast"
         assert analytics_edges[0].conditional is False
+
+    def test_generate_forecast_sits_between_compute_analytics_and_generate_insight(self):
+        """Prompt 16 (`16_FORECASTING_CONTRACT.md`): `generate_forecast` is
+        a straight edge on both sides (never a conditional one, never a new
+        `END` branch) -- it can never short-circuit the graph, the same
+        structural proof pattern `classify_analytical_intent`/
+        `build_analytical_plan`'s own equivalent tests already establish.
+        """
+        graph = build_graph()
+        node_names = set(graph.get_graph().nodes.keys())
+        assert "generate_forecast" in node_names
+
+        forecast_edges = [e for e in graph.get_graph().edges if e.source == "generate_forecast"]
+        assert len(forecast_edges) == 1
+        assert forecast_edges[0].target == "generate_insight"
+        assert forecast_edges[0].conditional is False
+
+        incoming = [e for e in graph.get_graph().edges if e.target == "generate_forecast"]
+        assert len(incoming) == 1
+        assert incoming[0].source == "compute_analytics"
+        assert incoming[0].conditional is False

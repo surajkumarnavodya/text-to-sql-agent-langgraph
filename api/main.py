@@ -97,6 +97,7 @@ from api.schemas import (
     DatabaseHealth,
     ExecuteRequest,
     ExecuteResponse,
+    ForecastResultOut,
     GoldenExampleFeedbackRequest,
     GoldenExampleFeedbackResponse,
     HealthResponse,
@@ -764,6 +765,22 @@ def _attachment_result_out(
     )
 
 
+def _forecast_result_out(result: Mapping[str, Any] | None) -> ForecastResultOut | None:
+    """Converts one `analytics.models.ForecastResult.model_dump()` dict
+    (`AgentState["forecast_result"]`) to its API shape -- `None` passes
+    through as `None`. No redaction applied (unlike `insight`/
+    `rejection_message`/etc.) -- a forecast's text fields
+    (`summary`/`limitations`/`rejection_reasons`) are built entirely from
+    this module's own fixed strings and the question's already-validated
+    historical period labels/values, never from raw LLM or database-error
+    text, so there's nothing here `security.redaction.redact_secrets`
+    would ever need to catch.
+    """
+    if result is None:
+        return None
+    return ForecastResultOut(**result)
+
+
 def _followup_resolved_against_out(
     exchange: Mapping[str, Any] | None,
 ) -> ConversationExchangeOut | None:
@@ -803,6 +820,7 @@ def _ask_response_from_state(
         attempt_history=_attempt_records_out(state),
         insight=_redact_text(state.get("insight"), settings),
         analytical_result=state.get("analytical_result"),
+        forecast_result=_forecast_result_out(state.get("forecast_result")),
         cost_notice=state.get("cost_notice"),
         low_confidence_notice=_redact_text(state.get("low_confidence_notice"), settings),
         rejection_reason=state.get("rejection_reason"),
@@ -1016,6 +1034,7 @@ def _run_orchestrated_with_timeout(
     attachment_ids: list[str] | None = None,
     model: str | None = None,
     tenant_id: str | None = None,
+    forecast_horizon: int | None = None,
 ) -> Mapping[str, Any]:
     """Runs `run_orchestrated` on `_get_ask_executor`'s bounded pool and
     gives up *waiting* past `timeout_seconds`, raising `_AskRequestTimedOut`
@@ -1054,6 +1073,7 @@ def _run_orchestrated_with_timeout(
                 attachment_ids=attachment_ids,
                 model=model,
                 tenant_id=tenant_id,
+                forecast_horizon=forecast_horizon,
             )
         except BaseException as exc:  # noqa: BLE001 - re-raised on the caller's thread below
             error["error"] = exc
@@ -1146,6 +1166,26 @@ def ask(
         )
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
 
+    # Prompt 16 (16_FORECASTING_CONTRACT.md): the same "validate before any
+    # admission-control slot is acquired or LLM/DB work starts" posture as
+    # the model-selection check just above -- an out-of-range
+    # AskRequest.forecast_horizon is a malformed request (HTTP 400), not a
+    # reason to spend a concurrency slot. AskRequest.forecast_horizon's own
+    # `Field(gt=0)` already rejects a non-positive value at the schema
+    # layer; only the configurable upper bound (Settings.forecast_max_horizon,
+    # not knowable at schema-definition time) needs a runtime check here.
+    if (
+        payload.forecast_horizon is not None
+        and payload.forecast_horizon > settings.forecast_max_horizon
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                f"forecast_horizon {payload.forecast_horizon} exceeds the configured "
+                f"maximum of {settings.forecast_max_horizon}."
+            ),
+        )
+
     # Admission control (scale-out hardening pass, docs/SCALE_OUT_PROMPT.md
     # bottleneck #1/#4): reject fast, before any LLM/DB work starts, once
     # either the global or this caller's own concurrency budget is
@@ -1198,6 +1238,7 @@ def ask(
             attachment_ids=payload.attachment_ids,
             model=selected_model,
             tenant_id=resolve_tenant_id_for_identity(identity),
+            forecast_horizon=payload.forecast_horizon,
         )
     except _AskRequestTimedOut:
         # See Settings.request_timeout_seconds's docstring: this is "stop

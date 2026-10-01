@@ -28,10 +28,10 @@ from __future__ import annotations
 from enum import Enum
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 from agent.insight import OutlierStat, TrendStat
-from agent.provenance import ProvenancedClaim
+from agent.provenance import DataTruthLevel, ProvenancedClaim
 
 #: The typed-contract schema version for everything `analytics.engine`
 #: produces -- stamped onto every `AnalyticsResult.engine_version` (Prompt
@@ -42,6 +42,13 @@ from agent.provenance import ProvenancedClaim
 #: finding's formula/shape changes in a way a consumer should be able to
 #: detect.
 ANALYTICS_ENGINE_VERSION = "1.0.0"
+
+#: The typed-contract schema version for everything `analytics.forecasting`
+#: produces -- Prompt 16 (`16_FORECASTING_CONTRACT.md`). Kept separate from
+#: `ANALYTICS_ENGINE_VERSION` above (own module, own versioning axis),
+#: mirroring `VISUALIZATION_ENGINE_VERSION`'s identical precedent in
+#: `analytics/visualization.py`.
+FORECASTING_ENGINE_VERSION = "1.0.0"
 
 
 class ResultShape(str, Enum):
@@ -527,3 +534,160 @@ class RootCauseResult(BaseModel):
         "confidence = min(1.0, sum(|contribution_percent| of validated contributors) / 100)"
     )
     engine_version: str = ANALYTICS_ENGINE_VERSION
+
+
+class ForecastModelType(str, Enum):
+    """Which deterministic baseline model produced (or, for `AUTO`, was
+    asked to select) a `ForecastResult` -- Prompt 16
+    (`16_FORECASTING_CONTRACT.md`). A closed set, like every other enum in
+    this module. `AUTO` is a caller-facing *selection* only -- see
+    `ForecastModelMetadata.model`'s own docstring for why it is never the
+    value stored there once a forecast is actually produced.
+    """
+
+    AUTO = "auto"
+    NAIVE = "naive"
+    SEASONAL_NAIVE = "seasonal_naive"
+    MOVING_AVERAGE = "moving_average"
+    LINEAR_TREND = "linear_trend"
+    SIMPLE_EXPONENTIAL_SMOOTHING = "simple_exponential_smoothing"
+
+
+class ForecastPoint(BaseModel):
+    """One future period's point forecast, with a prediction interval
+    where the model supports one (see `ForecastModelMetadata
+    .supports_interval`). `period` is synthesized by extrapolating the
+    same recognized period pattern (`analytics.engine
+    .classify_period_column`) the historical series itself matched --
+    never guessed for an unrecognized label shape (that's a hard
+    rejection instead, see `ForecastResult.status`).
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    period: str
+    forecast: float
+    lower_bound: float | None = None
+    upper_bound: float | None = None
+    horizon_step: int
+
+
+class ForecastEvaluation(BaseModel):
+    """A deterministic backtest -- the last `Settings
+    .forecast_backtest_holdout` historical points are held out, the model
+    is fit on everything before them, and the forecast for those points is
+    compared against their real, already-known values. `None` (via
+    `ForecastResult.evaluation`) when there wasn't enough history for a
+    holdout of that size -- disclosed in `ForecastResult.limitations`,
+    never silently skipped.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    holdout_size: int
+    mae: float
+    rmse: float
+    #: `None` when every held-out actual value was `0` (a percent error
+    #: from zero is undefined -- the identical zero-denominator guard
+    #: `agent.insight._compute_trend`/`analytics.engine._compute_growth_stat`
+    #: already establish elsewhere in this codebase).
+    mape: float | None = None
+    formula: str = (
+        "MAE = mean(|actual - forecast|); RMSE = sqrt(mean((actual - forecast)^2)); "
+        "MAPE = 100 * mean(|actual - forecast| / |actual|) over non-zero actuals"
+    )
+
+
+class ForecastModelMetadata(BaseModel):
+    """Which model actually produced a `ForecastResult`, with enough
+    recorded to reproduce it -- Prompt 16's own "record model version,
+    training window, parameters" requirement. Deliberately **no wall-clock
+    timestamp** -- `analytics.forecasting.generate_forecast` is a pure
+    function of its inputs, and keeping this metadata timestamp-free is
+    what makes "the same input always produces byte-identical output"
+    directly testable (see `tests/test_analytics_forecasting.py`'s own
+    reproducibility tests).
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    #: Never `ForecastModelType.AUTO` here -- once a forecast is actually
+    #: produced, this always names the one concrete model that produced it
+    #: (AUTO itself picked one via backtest comparison, see
+    #: `ForecastResult.candidate_evaluations`).
+    model: ForecastModelType
+    version: str = FORECASTING_ENGINE_VERSION
+    parameters: dict[str, float | int | str | None] = Field(default_factory=dict)
+    training_window_start: str
+    training_window_end: str
+    training_point_count: int
+    #: `"date"` is deliberately excluded -- `analytics.forecasting
+    #: .generate_forecast` rejects a raw-ISO-date-labeled series outright
+    #: (see that function's own docstring), since no reliable future-label
+    #: cadence can be synthesized from the label shape alone. Only a
+    #: produced (never rejected) `ForecastResult` ever constructs this
+    #: metadata, so this Literal is exhaustive in practice, not aspirational.
+    period_kind: Literal["year", "year_month"]
+    supports_interval: bool = True
+    confidence_level: float
+
+
+class ForecastResult(BaseModel):
+    """`analytics.forecasting.generate_forecast`'s full result -- Prompt 16
+    (`16_FORECASTING_CONTRACT.md`). Deliberately **not** folded into
+    `AnalyticsResult`/`AnalyticsFinding` (the same reasoning `RootCauseResult`
+    above already gives): a forecast is a standalone extrapolation beyond
+    one query result's own historical data, with its own status/rejection/
+    evaluation shape, not one more finding *about* that historical data.
+
+    Attributes:
+        status: `"ok"` or `"rejected"` -- see `rejection_reasons`.
+        rejection_reasons: Every reason a forecast was not produced (e.g.
+            "fewer than 4 historical points", "the label column is not
+            confidently chronological") -- always non-empty when
+            `status == "rejected"`, always empty when `status == "ok"`.
+        horizon: How many future periods were requested.
+        model: The model actually used -- `None` when rejected.
+        points: The forecast itself, one `ForecastPoint` per requested
+            horizon step, in chronological order -- empty when rejected.
+        evaluation: A backtest of `model` against recent held-out history,
+            or `None` when there wasn't enough history for one (see
+            `ForecastEvaluation`'s own docstring) -- never computed when
+            `status == "rejected"`.
+        candidate_evaluations: Every eligible model's own backtest,
+            keyed by `ForecastModelType.value`, populated only when
+            `ForecastModelType.AUTO` was requested (so a caller can see
+            why `model` was picked) -- empty otherwise.
+        limitations: Always non-empty for an `"ok"` result -- the literal
+            "forecasts are explicitly represented as estimates with
+            limitations" acceptance criterion. Disclosed caveats: no
+            exogenous variables, assumes the historical pattern continues
+            unchanged, prediction-interval validity depends on residuals
+            being roughly stable, etc.
+        truth_level: Always `DataTruthLevel.AI_INFERENCE` -- see
+            `analytics.forecasting`'s own module docstring for why a
+            deterministic (non-LLM) statistical extrapolation is still
+            classified this way rather than as `DATABASE_FACT`.
+        summary: A short, deterministic, human-readable sentence
+            describing the forecast (or, for a rejected one, why) -- the
+            same "always non-empty, grounded rendering" convention
+            `AnalyticsFinding.claim.value` already establishes, kept as a
+            plain string here rather than a full `ProvenancedClaim` since
+            `truth_level` above already carries this result's one truth
+            level for all of it.
+        engine_version: `FORECASTING_ENGINE_VERSION` at computation time.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    status: Literal["ok", "rejected"]
+    rejection_reasons: tuple[str, ...] = ()
+    horizon: int
+    model: ForecastModelMetadata | None = None
+    points: tuple[ForecastPoint, ...] = ()
+    evaluation: ForecastEvaluation | None = None
+    candidate_evaluations: dict[str, ForecastEvaluation] = Field(default_factory=dict)
+    limitations: tuple[str, ...] = ()
+    truth_level: DataTruthLevel = DataTruthLevel.AI_INFERENCE
+    summary: str = ""
+    engine_version: str = FORECASTING_ENGINE_VERSION

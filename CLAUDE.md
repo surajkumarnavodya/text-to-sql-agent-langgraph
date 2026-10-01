@@ -325,7 +325,15 @@ below, and `docs/MULTI_SOURCE_GUIDE.md` for how to configure each source.
   tenant-aware draft→reviewed→published→superseded business-concept
   catalog — entities/metrics/dimensions/domains, not metrics alone) and
   `semantic/catalog_policy.py`'s RBAC+ABAC. See "Tenant-aware semantic
-  catalog" below.
+  catalog" below. **Prompt 16** (`16_FORECASTING_CONTRACT.md`) added
+  `analytics/forecasting.py` and is the first real producer of
+  `recommendation.models.Recommendation` anywhere in this codebase
+  (`recommendations_for_forecast`) — `recommendation/`'s own
+  `RecommendationProvider` Protocol remains contracts-only, unimplemented;
+  this is a standalone function reusing its typed `Recommendation`/
+  `RecommendationKind` shape directly, not an implementation of that
+  Protocol (its own docstring discloses why — see "Deterministic
+  forecasting" below).
 - `rag/` — document/policy agentic RAG, one implementation shared by both
   the "documents" and "policies" collections (parameterized by collection
   name, not two near-duplicate modules): `store.py` (SQL Server native
@@ -584,16 +592,17 @@ below, and `docs/MULTI_SOURCE_GUIDE.md` for how to configure each source.
 ## Key design decisions
 
 ### Self-correcting retry loop (LangGraph)
-The full graph (`agent/graph.py`) is fifteen nodes (as of Prompt 12,
-`12_ANALYTICAL_PLANNING_CONTRACT.md` — previously fourteen, before that
-prompt's `build_analytical_plan`; before it, twelve, before Prompt 10's
+The full graph (`agent/graph.py`) is seventeen nodes (as of Prompt 16,
+`16_FORECASTING_CONTRACT.md`'s `generate_forecast` — previously sixteen,
+after Prompt 13's `compute_analytics`; before that, fifteen, after Prompt
+12's `build_analytical_plan`; before it, twelve, before Prompt 10's
 `review_metric_conformance` and Prompt 11's `classify_analytical_intent`):
 `sanitize_input → classify_followup → retrieve_schema →
 retrieve_golden_examples → retrieve_business_context →
 classify_analytical_intent → build_analytical_plan → plan_query →
 generate_sql → review_sql → review_metric_conformance → validate_sql →
-estimate_cost → execute_sql → generate_insight`. On a review, validation,
-cost-estimate, or execution
+estimate_cost → execute_sql → compute_analytics → generate_forecast →
+generate_insight`. On a review, validation, cost-estimate, or execution
 failure, a conditional edge routes back to `generate_sql` (or, for a
 "missing reference" execution error, back to `retrieve_schema`) with the
 error message appended to state history, so the LLM sees what went wrong
@@ -2271,6 +2280,55 @@ rerun clean — 3088 backend / 287 frontend, zero regressions), the two
 real bugs found and fixed (the title double-prefix, the frontend
 histogram validity rule and its `ChartPicker.tsx` icon-map crash), and
 the security/tenant-isolation/performance review.
+
+### Deterministic forecasting (Prompt 16)
+`analytics/forecasting.py`'s `generate_forecast` extends
+`compute_analytics_result`'s `TIME_SERIES` branch one step further: not
+just describing observed history, but projecting it forward. Five
+deterministic, stdlib-only baseline models (naive, seasonal-naive, moving
+average, linear trend, simple exponential smoothing) plus an `AUTO` mode
+that backtests every eligible candidate and picks the most accurate — no
+numpy/pandas-time-series/statsmodels/sklearn added, matching `analytics/`'s
+own established "stdlib only" posture. New `agent.nodes.generate_forecast_node`,
+wired `compute_analytics → generate_forecast → generate_insight` (a
+straight edge, never a conditional one, so it can never short-circuit the
+graph) — the graph is now seventeen nodes (see "Self-correcting retry
+loop" above). Only ever attempts a forecast when
+`classify_analytical_intent_node` already classified the question as
+`AnalyticalIntentType.FORECAST` (Prompt 11's own intent, unused by
+anything until now) — no new classification, pure reuse of a judgment
+already made earlier in the same run. `AskRequest.forecast_horizon`/
+`AskResponse.forecast_result` thread the same validate-before-admission-
+control pattern `model` selection already established; `run_orchestrated`
+threads the identical parameter through to both the short-circuit and
+multi-source paths.
+
+**Invariants that must not regress:** every `"ok"` `ForecastResult` is
+always `DataTruthLevel.AI_INFERENCE` and always carries a non-empty
+`limitations` tuple — the literal "forecasts are explicitly represented
+as estimates with limitations" acceptance criterion, enforced inside the
+engine itself, not left to whichever caller renders the result. A
+data-insufficient or untrusted-temporal-semantics series (fewer than
+`Settings.forecast_min_data_points` points, an unrecognized label
+pattern, or a raw-ISO-date-labeled series — forecasting inherits
+`detect_missing_periods`'s own "date gets no gap detection" scope
+boundary rather than relaxing it) is a normal, typed
+`ForecastResult(status="rejected", ...)`, never an exception and never a
+reason `/ask` itself fails. `recommendations_for_forecast` (the first
+real producer of `recommendation.models.Recommendation` in this
+codebase) and `analytics.visualization.build_forecast_chart_spec` are
+built and fully tested but **not wired into the live `/ask`/`/execute`
+paths or the frontend in this pass** — the same disclosed "compute +
+test, defer the deepest wiring" deferral Prompts 14/15 already
+established.
+
+**Read [`16_FORECASTING_CONTRACT.md`](16_FORECASTING_CONTRACT.md)** for
+the full inspection findings, every model's fitting/backtest/interval
+design, the testing summary (3132/3132 backend tests passing, up from
+3088 before this prompt — including 7 pre-existing orchestrator/`/ask`
+tests whose own stand-ins needed updating for `run_agent`'s new
+parameter, not a regression in this prompt's own code), and the
+disclosed, honest scope boundaries.
 
 ## How to run
 

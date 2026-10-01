@@ -186,6 +186,7 @@ class TestAsk:
             attachment_ids=None,
             model=None,
             tenant_id=None,
+            forecast_horizon=None,
         ):
             captured["question"] = question
             captured["conversation_history"] = conversation_history
@@ -196,6 +197,7 @@ class TestAsk:
             captured["attachment_ids"] = attachment_ids
             captured["model"] = model
             captured["tenant_id"] = tenant_id
+            captured["forecast_horizon"] = forecast_horizon
             return {"status": "succeeded", "error_history": []}
 
         monkeypatch.setattr("api.main.run_orchestrated", _capture)

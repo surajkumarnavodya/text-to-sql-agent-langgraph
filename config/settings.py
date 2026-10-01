@@ -909,6 +909,37 @@ class Settings(BaseSettings):
             rendering capability today; geography-shaped data is
             recommended as `ChartType.BAR` instead until a future prompt
             adds one.
+        enable_forecasting: Whether `agent.nodes.generate_forecast_node`
+            calls `analytics.forecasting.generate_forecast`. True by
+            default -- a pure, deterministic, zero-I/O computation (no
+            Ollama call), same "operator escape hatch" posture as
+            `enable_analytics_engine`; the node itself only ever fires
+            when `classify_analytical_intent_node` already classified the
+            question as `AnalyticalIntentType.FORECAST`. See
+            `16_FORECASTING_CONTRACT.md`.
+        forecast_default_horizon: How many future periods to forecast
+            when a caller doesn't specify one.
+        forecast_max_horizon: A hard cap on a caller-requested horizon --
+            rejected outright (never silently clamped) above this.
+        forecast_min_data_points: Fewer than this many historical points
+            and `analytics.forecasting.generate_forecast` returns a typed
+            rejection rather than guessing -- the literal "reject
+            forecasts when data is insufficient" requirement.
+        forecast_seasonal_period: The lag `analytics.forecasting`'s
+            seasonal-naive model repeats -- `None` (auto) resolves to `12`
+            for a year-month-labeled series and leaves seasonal-naive
+            unavailable for a year-labeled one unless set explicitly.
+        forecast_moving_average_window: The moving-average model's window
+            size, capped to the available history when shorter.
+        forecast_ses_alpha: The fixed smoothing constant for the simple
+            exponential smoothing model (no iterative fitting).
+        forecast_backtest_holdout: How many of the most recent historical
+            points are held out to backtest a model's own accuracy
+            (MAE/RMSE/MAPE) -- also `AUTO`'s own model-selection signal.
+        forecast_confidence_level: The two-sided confidence level
+            `analytics.forecasting`'s prediction intervals target -- an
+            unlisted value falls back to a 95% z-multiplier, disclosed via
+            `ForecastResult.limitations`.
         enable_golden_examples: Whether `agent.nodes
             .retrieve_golden_examples_node` looks up human-approved past
             (question, SQL) pairs (see `embeddings.golden_examples`) and
@@ -1677,6 +1708,59 @@ class Settings(BaseSettings):
     visualization_default_top_n: int = Field(default=20, gt=0)
     enable_box_plot_charts: bool = False
     enable_map_charts: bool = False
+    # Prompt 16 (16_FORECASTING_CONTRACT.md): analytics.forecasting
+    # .generate_forecast's own tunables, gating agent.nodes
+    # .generate_forecast_node's call to it. Same "pure, deterministic,
+    # zero-I/O, operator escape hatch" posture as enable_analytics_engine/
+    # enable_anomaly_detection above -- on by default, since the
+    # computation itself is cheap and the node only ever runs when
+    # classify_analytical_intent_node already classified the question as
+    # AnalyticalIntentType.FORECAST (see that node's own docstring).
+    enable_forecasting: bool = True
+    # How many future periods to forecast when AskRequest.forecast_horizon
+    # is omitted.
+    forecast_default_horizon: int = Field(default=3, gt=0)
+    # A hard cap on AskRequest.forecast_horizon -- validated at the /ask
+    # handler (HTTP 400 if exceeded), the identical "reject before any
+    # LLM/DB work starts" posture AskRequest.model's own allowlist check
+    # already establishes.
+    forecast_max_horizon: int = Field(default=24, gt=0)
+    # The literal "reject forecasts when data is insufficient" threshold --
+    # fewer than this many historical (period, value) points and
+    # analytics.forecasting.generate_forecast returns a typed rejection
+    # rather than guessing.
+    forecast_min_data_points: int = Field(default=4, gt=1)
+    # None (auto) by default: analytics.forecasting.generate_forecast uses
+    # 12 (a yearly cycle) for a year_month-labeled series and leaves
+    # seasonal_naive unavailable for a year-labeled one (no established
+    # default sub-annual cycle for already-yearly data) unless an operator
+    # sets this explicitly, e.g. 4 for quarterly-shaped data encoded as
+    # year_month.
+    forecast_seasonal_period: int | None = None
+    # analytics.forecasting's moving-average model's own window size --
+    # silently capped to the available history length when shorter
+    # (see _fit_moving_average).
+    forecast_moving_average_window: int = Field(default=3, gt=0)
+    # The fixed smoothing constant for analytics.forecasting's simple
+    # exponential smoothing model (no iterative fitting -- a single,
+    # operator-configurable alpha, matching this module's own "stdlib
+    # only, no optimizer dependency" posture).
+    forecast_ses_alpha: float = Field(default=0.5, gt=0.0, le=1.0)
+    # How many of the most recent historical points analytics.forecasting
+    # .generate_forecast holds out to backtest a model's own accuracy
+    # (MAE/RMSE/MAPE) before trusting it -- also AUTO's own model-selection
+    # mechanism (lowest backtest MAPE wins). A series shorter than this
+    # value plus Settings.forecast_min_data_points simply gets no
+    # evaluation (disclosed via ForecastResult.limitations), never a
+    # rejection by itself.
+    forecast_backtest_holdout: int = Field(default=2, gt=0)
+    # The two-sided confidence level analytics.forecasting's prediction
+    # intervals target. Only a handful of common levels (80/90/95/98/99%)
+    # have an exact z-multiplier configured (no scipy dependency, see that
+    # module's own docstring) -- an unlisted value falls back to the 95%
+    # z-value and is disclosed via ForecastResult.limitations, never
+    # silently misreported as the requested level.
+    forecast_confidence_level: float = Field(default=0.95, gt=0.0, lt=1.0)
     enable_golden_examples: bool = True
     golden_examples_top_k: int = Field(default=3, gt=0)
     golden_examples_min_similarity: float = Field(default=0.75, ge=0.0, le=1.0)

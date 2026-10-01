@@ -507,6 +507,39 @@ class AgentState(TypedDict, total=False):
     # stddev fields already established before this prompt existed.
     analytical_result: dict | None
 
+    # Input, set once by `run_agent()` from the caller (`AskRequest
+    # .forecast_horizon`, already range-validated against
+    # `Settings.forecast_max_horizon` by `api/main.py`'s `/ask` handler
+    # before this function is ever called -- the identical "validate
+    # before any admission-control slot is acquired" pattern
+    # `AskRequest.model` already uses). `None` (the default -- every
+    # caller before this field existed) means "use
+    # `Settings.forecast_default_horizon`", resolved by `analytics
+    # .forecasting.generate_forecast` itself, not here.
+    forecast_horizon: int | None
+
+    # Set by generate_forecast_node (Prompt 16,
+    # 16_FORECASTING_CONTRACT.md), which runs between compute_analytics and
+    # generate_insight, only when classify_analytical_intent_node already
+    # classified the question as AnalyticalIntentType.FORECAST --
+    # analytics.forecasting.generate_forecast's full typed
+    # ForecastResult.model_dump() output (status, the model actually used
+    # and its training-window/parameters metadata, the forecasted points
+    # with prediction intervals where supported, a backtest evaluation,
+    # and always-non-empty limitations), or `None` when forecasting wasn't
+    # even attempted (feature disabled, no FORECAST intent, or no
+    # time-series growth data available for this result -- see that
+    # node's own docstring for the full skip/fail-open conditions). A
+    # *rejected* ForecastResult (data insufficient / untrusted temporal
+    # semantics) is still stored here, not collapsed into None -- so a
+    # caller can see why forecasting didn't happen. Always a plain dict,
+    # matching this TypedDict's established convention. Every value in it
+    # is DataTruthLevel.AI_INFERENCE (agent.provenance) -- a statistical
+    # extrapolation beyond the already-executed result, never a confirmed
+    # fact; see analytics.forecasting's own module docstring for why this
+    # is classified that way rather than as DATABASE_FACT.
+    forecast_result: dict | None
+
     # Input, set once by the caller -- whether generate_insight_node should
     # even attempt an insight. True (the default) is normally low-risk and
     # high-value; the UI exposes this as a toggle so it can be turned off

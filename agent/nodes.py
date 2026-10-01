@@ -25,6 +25,7 @@ from collections.abc import Callable
 from typing import Any
 
 from analytics.engine import compute_analytics_result
+from analytics.forecasting import generate_forecast
 from retrieval.retriever import extract_governing_metrics, retrieve_business_context
 from sqlalchemy.exc import SQLAlchemyError
 
@@ -45,7 +46,7 @@ from agent.input_guard import (
     sanitize_conversation_history,
 )
 from agent.insight import is_insight_grounded, should_skip_insight, summarize_result
-from agent.intent import intent_implies_planning
+from agent.intent import AnalyticalIntentType, intent_implies_planning
 from agent.llm_client import (
     generate_analytical_intent_from_llm,
     generate_analytical_plan_from_llm,
@@ -1867,6 +1868,99 @@ def compute_analytics_node(state: AgentState) -> dict[str, Any]:
         result.insufficient_data_reasons,
     )
     return {"analytical_result": result.model_dump(mode="json")}
+
+
+def _extract_growth_series(analytical_result: dict | None) -> list[tuple[str, float]] | None:
+    """Pulls the `(period, value)` series out of an already-computed
+    `analytics.engine.compute_analytics_result` dict's own `GROWTH`
+    finding, if it has one -- `None` when there isn't one (the result
+    wasn't classified `TIME_SERIES`, `compute_analytics_node` didn't run,
+    or growth itself was skipped for having fewer than 2 periods). Zero
+    recomputation: this is the exact series `analytics.anomaly
+    .detect_anomalies` already reuses via `analytics.engine
+    ._anomaly_findings`, reused here the same way for forecasting.
+    """
+    if not analytical_result:
+        return None
+    for finding in analytical_result.get("findings", []):
+        if finding.get("kind") == "growth" and finding.get("growth"):
+            return [(p["period"], p["value"]) for p in finding["growth"]["points"]]
+    return None
+
+
+@_timed_node("generate_forecast")
+def generate_forecast_node(state: AgentState) -> dict[str, Any]:
+    """Forecasts future periods for a successfully executed, time-series-
+    shaped query result -- Prompt 16 (`16_FORECASTING_CONTRACT.md`).
+
+    Only reachable from `compute_analytics_node`, immediately before
+    `generate_insight` (see `agent/graph.py`) -- a straight edge, never a
+    conditional one, so this node can never short-circuit the graph the
+    way `classify_followup_node`'s "ambiguous" classification can.
+
+    Unlike `compute_analytics_node` right before it (which runs on *every*
+    successful execution), this node only ever attempts a forecast when
+    `classify_analytical_intent_node` already classified the question as
+    `agent.intent.AnalyticalIntentType.FORECAST` -- no new classification,
+    no keyword regex, purely reusing a judgment already made earlier in
+    this same run. `Settings.enable_forecasting` off, a `None`/non-FORECAST
+    `state["analytical_intent"]`, or `_extract_growth_series` finding no
+    growth series to forecast from (the result wasn't a recognized time
+    series) all skip the actual forecasting call -- leaving
+    `state["forecast_result"]` as `None`, never a reason the question
+    itself fails.
+
+    Delegates entirely to `analytics.forecasting.generate_forecast`,
+    reusing `state["analytical_result"]`'s already-computed
+    `GrowthStat.points` series (zero new queries). A data-insufficient or
+    untrusted-temporal-semantics series resolves to a normal, typed
+    `ForecastResult(status="rejected", ...)` from that function -- not an
+    exception -- which is still stored here (so the caller can see *why*
+    forecasting didn't happen), not treated as the empty `None` case
+    above. Fails open on any genuinely unexpected error, the same posture
+    `compute_analytics_node` already establishes.
+
+    Every forecasted value is `DataTruthLevel.AI_INFERENCE`
+    (`ForecastResult.truth_level`) -- see `analytics.forecasting`'s own
+    module docstring for why a deterministic, non-LLM extrapolation is
+    still classified this way rather than as `DATABASE_FACT`, and never
+    silently promoted further (master-contract rules 9-10).
+    """
+    settings = get_settings()
+    if not settings.enable_forecasting:
+        logger.info("[generate_forecast] skipped (enable_forecasting=False)")
+        return {"forecast_result": None}
+
+    analytical_intent = state.get("analytical_intent")
+    if (
+        not analytical_intent
+        or AnalyticalIntentType(analytical_intent["intent"]) != AnalyticalIntentType.FORECAST
+    ):
+        return {"forecast_result": None}
+
+    series = _extract_growth_series(state.get("analytical_result"))
+    if series is None:
+        logger.info(
+            "[generate_forecast] FORECAST intent classified, but no time-series growth "
+            "data is available for this result -- skipping"
+        )
+        return {"forecast_result": None}
+
+    try:
+        result = generate_forecast(series, horizon=state.get("forecast_horizon"), settings=settings)
+    except Exception as exc:  # noqa: BLE001 - an accuracy aid must never block the run
+        logger.warning(
+            "[generate_forecast] computation failed unexpectedly, proceeding without: %s", exc
+        )
+        return {"forecast_result": None}
+
+    logger.info(
+        "[generate_forecast] status=%s model=%s horizon=%d",
+        result.status,
+        result.model.model.value if result.model else None,
+        result.horizon,
+    )
+    return {"forecast_result": result.model_dump(mode="json")}
 
 
 @_timed_node("generate_insight")

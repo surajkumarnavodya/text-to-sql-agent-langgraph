@@ -708,6 +708,7 @@ def sql_subgraph_node(state: OrchestratorState) -> dict[str, Any]:
         state.get("enable_insight", True),
         state.get("caller_roles", ()),
         state.get("selected_model"),
+        forecast_horizon=state.get("forecast_horizon"),
     )
     result = dict(sql_state)
     result["sources_used"] = ["sql"]

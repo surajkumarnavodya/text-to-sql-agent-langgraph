@@ -153,6 +153,7 @@ def run_orchestrated(
     attachment_ids: list[str] | None = None,
     model: str | None = None,
     tenant_id: str | None = None,
+    forecast_horizon: int | None = None,
 ) -> AgentState | OrchestratorState:
     """Routes a question to one or more sources and returns the combined result.
 
@@ -206,6 +207,12 @@ def run_orchestrated(
             short-circuit path (directly to `run_agent`) and the
             multi-source path (`OrchestratorState["tenant_id"]`). Nothing
             reads it yet on either path.
+        forecast_horizon: Same shape and meaning as `agent.graph.run_agent`'s
+            parameter of the same name -- already validated by `api/main.py`'s
+            `/ask` handler. Passed directly to `run_agent` on the
+            short-circuit path below; threaded through
+            `OrchestratorState["forecast_horizon"]` to `sql_subgraph_node` on
+            the multi-source path.
 
     Returns:
         When `Settings.enable_multi_source_router` is off AND no
@@ -226,6 +233,7 @@ def run_orchestrated(
             caller_roles,
             model,
             tenant_id,
+            forecast_horizon,
         )
 
     logger.info(
@@ -256,6 +264,8 @@ def run_orchestrated(
         "clarification_message": None,
         "selected_database": None,
         "selected_model": model,
+        "forecast_horizon": forecast_horizon,
+        "forecast_result": None,
         "enable_insight": enable_insight,
         "insight": None,
         "insight_summary": None,

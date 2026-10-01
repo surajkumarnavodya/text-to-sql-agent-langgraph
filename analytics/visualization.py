@@ -43,7 +43,7 @@ from enum import Enum
 
 from pydantic import BaseModel, ConfigDict
 
-from analytics.models import AnalyticsResult
+from analytics.models import AnalyticsResult, ForecastResult
 from config.settings import Settings, get_settings
 
 #: Bumped when this module's chart-type-selection rules, title/format/
@@ -488,5 +488,93 @@ def build_chart_spec(
         notices=tuple(notices),
         accessibility=accessibility,
         reason=reason,
+        engine_version=VISUALIZATION_ENGINE_VERSION,
+    )
+
+
+def build_forecast_chart_spec(
+    forecast_result: ForecastResult,
+    historical_points: list[tuple[str, float]],
+    value_column_name: str = "value",
+    settings: Settings | None = None,
+) -> ChartSpec | None:
+    """Builds a deterministic chart specification for an already-computed
+    `analytics.forecasting.ForecastResult` -- Prompt 16's own "integrate
+    with the visualization contract" requirement.
+
+    Reuses the exact same `ChartSpec`/`ChartField`/`FieldRole`/
+    `AccessibilityMetadata` typed contracts `build_chart_spec` above
+    already establishes -- no new chart-data shape. Returns `None` when
+    `forecast_result.status != "ok"` (nothing to chart), mirroring
+    `build_chart_spec`'s own "no chart type fits -> None" contract.
+
+    Always a `LINE` chart with two distinct `Y`/`SERIES` fields (the
+    historical actual series and the forecasted estimate) -- never one
+    blended, undifferentiated series -- and discloses the estimate nature
+    of the forecasted portion via both `notices` (every one of
+    `forecast_result.limitations`, plus which periods are estimates) and
+    `accessibility` (`forecast_result.summary`, which itself always says
+    "estimate"/"forecast", never phrased as a confirmed value). Not
+    consumed by `frontend/src/lib/chartEngine.ts` in this pass -- the
+    identical "computed + tested + exposed via the API, not yet wired into
+    the frontend" deferral `build_chart_spec`'s own `visualization_spec`
+    already established for Prompt 15.
+
+    Args:
+        forecast_result: An already-computed `analytics.forecasting
+            .generate_forecast` result.
+        historical_points: The same `(period, value)` series that was fed
+            into `generate_forecast` -- used only to anchor the "estimates
+            start after period X" notice; never re-validated or
+            re-forecast here.
+        value_column_name: The historical series' own value column name
+            (e.g. `"TotalRevenue"`), used for titling/format inference via
+            the exact same `_humanize`/`_infer_format` helpers
+            `build_chart_spec` uses. Defaults to a generic `"value"` when
+            the caller doesn't have a more specific column name on hand.
+        settings: Defaults to `config.settings.get_settings()`.
+    """
+    settings = settings or get_settings()
+    if forecast_result.status != "ok" or forecast_result.model is None:
+        return None
+
+    x_field = ChartField(column="period", role=FieldRole.X, aggregation=None, format="plain")
+    value_format = _infer_format(value_column_name)
+    actual_field = ChartField(
+        column=value_column_name, role=FieldRole.Y, aggregation=None, format=value_format
+    )
+    forecast_field = ChartField(
+        column=f"{value_column_name}_forecast",
+        role=FieldRole.SERIES,
+        aggregation=None,
+        format=value_format,
+    )
+
+    model_name = forecast_result.model.model.value
+    title = f"{_humanize(value_column_name)} Forecast ({model_name.replace('_', ' ').title()})"
+
+    notices: list[str] = []
+    if historical_points:
+        notices.append(
+            f"Periods after {historical_points[-1][0]} are forecasted estimates, not actual "
+            "results."
+        )
+    notices.extend(forecast_result.limitations)
+
+    accessibility = AccessibilityMetadata(
+        alt_text=f"{title}. {forecast_result.summary}",
+        summary=forecast_result.summary,
+    )
+
+    return ChartSpec(
+        chart_type=ChartType.LINE,
+        title=title,
+        fields=(x_field, actual_field, forecast_field),
+        sort=ChartSort(column="period", direction="asc"),
+        limit=None,
+        is_downsampled=False,
+        notices=tuple(notices),
+        accessibility=accessibility,
+        reason="A forecast extends a historical trend line with an estimated continuation.",
         engine_version=VISUALIZATION_ENGINE_VERSION,
     )
