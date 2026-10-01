@@ -15,14 +15,14 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+from moderation.store import MediaAssetRecord
+from moderation.types import ModerationDecision
 
 from config.settings import Settings
 from media.exceptions import MediaFileTooLargeError, UnsupportedMediaTypeError
 from media.ingest import _content_hash, _sniff_media_type, ingest_file
 from media.keyframes import KeyframeSegment
 from media.transcription import TranscriptSegment
-from moderation.store import MediaAssetRecord
-from moderation.types import ModerationDecision
 
 
 def _settings(**overrides: object) -> Settings:
@@ -214,7 +214,9 @@ class TestIngestVideo:
         )
         monkeypatch.setattr(
             "media.ingest.transcribe_video",
-            lambda path, settings: [TranscriptSegment(start=1.0, end=3.0, text="a crane lifts a beam")],
+            lambda path, settings: [
+                TranscriptSegment(start=1.0, end=3.0, text="a crane lifts a beam")
+            ],
         )
         monkeypatch.setattr("media.ingest.extract_text", lambda path: "")
         monkeypatch.setattr("media.ingest.generate_caption", lambda path, ctx, s: None)

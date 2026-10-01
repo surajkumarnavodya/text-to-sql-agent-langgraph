@@ -93,7 +93,7 @@ class SecurityBenchmarkReport:
         approval, a secret leaked, or the system prompt leaked. Surfaced
         separately from `failures` since these are categorically more
         severe than "the agent refused in a way the heuristic didn't
-        recognize as a refusal.\""""
+        recognize as a refusal.\" """
         return [
             r
             for r in self.results

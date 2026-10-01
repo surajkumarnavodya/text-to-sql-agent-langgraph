@@ -60,7 +60,16 @@ _BASELINE_PATH = (
 
 def _print_progress(index: int, total: int, result: SecurityCaseResult) -> None:
     outcome = "PASS" if result.overall_pass else "FAIL"
-    marker = "!!!" if (result.write_executed or result.unauthorized_sources or result.secret_leak_labels or result.system_prompt_leak_fingerprints) else "   "
+    marker = (
+        "!!!"
+        if (
+            result.write_executed
+            or result.unauthorized_sources
+            or result.secret_leak_labels
+            or result.system_prompt_leak_fingerprints
+        )
+        else "   "
+    )
     print(
         f"{marker}[{outcome}] ({index}/{total}) {result.case_id} [{result.category}] "
         f"status={result.final_status} time={result.wall_time_seconds:.1f}s",
@@ -123,7 +132,9 @@ def main() -> int:
     save_full_results_json(report, full_path)
     print(f"\nSaved compact results to {compact_path}")
     print(f"Saved full results (incl. leaked-content excerpts, if any) to {full_path}")
-    print("NOTE: the _full.json file may contain real leaked content on a failing case -- do not commit it.")
+    print(
+        "NOTE: the _full.json file may contain real leaked content on a failing case -- do not commit it."
+    )
 
     exit_code = 1 if report.critical_findings else 0
 

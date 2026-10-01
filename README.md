@@ -241,7 +241,7 @@ cd text-to-sql-agent-langgraph
 python -m venv .venv
 source .venv/bin/activate        # Windows: .venv\Scripts\Activate.ps1
 pip install --upgrade pip
-pip install -r requirements.txt
+pip install -r requirements-dev.txt   # or requirements.txt for a runtime-only install
 cp .env.example .env             # Windows: Copy-Item .env.example .env
 ```
 

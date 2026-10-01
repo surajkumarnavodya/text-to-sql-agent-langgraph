@@ -4,8 +4,9 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from config.moderation_blocklist import find_matches, load_blocklist
 from moderation.taxonomy import ALL_CATEGORIES, decision_for
+
+from config.moderation_blocklist import find_matches, load_blocklist
 
 
 def _write_yaml(tmp_path: Path, content: str) -> Path:
@@ -52,7 +53,7 @@ class TestFindMatches:
         assert find_matches("A HANDGUN was visible on the table", blocklist) == ["weapons"]
 
     def test_no_match_on_substring(self):
-        """"handgun" must not match inside an unrelated word like
+        """ "handgun" must not match inside an unrelated word like
         "handgunners" or "shorthandgun" -- whole-word matching only."""
         blocklist = {"weapons": ["handgun"]}
         assert find_matches("shorthandgunmanship", blocklist) == []

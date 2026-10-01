@@ -6,10 +6,13 @@ suggestions, and bug reports are welcome.
 ## Dev environment setup
 
 Follow the **Getting Started** section in [`README.md`](README.md) — clone, create a
-venv, `pip install -r requirements.txt`, copy `.env.example` to `.env` and
-point it at a real (ideally read-only, non-production) database. The
-mocked `pytest` suite doesn't need a real database or Ollama; the benchmark
-harness (`scripts/run_benchmark.py`) and `scripts/integration_test.py` do.
+venv, `pip install -r requirements-dev.txt` (pulls in `requirements.txt` too,
+plus pytest/black/ruff/mypy/reportlab — the production image installs only
+`requirements.txt`, see that file's own comment), copy `.env.example` to
+`.env` and point it at a real (ideally read-only, non-production) database.
+The mocked `pytest` suite doesn't need a real database or Ollama; the
+benchmark harness (`scripts/run_benchmark.py`) and
+`scripts/integration_test.py` do.
 
 ## Coding standards
 

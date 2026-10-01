@@ -18,7 +18,6 @@ import re
 from pathlib import Path
 
 import yaml
-
 from moderation.taxonomy import Category
 
 _DEFAULT_PATH = Path(__file__).resolve().parent / "moderation_blocklist.yaml"

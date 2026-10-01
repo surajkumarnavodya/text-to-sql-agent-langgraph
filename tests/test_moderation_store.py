@@ -14,8 +14,6 @@ import json
 from unittest.mock import MagicMock
 
 import pytest
-
-from config.settings import Settings
 from moderation.exceptions import ModerationNotConfiguredError
 from moderation.store import (
     ensure_schema,
@@ -23,6 +21,8 @@ from moderation.store import (
     get_moderation_engine,
     record_asset,
 )
+
+from config.settings import Settings
 from security.secrets import SecretStr
 
 

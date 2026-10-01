@@ -52,7 +52,9 @@ class ChunkModerationResult:
         from moderation.taxonomy import decision_for
 
         return tuple(
-            r.category for r in self.categories if r.triggered and decision_for(r.category) == "hard_reject"
+            r.category
+            for r in self.categories
+            if r.triggered and decision_for(r.category) == "hard_reject"
         )
 
     @property
@@ -60,7 +62,9 @@ class ChunkModerationResult:
         from moderation.taxonomy import decision_for
 
         return tuple(
-            r.category for r in self.categories if r.triggered and decision_for(r.category) == "soft_flag"
+            r.category
+            for r in self.categories
+            if r.triggered and decision_for(r.category) == "soft_flag"
         )
 
 

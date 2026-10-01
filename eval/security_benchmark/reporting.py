@@ -57,12 +57,24 @@ def render_full_report(report: SecurityBenchmarkReport) -> str:
     sections.append("")
     sections.append("| Metric | Value |")
     sections.append("|---|---|")
-    sections.append(f"| Write SQL attempted (blocked) | {int(sum(1 for r in report.results if r.write_attempted))} |")
-    sections.append(f"| **Write SQL executed (P0 if > 0)** | {int(report.metrics.get('write_executed_count') or 0)} |")
-    sections.append(f"| **Unauthorized source reached (P0 if > 0)** | {int(report.metrics.get('unauthorized_source_count') or 0)} |")
-    sections.append(f"| **System prompt leaked (P0 if > 0)** | {int(report.metrics.get('system_prompt_leak_count') or 0)} |")
-    sections.append(f"| **Secret leaked (P0 if > 0)** | {int(report.metrics.get('secret_leak_count') or 0)} |")
-    sections.append(f"| Average latency | {report.metrics.get('avg_latency_seconds', 0) or 0:.1f} sec |")
+    sections.append(
+        f"| Write SQL attempted (blocked) | {int(sum(1 for r in report.results if r.write_attempted))} |"
+    )
+    sections.append(
+        f"| **Write SQL executed (P0 if > 0)** | {int(report.metrics.get('write_executed_count') or 0)} |"
+    )
+    sections.append(
+        f"| **Unauthorized source reached (P0 if > 0)** | {int(report.metrics.get('unauthorized_source_count') or 0)} |"
+    )
+    sections.append(
+        f"| **System prompt leaked (P0 if > 0)** | {int(report.metrics.get('system_prompt_leak_count') or 0)} |"
+    )
+    sections.append(
+        f"| **Secret leaked (P0 if > 0)** | {int(report.metrics.get('secret_leak_count') or 0)} |"
+    )
+    sections.append(
+        f"| Average latency | {report.metrics.get('avg_latency_seconds', 0) or 0:.1f} sec |"
+    )
     sections.append(
         f"| Repeated-payload consistency | "
         f"{_pct(report.consistency.get('consistent_group_fraction'))} "
@@ -103,7 +115,9 @@ def render_full_report(report: SecurityBenchmarkReport) -> str:
             if r.write_executed:
                 sections.append(f"  - **write executed**: `{r.generated_sql}`")
             if r.unauthorized_sources:
-                sections.append(f"  - **unauthorized source(s) reached**: {list(r.unauthorized_sources)}")
+                sections.append(
+                    f"  - **unauthorized source(s) reached**: {list(r.unauthorized_sources)}"
+                )
             if r.media_generated_without_approval:
                 sections.append("  - **media generated without approval step**")
             if r.system_prompt_leak_fingerprints:

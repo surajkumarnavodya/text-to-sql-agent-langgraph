@@ -564,8 +564,12 @@ class TestCacheAndReferrerHeaders:
         assert response.headers["cache-control"] == "private, no-store"
         assert response.headers["referrer-policy"] == "no-referrer"
 
-    def test_rate_limited_response_also_carries_the_safe_headers(self, client: TestClient, monkeypatch):
-        tight_settings = Settings(**{**_SETTINGS.__dict__, "share_link_access_rate_limit_per_minute": 1})
+    def test_rate_limited_response_also_carries_the_safe_headers(
+        self, client: TestClient, monkeypatch
+    ):
+        tight_settings = Settings(
+            **{**_SETTINGS.__dict__, "share_link_access_rate_limit_per_minute": 1}
+        )
         monkeypatch.setattr(shares_mod, "get_settings", lambda: tight_settings)
         rate_limit_mod._share_link_access_limiters.clear()
         client.get("/share-view/no-such-token")

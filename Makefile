@@ -7,7 +7,11 @@ PIP := $(VENV)/bin/pip
 setup:
 	python3 -m venv $(VENV)
 	$(PIP) install --upgrade pip
-	$(PIP) install -r requirements.txt
+	# requirements-dev.txt, not requirements.txt -- a local dev venv needs
+	# pytest/black/ruff/mypy too (the test/lint/format targets below depend
+	# on them); the production Docker image deliberately installs only
+	# requirements.txt (2026 security remediation pass).
+	$(PIP) install -r requirements-dev.txt
 	@test -f .env || cp .env.example .env
 
 check-db:

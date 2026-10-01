@@ -27,7 +27,14 @@ chromadb==1.5.9
 
 # PDF text extraction for document/policy RAG ingestion (rag/ingestion.py) --
 # pure-Python, no system dependency (unlike e.g. poppler-based extractors).
-pypdf==6.18.0
+# Also used directly by attachments/processors/pdf_processor.py for chat PDF
+# attachments -- both call sites parse attacker-controlled PDF bytes, so this
+# stays current with pypdf's own disclosed DoS fixes (large-memory-usage /
+# long-runtime bugs in page-label, /ToUnicode, font, FlateDecode, appearance-
+# stream, and embedded-file parsing -- CVE-2026-102995 through -102999 and
+# CVE-2026-103000, all fixed by 6.18.1/6.19.0; bumped straight to 6.19.0,
+# 2026 security remediation pass).
+pypdf==6.19.0
 
 # XXE/billion-laughs-hardened XML parsing for db/query_cost.py's MSSQL
 # SHOWPLAN_XML parsing -- was already present transitively but pinned
@@ -112,7 +119,16 @@ email-validator==2.2.0
 # silently relying on another package continuing to pull cryptography in.
 # `PyJWKClient` (this module's actual JWKS-fetch/cache/key-rotation
 # mechanism) is part of the base package, not the extra.
-pyjwt[crypto]==2.14.0
+# Bumped 2.14.0 -> 2.15.1 (2026 security remediation pass) for
+# CVE-2026-101918/GHSA-42vr-xj54-vc7v: `PyJWKClient.get_signing_key_from_jwt`
+# (called directly at security/oidc.py's `jwk_client.get_signing_key_from_jwt(token)`
+# call site, before signature verification) only catches `ValueError` around
+# its pre-verification payload parse, not `RecursionError` -- an
+# unauthenticated caller sending a deeply, recursively nested JWT payload to
+# any OIDC-protected route raises an uncaught exception (caught by this app's
+# own global exception handler, so not a process crash, but a real
+# unauthenticated DoS/error-rate vector nonetheless). Fixed in 2.15.0.
+pyjwt[crypto]==2.15.1
 
 # --- Google sign-in (optional, see security/google_oidc.py, docs/AUTHENTICATION.md) ---
 # google.oauth2.id_token.verify_oauth2_token is Google's own maintained ID-
@@ -192,17 +208,20 @@ python-pptx==1.0.2
 python-dotenv==1.2.2
 pyyaml==6.0.3   # config/table_descriptions.py -- was only a transitive dep before
 
-# --- Dev / test / lint (not required to run the app) ---
-pytest==8.3.4
-black==24.10.0
-ruff==0.8.4
-mypy==1.13.0
-types-PyYAML==6.0.12.20260815
-
-# --- Docs build (not required to run the app) ---
-# Pure-Python PDF generation for scripts/build_user_guide_pdf.py, the actual
-# source of docs/User_Guide.pdf -- see that script's docstring. Previously a
-# standalone binary with no checked-in source or build tool (three prior
-# revisions were each hand-authored outside the repo); this replaces that
-# with a reproducible build from USER_GUIDE.md's own content.
-reportlab==5.0.1
+# Dev/test/lint/docs-build tooling (pytest, black, ruff, mypy, reportlab, ...)
+# lives in requirements-dev.txt, not here (2026 security remediation pass).
+# Previously all of it was appended to *this* file under its own "not
+# required to run the app" comments -- true for what the app's own `CMD`
+# invokes, but the Dockerfile's `pip install -r requirements.txt` still
+# installed every one of those packages (including their own code, not just
+# metadata) into the actual production image regardless. That mattered
+# concretely for pytest/black: both have had CVEs with no patched release in
+# their previously-pinned line (predictable temp-dir naming;
+# `--python-cell-magics` cache-path traversal), and neither CVE was reachable
+# through this app's own runtime behavior -- but "present in the image,
+# unreachable today" is weaker than "not present in the image at all," and
+# costs nothing to fix here since nothing in `CMD`/the app's own code ever
+# imports them. See requirements-dev.txt; `Dockerfile`'s `pip install` is
+# unchanged (`-r requirements.txt`), so this split is what actually shrinks
+# the production image's installed package set, not just a documentation
+# reorganization.

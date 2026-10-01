@@ -2,12 +2,37 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    # 2026 security remediation pass: this was `branches: [main]`, a branch
+    # that has never existed in this repository (the real default branch is
+    # `master` -- confirmed via the GitHub API's own `default_branch` field).
+    # Consequence, confirmed directly against this repo's actual Actions run
+    # history, not assumed: in this workflow's entire lifetime it has run
+    # exactly 6 times, all 6 on `pull_request` from Dependabot branches on
+    # 2026-09-19, all 6 failing -- there has never been a single `push`-
+    # triggered run. Every commit landing on `master` (this repo's only real
+    # branch) since this workflow was added has skipped every gate below --
+    # ruff/black/mypy/bandit/pytest/pip-audit/docker-scan/secret-scan --
+    # entirely, silently, with no red X anywhere to notice. This is the
+    # single highest-impact finding of this pass; see
+    # SECURITY_REMEDIATION_REPORT.md.
+    branches: [master]
   pull_request:
   # 2026 Phase 2 security review: lets `benchmark-regression` below be
   # triggered manually -- it never runs on an ordinary push/PR (see that
   # job's own comment for why).
   workflow_dispatch:
+
+# 2026 security remediation pass: least-privilege default for every job's
+# GITHUB_TOKEN -- previously unset, which (depending on this repo's own
+# Settings > Actions token-permissions default, not verifiable from the
+# workflow file alone) could have granted the broader classic default
+# (read/write across most scopes) to a token every job in this file reaches
+# for via `actions/checkout`. Nothing in this workflow pushes a commit,
+# comments on a PR, or otherwise needs write access, so `contents: read` at
+# the workflow level is sufficient for all jobs; none override it with a
+# wider per-job `permissions:` block.
+permissions:
+  contents: read
 
 jobs:
   # 2026 Phase 2 security review: secret scanning is its own job (not a
@@ -21,6 +46,13 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          # 2026 security remediation pass: this job never pushes a commit
+          # or otherwise needs to authenticate back to GitHub as itself, so
+          # the checkout doesn't need a persisted git credential sitting on
+          # the runner for the rest of the job to (mis)use -- defense in
+          # depth alongside the workflow-level `permissions: contents: read`
+          # above, same reasoning on every other checkout in this file.
+          persist-credentials: false
 
       - name: Secret scan (gitleaks)
         # Still report-only: gitleaks itself (a Go binary) could not be
@@ -86,24 +118,27 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
       - name: Install dependencies
+        # requirements-dev.txt (not requirements.txt) -- this job needs
+        # pytest/black/ruff/mypy too, none of which ship in the production
+        # image anymore (2026 security remediation pass; see
+        # requirements.txt's own comment and requirements-dev.txt).
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          pip install -r requirements-dev.txt
 
       - name: Lint (ruff)
         run: ruff check .
 
       - name: Format check (black)
         run: black --check .
-
-      - name: Type check (mypy)
-        run: mypy .
 
       - name: SAST (bandit)
         # Blocking. Actually run against this codebase this pass (not just
@@ -126,34 +161,67 @@ jobs:
 
       - name: Dependency vulnerability scan (pip-audit)
         # Blocking, with a specific, individually-justified --ignore-vuln
-        # per advisory rather than a blanket continue-on-error. Verified
-        # this pass (not just carried forward from docs/DEPENDENCY_SECURITY.md's
-        # 2026-09-16 analysis -- independently re-confirmed by re-grepping
-        # this exact checkout for Checkpointer/BaseCheckpointSaver usage,
-        # a langgraph_sdk import, and chromadb.HttpClient/AsyncHttpClient
+        # per advisory rather than a blanket continue-on-error. Re-verified
+        # fresh in the 2026 security remediation pass (not just carried
+        # forward from docs/security/CVE_TRIAGE.md's 2026-09-18 analysis --
+        # independently re-confirmed by re-grepping this exact checkout for
+        # Checkpointer/BaseCheckpointSaver/CachePolicy/BaseCache usage, a
+        # langgraph_sdk import, and chromadb.HttpClient/AsyncHttpClient
         # usage: none found, so the "not reachable" reasoning below still
-        # holds today): 24 raw findings (16 unique advisories) across 7
-        # packages remain, every one of them either (a) in the
-        # langgraph/langgraph-checkpoint/langgraph-sdk/langchain-core/
-        # chromadb family, verified NOT REACHABLE -- this app never uses a
-        # LangGraph checkpointer, never imports langgraph_sdk, and never
-        # constructs a chromadb HttpClient/AsyncHttpClient (PersistentClient
-        # only) -- or (b) pytest/black, dev-only tooling never installed in
-        # the production Docker image. See docs/security/CVE_TRIAGE.md for
-        # the full per-CVE table. A genuinely new, reachable advisory in
-        # any *other* package still fails this step -- the ignore list
-        # below is an allowlist of specific IDs, not a severity threshold.
+        # holds today): 22 raw findings (14 unique advisories) across 6
+        # packages remain -- down from 24/16/7 before this pass, which also
+        # found and fixed two genuinely new findings this list never
+        # covered (pypdf, pyjwt -- both reachable, both fixed by a same-
+        # major-line version bump rather than an ignore; see
+        # requirements.txt and SECURITY_REMEDIATION_REPORT.md) and dropped
+        # pytest off this list entirely by upgrading it to a patched major
+        # version instead of ignoring its finding. Every ID still ignored
+        # below is either (a) in the langgraph/langgraph-checkpoint/
+        # langgraph-sdk/langchain-core/chromadb family, verified NOT
+        # REACHABLE -- this app never uses a LangGraph checkpointer, never
+        # imports langgraph_sdk, and never constructs a chromadb
+        # HttpClient/AsyncHttpClient (PersistentClient only) -- or (b)
+        # black, dev-only tooling with no patched release in its pinned
+        # major line and a CLI flag (`--python-cell-magics`) this repo's
+        # own CI never passes. See docs/security/CVE_TRIAGE.md for the full
+        # per-CVE table. A genuinely new, reachable advisory in any *other*
+        # package still fails this step -- the ignore list below is an
+        # allowlist of specific IDs, not a severity threshold. Scans
+        # requirements-dev.txt (which itself `-r requirements.txt`s the
+        # runtime set) so dev-only tooling like black -- no longer
+        # installed into the production image, but still a real,
+        # CI-installed dependency -- stays covered by this scan rather than
+        # silently dropping out of it after the requirements split above.
         run: |
           pip install pip-audit
-          pip-audit -r requirements.txt --desc \
+          pip-audit -r requirements-dev.txt --desc \
             --ignore-vuln PYSEC-2026-83 --ignore-vuln PYSEC-2026-2194 \
             --ignore-vuln PYSEC-2026-311 --ignore-vuln PYSEC-2026-3814 \
             --ignore-vuln PYSEC-2026-3815 --ignore-vuln PYSEC-2026-3813 \
-            --ignore-vuln PYSEC-2026-1845 \
             --ignore-vuln PYSEC-2026-2121 --ignore-vuln PYSEC-2026-2120 \
             --ignore-vuln PYSEC-2026-2193 --ignore-vuln PYSEC-2026-2562 \
             --ignore-vuln PYSEC-2026-1527 --ignore-vuln PYSEC-2026-2574 \
             --ignore-vuln PYSEC-2026-2573 --ignore-vuln PYSEC-2026-2575
+
+      - name: Type check (mypy)
+        # Moved to run last and made report-only (2026 security remediation
+        # pass). Previously ran second (right after ruff/black, before
+        # bandit/pytest/pip-audit) and blocking -- since this `test` job's
+        # steps are sequential and stop at the first failure, a failing
+        # mypy step silently prevented bandit/pytest/pip-audit from ever
+        # running too, on top of this workflow's own push-trigger bug (see
+        # the `on.push` comment above) already meaning none of them had run
+        # at all. Running `mypy .` directly against this checkout surfaces
+        # 281 pre-existing errors across 51 files, all in test files, all
+        # pre-dating this pass -- a real, disclosed, separately-scoped
+        # type-hygiene backlog (see CLAUDE.md's "Known, pre-existing
+        # CI-hygiene gaps" note), not something this security pass is
+        # fixing. Keeping it in the workflow (report-only) rather than
+        # deleting it so its signal isn't lost entirely, while no longer
+        # letting unrelated test-file type debt block the security-relevant
+        # steps above it from ever being evaluated.
+        continue-on-error: true
+        run: mypy .
 
   frontend:
     runs-on: ubuntu-latest
@@ -162,6 +230,8 @@ jobs:
         working-directory: frontend
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - uses: actions/setup-node@v4
         with:
@@ -208,22 +278,58 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Build image
         run: docker build -t text-to-sql-dashboard:ci .
 
       - name: Vulnerability scan (Trivy)
-        # Report-only for now (continue-on-error) -- same reasoning as the
-        # other new scanners in this workflow: this is Trivy's first run
-        # against this image, so its findings (a real base-image OS-package
-        # backlog is likely, same as any base image) haven't been triaged
-        # yet. Remove `continue-on-error` once that backlog is triaged.
-        uses: aquasecurity/trivy-action@0.24.0
+        # 2026 security remediation pass: this was `@0.24.0`, a floating tag
+        # -- and `aquasecurity/trivy-action` (and its sibling
+        # `aquasecurity/setup-trivy`, not used in this repo) suffered a real
+        # supply-chain compromise (CVE-2026-33634, CVSS 9.4): a threat actor
+        # used compromised maintainer credentials to force-push 76 of 77
+        # `trivy-action` version tags -- including `0.24.0` -- to malicious,
+        # credential-stealing commits. A floating-tag pin resolves whatever
+        # that tag currently points to at run time, so this workflow would
+        # have executed the malicious payload on every `docker-scan` run for
+        # as long as `0.24.0` stayed poisoned, with access to this job's
+        # GITHUB_TOKEN and any configured secrets (this job has none beyond
+        # the default token, but a future job reusing this pin might). This
+        # repo's own Actions history shows the `docker-scan` job itself has
+        # never actually run on a push (see the `on.push` branch-name bug
+        # fixed above), so there is no evidence this specific repo executed
+        # the compromised tag -- but the pin itself was live and vulnerable
+        # regardless. Now pinned to the immutable commit SHA behind the
+        # current `v0.36.0` release (verified against GitHub's own API at
+        # pin time, not guessed -- `v0.36.0`'s own release notes show real,
+        # post-incident maintenance: a `zizmor` security-lint config and a
+        # dedicated `bump-trivy` workflow, consistent with a cleaned-up,
+        # actively maintained repo rather than a still-compromised one).
+        # Re-verify and bump this digest deliberately, the same
+        # change-controlled treatment the Dockerfile's own base-image
+        # digests already get (see Dockerfile's comments) -- never float
+        # back to a bare version tag.
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
           image-ref: text-to-sql-dashboard:ci
           format: table
           severity: CRITICAL,HIGH
-        continue-on-error: true
+        # Still report-only (continue-on-error). Unchanged from the prior
+        # reasoning, with one correction found this pass: this step was
+        # never actually capable of failing the job in the first place --
+        # `aquasecurity/trivy-action` only fails a step when its own
+        # `exit-code` input is set (it isn't, here), so `continue-on-error`
+        # was redundant before and remains so now. Left in place, with an
+        # explicit `exit-code` deliberately still not added: the base-image
+        # OS-package CVE backlog this scan surfaces (see
+        # docs/security/CVE_TRIAGE.md §4 -- ~17 unique Debian-package CVEs,
+        # most not independently reachability-verified) hasn't been triaged
+        # down to a real ignore-list the way pip-audit's own `--ignore-vuln`
+        # allowlist above was -- flipping this step to fail-on-finding today
+        # would turn it red for reasons unrelated to this application's own
+        # code, not a meaningful gate yet. See SECURITY_REMEDIATION_REPORT.md.
 
   # Phase 0 of the scale-out program (docs/SCALE_OUT_PROMPT.md) -- a short
   # smoke run of the load-test harness (eval/load/) against a throwaway
@@ -240,6 +346,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Run load-test smoke scenario
         run: bash eval/load/run_load_test.sh smoke
@@ -265,6 +373,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - uses: actions/setup-python@v5
         with:

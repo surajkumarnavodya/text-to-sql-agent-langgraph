@@ -7,9 +7,10 @@ I/O happens.
 
 from __future__ import annotations
 
-from config.settings import Settings
 from moderation.gate import decision_summary, moderate_chunks
 from moderation.types import CategoryResult, ModerationChunk
+
+from config.settings import Settings
 
 
 def _settings(**overrides: object) -> Settings:

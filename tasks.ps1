@@ -39,7 +39,12 @@ function Invoke-Setup {
         }
     }
     & $VenvPython -m pip install --upgrade pip
-    & $VenvPython -m pip install -r requirements.txt
+    # requirements-dev.txt (not just requirements.txt) -- a local dev venv
+    # needs pytest/black/ruff/mypy too (the `test`/`lint`/`format` tasks
+    # below depend on them), unlike the production Docker image, which
+    # deliberately installs only requirements.txt (2026 security
+    # remediation pass -- see requirements.txt's own comment).
+    & $VenvPython -m pip install -r requirements-dev.txt
 
     if (-not (Test-Path ".env")) {
         Copy-Item ".env.example" ".env"

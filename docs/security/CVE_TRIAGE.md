@@ -1,5 +1,27 @@
 # CVE / Scanner Triage
 
+**2026 security remediation pass addendum (see
+[`SECURITY_REMEDIATION_REPORT.md`](../../SECURITY_REMEDIATION_REPORT.md),
+current source of truth for overall status):** this file's findings below
+are otherwise unchanged and were independently re-confirmed still accurate
+(same 24 pip-audit findings minus the two this pass fixed, same reachability
+grep results re-run fresh). What changed: **pypdf** (6 new CVEs, not
+previously tracked here — DoS-shaped bugs in page-label/ToUnicode/font/
+FlateDecode/appearance-stream/embedded-file parsing, reachable via
+`rag/ingestion.py` and `attachments/processors/`'s untrusted-PDF parsing)
+and **PyJWT** (1 new CVE, not previously tracked — an unauthenticated
+RecursionError DoS in `PyJWKClient.get_signing_key_from_jwt`, reachable via
+`security/oidc.py`) were found fresh this pass and fixed by same-major-line
+version bumps; **pytest** was bumped 8.3.4→9.1.1 (verified compatible,
+3088/3088 tests green) rather than left ignored; **black** remains
+unfixed (UPSTREAM FIX REQUIRED in its pinned line) but now lives in the new
+`requirements-dev.txt`, not the production image at all. See the new
+report for the full write-up, plus the CI/CD findings (a push-trigger
+branch-name bug that silently disabled every blocking gate on `master`,
+and the `aquasecurity/trivy-action` supply-chain compromise,
+CVE-2026-33634) this pass also found and fixed, which are out of this
+file's original scope.
+
 **Last updated:** 2026-09-18 (dependency-security remediation pass, session 2 — supersedes this file's own prior version from the CI-gate-hardening pass earlier the same day; every finding below was independently re-scanned and re-verified this session, not carried forward from memory).
 
 **Method.** Every claim is grounded in one of: (a) an actually-executed

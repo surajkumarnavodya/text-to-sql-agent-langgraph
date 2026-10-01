@@ -170,7 +170,9 @@ def download_media_bytes(
 
     for _ in range(_MAX_REDIRECTS):
         try:
-            response = requests.get(current_url, timeout=timeout, stream=True, allow_redirects=False)
+            response = requests.get(
+                current_url, timeout=timeout, stream=True, allow_redirects=False
+            )
         except requests.RequestException as exc:
             raise MediaGenerationError(
                 f"Network error downloading generated media: {redact_secrets(str(exc))}"

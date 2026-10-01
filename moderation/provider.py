@@ -38,7 +38,9 @@ logger = logging.getLogger(__name__)
 
 _API_VERSION = "2023-10-01"
 _REQUEST_TIMEOUT_SECONDS = 15
-_AZURE_HARM_CATEGORIES = tuple(AZURE_CATEGORY_MAP.keys())  # ("Hate", "SelfHarm", "Sexual", "Violence")
+_AZURE_HARM_CATEGORIES = tuple(
+    AZURE_CATEGORY_MAP.keys()
+)  # ("Hate", "SelfHarm", "Sexual", "Violence")
 
 # Azure's own documented max input sizes for a single Analyze call -- a
 # request over either limit is rejected by Azure itself with a clean 4xx,
@@ -116,7 +118,11 @@ def _azure_content_safety(chunk: ModerationChunk, settings: Settings) -> list[Ca
         response = httpx.post(
             f"{endpoint}/contentsafety/text:analyze?api-version={_API_VERSION}",
             headers=_azure_headers(key),
-            json={"text": text, "categories": list(_AZURE_HARM_CATEGORIES), "outputType": "FourSeverityLevels"},
+            json={
+                "text": text,
+                "categories": list(_AZURE_HARM_CATEGORIES),
+                "outputType": "FourSeverityLevels",
+            },
             timeout=_REQUEST_TIMEOUT_SECONDS,
         )
     else:
@@ -142,7 +148,9 @@ def _azure_content_safety(chunk: ModerationChunk, settings: Settings) -> list[Ca
 # (severity/`triggered=False` only -- the threshold decision is
 # `moderation/gate.py`'s job, kept out of every provider implementation so
 # adding a second provider never needs to duplicate that policy logic).
-SUPPORTED_MODERATION_PROVIDERS: dict[str, Callable[[ModerationChunk, Settings], list[CategoryResult]]] = {
+SUPPORTED_MODERATION_PROVIDERS: dict[
+    str, Callable[[ModerationChunk, Settings], list[CategoryResult]]
+] = {
     "azure_content_safety": _azure_content_safety,
 }
 

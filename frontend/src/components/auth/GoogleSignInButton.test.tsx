@@ -1,5 +1,5 @@
 import { render, screen, waitFor } from '@testing-library/react'
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi, type Mock } from 'vitest'
 import * as identityApi from '@/lib/identityApi'
 import { GoogleSignInButton } from './GoogleSignInButton'
 
@@ -15,8 +15,8 @@ vi.mock('@/lib/googleIdentity', () => ({
 import { loadGoogleIdentityScript } from '@/lib/googleIdentity'
 
 describe('GoogleSignInButton', () => {
-  let initializeMock: ReturnType<typeof vi.fn>
-  let renderButtonMock: ReturnType<typeof vi.fn>
+  let initializeMock: Mock<(config: GoogleIdentityInitializeConfig) => void>
+  let renderButtonMock: Mock<(parent: HTMLElement, options: GoogleIdentityButtonOptions) => void>
 
   beforeEach(() => {
     initializeMock = vi.fn()

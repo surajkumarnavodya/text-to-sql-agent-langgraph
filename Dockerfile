@@ -70,6 +70,13 @@ WORKDIR /app
 # cached across ordinary code changes (only invalidated when
 # requirements.txt itself changes) -- requirements.txt is fully pinned
 # (see its own header comment), so this build is reproducible.
+#
+# Deliberately requirements.txt, not requirements-dev.txt (2026 security
+# remediation pass) -- dev/test/lint/docs-build tooling (pytest, black,
+# ruff, mypy, reportlab) has no reason to ship inside the image this
+# project actually runs in production, and keeping it out shrinks the
+# image's installed-package attack surface for free (it was previously
+# installed, just never invoked by this file's own CMD below).
 COPY requirements.txt .
 RUN pip install --no-cache-dir --upgrade pip \
     && pip install --no-cache-dir -r requirements.txt \

@@ -1,0 +1,53 @@
+# Dev / test / lint / docs-build tooling -- NOT installed into the
+# production Docker image (see Dockerfile and requirements.txt's own
+# comment). Install this file (which pulls in requirements.txt too, via the
+# `-r` line below) for local development, CI, or anything that needs to run
+# pytest/black/ruff/mypy/bandit or rebuild docs/User_Guide.pdf.
+#
+#   pip install -r requirements-dev.txt
+#
+# 2026 security remediation pass: split out of requirements.txt so these
+# packages' own code (not just the app's) stops shipping inside the
+# production image -- see requirements.txt's own comment for the full
+# reasoning. bandit and pip-audit are intentionally NOT pinned here: both
+# are meant to catch *current* findings against whatever's actually
+# installed, so CI installs each fresh at run time (see
+# .github/workflows/ci.yml) rather than via a version frozen in this file.
+-r requirements.txt
+
+# --- Dev / test / lint ---
+# Bumped 8.3.4 -> 9.1.1 (2026 security remediation pass) for
+# CVE-2025-71176/PYSEC-2026-1845 (predictable /tmp/pytest-of-{user} temp-dir
+# naming -> local DoS/symlink risk on a shared multi-user host) -- the 8.x
+# line has no patched release at all (verified against PyPI: 8.4.2 is the
+# newest 8.x), so the only real fix is this major bump. Verified compatible
+# first, not applied blind: this project's full 3088-test suite reran clean
+# against 9.1.1 with zero failures and zero collection errors before this
+# pin was changed.
+pytest==9.1.1
+# NOT bumped (2026 security remediation pass reconfirmed this): has two open
+# CVEs (CVE-2026-32274/PYSEC-2026-2121, an unsanitized `--python-cell-magics`
+# CLI value causing a cache-path traversal; CVE-2026-31900/PYSEC-2026-2120,
+# a supply-chain issue in Black's own GitHub Action, which this repo doesn't
+# use). Neither is reachable: this repo's CI invokes plain `black --check .`
+# with no `--python-cell-magics` flag, ever, and no workflow here references
+# `psf/black`'s own Action. No patched release exists in the 24.x line
+# (verified against PyPI: 24.10.0 is still the newest 24.x; the next is
+# 25.1.0). The fixed 26.x line reformats 11 files' worth of this codebase's
+# current, intentional style on a clean `black --check .` run (verified
+# directly) -- a large, unrelated-to-security diff this pass declined to
+# force through. UPSTREAM FIX REQUIRED for a 24.x-line patch; re-evaluate
+# the 26.x reformat as its own reviewed change, not bundled with a security
+# pass.
+black==24.10.0
+ruff==0.8.4
+mypy==1.13.0
+types-PyYAML==6.0.12.20260815
+
+# --- Docs build ---
+# Pure-Python PDF generation for scripts/build_user_guide_pdf.py, the actual
+# source of docs/User_Guide.pdf -- see that script's docstring. Previously a
+# standalone binary with no checked-in source or build tool (three prior
+# revisions were each hand-authored outside the repo); this replaces that
+# with a reproducible build from USER_GUIDE.md's own content.
+reportlab==5.0.1

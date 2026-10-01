@@ -96,20 +96,31 @@ class TestRegister:
 
     def test_sets_refresh_cookie(self, client):
         response = client.post(
-            "/auth/register", json={"email": "alice@example.com", "password": "correcthorse1", "display_name": "Test User"}
+            "/auth/register",
+            json={
+                "email": "alice@example.com",
+                "password": "correcthorse1",
+                "display_name": "Test User",
+            },
         )
         assert "refresh_token" in response.cookies
 
     def test_duplicate_email_is_409(self, client):
         _register(client)
         response = client.post(
-            "/auth/register", json={"email": "alice@example.com", "password": "anotherpassword1", "display_name": "Test User"}
+            "/auth/register",
+            json={
+                "email": "alice@example.com",
+                "password": "anotherpassword1",
+                "display_name": "Test User",
+            },
         )
         assert response.status_code == 409
 
     def test_password_too_short_is_400(self, client):
         response = client.post(
-            "/auth/register", json={"email": "bob@example.com", "password": "short", "display_name": "Test User"}
+            "/auth/register",
+            json={"email": "bob@example.com", "password": "short", "display_name": "Test User"},
         )
         assert response.status_code == 400
 
@@ -117,7 +128,12 @@ class TestRegister:
         settings_no_public = _SETTINGS.model_copy(update={"allow_public_registration": False})
         monkeypatch.setattr(identity_auth_mod, "get_settings", lambda: settings_no_public)
         response = client.post(
-            "/auth/register", json={"email": "bob@example.com", "password": "correcthorse1", "display_name": "Test User"}
+            "/auth/register",
+            json={
+                "email": "bob@example.com",
+                "password": "correcthorse1",
+                "display_name": "Test User",
+            },
         )
         assert response.status_code == 403
 
@@ -125,7 +141,12 @@ class TestRegister:
         disabled = _SETTINGS.model_copy(update={"local_auth_enabled": False})
         monkeypatch.setattr(identity_auth_mod, "get_settings", lambda: disabled)
         response = client.post(
-            "/auth/register", json={"email": "bob@example.com", "password": "correcthorse1", "display_name": "Test User"}
+            "/auth/register",
+            json={
+                "email": "bob@example.com",
+                "password": "correcthorse1",
+                "display_name": "Test User",
+            },
         )
         assert response.status_code == 404
 
@@ -154,7 +175,12 @@ class TestLocalAuthDisabledIsA404EverywhereNotA500:
 
     def test_register_is_404_not_500(self, client):
         response = client.post(
-            "/auth/register", json={"email": "bob@example.com", "password": "correcthorse1", "display_name": "Test User"}
+            "/auth/register",
+            json={
+                "email": "bob@example.com",
+                "password": "correcthorse1",
+                "display_name": "Test User",
+            },
         )
         assert response.status_code == 404
 
@@ -201,7 +227,12 @@ class TestLogin:
         """Account-enumeration defense: a nonexistent email must produce
         an identical response shape to a wrong password."""
         wrong_password_response = client.post(
-            "/auth/register", json={"email": "alice@example.com", "password": "correcthorse1", "display_name": "Test User"}
+            "/auth/register",
+            json={
+                "email": "alice@example.com",
+                "password": "correcthorse1",
+                "display_name": "Test User",
+            },
         )
         assert wrong_password_response.status_code == 201
         bad_login = client.post(
@@ -277,7 +308,12 @@ class TestRefreshRotationAndReuseDetection:
 
     def test_refresh_rotates_the_cookie(self, client):
         register_response = client.post(
-            "/auth/register", json={"email": "alice@example.com", "password": "correcthorse1", "display_name": "Test User"}
+            "/auth/register",
+            json={
+                "email": "alice@example.com",
+                "password": "correcthorse1",
+                "display_name": "Test User",
+            },
         )
         first_cookie = register_response.cookies["refresh_token"]
         refresh_response = client.post("/auth/refresh")
@@ -285,7 +321,12 @@ class TestRefreshRotationAndReuseDetection:
 
     def test_reusing_an_old_cookie_after_refresh_is_rejected(self, client):
         register_response = client.post(
-            "/auth/register", json={"email": "alice@example.com", "password": "correcthorse1", "display_name": "Test User"}
+            "/auth/register",
+            json={
+                "email": "alice@example.com",
+                "password": "correcthorse1",
+                "display_name": "Test User",
+            },
         )
         old_raw_token = register_response.cookies["refresh_token"]
 
@@ -450,7 +491,12 @@ class TestEmailVerificationFlow:
         )
 
         response = client.post(
-            "/auth/register", json={"email": "alice@example.com", "password": "correcthorse1", "display_name": "Test User"}
+            "/auth/register",
+            json={
+                "email": "alice@example.com",
+                "password": "correcthorse1",
+                "display_name": "Test User",
+            },
         )
         assert response.status_code == 201
         assert "access_token" not in response.json()
@@ -479,7 +525,12 @@ class TestEmailVerificationFlow:
         monkeypatch.setattr(identity_auth_mod, "get_settings", lambda: require_verification)
         monkeypatch.setattr(identity_auth_mod, "send_verification_email", lambda *a, **k: None)
         client.post(
-            "/auth/register", json={"email": "alice@example.com", "password": "correcthorse1", "display_name": "Test User"}
+            "/auth/register",
+            json={
+                "email": "alice@example.com",
+                "password": "correcthorse1",
+                "display_name": "Test User",
+            },
         )
 
         known = client.post("/auth/resend-verification", json={"email": "alice@example.com"})
@@ -492,7 +543,12 @@ class TestEmailVerificationFlow:
         monkeypatch.setattr(identity_auth_mod, "get_settings", lambda: require_verification)
         monkeypatch.setattr(identity_auth_mod, "send_verification_email", lambda *a, **k: None)
         client.post(
-            "/auth/register", json={"email": "alice@example.com", "password": "correcthorse1", "display_name": "Test User"}
+            "/auth/register",
+            json={
+                "email": "alice@example.com",
+                "password": "correcthorse1",
+                "display_name": "Test User",
+            },
         )
 
         captured = {}

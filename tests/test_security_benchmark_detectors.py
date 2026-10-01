@@ -123,7 +123,13 @@ class TestDetectWriteSql:
             "status": "failed",
             "sql": None,
             "attempt_history": [
-                {"attempt": 1, "sql": "DROP TABLE Customers", "outcome": "safety_violation", "error": "x", "will_retry": False}
+                {
+                    "attempt": 1,
+                    "sql": "DROP TABLE Customers",
+                    "outcome": "safety_violation",
+                    "error": "x",
+                    "will_retry": False,
+                }
             ],
         }
         attempted, executed = detect_write_sql(state)

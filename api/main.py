@@ -655,7 +655,7 @@ def _json_safe_cell(value: Any) -> Any:
     placeholder -- never a base64 dump, which could turn one cell into
     several MB of response body for a large image/blob column.
     """
-    if isinstance(value, (bytes, bytearray, memoryview)):
+    if isinstance(value, bytes | bytearray | memoryview):
         return f"<binary data, {len(value)} bytes>"
     return value
 

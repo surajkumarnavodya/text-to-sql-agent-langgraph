@@ -8,11 +8,11 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
-
-from config.settings import Settings
 from moderation.exceptions import ModerationNotConfiguredError
 from moderation.provider import analyze_chunk
 from moderation.types import ModerationChunk
+
+from config.settings import Settings
 from security.secrets import SecretStr
 
 
