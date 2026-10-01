@@ -26,6 +26,8 @@ from typing import Any
 
 from analytics.engine import compute_analytics_result
 from analytics.forecasting import generate_forecast
+from analytics.models import AnalyticsResult
+from recommendation.engine import RecommendationInputs, generate_recommendations
 from retrieval.retriever import extract_governing_metrics, retrieve_business_context
 from sqlalchemy.exc import SQLAlchemyError
 
@@ -85,6 +87,7 @@ from db.query_cost import MODERATE_COST_NOTICE, estimate_query_cost, high_cost_e
 from db.schema_introspection import extract_ddl_column_names
 from embeddings.golden_examples import retrieve_golden_examples
 from embeddings.retriever import retrieve_relevant_schema, select_database
+from observability.metrics import get_default_metrics
 from security.audit_log import log_security_event
 from security.injection_patterns import INJECTION_PATTERNS
 from security.redaction import redact_secrets
@@ -1961,6 +1964,141 @@ def generate_forecast_node(state: AgentState) -> dict[str, Any]:
         result.horizon,
     )
     return {"forecast_result": result.model_dump(mode="json")}
+
+
+def _restricted_column_hits_in_sql(
+    sql: str, state: AgentState, settings: Any
+) -> tuple[tuple[str, str], ...]:
+    """Re-detects which already-classified-restricted (table, column)
+    pairs the final, executed SQL references -- reuses `agent
+    .sql_validator.find_restricted_column_references` directly (the exact
+    function `validate_sql_node` already applies pre-execution) rather
+    than a second detection implementation. Unlike that node's own gate
+    (which only runs this check for a caller who *lacks*
+    `Permission.VIEW_RESTRICTED_COLUMNS`, since that's the only case where
+    a hit matters for *blocking execution*), this always runs it: a
+    restricted column reached a successful execution only because the
+    executing caller *did* have permission, but `recommendation.engine`'s
+    own SECURITY rule exists precisely to surface that fact for review --
+    see that module's own docstring. Fails open (returns `()`) on any
+    parse/lookup error, the same posture every other accuracy-aid
+    computation in this node already takes.
+    """
+    try:
+        classifications = load_sensitive_columns()
+        restricted_pairs = {pair for pair, tier in classifications.items() if tier == "restricted"}
+        if not restricted_pairs:
+            return ()
+        db_config = get_connection(settings, state.get("selected_database") or "default")
+        dialect = get_sqlglot_dialect(db_config.db_type)
+        known_tables = {t["table_name"] for t in state.get("schema_tables", [])}
+        hits = find_restricted_column_references(
+            sql, restricted_pairs, known_tables, dialect=dialect
+        )
+        return tuple(hits)
+    except Exception as exc:  # noqa: BLE001 - an accuracy aid must never block the run
+        logger.warning(
+            "[generate_recommendations] restricted-column re-detection failed, proceeding "
+            "without: %s",
+            exc,
+        )
+        return ()
+
+
+@_timed_node("generate_recommendations")
+def generate_recommendations_node(state: AgentState) -> dict[str, Any]:
+    """Builds evidence-backed recommendations for a successfully executed
+    query result -- Prompt 17 (`17_RECOMMENDATION_ENGINE_CONTRACT.md`).
+
+    Only reachable from `generate_forecast_node`, immediately before
+    `generate_insight` (see `agent/graph.py`) -- a straight edge, never a
+    conditional one, so this node can never short-circuit the graph.
+
+    Delegates entirely to `recommendation.engine.generate_recommendations`
+    (this node owns none of the actual rules). Feeds it whichever typed
+    evidence this request already has in hand, zero new queries:
+    `state["analytical_result"]` (reconstructed into the typed
+    `AnalyticsResult` `recommendation.engine` expects), `state
+    ["cost_estimate"]` (already the typed `db.query_cost.CostEstimate`
+    object, see `AgentState.cost_estimate`'s own docstring), a live
+    `observability.metrics.PerformanceMetrics.snapshot()` (an existing,
+    cheap, in-process rollup -- no new instrumentation), and any
+    restricted-column hit in the final executed SQL (see
+    `_restricted_column_hits_in_sql` above). `root_cause_result` is never
+    supplied here -- this single-query pipeline never produces the
+    second, comparison dataset `analytics.root_cause
+    .investigate_root_cause` needs (see that module's own disclosed gap,
+    inherited rather than worked around); the OPERATIONS category
+    therefore never fires from this live node, only from a direct,
+    standalone call to `recommendation.engine.generate_recommendations`.
+
+    `inputs.caller_roles` is this same run's `state["caller_roles"]` --
+    the authorization check this enables is provably redundant with
+    `validate_sql_node`'s own pre-execution gate *in this one place*
+    (a restricted column could only have reached a successful execution
+    because this exact caller already had permission), but is not
+    redundant for any other caller of the engine; see `recommendation
+    .engine`'s own module docstring for the full reasoning.
+
+    Fails open on any unexpected error -- logged,
+    `state["recommendations"]` stays `[]`, never a reason the question
+    itself fails, the same posture every other accuracy-aid node in this
+    graph already takes.
+    """
+    settings = get_settings()
+    if not settings.enable_recommendation_engine:
+        logger.info("[generate_recommendations] skipped (enable_recommendation_engine=False)")
+        return {"recommendations": []}
+
+    analytical_result_dict = state.get("analytical_result")
+    try:
+        analytics_result = (
+            AnalyticsResult(**analytical_result_dict) if analytical_result_dict else None
+        )
+    except Exception as exc:  # noqa: BLE001 - an accuracy aid must never block the run
+        logger.warning(
+            "[generate_recommendations] could not reconstruct AnalyticsResult, proceeding "
+            "without it: %s",
+            exc,
+        )
+        analytics_result = None
+
+    sql = state.get("sql") or ""
+    restricted_hits = _restricted_column_hits_in_sql(sql, state, settings) if sql else ()
+
+    try:
+        performance_snapshot = get_default_metrics().snapshot()
+    except Exception as exc:  # noqa: BLE001 - an accuracy aid must never block the run
+        logger.warning(
+            "[generate_recommendations] could not read performance snapshot, proceeding "
+            "without it: %s",
+            exc,
+        )
+        performance_snapshot = None
+
+    inputs = RecommendationInputs(
+        analytics_result=analytics_result,
+        root_cause_result=None,
+        cost_estimate=state.get("cost_estimate"),
+        performance_snapshot=performance_snapshot,
+        restricted_column_hits=restricted_hits,
+        caller_roles=tuple(state.get("caller_roles", ())),
+    )
+
+    try:
+        recommendations = generate_recommendations(inputs, settings)
+    except Exception as exc:  # noqa: BLE001 - an accuracy aid must never block the run
+        logger.warning(
+            "[generate_recommendations] computation failed unexpectedly, proceeding without: %s",
+            exc,
+        )
+        return {"recommendations": []}
+
+    logger.info(
+        "[generate_recommendations] produced %d recommendation(s)",
+        len(recommendations),
+    )
+    return {"recommendations": [rec.model_dump(mode="json") for rec in recommendations]}
 
 
 @_timed_node("generate_insight")

@@ -312,7 +312,7 @@ below, and `docs/MULTI_SOURCE_GUIDE.md` for how to configure each source.
   `AnalyticsProvider` + a real adapter over `agent.insight.ResultSummary`'s
   already-computed, never-rendered `trend`/`outliers`/`stddev`;
   `recommendation/`'s `RecommendationProvider` (contracts only, no
-  implementation exists); `semantic/metrics.py`'s governed
+  implementation exists until Prompt 17, see below); `semantic/metrics.py`'s governed
   `MetricDefinition`/`MetricRegistry`, loading the same
   `data/knowledge/metrics.yaml` `retrieval/` already parses for fuzzy
   retrieval, deliberately not a reuse of `retrieval.models.ChunkType
@@ -333,7 +333,17 @@ below, and `docs/MULTI_SOURCE_GUIDE.md` for how to configure each source.
   this is a standalone function reusing its typed `Recommendation`/
   `RecommendationKind` shape directly, not an implementation of that
   Protocol (its own docstring discloses why — see "Deterministic
-  forecasting" below).
+  forecasting" below). **Prompt 17**
+  (`17_RECOMMENDATION_ENGINE_CONTRACT.md`) added the first real,
+  general-purpose implementation: `recommendation/engine.py`'s
+  `generate_recommendations` — a Data→Finding→Evidence→Rule→Candidate→
+  Validation→Confidence→Recommendation pipeline across nine categories,
+  wired live into `agent/graph.py` as `generate_recommendations_node`.
+  `RecommendationProvider` itself is still unimplemented (the engine is a
+  standalone module, not that Protocol's implementation — its own
+  `recommend(summary: ResultSummary)` signature still doesn't fit this
+  engine's own, richer multi-source input shape). See "Evidence-first
+  recommendation engine" below.
 - `rag/` — document/policy agentic RAG, one implementation shared by both
   the "documents" and "policies" collections (parameterized by collection
   name, not two near-duplicate modules): `store.py` (SQL Server native
@@ -592,17 +602,19 @@ below, and `docs/MULTI_SOURCE_GUIDE.md` for how to configure each source.
 ## Key design decisions
 
 ### Self-correcting retry loop (LangGraph)
-The full graph (`agent/graph.py`) is seventeen nodes (as of Prompt 16,
-`16_FORECASTING_CONTRACT.md`'s `generate_forecast` — previously sixteen,
-after Prompt 13's `compute_analytics`; before that, fifteen, after Prompt
-12's `build_analytical_plan`; before it, twelve, before Prompt 10's
-`review_metric_conformance` and Prompt 11's `classify_analytical_intent`):
+The full graph (`agent/graph.py`) is eighteen nodes (as of Prompt 17,
+`17_RECOMMENDATION_ENGINE_CONTRACT.md`'s `generate_recommendations` —
+previously seventeen, after Prompt 16's `generate_forecast`; before that,
+sixteen, after Prompt 13's `compute_analytics`; before that, fifteen,
+after Prompt 12's `build_analytical_plan`; before it, twelve, before
+Prompt 10's `review_metric_conformance` and Prompt 11's
+`classify_analytical_intent`):
 `sanitize_input → classify_followup → retrieve_schema →
 retrieve_golden_examples → retrieve_business_context →
 classify_analytical_intent → build_analytical_plan → plan_query →
 generate_sql → review_sql → review_metric_conformance → validate_sql →
 estimate_cost → execute_sql → compute_analytics → generate_forecast →
-generate_insight`. On a review, validation, cost-estimate, or execution
+generate_recommendations → generate_insight`. On a review, validation, cost-estimate, or execution
 failure, a conditional edge routes back to `generate_sql` (or, for a
 "missing reference" execution error, back to `retrieve_schema`) with the
 error message appended to state history, so the LLM sees what went wrong
@@ -2290,10 +2302,11 @@ average, linear trend, simple exponential smoothing) plus an `AUTO` mode
 that backtests every eligible candidate and picks the most accurate — no
 numpy/pandas-time-series/statsmodels/sklearn added, matching `analytics/`'s
 own established "stdlib only" posture. New `agent.nodes.generate_forecast_node`,
-wired `compute_analytics → generate_forecast → generate_insight` (a
-straight edge, never a conditional one, so it can never short-circuit the
-graph) — the graph is now seventeen nodes (see "Self-correcting retry
-loop" above). Only ever attempts a forecast when
+wired `compute_analytics → generate_forecast → generate_recommendations`
+(a straight edge, never a conditional one, so it can never short-circuit
+the graph; `generate_recommendations` is Prompt 17's own node, inserted
+immediately after this one — see "Evidence-first recommendation engine"
+below). Only ever attempts a forecast when
 `classify_analytical_intent_node` already classified the question as
 `AnalyticalIntentType.FORECAST` (Prompt 11's own intent, unused by
 anything until now) — no new classification, pure reuse of a judgment
@@ -2329,6 +2342,73 @@ design, the testing summary (3132/3132 backend tests passing, up from
 tests whose own stand-ins needed updating for `run_agent`'s new
 parameter, not a regression in this prompt's own code), and the
 disclosed, honest scope boundaries.
+
+### Evidence-first recommendation engine (Prompt 17)
+`recommendation/engine.py`'s `generate_recommendations` is the first
+general-purpose recommendation engine in this codebase — a deterministic
+Data → Finding → Evidence → Rule/Model → Candidate → Evidence Validation
+→ Confidence → Recommendation pipeline across nine modular categories
+(performance, anomaly, revenue, customer, product, operations,
+data_quality, security, database_performance), each rule consuming a
+typed fact some other, already-existing module already computed
+deterministically (`analytics.engine.compute_analytics_result`,
+`analytics.root_cause.investigate_root_cause`, `db.query_cost
+.estimate_query_cost`, `observability.metrics.PerformanceMetrics
+.snapshot`, `config.sensitive_columns`) — zero new queries, zero new LLM
+calls. New `agent.nodes.generate_recommendations_node`, wired
+`generate_forecast → generate_recommendations → generate_insight` (a
+straight edge, never a conditional one, so it can never short-circuit
+the graph) — the graph is now eighteen nodes (see "Self-correcting
+retry loop" above).
+
+**Invariants that must not regress:** "no recommendation without
+evidence" is enforced in code, not by convention —
+`recommendation.engine._finalize_candidate` is the *only* place this
+module ever constructs a `Recommendation`, and it refuses to for any
+candidate whose `evidence` tuple is empty. This is deliberately a
+**pipeline-level** invariant, not a `Recommendation` `model_validator`:
+`analytics.forecasting.recommendations_for_forecast`'s six pre-existing
+call sites construct `Recommendation`s with no evidence at all and must
+keep validating unmodified (master rule 4) — `Recommendation.evidence`
+legally defaults to `()`. What the model *does* enforce at the type
+level: any `evidence` item present must be `DataTruthLevel.DATABASE_FACT`
+or `CONFIRMED_BUSINESS_TRUTH`, never `AI_INFERENCE` — an inference cannot
+ground another inference. A candidate also clearing evidence validation
+but whose rule-computed confidence falls below
+`Settings.recommendation_min_confidence` is still dropped — the literal
+"supported vs. unsupported" distinction, separately testable from
+evidence presence. **Authorization is re-checked inside the engine
+itself**, independent of whatever role the original query ran under
+(following `agent/authz.py`'s own stated "no frontend-level restriction
+is a security boundary ... the corresponding internal node re-checks
+independently" principle): a candidate whose evidence touches a column
+`config.sensitive_columns` classifies restricted is suppressed outright
+for a viewer lacking `Permission.VIEW_RESTRICTED_COLUMNS` — not
+SECURITY-category-specific; any category's candidate referencing a
+restricted column is suppressed the same way. In the one place this is
+wired live today (the graph node, same request, same caller), this check
+is provably redundant with `validate_sql_node`'s own pre-execution gate
+(a restricted column could only reach a successful execution because
+that caller already had permission) — it exists for every *other*
+caller of `recommendation.engine.generate_recommendations` (a future
+report job, a future dedicated route, a batch recompute with a different
+viewer's roles), where it is not redundant at all.
+
+**Known, disclosed limitation:** the `operations` category (built on
+`analytics.root_cause.investigate_root_cause`) never fires from the live
+graph node — inherited directly from Prompt 14's own disclosed gap (root
+cause needs a second, comparison dataset this single-query pipeline
+doesn't produce); it remains fully built, fully tested, and reachable by
+calling the engine directly with one in hand. Column-name keyword
+heuristics (revenue/customer/product) are a disclosed, bounded approach,
+not a business-glossary lookup — a natural, not-yet-taken follow-up is
+feeding these from `semantic/catalog.py`'s own governed business
+concepts (Prompt 9/10) instead.
+
+**Read [`17_RECOMMENDATION_ENGINE_CONTRACT.md`](17_RECOMMENDATION_ENGINE_CONTRACT.md)**
+for the full inspection findings, every category rule's design, the
+testing summary (3172/3172 backend tests passing, up from 3132 before
+this prompt), and the disclosed, honest scope boundaries.
 
 ## How to run
 

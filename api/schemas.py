@@ -650,6 +650,22 @@ class AskResponse(BaseModel):
             "summary as confirmed fact (see ForecastResultOut's own docstring)."
         ),
     )
+    recommendations: list[dict[str, Any]] = Field(
+        default_factory=list,
+        description=(
+            "recommendation.engine.generate_recommendations's output -- one dict per "
+            "recommendation.models.Recommendation.model_dump(), each carrying its own "
+            "finding/evidence/affected_entity/action/measurable_impact/confidence/"
+            "rule_or_model/limitations/category (one of nine: performance, anomaly, "
+            "revenue, customer, product, operations, data_quality, security, "
+            "database_performance). Always AI_INFERENCE (agent.provenance.DataTruthLevel), "
+            "grounded in the DATABASE_FACT/CONFIRMED_BUSINESS_TRUTH evidence it carries -- "
+            "never render as confirmed fact. Empty (never a sentinel) when "
+            "Settings.enable_recommendation_engine is off, the run didn't reach a "
+            "successful execution, or no candidate cleared evidence/confidence/"
+            "authorization validation."
+        ),
+    )
     cost_notice: str | None = None
     low_confidence_notice: str | None = Field(
         default=None,

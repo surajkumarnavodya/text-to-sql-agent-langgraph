@@ -940,6 +940,27 @@ class Settings(BaseSettings):
             `analytics.forecasting`'s prediction intervals target -- an
             unlisted value falls back to a 95% z-multiplier, disclosed via
             `ForecastResult.limitations`.
+        enable_recommendation_engine: Whether `agent.nodes
+            .generate_recommendations_node` calls `recommendation.engine
+            .generate_recommendations`. True by default -- a pure,
+            deterministic, zero-I/O-beyond-already-computed-evidence
+            computation (no new query, no Ollama call), same "operator
+            escape hatch" posture as `enable_analytics_engine`. See
+            `17_RECOMMENDATION_ENGINE_CONTRACT.md`.
+        recommendation_min_confidence: `recommendation.engine`'s
+            confidence floor -- a candidate with non-empty evidence but a
+            rule-computed confidence below this is still dropped
+            ("supported" requires both evidence AND confidence).
+        recommendation_null_rate_threshold: `recommendation.engine`'s
+            DATA_QUALITY rule fires when a column's null rate, within one
+            result, is at least this fraction.
+        recommendation_concentration_share_threshold: `recommendation
+            .engine`'s CUSTOMER/PRODUCT concentration rule fires when a
+            single ranked label's share of the total (percent) is at
+            least this.
+        recommendation_slow_stage_ms_threshold: `recommendation.engine`'s
+            PERFORMANCE rule fires when a LangGraph pipeline stage's
+            rolling p95 duration (milliseconds) is at least this.
         enable_golden_examples: Whether `agent.nodes
             .retrieve_golden_examples_node` looks up human-approved past
             (question, SQL) pairs (see `embeddings.golden_examples`) and
@@ -1761,6 +1782,30 @@ class Settings(BaseSettings):
     # z-value and is disclosed via ForecastResult.limitations, never
     # silently misreported as the requested level.
     forecast_confidence_level: float = Field(default=0.95, gt=0.0, lt=1.0)
+
+    # --- Prompt 17 (17_RECOMMENDATION_ENGINE_CONTRACT.md): recommendation.engine's
+    # own tunables, gating agent.nodes.generate_recommendations_node's call to
+    # it. Same "pure, deterministic, operator escape hatch" posture as
+    # enable_analytics_engine/enable_forecasting above.
+    enable_recommendation_engine: bool = True
+    # A candidate with non-empty evidence but a rule-computed confidence
+    # below this is still dropped -- see recommendation.engine
+    # ._finalize_candidate's own docstring for why this is a floor, not
+    # just a sort key.
+    recommendation_min_confidence: float = Field(default=0.5, ge=0.0, le=1.0)
+    # recommendation.engine's DATA_QUALITY rule (HighNullRateRule) fires
+    # when a column's null rate, within one result, is at least this
+    # fraction.
+    recommendation_null_rate_threshold: float = Field(default=0.2, ge=0.0, le=1.0)
+    # recommendation.engine's CUSTOMER/PRODUCT concentration rules fire
+    # when a single ranked label's share of the total (percent, 0-100) is
+    # at least this.
+    recommendation_concentration_share_threshold: float = Field(default=50.0, ge=0.0, le=100.0)
+    # recommendation.engine's PERFORMANCE rule (SlowStageRule) fires when
+    # a LangGraph pipeline stage's rolling p95 duration (milliseconds, from
+    # observability.metrics.PerformanceMetrics.snapshot) is at least this.
+    recommendation_slow_stage_ms_threshold: float = Field(default=2000.0, gt=0.0)
+
     enable_golden_examples: bool = True
     golden_examples_top_k: int = Field(default=3, gt=0)
     golden_examples_min_similarity: float = Field(default=0.75, ge=0.0, le=1.0)

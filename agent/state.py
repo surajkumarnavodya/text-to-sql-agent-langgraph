@@ -540,6 +540,32 @@ class AgentState(TypedDict, total=False):
     # is classified that way rather than as DATABASE_FACT.
     forecast_result: dict | None
 
+    # Set by generate_recommendations_node (Prompt 17,
+    # 17_RECOMMENDATION_ENGINE_CONTRACT.md), which runs between
+    # generate_forecast and generate_insight -- recommendation.engine
+    # .generate_recommendations's output, one dict per
+    # recommendation.models.Recommendation.model_dump(), covering whichever
+    # of its nine categories found evidence-backed, sufficiently-confident,
+    # authorized candidates for this result (ANOMALY/DATA_QUALITY/REVENUE/
+    # CUSTOMER/PRODUCT from state["analytical_result"], DATABASE_PERFORMANCE
+    # from state["cost_estimate"], PERFORMANCE from the live
+    # observability.metrics snapshot, SECURITY from any restricted-column
+    # reference in state["sql"]). Always `[]` (never `None`) when the engine
+    # ran and found nothing, matching this TypedDict's established
+    # "always iterable" convention for plural fields; `[]` also when
+    # Settings.enable_recommendation_engine is off or the computation raised
+    # unexpectedly (fails open, logged, never a reason a question fails --
+    # see that node's own docstring). OPERATIONS (which needs a
+    # analytics.root_cause.RootCauseResult -- a second, comparison dataset
+    # this single-query pipeline doesn't produce, see that module's own
+    # disclosed gap) never fires from this live node; it remains reachable
+    # only by calling recommendation.engine.generate_recommendations
+    # directly with one in hand. Every value in it is
+    # DataTruthLevel.AI_INFERENCE (agent.provenance), grounded in
+    # DATABASE_FACT/CONFIRMED_BUSINESS_TRUTH evidence -- never a bare,
+    # ungrounded suggestion (master rules 9-10).
+    recommendations: list[dict]
+
     # Input, set once by the caller -- whether generate_insight_node should
     # even attempt an insight. True (the default) is normally low-risk and
     # high-value; the UI exposes this as a toggle so it can be turned off

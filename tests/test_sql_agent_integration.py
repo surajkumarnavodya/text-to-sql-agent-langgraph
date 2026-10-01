@@ -263,7 +263,7 @@ class TestGraphStructure:
         outcome at compute_analytics instead of generate_insight directly.
         Updated by Prompt 16 (`16_FORECASTING_CONTRACT.md`): compute_analytics
         now feeds generate_forecast directly, not generate_insight -- see
-        `test_generate_forecast_sits_between_compute_analytics_and_generate_insight`
+        `test_generate_forecast_sits_between_compute_analytics_and_generate_recommendations`
         below for that link.
         """
         graph = build_graph()
@@ -281,12 +281,19 @@ class TestGraphStructure:
         assert analytics_edges[0].target == "generate_forecast"
         assert analytics_edges[0].conditional is False
 
-    def test_generate_forecast_sits_between_compute_analytics_and_generate_insight(self):
+    def test_generate_forecast_sits_between_compute_analytics_and_generate_recommendations(self):
         """Prompt 16 (`16_FORECASTING_CONTRACT.md`): `generate_forecast` is
         a straight edge on both sides (never a conditional one, never a new
         `END` branch) -- it can never short-circuit the graph, the same
         structural proof pattern `classify_analytical_intent`/
         `build_analytical_plan`'s own equivalent tests already establish.
+
+        Its downstream neighbor changed from `generate_insight` to
+        `generate_recommendations` with Prompt 17
+        (`17_RECOMMENDATION_ENGINE_CONTRACT.md`), which now sits between
+        the two -- see `test_generate_recommendations_sits_between_
+        generate_forecast_and_generate_insight` below for that node's own
+        equivalent proof.
         """
         graph = build_graph()
         node_names = set(graph.get_graph().nodes.keys())
@@ -294,10 +301,31 @@ class TestGraphStructure:
 
         forecast_edges = [e for e in graph.get_graph().edges if e.source == "generate_forecast"]
         assert len(forecast_edges) == 1
-        assert forecast_edges[0].target == "generate_insight"
+        assert forecast_edges[0].target == "generate_recommendations"
         assert forecast_edges[0].conditional is False
 
         incoming = [e for e in graph.get_graph().edges if e.target == "generate_forecast"]
         assert len(incoming) == 1
         assert incoming[0].source == "compute_analytics"
+        assert incoming[0].conditional is False
+
+    def test_generate_recommendations_sits_between_generate_forecast_and_generate_insight(self):
+        """Prompt 17 (`17_RECOMMENDATION_ENGINE_CONTRACT.md`):
+        `generate_recommendations` is a straight edge on both sides (never
+        a conditional one, never a new `END` branch) -- it can never
+        short-circuit the graph, the identical structural proof pattern
+        `generate_forecast`'s own equivalent test above establishes.
+        """
+        graph = build_graph()
+        node_names = set(graph.get_graph().nodes.keys())
+        assert "generate_recommendations" in node_names
+
+        outgoing = [e for e in graph.get_graph().edges if e.source == "generate_recommendations"]
+        assert len(outgoing) == 1
+        assert outgoing[0].target == "generate_insight"
+        assert outgoing[0].conditional is False
+
+        incoming = [e for e in graph.get_graph().edges if e.target == "generate_recommendations"]
+        assert len(incoming) == 1
+        assert incoming[0].source == "generate_forecast"
         assert incoming[0].conditional is False

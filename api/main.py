@@ -821,6 +821,7 @@ def _ask_response_from_state(
         insight=_redact_text(state.get("insight"), settings),
         analytical_result=state.get("analytical_result"),
         forecast_result=_forecast_result_out(state.get("forecast_result")),
+        recommendations=state.get("recommendations") or [],
         cost_notice=state.get("cost_notice"),
         low_confidence_notice=_redact_text(state.get("low_confidence_notice"), settings),
         rejection_reason=state.get("rejection_reason"),

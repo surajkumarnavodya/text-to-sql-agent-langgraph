@@ -32,6 +32,7 @@ from agent.nodes import (
     execute_sql_node,
     generate_forecast_node,
     generate_insight_node,
+    generate_recommendations_node,
     generate_sql_node,
     plan_query_node,
     retrieve_golden_examples_node,
@@ -2045,6 +2046,116 @@ class TestGenerateForecastNode:
         insight_update = generate_insight_node(state)
 
         assert state["forecast_result"] is not None
+        assert insight_update["insight"] == "A short insight."
+
+
+class TestGenerateRecommendationsNode:
+    """Prompt 17 (`17_RECOMMENDATION_ENGINE_CONTRACT.md`)."""
+
+    def test_skips_when_disabled(self, monkeypatch, _mock_settings):
+        monkeypatch.setattr(
+            "agent.nodes.get_settings",
+            lambda: Settings(**{**_mock_settings.__dict__, "enable_recommendation_engine": False}),
+        )
+
+        def _fail(*args, **kwargs):
+            raise AssertionError(
+                "should not compute anything when enable_recommendation_engine=False"
+            )
+
+        monkeypatch.setattr("agent.nodes.generate_recommendations", _fail)
+
+        result = generate_recommendations_node({})
+
+        assert result["recommendations"] == []
+
+    def test_produces_recommendations_from_an_anomalous_result(self, monkeypatch):
+        monkeypatch.setattr(
+            "agent.nodes.get_default_metrics",
+            lambda: type("_Fake", (), {"snapshot": staticmethod(lambda: {"stages": []})})(),
+        )
+        rows = [(2015 + i, 100.0) for i in range(10)]
+        rows[-1] = (2024, 10_000.0)
+        state: AgentState = {"result_columns": ["Year", "Value"], "result_rows": rows}
+        state.update(compute_analytics_node(state))
+
+        result = generate_recommendations_node(state)
+
+        assert result["recommendations"]
+        assert any(r["category"] == "anomaly" for r in result["recommendations"])
+        assert all(r["evidence"] for r in result["recommendations"])
+
+    def test_empty_result_produces_no_recommendations_not_a_crash(self):
+        state: AgentState = {"result_columns": ["n"], "result_rows": []}
+        state.update(compute_analytics_node(state))
+
+        result = generate_recommendations_node(state)
+
+        assert result["recommendations"] == []
+
+    def test_missing_state_fields_default_to_empty_without_crashing(self):
+        result = generate_recommendations_node({})
+        assert result["recommendations"] == []
+
+    def test_fails_open_on_unexpected_computation_error(self, monkeypatch):
+        def _raise(*args, **kwargs):
+            raise RuntimeError("unexpected boom")
+
+        monkeypatch.setattr("agent.nodes.generate_recommendations", _raise)
+
+        state: AgentState = {"result_columns": ["n"], "result_rows": [(1,)]}
+        state.update(compute_analytics_node(state))
+
+        result = generate_recommendations_node(state)
+
+        assert result["recommendations"] == []
+
+    def test_restricted_column_reference_produces_a_security_recommendation(self, monkeypatch):
+        monkeypatch.setattr(
+            "agent.nodes.load_sensitive_columns", lambda: {("Employee", "SSN"): "restricted"}
+        )
+        monkeypatch.setattr(
+            "agent.nodes.get_default_metrics",
+            lambda: type("_Fake", (), {"snapshot": staticmethod(lambda: {"stages": []})})(),
+        )
+        state: AgentState = {
+            "sql": "SELECT SSN FROM Employee",
+            "selected_database": None,
+            "caller_roles": ("admin",),
+            "schema_tables": [],
+            "result_columns": ["n"],
+            "result_rows": [],
+        }
+        state.update(compute_analytics_node(state))
+
+        result = generate_recommendations_node(state)
+
+        security = [r for r in result["recommendations"] if r["category"] == "security"]
+        assert security
+        assert security[0]["affected_entity"] == "Employee.SSN"
+
+    def test_runs_before_generate_insight_without_interfering_with_it(self, monkeypatch):
+        """Structural proof at the function-call level (the real graph
+        wiring is proven separately in tests/test_sql_agent_integration.py)."""
+        monkeypatch.setattr(
+            "agent.nodes.generate_insight_from_llm", lambda *a, **k: "A short insight."
+        )
+        monkeypatch.setattr("agent.nodes.is_insight_grounded", lambda *a, **k: True)
+
+        state: AgentState = {
+            "question": "revenue by category",
+            "sql": "SELECT Category, SUM(Revenue) FROM t GROUP BY Category",
+            "result_columns": ["Category", "Revenue"],
+            "result_rows": [("Bikes", 100.0), ("Accessories", 50.0), ("Clothing", 60.0)],
+            "enable_insight": True,
+        }
+        state.update(compute_analytics_node(state))
+
+        recommendations_update = generate_recommendations_node(state)
+        state.update(recommendations_update)
+        insight_update = generate_insight_node(state)
+
+        assert "recommendations" in state
         assert insight_update["insight"] == "A short insight."
 
 

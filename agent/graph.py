@@ -1,6 +1,6 @@
 """Wires the agent nodes into a compiled LangGraph state machine.
 
-    sanitize_input -> classify_followup -> retrieve_schema -> retrieve_golden_examples -> retrieve_business_context -> classify_analytical_intent -> build_analytical_plan -> plan_query -> generate_sql -+-> review_sql -+-> review_metric_conformance -+-> validate_sql -+-> estimate_cost -+-> execute_sql -+-> compute_analytics -> generate_forecast -> generate_insight -> END
+    sanitize_input -> classify_followup -> retrieve_schema -> retrieve_golden_examples -> retrieve_business_context -> classify_analytical_intent -> build_analytical_plan -> plan_query -> generate_sql -+-> review_sql -+-> review_metric_conformance -+-> validate_sql -+-> estimate_cost -+-> execute_sql -+-> compute_analytics -> generate_forecast -> generate_recommendations -> generate_insight -> END
          |                    |                    ^                                                                  |               ^                              |                 ^                |                  ^                 |                |
          |                    |                    +----------------------------------(retry, up to max_retries)------+---------------+------------------------------+-----------------+---(retry, high    |               |
          |                    |                                                                                       |                                                                                    cost only)      +--(retry, only  |
@@ -182,6 +182,23 @@ on top of the intent check; a straight edge, never a conditional one, so
 this node can never short-circuit the graph. See `agent.nodes
 .generate_forecast_node`.
 
+`generate_recommendations` (between `generate_forecast` and
+`generate_insight`, Prompt 17, `17_RECOMMENDATION_ENGINE_CONTRACT.md`) is
+the Evidence-First Recommendation Engine: on every successful execution
+(gated only by `Settings.enable_recommendation_engine`) it runs
+`recommendation.engine.generate_recommendations` over whichever typed
+evidence this request already has in hand (`state["analytical_result"]`,
+`state["cost_estimate"]`, a live `observability.metrics` snapshot, any
+restricted-column reference in the final SQL) -- zero new queries, zero
+new LLM calls. A candidate without evidence, or below the configured
+confidence floor, or that the running caller isn't authorized to see, is
+dropped before construction; see `recommendation.engine`'s own module
+docstring for the full Data -> Finding -> Evidence -> Rule -> Candidate
+-> Validation -> Confidence -> Recommendation pipeline. A straight edge,
+never a conditional one, so this node can never short-circuit the graph.
+Fails open on any unexpected error, the same posture every other
+accuracy-aid node here takes. See `agent.nodes.generate_recommendations_node`.
+
 `generate_insight` is the only node reachable from execute_sql's *success*
 path -- a failed, needs-clarification, or rejected run never generates one.
 It is a narrative layer only: see `agent.nodes.generate_insight_node` for
@@ -211,6 +228,7 @@ from agent.nodes import (
     execute_sql_node,
     generate_forecast_node,
     generate_insight_node,
+    generate_recommendations_node,
     generate_sql_node,
     plan_query_node,
     retrieve_business_context_node,
@@ -245,13 +263,14 @@ def build_graph():
     never on the compiled graph object itself -- so building it once and
     reusing it (the same `functools`-based singleton pattern already used
     for `config.settings.get_settings()` and `db.connection._cached_engine`)
-    is safe and avoids re-wiring all seventeen nodes on every single question.
+    is safe and avoids re-wiring all eighteen nodes on every single question.
     Graph *shape* never depends on `Settings` (`retrieve_golden_examples`/
     `classify_analytical_intent`/`build_analytical_plan`/`plan_query`/
     `review_sql`/`review_metric_conformance`/`compute_analytics`/
-    `generate_forecast` are pass-throughs, not conditionally-omitted nodes,
-    when their respective flag (or, for `generate_forecast`, its intent
-    gate) doesn't fire -- see this module's docstring), so
+    `generate_forecast`/`generate_recommendations` are pass-throughs, not
+    conditionally-omitted nodes, when their respective flag (or, for
+    `generate_forecast`, its intent gate) doesn't fire -- see this
+    module's docstring), so
     there's no per-settings cache key to worry about; like every other
     process-lifetime singleton here, a config change that would matter
     takes a process restart.
@@ -277,6 +296,7 @@ def build_graph():
     graph.add_node("execute_sql", execute_sql_node)
     graph.add_node("compute_analytics", compute_analytics_node)
     graph.add_node("generate_forecast", generate_forecast_node)
+    graph.add_node("generate_recommendations", generate_recommendations_node)
     graph.add_node("generate_insight", generate_insight_node)
 
     graph.set_entry_point("sanitize_input")
@@ -360,7 +380,8 @@ def build_graph():
         },
     )
     graph.add_edge("compute_analytics", "generate_forecast")
-    graph.add_edge("generate_forecast", "generate_insight")
+    graph.add_edge("generate_forecast", "generate_recommendations")
+    graph.add_edge("generate_recommendations", "generate_insight")
     graph.add_edge("generate_insight", END)
 
     return graph.compile()
@@ -496,6 +517,7 @@ def run_agent(
         "analytical_result": None,
         "forecast_horizon": forecast_horizon,
         "forecast_result": None,
+        "recommendations": [],
         "retry_count": 0,
         "max_retries": effective_max_retries,
         "complexity_signals": complexity_signals,
