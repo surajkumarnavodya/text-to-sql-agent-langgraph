@@ -51,6 +51,7 @@ from agent.nodes import (
 from agent.state import AgentState, ConversationExchange, TableSchema
 from config.settings import Settings
 from db.query_cost import MODERATE_COST_NOTICE, CostEstimate
+from db.query_store import QueryStoreAvailability, QueryStoreFindings, QueryStoreQueryStats
 from security.secrets import SecretStr
 
 
@@ -2157,6 +2158,102 @@ class TestGenerateRecommendationsNode:
 
         assert "recommendations" in state
         assert insight_update["insight"] == "A short insight."
+
+
+class TestGenerateRecommendationsNodeQueryStore:
+    """Prompt 19 (`19_QUERY_STORE_PERFORMANCE_CONTRACT.md`). `_mock_settings`
+    defaults to `db_type="postgresql"` -- see that fixture's own docstring
+    -- which is exactly what proves the "does not break other database
+    providers" acceptance criterion: a postgres-routed question must never
+    even call into `db.query_store` at all.
+    """
+
+    def _minimal_state(self) -> AgentState:
+        state: AgentState = {"result_columns": ["n"], "result_rows": [(1,)]}
+        state.update(compute_analytics_node(state))
+        return state
+
+    def test_non_mssql_database_never_calls_query_store(self, monkeypatch):
+        def _fail(*args, **kwargs):
+            raise AssertionError("should never call Query Store for a non-mssql database")
+
+        monkeypatch.setattr("agent.nodes.get_cached_query_store_findings", _fail)
+
+        result = generate_recommendations_node(self._minimal_state())
+
+        assert result["recommendations"] == []
+
+    def test_mssql_database_produces_a_query_store_recommendation(
+        self, monkeypatch, _mock_settings
+    ):
+        monkeypatch.setattr(
+            "agent.nodes.get_settings",
+            lambda: Settings(**{**_mock_settings.__dict__, "db_type": "mssql", "databases": ()}),
+        )
+        findings = QueryStoreFindings(
+            availability=QueryStoreAvailability(available=True, reason="available"),
+            top_queries=(
+                QueryStoreQueryStats(
+                    query_id=1,
+                    query_fingerprint="abc123",
+                    normalized_sql_preview="SELECT * FROM T WHERE x = ?",
+                    execution_count=50,
+                    avg_duration_ms=2500.0,
+                    avg_cpu_ms=1200.0,
+                    avg_logical_reads=5000.0,
+                    plan_count=1,
+                    has_forced_plan=False,
+                ),
+            ),
+            regressions=(),
+            lookback_hours=24.0,
+        )
+        monkeypatch.setattr("agent.nodes.get_cached_query_store_findings", lambda *a, **k: findings)
+
+        result = generate_recommendations_node(self._minimal_state())
+
+        db_perf = [r for r in result["recommendations"] if r["category"] == "database_performance"]
+        assert db_perf
+        assert db_perf[0]["affected_entity"] == "abc123"
+
+    def test_feature_flag_off_never_calls_query_store(self, monkeypatch, _mock_settings):
+        monkeypatch.setattr(
+            "agent.nodes.get_settings",
+            lambda: Settings(
+                **{
+                    **_mock_settings.__dict__,
+                    "db_type": "mssql",
+                    "enable_query_store_insights": False,
+                    "databases": (),
+                }
+            ),
+        )
+
+        def _fail(*args, **kwargs):
+            raise AssertionError("should not call Query Store when the feature flag is off")
+
+        monkeypatch.setattr("agent.nodes.get_cached_query_store_findings", _fail)
+
+        result = generate_recommendations_node(self._minimal_state())
+
+        assert result["recommendations"] == []
+
+    def test_query_store_failure_fails_open(self, monkeypatch, _mock_settings):
+        monkeypatch.setattr(
+            "agent.nodes.get_settings",
+            lambda: Settings(**{**_mock_settings.__dict__, "db_type": "mssql", "databases": ()}),
+        )
+
+        def _raise(*args, **kwargs):
+            raise RuntimeError("Query Store DMV read failed")
+
+        monkeypatch.setattr("agent.nodes.get_cached_query_store_findings", _raise)
+
+        result = generate_recommendations_node(self._minimal_state())
+
+        # Fails open -- the node itself must not crash or drop every other
+        # recommendation source just because Query Store failed.
+        assert result["recommendations"] == []
 
 
 class TestGenerateInsightNode:

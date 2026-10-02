@@ -167,7 +167,24 @@ function inferRoleFromValues(name: string, values: unknown[]): ColumnRole {
  * .classify_columns`'s pandas-dtype-based detection, more reliable than
  * guessing from JSON string values) and falls back to client-side
  * inference from the actual returned values when a column's server type is
- * missing or unrecognized. */
+ * missing or unrecognized.
+ *
+ * One deliberate exception to "prefer the server type": a server `"text"`
+ * is re-checked against the actual values and overridden to `"numeric"`
+ * when every one of them actually parses as a number. This is defense in
+ * depth for a real, previously-shipped backend bug (a SQL Server
+ * `DECIMAL`/`MONEY` column arrives via `pyodbc` as `decimal.Decimal`,
+ * which pandas stores as `object` dtype -- `agent.result_charting
+ * .classify_columns` has its own fix for this now, but this client-side
+ * check keeps "Visualize" working correctly even against an older
+ * backend, a stale cached response, or a future reclassification gap,
+ * following this module's own "never trust a hint outright" principle
+ * (already applied to `chart_recommendation`) consistently for
+ * `column_types` too. Deliberately *not* applied to a server `"numeric"`/
+ * `"date"` claim -- those are costlier to get "accidentally right" by
+ * string-shape coincidence, and `inferColumnRoles`'s own test suite
+ * already locks in "trust the server's numeric claim" for that
+ * direction. */
 export function inferColumnRoles(
   columns: string[],
   rows: unknown[][],
@@ -175,10 +192,17 @@ export function inferColumnRoles(
 ): ColumnInfo[] {
   return columns.map((name, index) => {
     const serverType = serverColumnTypes?.[name]
-    if (serverType === 'numeric' || serverType === 'date' || serverType === 'text') {
+    const values = rows.map((row) => row[index])
+    if (serverType === 'numeric' || serverType === 'date') {
       return { name, role: serverType }
     }
-    const values = rows.map((row) => row[index])
+    if (serverType === 'text') {
+      const nonNull = values.filter((v) => v !== null && v !== undefined)
+      if (nonNull.length > 0 && nonNull.every(parsesAsNumber)) {
+        return { name, role: 'numeric' }
+      }
+      return { name, role: 'text' }
+    }
     return { name, role: inferRoleFromValues(name, values) }
   })
 }

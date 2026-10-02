@@ -84,6 +84,7 @@ from config.table_descriptions import apply_table_description, load_table_descri
 from db.connection import get_connection, get_read_only_engine, get_sqlglot_dialect
 from db.execution import execute_readonly_sql
 from db.query_cost import MODERATE_COST_NOTICE, estimate_query_cost, high_cost_error_message
+from db.query_store import QueryStoreFindings, get_cached_query_store_findings
 from db.schema_introspection import extract_ddl_column_names
 from embeddings.golden_examples import retrieve_golden_examples
 from embeddings.retriever import retrieve_relevant_schema, select_database
@@ -2005,6 +2006,42 @@ def _restricted_column_hits_in_sql(
         return ()
 
 
+def _query_store_findings_for_state(state: AgentState, settings: Any) -> QueryStoreFindings | None:
+    """SQL Server Query Store evidence for whichever database this
+    question was routed to -- Prompt 19
+    (`19_QUERY_STORE_PERFORMANCE_CONTRACT.md`). A structural no-op for
+    every other `DB_TYPE`: the engine/connection lookup still happens
+    (cheap -- no new connection is opened), but `db.query_store` itself
+    short-circuits on `db_type != "mssql"` before ever touching the
+    database (see that module's own docstring) -- a non-MSSQL deployment
+    never pays for, or risks, a Query Store DMV query at all.
+
+    Uses `db.query_store.get_cached_query_store_findings` (not the bare
+    `get_query_store_findings`) so the live `/ask` pipeline's added cost
+    is "usually free," bounded by `Settings
+    .query_store_refresh_interval_seconds` -- Query Store reflects
+    server-wide historical activity, not anything specific to this one
+    question, so re-querying its DMVs on every single request would be
+    pure waste. Fails open (returns `None`) on any error, the same
+    posture every other accuracy-aid computation in this node takes.
+    """
+    if not settings.enable_query_store_insights:
+        return None
+    try:
+        db_name = state.get("selected_database") or "default"
+        db_config = get_connection(settings, db_name)
+        if db_config.db_type != "mssql":
+            return None
+        engine = get_read_only_engine(db_config)
+        return get_cached_query_store_findings(engine, db_config.db_type, db_name, settings)
+    except Exception as exc:  # noqa: BLE001 - an accuracy aid must never block the run
+        logger.warning(
+            "[generate_recommendations] Query Store lookup failed, proceeding without: %s",
+            exc,
+        )
+        return None
+
+
 @_timed_node("generate_recommendations")
 def generate_recommendations_node(state: AgentState) -> dict[str, Any]:
     """Builds evidence-backed recommendations for a successfully executed
@@ -2076,10 +2113,13 @@ def generate_recommendations_node(state: AgentState) -> dict[str, Any]:
         )
         performance_snapshot = None
 
+    query_store_findings = _query_store_findings_for_state(state, settings)
+
     inputs = RecommendationInputs(
         analytics_result=analytics_result,
         root_cause_result=None,
         cost_estimate=state.get("cost_estimate"),
+        query_store_findings=query_store_findings,
         performance_snapshot=performance_snapshot,
         restricted_column_hits=restricted_hits,
         caller_roles=tuple(state.get("caller_roles", ())),

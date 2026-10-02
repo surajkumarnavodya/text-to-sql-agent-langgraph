@@ -28,6 +28,12 @@ from recommendation.models import RecommendationCategory, RecommendationKind
 from agent.provenance import DataTruthLevel, ProvenancedClaim
 from config.settings import Settings
 from db.query_cost import CostEstimate
+from db.query_store import (
+    QueryStoreAvailability,
+    QueryStoreFindings,
+    QueryStoreQueryStats,
+    QueryStoreRegression,
+)
 from security.secrets import SecretStr
 
 
@@ -258,6 +264,144 @@ class TestDatabasePerformanceRule:
         recs = generate_recommendations(inputs, _settings())
 
         assert not [r for r in recs if r.category == RecommendationCategory.DATABASE_PERFORMANCE]
+
+
+def _query_store_stats(**overrides) -> QueryStoreQueryStats:
+    defaults = dict(
+        query_id=1,
+        query_fingerprint="abc123",
+        normalized_sql_preview="SELECT * FROM T WHERE x = ?",
+        execution_count=50,
+        avg_duration_ms=2500.0,
+        avg_cpu_ms=1200.0,
+        avg_logical_reads=5000.0,
+        plan_count=1,
+        has_forced_plan=False,
+    )
+    defaults.update(overrides)
+    return QueryStoreQueryStats(**defaults)
+
+
+def _query_store_regression(**overrides) -> QueryStoreRegression:
+    defaults = dict(
+        query_id=2,
+        query_fingerprint="def456",
+        normalized_sql_preview="SELECT * FROM U WHERE y = ?",
+        baseline_avg_duration_ms=100.0,
+        recent_avg_duration_ms=400.0,
+        regression_factor=4.0,
+        recent_execution_count=20,
+        baseline_execution_count=30,
+    )
+    defaults.update(overrides)
+    return QueryStoreRegression(**defaults)
+
+
+def _query_store_findings(**overrides) -> QueryStoreFindings:
+    defaults = dict(
+        availability=QueryStoreAvailability(available=True, reason="available"),
+        top_queries=(),
+        regressions=(),
+        lookback_hours=24.0,
+    )
+    defaults.update(overrides)
+    return QueryStoreFindings(**defaults)
+
+
+class TestQueryStoreHighCostRule:
+    def test_supported_high_duration_query_produces_a_recommendation(self):
+        findings = _query_store_findings(top_queries=(_query_store_stats(),))
+        inputs = RecommendationInputs(query_store_findings=findings)
+
+        recs = generate_recommendations(inputs, _settings())
+
+        perf = [
+            r
+            for r in recs
+            if r.rule_or_model == "recommendation.engine.QueryStoreHighCostRepeatedQueryRule"
+        ]
+        assert perf
+        assert perf[0].category == RecommendationCategory.DATABASE_PERFORMANCE
+        assert perf[0].affected_entity == "abc123"
+        assert "secret" not in perf[0].claim.value
+        assert all(e.level == DataTruthLevel.DATABASE_FACT for e in perf[0].evidence)
+
+    def test_unsupported_below_duration_threshold(self):
+        findings = _query_store_findings(top_queries=(_query_store_stats(avg_duration_ms=50.0),))
+        inputs = RecommendationInputs(
+            query_store_findings=findings,
+        )
+
+        recs = generate_recommendations(
+            inputs, _settings(query_store_high_duration_ms_threshold=1000.0)
+        )
+
+        assert not [
+            r
+            for r in recs
+            if r.rule_or_model == "recommendation.engine.QueryStoreHighCostRepeatedQueryRule"
+        ]
+
+    def test_unavailable_query_store_produces_nothing(self):
+        findings = _query_store_findings(
+            availability=QueryStoreAvailability(available=False, reason="not mssql"),
+            top_queries=(_query_store_stats(),),
+        )
+        inputs = RecommendationInputs(query_store_findings=findings)
+
+        recs = generate_recommendations(inputs, _settings())
+
+        assert not [r for r in recs if r.category == RecommendationCategory.DATABASE_PERFORMANCE]
+
+    def test_none_query_store_findings_is_a_no_op(self):
+        inputs = RecommendationInputs(query_store_findings=None)
+        recs = generate_recommendations(inputs, _settings())
+        assert recs == ()
+
+
+class TestQueryStoreRegressionRule:
+    def test_supported_regression_produces_a_recommendation(self):
+        findings = _query_store_findings(regressions=(_query_store_regression(),))
+        inputs = RecommendationInputs(query_store_findings=findings)
+
+        recs = generate_recommendations(inputs, _settings())
+
+        regression_recs = [
+            r for r in recs if r.rule_or_model == "recommendation.engine.QueryStoreRegressionRule"
+        ]
+        assert regression_recs
+        assert regression_recs[0].category == RecommendationCategory.DATABASE_PERFORMANCE
+        assert regression_recs[0].affected_entity == "def456"
+        assert "4.0x" in regression_recs[0].claim.value
+
+    def test_no_regressions_produces_nothing(self):
+        findings = _query_store_findings(regressions=())
+        inputs = RecommendationInputs(query_store_findings=findings)
+
+        recs = generate_recommendations(inputs, _settings())
+
+        assert not [
+            r for r in recs if r.rule_or_model == "recommendation.engine.QueryStoreRegressionRule"
+        ]
+
+    def test_evidence_never_contains_raw_literal_text(self):
+        """The regression's own normalized_sql_preview is already literal-
+        masked by db.query_store -- this is a regression test proving the
+        recommendation layer never re-introduces a literal when rendering
+        its own claim/evidence text around that preview."""
+        findings = _query_store_findings(
+            regressions=(
+                _query_store_regression(normalized_sql_preview="SELECT * FROM U WHERE Email = ?"),
+            )
+        )
+        inputs = RecommendationInputs(query_store_findings=findings)
+
+        recs = generate_recommendations(inputs, _settings())
+
+        regression_recs = [
+            r for r in recs if r.rule_or_model == "recommendation.engine.QueryStoreRegressionRule"
+        ]
+        assert "@" not in regression_recs[0].claim.value
 
 
 class TestPerformanceRule:

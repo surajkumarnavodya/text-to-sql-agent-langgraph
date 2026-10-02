@@ -5,6 +5,8 @@ emits metadata, never a chart, so these tests stay narrow to that."""
 
 from __future__ import annotations
 
+from decimal import Decimal
+
 import pandas as pd
 
 from agent.result_charting import classify_columns, recommend_chart
@@ -30,6 +32,45 @@ class TestClassifyColumns:
     def test_mixed_columns(self):
         df = pd.DataFrame({"region": ["East", "West"], "revenue": [100, 200]})
         assert classify_columns(df) == {"region": "text", "revenue": "numeric"}
+
+
+class TestClassifyColumnsDecimalObjectDtype:
+    """A SQL Server `DECIMAL`/`MONEY`/`NUMERIC` column arrives via `pyodbc`
+    as Python `decimal.Decimal`, which pandas stores as `object` dtype, not
+    a numeric one -- a real bug that silently disabled the frontend's
+    "Visualize" action for any query whose only numeric measure was a
+    money/decimal column (the common case: revenue, sales, price, salary)."""
+
+    def test_decimal_column_is_classified_numeric(self):
+        df = pd.DataFrame(
+            {
+                "category": ["Bikes", "Accessories", "Clothing"],
+                "revenue": [Decimal("45231.50"), Decimal("12044.25"), Decimal("8830.00")],
+            }
+        )
+        assert classify_columns(df) == {"category": "text", "revenue": "numeric"}
+
+    def test_nullable_decimal_column_is_classified_numeric(self):
+        df = pd.DataFrame({"amount": [Decimal("1.5"), None, Decimal("3.25")]})
+        assert classify_columns(df) == {"amount": "numeric"}
+
+    def test_all_null_object_column_stays_text(self):
+        """Nothing to call numeric -- an all-null column must not be
+        misclassified just because it's technically object-dtype."""
+        df = pd.DataFrame({"x": [None, None]})
+        assert classify_columns(df) == {"x": "text"}
+
+    def test_mixed_decimal_and_text_object_column_stays_text(self):
+        """A genuinely mixed-content object column (not every value is
+        numeric) must not be swept into "numeric" by this fix."""
+        df = pd.DataFrame({"mixed": [Decimal("1.5"), "not a number", 2]})
+        assert classify_columns(df) == {"mixed": "text"}
+
+    def test_genuinely_text_object_column_is_unaffected(self):
+        """Regression guard: a real category column must keep classifying
+        as text, not be swept up by the new numeric check."""
+        df = pd.DataFrame({"region": ["East", "West", "North"]})
+        assert classify_columns(df) == {"region": "text"}
 
 
 class TestRecommendChart:
@@ -85,3 +126,29 @@ class TestRecommendChart:
         types = classify_columns(df)
         result = recommend_chart(df, types)
         assert result["chart_type"] == "bar"
+
+    def test_decimal_revenue_column_now_recommends_bar_not_none(self):
+        """The exact shape that used to silently disable "Visualize"
+        entirely (see TestClassifyColumnsDecimalObjectDtype) -- a
+        category plus a SQL Server decimal aggregate must recommend a
+        bar chart, not fall through to `None` for lack of any numeric
+        column."""
+        df = pd.DataFrame(
+            {
+                "category": ["Bikes", "Accessories"],
+                "revenue": [Decimal("45231.50"), Decimal("12044.25")],
+            }
+        )
+        types = classify_columns(df)
+        result = recommend_chart(df, types)
+        assert result is not None
+        assert result["chart_type"] == "bar"
+        assert result["x_column"] == "category"
+        assert result["y_column"] == "revenue"
+
+    def test_single_row_decimal_recommends_kpi(self):
+        df = pd.DataFrame({"total_revenue": [Decimal("12345.67")]})
+        types = classify_columns(df)
+        result = recommend_chart(df, types)
+        assert result["chart_type"] == "kpi"
+        assert result["y_column"] == "total_revenue"

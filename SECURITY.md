@@ -83,6 +83,16 @@ where the two differ — read the newer document, not just this paragraph.
   hold INSERT/UPDATE/DELETE grants, since the database role actually being
   read-only is the real guarantee behind the validator, not something this
   app can enforce by itself (see "What is explicitly not guaranteed" below).
+- `db/query_store.py`'s SQL Server Query Store insights (optional, SQL
+  Server only) need the connected principal to additionally hold
+  `VIEW DATABASE STATE` (SQL Server 2016–2019) or `VIEW DATABASE
+  PERFORMANCE STATE` (SQL Server 2022+) on the target database — a
+  database-scoped permission, never `VIEW SERVER STATE`/sysadmin. This
+  is an optional grant on top of the read-only `DB_USER` role above, not
+  a requirement for it: a `DB_USER` without it simply never sees Query
+  Store insights (fails open to "unavailable"), and every query's own
+  text is literal-masked via `sqlglot` before it ever leaves that
+  module regardless — see `19_QUERY_STORE_PERFORMANCE_CONTRACT.md`.
 - `db/value_sampling.py` quotes table/column identifiers via the connected
   engine's own dialect-aware `identifier_preparer` before building the
   `SELECT DISTINCT` text it uses to sample values, rather than

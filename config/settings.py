@@ -971,6 +971,44 @@ class Settings(BaseSettings):
             deployment that wants Prompt 17's recommendations surfaced in
             `/ask` without the extra identity-DB write per question. See
             `18_RECOMMENDATION_GOVERNANCE_CONTRACT.md`.
+        enable_query_store_insights: Whether `db.query_store` is consulted
+            at all -- a no-op for every `DB_TYPE` other than `"mssql"`
+            regardless (see that module's own docstring). True by
+            default; a database-scoped `VIEW DATABASE STATE`/`VIEW
+            DATABASE PERFORMANCE STATE` permission gap (or Query Store
+            simply not being enabled) degrades to "unavailable," never an
+            error. See `19_QUERY_STORE_PERFORMANCE_CONTRACT.md`.
+        query_store_lookback_hours: How far back `db.query_store` looks
+            for high-cost/repeated queries and the regression baseline
+            window.
+        query_store_top_n_queries: Caps both `get_top_queries` and
+            `get_regressions` at this many rows each.
+        query_store_min_execution_count: A query below this many
+            executions (in the relevant window) is excluded -- a
+            one-off slow query isn't a "repeated pattern."
+        query_store_regression_factor: A query's recent-window average
+            duration must be at least this many times its own baseline
+            average to be reported as a regression.
+        query_store_regression_recent_hours: The width of the "recent"
+            window compared against the rest of `query_store_lookback_hours`
+            (the baseline) -- must be strictly less than it (enforced by
+            a cross-field validator, the same pattern
+            `cost_moderate_row_threshold`/`cost_high_row_threshold`
+            already establishes).
+        query_store_timeout_seconds: Wall-clock timeout for each
+            individual Query Store DMV read, via the same
+            `db.execution.execute_readonly_sql` every other query in
+            this app already uses.
+        query_store_refresh_interval_seconds: How long
+            `db.query_store.get_cached_query_store_findings` reuses an
+            already-computed result before re-querying -- keeps the live
+            `/ask` pipeline's added cost "usually free" rather than one
+            more DMV round-trip per question.
+        query_store_preview_max_chars: Caps `normalized_sql_preview`
+            (already literal-masked) at this many characters.
+        query_store_high_duration_ms_threshold: `recommendation.engine`'s
+            QueryStoreHighCostRepeatedQueryRule fires when a top query's
+            average duration (milliseconds) is at least this.
         enable_golden_examples: Whether `agent.nodes
             .retrieve_golden_examples_node` looks up human-approved past
             (question, SQL) pairs (see `embeddings.golden_examples`) and
@@ -1821,6 +1859,20 @@ class Settings(BaseSettings):
     # regardless unless local_auth_enabled is also on.
     enable_recommendation_persistence: bool = True
 
+    # Prompt 19 (19_QUERY_STORE_PERFORMANCE_CONTRACT.md): db.query_store's
+    # own tunables -- a no-op for every DB_TYPE other than "mssql"
+    # regardless of these values (see that module's own docstring).
+    enable_query_store_insights: bool = True
+    query_store_lookback_hours: float = Field(default=24.0, gt=0.0)
+    query_store_top_n_queries: int = Field(default=10, gt=0)
+    query_store_min_execution_count: int = Field(default=5, gt=0)
+    query_store_regression_factor: float = Field(default=1.5, gt=1.0)
+    query_store_regression_recent_hours: float = Field(default=1.0, gt=0.0)
+    query_store_timeout_seconds: int = Field(default=5, gt=0)
+    query_store_refresh_interval_seconds: float = Field(default=300.0, gt=0.0)
+    query_store_preview_max_chars: int = Field(default=300, gt=0)
+    query_store_high_duration_ms_threshold: float = Field(default=1000.0, gt=0.0)
+
     enable_golden_examples: bool = True
     golden_examples_top_k: int = Field(default=3, gt=0)
     golden_examples_min_similarity: float = Field(default=0.75, ge=0.0, le=1.0)
@@ -2341,6 +2393,23 @@ class Settings(BaseSettings):
                 f"strictly less than COST_HIGH_ROW_THRESHOLD ({self.cost_high_row_threshold}) "
                 f"-- otherwise a query is never classified 'moderate', only 'low' or 'high'. "
                 f"Fix both in .env."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_query_store_window_ordering(self) -> Settings:
+        """`QUERY_STORE_REGRESSION_RECENT_HOURS` must be strictly less than
+        `QUERY_STORE_LOOKBACK_HOURS` -- otherwise `db.query_store
+        .get_regressions`'s baseline window (the lookback window minus the
+        recent window) is empty or negative, and no regression could ever
+        be computed. The identical cross-field-ordering shape
+        `_validate_cost_threshold_ordering` already establishes just above."""
+        if self.query_store_regression_recent_hours >= self.query_store_lookback_hours:
+            raise ConfigurationError(
+                f"QUERY_STORE_REGRESSION_RECENT_HOURS ({self.query_store_regression_recent_hours}) "
+                f"must be strictly less than QUERY_STORE_LOOKBACK_HOURS "
+                f"({self.query_store_lookback_hours}) -- otherwise there is no baseline window "
+                f"left to compare the recent window against. Fix both in .env."
             )
         return self
 

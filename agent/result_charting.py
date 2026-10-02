@@ -24,11 +24,48 @@ chart).
 from __future__ import annotations
 
 from collections.abc import Mapping
+from decimal import Decimal
 from typing import Literal, TypedDict
 
 import pandas as pd
 
 ColumnType = Literal["numeric", "date", "text"]
+
+# Mirrors `analytics.engine._NUMERIC_TYPES`/`agent.insight._NUMERIC_TYPES`
+# exactly (by value, not by import -- see this codebase's established
+# convention for sharing a constant across modules that shouldn't
+# cross-import, e.g. `analytics/engine.py`'s own docstring for why) --
+# bool is deliberately excluded, same reason: Python's bool is an int
+# subclass, and a True/False column is not a numeric measure.
+_NUMERIC_SCALAR_TYPES = (int, float, Decimal)
+
+
+def _is_numeric_object_column(series: pd.Series) -> bool:
+    """True when `series` has pandas `object` dtype but every non-null
+    value is actually a numeric scalar.
+
+    A real, previously undiagnosed gap: `pd.api.types.is_numeric_dtype`
+    is `False` for an `object`-dtype column, and a SQL Server
+    `DECIMAL`/`MONEY`/`NUMERIC` column comes back from `pyodbc` as
+    Python `decimal.Decimal` -- which pandas stores as `object`, not a
+    numeric dtype, regardless of the values themselves being perfectly
+    numeric. Without this check, `classify_columns` mislabels every such
+    column `"text"`, which silently disabled the entire client-side
+    chart-eligibility check (`frontend/src/lib/chartEngine.ts`) for any
+    query whose only numeric measure was a money/decimal column -- the
+    common case for a real business database (revenue, sales, price,
+    salary, ...). An all-null column returns `False` (nothing to call
+    numeric); `bool` values are deliberately excluded via
+    `_NUMERIC_SCALAR_TYPES`'s own exclusion.
+    """
+    non_null = series.dropna()
+    if non_null.empty:
+        return False
+    return bool(
+        non_null.map(
+            lambda v: isinstance(v, _NUMERIC_SCALAR_TYPES) and not isinstance(v, bool)
+        ).all()
+    )
 
 
 def _looks_like_date(name: str, series: pd.Series) -> bool:
@@ -58,11 +95,20 @@ def classify_columns(df: pd.DataFrame) -> dict[str, ColumnType]:
     .column_types`) so its chart engine doesn't have to re-guess types
     from raw JSON values (a JS `typeof` check can't reliably distinguish a
     date string from an arbitrary string the way pandas' own dtype
-    inference plus a parse attempt can)."""
+    inference plus a parse attempt can).
+
+    `pd.api.types.is_numeric_dtype` alone is not sufficient: a SQL
+    Server `DECIMAL`/`MONEY`/`NUMERIC` column arrives via `pyodbc` as
+    Python `decimal.Decimal`, which pandas stores as `object` dtype, not
+    a numeric one -- `_is_numeric_object_column` is the fallback that
+    catches this (see its own docstring for the real, previously
+    undiagnosed bug this closes: the client's "Visualize" action was
+    unreachable for any query whose only numeric measure was a
+    money/decimal column)."""
     types: dict[str, ColumnType] = {}
     for col in df.columns:
         series = df[col]
-        if pd.api.types.is_numeric_dtype(series):
+        if pd.api.types.is_numeric_dtype(series) or _is_numeric_object_column(series):
             types[col] = "numeric"
         elif pd.api.types.is_datetime64_any_dtype(series) or _looks_like_date(col, series):
             types[col] = "date"

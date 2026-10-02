@@ -10,12 +10,16 @@ already-computed, typed evidence a caller hands it
 revenue, customer, product, operations, data quality, security, and
 database performance.
 
-**Zero new queries, zero new LLM calls.** Every rule below consumes a
-typed result some other, already-existing module in this codebase already
-computed deterministically: `analytics.engine.compute_analytics_result`
+**Zero new queries, zero new LLM calls** on this module's own part --
+every rule below consumes a typed result some other, already-existing
+module already computed: `analytics.engine.compute_analytics_result`
 (anomaly, data quality, revenue, customer, product), `analytics.root_cause
 .investigate_root_cause` (operations), `db.query_cost.estimate_query_cost`
-(database performance), `observability.metrics.PerformanceMetrics.snapshot`
+(database performance, per-query plan estimate), `db.query_store
+.get_query_store_findings`/its cached wrapper (database performance,
+SQL Server Query Store high-cost/repeated-query and regression evidence
+-- Prompt 19, `19_QUERY_STORE_PERFORMANCE_CONTRACT.md`; `None` for every
+non-MSSQL database), `observability.metrics.PerformanceMetrics.snapshot`
 (performance), and `config.sensitive_columns.load_sensitive_columns` +
 `agent.sql_validator.find_restricted_column_references` (security). This
 module computes nothing from raw rows itself -- it is purely a
@@ -98,6 +102,7 @@ from agent.provenance import DataTruthLevel, ProvenancedClaim
 from config.sensitive_columns import load_sensitive_columns
 from config.settings import Settings, get_settings
 from db.query_cost import CostEstimate
+from db.query_store import QueryStoreFindings
 from recommendation.models import Recommendation, RecommendationCategory, RecommendationKind
 from security.audit_log import log_security_event
 
@@ -156,6 +161,15 @@ class RecommendationInputs(BaseModel):
             feeds the OPERATIONS rule.
         cost_estimate: `db.query_cost.estimate_query_cost`'s output for
             the executed query -- feeds the DATABASE_PERFORMANCE rule.
+        query_store_findings: `db.query_store.get_query_store_findings`
+            (or its cached wrapper)'s output -- SQL Server Query Store
+            high-cost/repeated-query and regression evidence, also
+            feeding the DATABASE_PERFORMANCE rule (Prompt 19,
+            `19_QUERY_STORE_PERFORMANCE_CONTRACT.md`). `None` for every
+            non-MSSQL database, or when Query Store itself is
+            unavailable -- see that module's own docstring; this field
+            being `None` produces zero DATABASE_PERFORMANCE candidates
+            from this source, never an error.
         performance_snapshot: `observability.metrics.PerformanceMetrics
             .snapshot()`'s output -- feeds the PERFORMANCE rule. A plain
             mapping (not the `MetricsSnapshot` TypedDict directly) so a
@@ -180,6 +194,7 @@ class RecommendationInputs(BaseModel):
     analytics_result: AnalyticsResult | None = None
     root_cause_result: RootCauseResult | None = None
     cost_estimate: CostEstimate | None = None
+    query_store_findings: QueryStoreFindings | None = None
     performance_snapshot: Mapping[str, Any] | None = None
     restricted_column_hits: tuple[tuple[str, str], ...] = ()
     caller_roles: tuple[str, ...] = ()
@@ -510,6 +525,132 @@ def _database_performance_candidates(estimate: CostEstimate) -> list[_Candidate]
     ]
 
 
+def _query_store_high_cost_candidates(
+    findings: QueryStoreFindings, settings: Settings
+) -> list[_Candidate]:
+    """DATABASE_PERFORMANCE: a SQL Server Query Store query whose average
+    duration clears `Settings.query_store_high_duration_ms_threshold` --
+    "high-cost/repeated" by construction, since `db.query_store
+    .get_top_queries` already filtered to queries clearing
+    `Settings.query_store_min_execution_count` over the lookback window
+    (Prompt 19, `19_QUERY_STORE_PERFORMANCE_CONTRACT.md`).
+
+    Evidence is built entirely from already literal-masked/numeric
+    fields -- `query.normalized_sql_preview` never contains a literal
+    value (see `db.query_store._mask_literals`'s own docstring), and
+    `affected_entity` is the query's hash fingerprint, never its text.
+    """
+    candidates: list[_Candidate] = []
+    for query in findings.top_queries:
+        if query.avg_duration_ms < settings.query_store_high_duration_ms_threshold:
+            continue
+        confidence = min(
+            1.0,
+            round(
+                0.5
+                + (query.avg_duration_ms / settings.query_store_high_duration_ms_threshold) * 0.1,
+                2,
+            ),
+        )
+        action = (
+            "Review this query's execution plan for a missing index, stale statistics, "
+            "or a parameter-sniffing issue."
+        )
+        evidence_claim = ProvenancedClaim(
+            value=(
+                f"Query {query.query_fingerprint} ({query.normalized_sql_preview}) executed "
+                f"{query.execution_count} time(s) over the last {findings.lookback_hours:g}h, "
+                f"averaging {query.avg_duration_ms:.0f}ms, {query.avg_cpu_ms:.0f}ms CPU, "
+                f"{query.avg_logical_reads:.0f} logical reads."
+            ),
+            level=DataTruthLevel.DATABASE_FACT,
+            source="db.query_store.get_top_queries",
+        )
+        candidates.append(
+            _Candidate(
+                category=RecommendationCategory.DATABASE_PERFORMANCE,
+                kind=RecommendationKind.ACTION,
+                text=(
+                    f"Query {query.query_fingerprint} is a high-cost, repeated pattern "
+                    f"({query.execution_count} execution(s), averaging "
+                    f"{query.avg_duration_ms:.0f}ms). {action}"
+                ),
+                rationale="SQL Server Query Store flagged this query across the lookback window.",
+                evidence=(evidence_claim,),
+                affected_entity=query.query_fingerprint,
+                action=action,
+                measurable_impact=(
+                    f"{query.execution_count} execution(s), avg {query.avg_duration_ms:.0f}ms, "
+                    f"{query.plan_count} plan(s) recorded."
+                ),
+                confidence=confidence,
+                rule_name="recommendation.engine.QueryStoreHighCostRepeatedQueryRule",
+                limitations=(
+                    "Query Store data reflects historical server-wide activity, not "
+                    "specifically this question -- this query may or may not be the one "
+                    "just executed.",
+                    "Query text literals are masked; only a normalized preview is shown.",
+                ),
+            )
+        )
+    return candidates
+
+
+def _query_store_regression_candidates(findings: QueryStoreFindings) -> list[_Candidate]:
+    """DATABASE_PERFORMANCE: a SQL Server Query Store regression --
+    `db.query_store.get_regressions` already validated that the recent
+    window's execution count, the baseline window's execution count, and
+    the regression factor itself all clear their configured bars; this
+    rule only renders what's already there, the identical "adapt, don't
+    recompute" posture every other rule in this module follows."""
+    candidates: list[_Candidate] = []
+    for regression in findings.regressions:
+        confidence = min(1.0, round(0.4 + regression.regression_factor * 0.1, 2))
+        action = (
+            "Investigate what changed for this query -- a plan change, stale statistics, "
+            "a data-volume shift, or a recent schema/index change are the usual causes."
+        )
+        evidence_claim = ProvenancedClaim(
+            value=(
+                f"Query {regression.query_fingerprint} ({regression.normalized_sql_preview}) "
+                f"regressed: {regression.recent_avg_duration_ms:.0f}ms average over "
+                f"{regression.recent_execution_count} recent execution(s), vs. a "
+                f"{regression.baseline_avg_duration_ms:.0f}ms baseline over "
+                f"{regression.baseline_execution_count} execution(s) -- "
+                f"{regression.regression_factor:.1f}x slower."
+            ),
+            level=DataTruthLevel.DATABASE_FACT,
+            source="db.query_store.get_regressions",
+        )
+        candidates.append(
+            _Candidate(
+                category=RecommendationCategory.DATABASE_PERFORMANCE,
+                kind=RecommendationKind.ACTION,
+                text=(
+                    f"Query {regression.query_fingerprint} has regressed "
+                    f"{regression.regression_factor:.1f}x against its own recent baseline. {action}"
+                ),
+                rationale="SQL Server Query Store's own recent-vs-baseline comparison flagged this query.",
+                evidence=(evidence_claim,),
+                affected_entity=regression.query_fingerprint,
+                action=action,
+                measurable_impact=(
+                    f"{regression.regression_factor:.1f}x slower "
+                    f"({regression.recent_avg_duration_ms:.0f}ms vs. "
+                    f"{regression.baseline_avg_duration_ms:.0f}ms baseline)."
+                ),
+                confidence=confidence,
+                rule_name="recommendation.engine.QueryStoreRegressionRule",
+                limitations=(
+                    "A statistical comparison of this query against its own recent "
+                    "history, not a root-cause diagnosis of why it changed.",
+                    "Query text literals are masked; only a normalized preview is shown.",
+                ),
+            )
+        )
+    return candidates
+
+
 def _performance_candidates(snapshot: Mapping[str, Any], settings: Settings) -> list[_Candidate]:
     """PERFORMANCE: a LangGraph pipeline stage whose rolling p95 duration
     (`observability.metrics.PerformanceMetrics.snapshot()`) clears
@@ -762,6 +903,13 @@ def generate_recommendations(
 
     if inputs.cost_estimate is not None:
         candidates.extend(_database_performance_candidates(inputs.cost_estimate))
+
+    if (
+        inputs.query_store_findings is not None
+        and inputs.query_store_findings.availability.available
+    ):
+        candidates.extend(_query_store_high_cost_candidates(inputs.query_store_findings, settings))
+        candidates.extend(_query_store_regression_candidates(inputs.query_store_findings))
 
     if inputs.performance_snapshot is not None:
         candidates.extend(_performance_candidates(inputs.performance_snapshot, settings))

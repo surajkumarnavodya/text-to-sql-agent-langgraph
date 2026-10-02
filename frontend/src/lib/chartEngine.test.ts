@@ -48,6 +48,32 @@ describe('inferColumnRoles', () => {
     const result = inferColumnRoles(['region'], [['East']], {})
     expect(result[0].role).toBe('text')
   })
+
+  // A real, previously-shipped backend bug: a SQL Server DECIMAL/MONEY
+  // column arrives via pyodbc as Python decimal.Decimal, which pandas
+  // stores as object dtype -- agent.result_charting.classify_columns used
+  // to mislabel it "text", which silently disabled the entire "Visualize"
+  // action for any query whose only numeric measure was a money/decimal
+  // column. This is the client-side defense-in-depth half of that fix.
+  it('overrides a server "text" label to numeric when every value actually parses as a number', () => {
+    const result = inferColumnRoles(['revenue'], [[45231.5], [12044.25]], { revenue: 'text' })
+    expect(result[0].role).toBe('numeric')
+  })
+
+  it('keeps a server "text" label when values are not all numeric (no false positive)', () => {
+    const result = inferColumnRoles(['region'], [['East'], ['West']], { region: 'text' })
+    expect(result[0].role).toBe('text')
+  })
+
+  it('keeps a server "text" label for a column with no non-null values at all', () => {
+    const result = inferColumnRoles(['x'], [[null], [undefined]], { x: 'text' })
+    expect(result[0].role).toBe('text')
+  })
+
+  it('still trusts a server "numeric" label outright, even over non-numeric-looking values', () => {
+    const result = inferColumnRoles(['mystery'], [['x'], ['y']], { mystery: 'numeric' })
+    expect(result[0].role).toBe('numeric')
+  })
 })
 
 describe('getChartTypeOptions', () => {
@@ -80,6 +106,26 @@ describe('getChartTypeOptions', () => {
     const options = getChartTypeOptions(columns, [[12345]])
     const kpi = options.find((o) => o.type === 'kpi')!
     expect(kpi.enabled).toBe(true)
+  })
+
+  it('enables bar/line/kpi for a category + decimal-sourced measure the server mislabels "text"', () => {
+    // The exact end-to-end shape of the "Visualize is always disabled" bug:
+    // a SQL Server decimal/money aggregate, which agent.result_charting
+    // .classify_columns used to send as column_types: {revenue: "text"}.
+    const rows = [
+      ['Bikes', 45231.5],
+      ['Accessories', 12044.25],
+    ]
+    const columns = inferColumnRoles(['category', 'revenue'], rows, {
+      category: 'text',
+      revenue: 'text',
+    })
+    const options = getChartTypeOptions(columns, rows)
+    const byType = Object.fromEntries(options.map((o) => [o.type, o]))
+    expect(byType.bar.enabled).toBe(true)
+    expect(byType['bar-horizontal'].enabled).toBe(true)
+    const hasAnyChartableType = options.some((o) => o.enabled && o.type !== 'table')
+    expect(hasAnyChartableType).toBe(true)
   })
 
   it('disables pie/doughnut when there are too many categories', () => {

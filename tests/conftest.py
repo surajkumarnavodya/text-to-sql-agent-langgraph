@@ -109,6 +109,7 @@ def _clear_process_singleton_caches() -> None:
     from agent.llm_client import _get_ollama_client
     from agent.orchestrator.graph import build_orchestrator_graph
     from api.main import _get_ask_executor
+    from db.query_store import clear_query_store_cache
     from embeddings.schema_indexer import _cached_chroma_client
 
     build_graph.cache_clear()
@@ -119,3 +120,4 @@ def _clear_process_singleton_caches() -> None:
     _cached_identity_engine.cache_clear()
     _cached_session_factory.cache_clear()
     _get_ask_executor.cache_clear()
+    clear_query_store_cache()

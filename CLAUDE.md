@@ -177,7 +177,12 @@ below, and `docs/MULTI_SOURCE_GUIDE.md` for how to configure each source.
   `execute_sql_node`/`POST /execute` already do — without it, a
   schema-qualified connection (this project's own real `HrAutomationDb`
   example, see the Python-3.14-gotchas note above) would have silently
-  failed every query through this still-unwired adapter.
+  failed every query through this still-unwired adapter. **Prompt 19**
+  (`19_QUERY_STORE_PERFORMANCE_CONTRACT.md`) added `query_store.py` — a
+  SQL-Server-only, fully optional module reading Query Store's own DMVs
+  for high-cost/repeated/regressed query evidence, feeding
+  `recommendation/engine.py`'s existing `DATABASE_PERFORMANCE` category.
+  See "SQL Server Query Store performance intelligence" below.
 - `embeddings/` — `schema_indexer.py`'s `build_index(tables, db_name, ...)`
   takes already-introspected `TableSchemaInfo` objects (not a file, not an
   engine) and embeds them into **that database's own Chroma collection**
@@ -349,7 +354,12 @@ below, and `docs/MULTI_SOURCE_GUIDE.md` for how to configure each source.
   `recommendation/governance_policy.py` (RBAC+ABAC) on top — a quality-
   measurement layer over already-produced recommendations, not a change
   to how/whether Prompt 17's engine produces them. See "Recommendation
-  governance & feedback" below.
+  governance & feedback" below. **Prompt 19**
+  (`19_QUERY_STORE_PERFORMANCE_CONTRACT.md`) added two more
+  `DATABASE_PERFORMANCE` rules to `recommendation/engine.py`
+  (`QueryStoreHighCostRepeatedQueryRule`/`QueryStoreRegressionRule`),
+  reusing the existing category rather than inventing a new one — see
+  "SQL Server Query Store performance intelligence" below.
 - `rag/` — document/policy agentic RAG, one implementation shared by both
   the "documents" and "policies" collections (parameterized by collection
   name, not two near-duplicate modules): `store.py` (SQL Server native
@@ -2498,6 +2508,55 @@ new RBAC permission codes were then confirmed seeded via a direct
 for the full inspection findings, every table/route's design, the
 testing summary (3272/3272 backend tests passing, up from 3172 before
 this prompt), and the disclosed, honest scope boundaries.
+
+### SQL Server Query Store performance intelligence (Prompt 19)
+`db/query_store.py` is a SQL-Server-only, fully optional module — a
+no-op for every other `DB_TYPE` regardless of its settings, the same
+provider-neutral posture `db/adapter.py::DatabaseCapabilities` and
+`db.connection.check_write_privileges`'s own `checked: bool`/fail-open
+contract already establish elsewhere in `db/`. `check_query_store_availability`
+is the mandatory first call (`db_type != "mssql"`, the feature flag off,
+a permission error, or Query Store simply not being enabled on the
+target database all resolve to the identical `available=False`, never
+an exception); `get_top_queries`/`get_regressions` then read SQL
+Server's own Query Store DMVs (`sys.query_store_query`/`_query_text`/
+`_plan`/`_runtime_stats`/`_runtime_stats_interval`) for high-cost/
+repeated patterns and self-referential regressions (a query's recent
+average duration vs. its own baseline), every DMV read going through
+the existing `db.execution.execute_readonly_sql` — no new execution
+path. A small, lock-protected, in-process TTL cache
+(`get_cached_query_store_findings`, default 5-minute refresh) keeps the
+live `/ask` pipeline's added cost "usually free," mirroring
+`observability.metrics.PerformanceMetrics`'s own posture.
+
+**Invariant that must not regress: literals never leave this module.**
+`_mask_literals` parses every query's text with `sqlglot` and replaces
+every literal with a placeholder *before* truncating it into a
+`normalized_sql_preview` — the only text form `db/query_store.py` ever
+constructs or returns; an unparseable query degrades to a fixed generic
+placeholder, never a raw-text pass-through. `recommendation/engine.py`'s
+two new rules (`QueryStoreHighCostRepeatedQueryRule`/
+`QueryStoreRegressionRule`) feed `RecommendationInputs
+.query_store_findings` into the **existing**
+`RecommendationCategory.DATABASE_PERFORMANCE` — reusing Prompt 17's own
+category, never a new one — and `agent.nodes
+._query_store_findings_for_state` only calls into `db.query_store` at
+all when the request's *selected* database's own `db_type == "mssql"`;
+a postgres/mysql/oracle-routed question never reaches this module,
+structurally, not just by convention (verified directly in
+`tests/test_agent_nodes.py` via an assertion-raising mock). Reading
+Query Store's DMVs needs the connected principal to hold the
+database-scoped `VIEW DATABASE STATE`/`VIEW DATABASE PERFORMANCE STATE`
+permission — an optional grant on top of this project's existing
+read-only `DB_USER` role; without it, Query Store insights are simply
+`available=False`, and every other feature keeps working unchanged.
+
+**Read [`19_QUERY_STORE_PERFORMANCE_CONTRACT.md`](19_QUERY_STORE_PERFORMANCE_CONTRACT.md)**
+for the full inspection findings, every DMV query's design, the testing
+summary (3308/3308 backend tests passing, up from 3272 before this
+prompt), and the disclosed, honest scope boundaries (most notably: no
+live SQL Server instance with Query Store enabled was available to
+verify the DMV queries against real data in this pass).
 
 ## How to run
 
