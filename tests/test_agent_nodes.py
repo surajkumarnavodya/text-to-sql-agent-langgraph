@@ -24,6 +24,7 @@ from sqlalchemy.exc import SQLAlchemyError
 
 from agent.exceptions import OllamaUnavailableError, SchemaRetrievalError
 from agent.nodes import (
+    _query_fingerprint,
     build_analytical_plan_node,
     classify_analytical_intent_node,
     classify_followup_node,
@@ -1545,6 +1546,115 @@ class TestEstimateQueryCostNode:
         result = estimate_query_cost_node(self._state(retry_count=0))
 
         assert route_after_cost_estimate(result) != "execute_sql"
+
+
+class TestQueryFingerprint:
+    """Prompt 23 (observability, evaluation & reliability):
+    `_query_fingerprint` backs `_timed_node`'s `[trace]` log line's
+    `query_fingerprint` field -- a hash, never SQL text or anything
+    derived from it, so a literal value can never leak into a log."""
+
+    def test_none_for_no_sql(self):
+        assert _query_fingerprint(None) is None
+
+    def test_none_for_empty_string(self):
+        assert _query_fingerprint("") is None
+
+    def test_same_sql_produces_the_same_fingerprint(self):
+        a = _query_fingerprint("SELECT id FROM customers")
+        b = _query_fingerprint("SELECT id FROM customers")
+        assert a == b
+
+    def test_different_sql_produces_a_different_fingerprint(self):
+        a = _query_fingerprint("SELECT id FROM customers")
+        b = _query_fingerprint("SELECT id FROM orders")
+        assert a != b
+
+    def test_never_contains_the_original_sql_text_or_a_literal(self):
+        fingerprint = _query_fingerprint("SELECT ssn FROM customers WHERE ssn = '123-45-6789'")
+        assert "123-45-6789" not in fingerprint
+        assert "ssn" not in fingerprint
+        assert "SELECT" not in fingerprint
+
+
+class TestTimedNodeTraceLogging:
+    """Prompt 23: `_timed_node`'s wrapper emits an additive `[trace]` log
+    line (never replacing the pre-existing `[timing]` one
+    `scripts/profile_pipeline.py` parses) carrying status/error-category/
+    model/db-provider/query-fingerprint/result-size whenever the stage
+    actually has one -- the literal mechanism behind "failures can be
+    attributed to a specific stage" without needing per-node code changes."""
+
+    def test_execute_sql_success_trace_includes_db_provider_fingerprint_and_result_size(
+        self, monkeypatch, caplog
+    ):
+        monkeypatch.setattr(
+            "agent.nodes.execute_readonly_sql",
+            lambda sql, timeout, max_rows, engine=None: (["id"], [(1,), (2,)]),
+        )
+        state: AgentState = {
+            "sql": "SELECT id FROM customers",
+            "retry_count": 0,
+            "selected_database": "default",
+        }
+
+        with caplog.at_level("INFO", logger="agent.nodes"):
+            execute_sql_node(state)
+
+        trace_lines = [r.message for r in caplog.records if r.message.startswith("[trace]")]
+        assert len(trace_lines) == 1
+        line = trace_lines[0]
+        assert "stage=execute_sql" in line
+        assert "status='succeeded'" in line
+        assert "db_provider='default'" in line
+        assert "result_size=2" in line
+        assert "query_fingerprint=" in line
+        assert "SELECT id FROM customers" not in line
+
+    def test_trace_omits_fields_that_are_not_applicable(self, caplog):
+        """A node call with no SQL/model/database in play yet (nothing has
+        been generated or selected) must not render `model=`/
+        `db_provider=`/`query_fingerprint=`/`result_size=` as literal
+        `None` placeholders -- each is omitted outright rather than
+        rendered empty."""
+        state: AgentState = {"question": "anything", "selected_database": None}
+
+        with caplog.at_level("INFO", logger="agent.nodes"):
+            retrieve_golden_examples_node(state)
+
+        trace_lines = [r.message for r in caplog.records if r.message.startswith("[trace]")]
+        assert len(trace_lines) == 1
+        line = trace_lines[0]
+        assert "model=" not in line
+        assert "db_provider=" not in line
+        assert "query_fingerprint=" not in line
+        assert "result_size=" not in line
+
+    def test_database_busy_rejection_trace_includes_error_category(self, monkeypatch, caplog):
+        class _AlwaysBusyLimiter:
+            def try_acquire(self) -> bool:
+                return False
+
+            def release(self) -> None:
+                raise AssertionError("must not be called")
+
+        monkeypatch.setattr(
+            "agent.nodes.get_database_execution_limiter",
+            lambda name, max_concurrent: _AlwaysBusyLimiter(),
+        )
+        state: AgentState = {
+            "sql": "SELECT id FROM customers",
+            "retry_count": 0,
+            "selected_database": "default",
+        }
+
+        with caplog.at_level("INFO", logger="agent.nodes"):
+            execute_sql_node(state)
+
+        trace_lines = [r.message for r in caplog.records if r.message.startswith("[trace]")]
+        assert len(trace_lines) == 1
+        assert "error_category='database_busy'" in trace_lines[0]
+        assert "status='failed'" in trace_lines[0]
 
 
 class TestExecuteSqlNode:

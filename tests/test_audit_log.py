@@ -7,8 +7,11 @@ import logging
 
 from security.audit_log import (
     CorrelationIdLogFilter,
+    TenantIdLogFilter,
     log_security_event,
+    reset_audit_tenant_id,
     reset_correlation_id,
+    set_audit_tenant_id,
     set_correlation_id,
 )
 
@@ -96,3 +99,43 @@ class TestCorrelationIdLogFilter:
             module_logger.removeFilter(correlation_filter)
 
         assert caplog.records[0].correlation_id == "req-xyz-789"
+
+
+class TestTenantIdLogFilter:
+    """Prompt 23 (observability, evaluation & reliability) -- the identical
+    gap `TestCorrelationIdLogFilter` above already documents, for the
+    tenant dimension: before this filter existed, a request's tenant was
+    only visible on `security.audit` events."""
+
+    def test_stamps_the_current_tenant_id_onto_the_record(self):
+        token = set_audit_tenant_id("tenant-a")
+        try:
+            record = logging.LogRecord("some.module", logging.INFO, __file__, 1, "msg", (), None)
+            result = TenantIdLogFilter().filter(record)
+        finally:
+            reset_audit_tenant_id(token)
+
+        assert result is True
+        assert record.tenant_id == "tenant-a"
+
+    def test_stamps_a_placeholder_when_no_tenant_is_bound(self):
+        record = logging.LogRecord("some.module", logging.INFO, __file__, 1, "msg", (), None)
+        TenantIdLogFilter().filter(record)
+        assert record.tenant_id == "-"
+
+    def test_ordinary_module_logger_gains_tenant_id_via_caplog(self, caplog):
+        """End-to-end: a plain per-module logger (not `security.audit`)
+        picks up the tenant once the filter is attached, exactly as
+        `configure_logging` wires it onto the root handler."""
+        module_logger = logging.getLogger("some.other.arbitrary.module")
+        tenant_filter = TenantIdLogFilter()
+        module_logger.addFilter(tenant_filter)
+        token = set_audit_tenant_id("tenant-b")
+        try:
+            with caplog.at_level(logging.INFO, logger="some.other.arbitrary.module"):
+                module_logger.info("doing work")
+        finally:
+            reset_audit_tenant_id(token)
+            module_logger.removeFilter(tenant_filter)
+
+        assert caplog.records[0].tenant_id == "tenant-b"

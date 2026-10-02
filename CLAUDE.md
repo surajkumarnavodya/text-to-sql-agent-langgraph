@@ -2803,6 +2803,101 @@ rate-limit additions, and
 [`21_ENTERPRISE_SECURITY_DATA_GOVERNANCE_CONTRACT.md`](21_ENTERPRISE_SECURITY_DATA_GOVERNANCE_CONTRACT.md)
 for the full prompt text and outcome summary.
 
+### Observability, evaluation & reliability (Prompt 23)
+Two additive pieces, reusing far more existing machinery than it added:
+per-stage tracing that threads correlation ID, tenant, and
+stage-specific metadata through every log line (extending `agent.nodes
+._timed_node`, `security/audit_log.py`, and `config.settings
+.configure_logging` — all pre-existing), and a new, fully-deterministic
+`eval/component_benchmark/` covering the four domains that had zero
+evaluation-dataset coverage before this prompt.
+
+**Tracing.** `agent.nodes._timed_node` (already wraps every one of the
+graph's nodes, see "Self-correcting retry loop" above) now also emits an
+additive `[trace] stage=<name> attempt=<n> duration_ms=<ms> <fields>`
+log line alongside its pre-existing `[timing]` one (kept byte-for-byte
+unchanged — `scripts/profile_pipeline.py` parses it). `<fields>` —
+`status`/`error_category`/`model`/`db_provider`/`query_fingerprint`/
+`result_size` — are read from already-existing `AgentState` keys with
+**zero changes to any individual node's own return contract**, the
+identical "cross-cutting, no node needs to know this exists" principle
+`stage_timings` itself already established; each is omitted outright
+(never a literal `None`) when not meaningful for that stage.
+`query_fingerprint` (`agent.nodes._query_fingerprint`) is a bare SHA-256
+prefix of the SQL text — never the text itself or anything derived from
+a literal value in it, a stronger guarantee than a masked-literal preview
+(`db.query_store._mask_literals`'s own, different use case) would give.
+`security/audit_log.py` gained `TenantIdLogFilter` (identical mechanism
+to the pre-existing `CorrelationIdLogFilter`, wired in alongside it by
+`config.settings.configure_logging`) — closing a real, found gap: a
+request's tenant was previously visible only on `security.audit` events,
+never on an ordinary `logger.info(...)` call (the `[timing]`/`[trace]`
+lines included). Together, this is the literal mechanism behind this
+prompt's acceptance criterion: a single `grep correlation_id=<id>` now
+surfaces one request's full stage-by-stage trace — including which
+stage set an error category, which model/database it used, and whether
+its result set was empty — without needing a second monitoring system.
+
+**Evaluation.** `eval/component_benchmark/` (new) covers **semantic**
+(governed-metric rendering determinism, `agent.llm_client
+._build_mandatory_metrics_block`), **planning** (the analytical-plan
+validator, `agent.plan_validator.validate_plan`), **analytics** (the
+deterministic analytics engine, `analytics.engine
+.compute_analytics_result`), and **recommendations** (the evidence-first
+recommendation engine, `recommendation.engine.generate_recommendations`)
+— the four domains Prompt 23 named that had no dedicated evaluation
+dataset at all before this pass (each already has its own, much more
+fine-grained pytest unit-test suite from the prompt that introduced it;
+this is a smaller set of named, realistic, regression-tracked scenarios,
+a qualitatively different thing from unit coverage, not a re-run of it).
+Every case calls a real production function **directly**, never a mock
+— all four domains are pure/deterministic with no I/O, which is what
+makes this the first `eval/` harness that's also wired into the ordinary
+`pytest` suite (`tests/test_eval_component_benchmark.py`) rather than
+staying a manual script, unlike `eval/runner.py`/`eval/security_benchmark
+/runner.py`, both of which need a live database and/or LLM this
+environment doesn't have. `eval/component_benchmark/regression.py` is a
+deliberately small, new, **case-level** (binary pass/fail per named
+case) regression gate against a committed baseline
+(`eval/baselines/component_benchmark_latest.json`) — not a reuse of
+`eval/regression.py`'s own metric-drift/tolerance-band logic, which is
+shaped for the SQL benchmark's scored accuracy/latency metrics and has
+no equivalent concept here. `scripts/run_component_benchmark.py` is the
+operator-facing CLI (`--save-baseline`/`--check-regression`), mirroring
+`scripts/run_benchmark.py`'s own flag shape.
+
+**Reused, not duplicated — the three domains this prompt also named that
+already had real coverage:** "SQL" is the existing, mature
+`eval/benchmark/*.yaml` harness (`eval/runner.py`/`eval/regression.py`,
+manual, needs a live DB+LLM); "security" is `eval/security_benchmark/`
+(the 500-case prompt-injection benchmark); "tenant isolation" is
+`tests/security/test_cross_tenant_isolation.py`/
+`test_cross_tenant_shared_infrastructure.py` — a real, CI-enforced
+pytest regression suite, arguably a *stronger* regression gate than a
+parallel YAML dataset would be, since it already runs on every PR. None
+of these three got a parallel dataset built alongside them.
+
+**Known limitations, disclosed rather than hidden:** the component
+benchmark's "planning"/"analytics"/"recommendations" cases are
+hand-authored and necessarily non-exhaustive (28 cases across 4
+domains) — they catch a *regression* in already-identified, realistic
+scenarios, not every possible input shape (that's what each domain's own
+much larger pytest suite is for). `[trace]`'s `model`/`db_provider`
+fields reflect whichever model/database was *selected* for this
+question, not a live token-count/dollar-cost figure — no per-call
+token/cost metadata is captured anywhere in this pass (Ollama's own
+`total_ms`/token-count breakdown, captured by `observability
+.llm_timing_capture.capture_llm_timings`, remains a separate,
+pre-existing, benchmark-only mechanism, not merged into this log-line
+trace). No new distributed-tracing backend (OpenTelemetry spans,
+Prometheus histograms) was introduced — unchanged, deliberate posture,
+see `docs/OBSERVABILITY.md`'s own "Known gaps" section.
+
+**Read [`docs/OBSERVABILITY.md`](docs/OBSERVABILITY.md)**'s §3/§3a for
+the full `[trace]`/tenant-propagation design, and
+[`23_OBSERVABILITY_EVALUATION_RELIABILITY_CONTRACT.md`](23_OBSERVABILITY_EVALUATION_RELIABILITY_CONTRACT.md)
+for the full prompt text and outcome summary.
+
 
 ## How to run
 

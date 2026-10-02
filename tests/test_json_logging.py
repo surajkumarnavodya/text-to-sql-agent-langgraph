@@ -11,7 +11,12 @@ import logging
 from pathlib import Path
 
 from config.settings import Settings, _JsonLogFormatter, configure_logging
-from security.audit_log import reset_correlation_id, set_correlation_id
+from security.audit_log import (
+    reset_audit_tenant_id,
+    reset_correlation_id,
+    set_audit_tenant_id,
+    set_correlation_id,
+)
 from security.secrets import SecretStr
 
 _BASE_SETTINGS = Settings(
@@ -58,6 +63,7 @@ class TestJsonLogFormatter:
     def test_emits_valid_json(self):
         record = self._record()
         record.correlation_id = "req-123"
+        record.tenant_id = "tenant-a"
         rendered = _JsonLogFormatter().format(record)
 
         parsed = json.loads(rendered)  # must not raise
@@ -65,26 +71,34 @@ class TestJsonLogFormatter:
         assert parsed["level"] == "INFO"
         assert parsed["logger"] == "some.module"
         assert parsed["correlation_id"] == "req-123"
+        assert parsed["tenant_id"] == "tenant-a"
         assert "timestamp" in parsed
 
     def test_missing_correlation_id_renders_as_null_not_a_crash(self):
         record = self._record()
-        # No `correlation_id` attribute set -- simulates a record that
-        # bypassed CorrelationIdLogFilter (shouldn't happen in practice,
-        # but the formatter must not crash on it).
+        # No `correlation_id`/`tenant_id` attribute set -- simulates a
+        # record that bypassed CorrelationIdLogFilter/TenantIdLogFilter
+        # (shouldn't happen in practice, but the formatter must not crash
+        # on it).
         rendered = _JsonLogFormatter().format(record)
         parsed = json.loads(rendered)
         assert parsed["correlation_id"] is None
+        assert parsed["tenant_id"] is None
 
     def test_placeholder_dash_correlation_id_renders_as_null(self):
         """CorrelationIdLogFilter stamps '-' outside a request -- the JSON
         formatter should render that as a real null, not the literal
         string '-', so a log-pipeline query for "no correlation id" works
-        naturally (`correlation_id IS NULL`, not `correlation_id = '-'`)."""
+        naturally (`correlation_id IS NULL`, not `correlation_id = '-'`).
+        Prompt 23: `TenantIdLogFilter` makes the identical choice for
+        `tenant_id`."""
         record = self._record()
         record.correlation_id = "-"
+        record.tenant_id = "-"
         rendered = _JsonLogFormatter().format(record)
-        assert json.loads(rendered)["correlation_id"] is None
+        parsed = json.loads(rendered)
+        assert parsed["correlation_id"] is None
+        assert parsed["tenant_id"] is None
 
     def test_exception_info_is_included_when_present(self):
         try:
@@ -140,11 +154,13 @@ class TestConfigureLoggingJsonFormat:
         monkeypatch.setattr("config.settings.get_settings", lambda: settings)
         configure_logging()
 
-        token = set_correlation_id("req-e2e-1")
+        correlation_token = set_correlation_id("req-e2e-1")
+        tenant_token = set_audit_tenant_id("tenant-e2e")
         try:
             logging.getLogger("test.json.e2e").warning("something happened")
         finally:
-            reset_correlation_id(token)
+            reset_correlation_id(correlation_token)
+            reset_audit_tenant_id(tenant_token)
 
         captured = capsys.readouterr()
         # The formatter emits one JSON object per line -- find the one this
@@ -157,3 +173,4 @@ class TestConfigureLoggingJsonFormat:
         assert parsed["message"] == "something happened"
         assert parsed["level"] == "WARNING"
         assert parsed["correlation_id"] == "req-e2e-1"
+        assert parsed["tenant_id"] == "tenant-e2e"

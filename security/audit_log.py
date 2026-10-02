@@ -143,6 +143,33 @@ class CorrelationIdLogFilter(logging.Filter):
         return True
 
 
+class TenantIdLogFilter(logging.Filter):
+    """Stamps `record.tenant_id` from the current request context onto
+    every log record passing through the handler this filter is attached
+    to -- the identical mechanism `CorrelationIdLogFilter` above already
+    established, applied to the second piece of per-request context this
+    codebase tracks (Prompt 23, observability/evaluation/reliability).
+
+    Before this, a request's tenant was only visible on `security.audit`
+    events (`log_security_event` reads `_tenant_id` explicitly) -- every
+    *ordinary* `logger.info`/`.warning`/`.error` call (`agent/nodes.py`'s
+    `[timing]`/`[trace]` lines included) carried a correlation ID but no
+    tenant, making "which tenant's request produced this log line" only
+    answerable by also having the audit-event stream open at the same
+    time. Attaching this filter to the root handler
+    (`config.settings.configure_logging`) fixes that for every existing
+    call site with zero changes to any of those modules, exactly like
+    `CorrelationIdLogFilter` did for correlation IDs.
+
+    Renders as `"-"` (never the string `"None"`) when unbound, same
+    stable-width/greppability reasoning as `CorrelationIdLogFilter`.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        record.tenant_id = get_audit_tenant_id() or "-"
+        return True
+
+
 Severity = Literal["info", "warning", "critical"]
 
 _LEVEL_MAP: dict[Severity, int] = {

@@ -2907,11 +2907,15 @@ class _JsonLogFormatter(logging.Formatter):
         # a log-pipeline query for "no correlation id" is a natural `IS
         # NULL`, not a string-literal match on an internal placeholder.
         correlation_id = getattr(record, "correlation_id", None)
+        # Prompt 23: same "-" -> JSON null convention as correlation_id
+        # above, for `TenantIdLogFilter`'s own placeholder.
+        tenant_id = getattr(record, "tenant_id", None)
         payload: dict[str, object] = {
             "timestamp": self.formatTime(record, "%Y-%m-%dT%H:%M:%S%z"),
             "level": record.levelname,
             "logger": record.name,
             "correlation_id": None if correlation_id in (None, "-") else correlation_id,
+            "tenant_id": None if tenant_id in (None, "-") else tenant_id,
             "message": record.getMessage(),
         }
         if record.exc_info:
@@ -2927,11 +2931,12 @@ def configure_logging(level: str | None = None) -> None:
     reconfiguring a caller's logging setup.
 
     Every handler on the root logger gets `security.audit_log
-    .CorrelationIdLogFilter` attached, and the format includes
-    `correlation_id` -- this is what makes a request's correlation ID show
-    up on *every* log line (agent nodes, RAG, DB, external-call modules),
-    not just the dedicated `security.audit` event stream. See that filter's
-    docstring for the Phase 3 observability gap this closes.
+    .CorrelationIdLogFilter` and (Prompt 23) `TenantIdLogFilter` attached,
+    and the format includes `correlation_id`/`tenant_id` -- this is what
+    makes a request's correlation ID and tenant show up on *every* log
+    line (agent nodes, RAG, DB, external-call modules), not just the
+    dedicated `security.audit` event stream. See those filters'
+    docstrings for the observability gaps each closes.
 
     `Settings.log_format` picks the rendering: "text" (the default) is this
     codebase's original terminal-friendly pipe-delimited format, unchanged;
@@ -2940,7 +2945,7 @@ def configure_logging(level: str | None = None) -> None:
     log pipeline to ingest. Same underlying log records either way -- this
     only changes how they're rendered.
     """
-    from security.audit_log import CorrelationIdLogFilter
+    from security.audit_log import CorrelationIdLogFilter, TenantIdLogFilter
 
     settings = get_settings()
     resolved_level = (level or settings.log_level).upper()
@@ -2950,7 +2955,10 @@ def configure_logging(level: str | None = None) -> None:
     else:
         handler.setFormatter(
             logging.Formatter(
-                fmt="%(asctime)s | %(levelname)-8s | %(name)s | correlation_id=%(correlation_id)s | %(message)s",
+                fmt=(
+                    "%(asctime)s | %(levelname)-8s | %(name)s | "
+                    "correlation_id=%(correlation_id)s | tenant_id=%(tenant_id)s | %(message)s"
+                ),
                 datefmt="%H:%M:%S",
             )
         )
@@ -2960,5 +2968,7 @@ def configure_logging(level: str | None = None) -> None:
         force=True,
     )
     correlation_filter = CorrelationIdLogFilter()
+    tenant_filter = TenantIdLogFilter()
     for configured_handler in logging.getLogger().handlers:
         configured_handler.addFilter(correlation_filter)
+        configured_handler.addFilter(tenant_filter)

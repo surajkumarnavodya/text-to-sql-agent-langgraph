@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import difflib
 import functools
+import hashlib
 import logging
 import re
 import time
@@ -108,8 +109,30 @@ __all__ = ["execute_readonly_sql"]
 logger = logging.getLogger(__name__)
 
 
+def _query_fingerprint(sql: str | None) -> str | None:
+    """A short, non-reversible fingerprint of `sql` for trace logs --
+    `None` when there's no SQL yet for this stage.
+
+    Prompt 23 (observability, evaluation & reliability): the trace log
+    below (see `_timed_node`) needs to answer "did the SQL text change
+    between attempt 1 and attempt 2" and "which stage produced which
+    query" without ever putting SQL text -- or anything derived from it
+    that could leak a literal value -- into a log line. A plain SHA-256
+    hash (truncated for readability) gives a stable, comparable identifier
+    with zero content leakage, which is a stronger guarantee than a
+    masked-literal preview would be (see `db.query_store._mask_literals`'s
+    own, different use case: a *human-readable* preview, which is never
+    what a log line needs). Deliberately a free function, not a method on
+    any class, since it has no state of its own.
+    """
+    if not sql:
+        return None
+    return hashlib.sha256(sql.encode()).hexdigest()[:16]
+
+
 def _timed_node(stage: str) -> Callable[[Callable[[AgentState], dict[str, Any]]], Callable]:
-    """Records a node's wall-clock duration into `stage_timings`, uniformly.
+    """Records a node's wall-clock duration into `stage_timings`, uniformly,
+    and emits a structured `[trace]` log line for that same call.
 
     Applied as a decorator rather than hand-timing each node body: every
     node here has several early-return branches for different outcomes
@@ -118,6 +141,26 @@ def _timed_node(stage: str) -> Callable[[Callable[[AgentState], dict[str, Any]]]
     node's own logic needing to know timing exists. See
     `scripts/profile_pipeline.py` for how this data gets turned into a
     stage-by-stage breakdown.
+
+    Prompt 23 (observability, evaluation & reliability) added the
+    `[trace]` line below, additive to the pre-existing `[timing]` one
+    (kept byte-for-byte unchanged -- `scripts/profile_pipeline.py` parses
+    it) rather than folding new fields into it, so a tool that already
+    greps for `[timing]` is unaffected. `correlation_id`/`tenant_id` are
+    never included explicitly here -- both are already stamped onto
+    *every* log line (this one included) by `security.audit_log
+    .CorrelationIdLogFilter`/`TenantIdLogFilter`, attached once at the
+    root logger (`config.settings.configure_logging`), so repeating them
+    per call site would be redundant, not additive. Every other field is
+    read from `state`/`result` by well-known, already-existing key names
+    (`selected_model`, `selected_database`, `sql`, `last_error_category`,
+    `row_count`) -- zero changes needed to any individual node's own
+    return contract, the same "cross-cutting, no node needs to know this
+    exists" principle `stage_timings` itself already established. Every
+    field is optional and omitted (not rendered as a literal `"None"`)
+    when not meaningful for this particular stage/outcome -- e.g. `model`
+    is absent before `retrieve_schema` has even run, `result_size` is
+    absent for every stage except a successful `execute_sql`.
     """
 
     def decorator(node_func: Callable[[AgentState], dict[str, Any]]) -> Callable:
@@ -130,6 +173,40 @@ def _timed_node(stage: str) -> Callable[[Callable[[AgentState], dict[str, Any]]]
             logger.info(
                 "[timing] stage=%s attempt=%d duration_ms=%.1f", stage, attempt_number, duration_ms
             )
+            # The merged, post-update view -- a pass-through node (e.g. a
+            # disabled-flag no-op) may return a result dict with none of
+            # these keys at all, in which case the value already present in
+            # the *input* state (set by an earlier stage this run) is still
+            # the right one to report, not a false "unknown."
+            merged = {**state, **result}
+            trace_fields: dict[str, Any] = {}
+            status = merged.get("status")
+            if status is not None:
+                trace_fields["status"] = status
+            error_category = merged.get("last_error_category")
+            if error_category is not None:
+                trace_fields["error_category"] = error_category
+            model = merged.get("selected_model")
+            if model is not None:
+                trace_fields["model"] = model
+            db_provider = merged.get("selected_database")
+            if db_provider is not None:
+                trace_fields["db_provider"] = db_provider
+            query_fingerprint = _query_fingerprint(merged.get("sql"))
+            if query_fingerprint is not None:
+                trace_fields["query_fingerprint"] = query_fingerprint
+            result_size = merged.get("row_count")
+            if result_size is not None:
+                trace_fields["result_size"] = result_size
+            if trace_fields:
+                rendered = " ".join(f"{key}={value!r}" for key, value in trace_fields.items())
+                logger.info(
+                    "[trace] stage=%s attempt=%d duration_ms=%.1f %s",
+                    stage,
+                    attempt_number,
+                    duration_ms,
+                    rendered,
+                )
             timing: StageTiming = {
                 "stage": stage,
                 "attempt": attempt_number,
