@@ -45,6 +45,16 @@ scopes:
     data state model) -- a real multi-replica deployment needs to revisit
     this regardless (see Phase 3 above), so a per-caller refinement here
     specifically wasn't prioritized ahead of that.
+  - **Per-database execution concurrency** (`ConcurrencyLimiter`,
+    `get_database_execution_limiter`, Prompt 22 -- scale/performance
+    hardening): keyed by configured database name, sized from that
+    database's own `db_pool_size + db_max_overflow`. Distinct from the
+    `/ask`-level limiter above, which protects the API tier as a whole --
+    this protects one specific customer database's connection pool from
+    being saturated by several concurrent `/ask`/`/execute` calls routed
+    to it, turning what would otherwise be a blocking `QueuePool` checkout
+    wait (up to SQLAlchemy's own `pool_timeout`) into an immediate,
+    clearly-worded rejection.
 
 Every trip logs through this module's own logger (`agent.rate_limit` --
 distinct from `agent.nodes`'/`agent.input_guard`'s categories, so rate-limit
@@ -386,6 +396,47 @@ def get_per_caller_ask_concurrency_limiter(
         caller_key,
         max_concurrent=max_concurrent,
         name=f"ask_requests_per_caller[{caller_key}]",
+    )
+
+
+DATABASE_CONCURRENCY_LIMIT_MESSAGE = (
+    "This database is handling too many queries right now -- please wait a moment and try again."
+)
+
+# Keyed by database name (`Settings.databases[i].name`) -- one configured
+# customer database's own connection pool
+# (`db_pool_size + db_max_overflow`, see `db/connection.py`) is a shared,
+# finite resource across every concurrent `/ask` and `/execute` call
+# routed to it, independent of (and not bounded by) the *API-tier*
+# `ask_requests_global`/`ask_requests_per_caller` limiters above, which
+# protect the FastAPI process, not any one customer database specifically.
+# Bounded the same way as `_per_caller_ask_concurrency_limiters` (database
+# names are operator-configured, not attacker-controlled, so unbounded
+# growth isn't a real risk here -- bounded anyway for the same
+# defense-in-depth reason `BoundedConcurrencyLimiterCache` exists at all).
+_database_execution_limiters = BoundedConcurrencyLimiterCache()
+
+
+def get_database_execution_limiter(database_name: str, max_concurrent: int) -> ConcurrencyLimiter:
+    """Returns the in-flight execution limiter for one configured database,
+    creating it on first use for that name -- same first-call-wins
+    singleton pattern as `get_ask_concurrency_limiter`.
+
+    `max_concurrent` is normally `db_pool_size + db_max_overflow +
+    database_concurrency_limit_overhead` for that specific database's own
+    config (`Settings.enable_database_concurrency_limit`) -- sized so the
+    limiter trips at (or just past) the exact point `QueuePool` checkout
+    would otherwise start blocking, turning that blocking wait into an
+    immediate, clearly-worded rejection instead. Checked by
+    `agent.nodes.execute_sql_node` and `api/main.py`'s `POST /execute`,
+    both of which run real, row-returning execution against the database
+    -- never by `db.query_cost`'s own cost-estimation round trip, which is
+    cheap and plan-only, not a real query.
+    """
+    return _database_execution_limiters.get_or_create(
+        database_name,
+        max_concurrent=max_concurrent,
+        name=f"database_execution[{database_name}]",
     )
 
 

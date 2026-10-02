@@ -59,7 +59,11 @@ from agent.llm_client import (
     review_sql_against_plan_from_llm,
 )
 from agent.plan_validator import validate_plan
-from agent.rate_limit import LLM_CALL_LIMIT_MESSAGE, get_llm_call_limiter
+from agent.rate_limit import (
+    LLM_CALL_LIMIT_MESSAGE,
+    get_database_execution_limiter,
+    get_llm_call_limiter,
+)
 from agent.sql_validator import (
     SAFETY_VIOLATION_TYPES,
     enforce_row_limit,
@@ -92,6 +96,7 @@ from observability.metrics import get_default_metrics
 from security.audit_log import log_security_event
 from security.injection_patterns import INJECTION_PATTERNS
 from security.redaction import redact_secrets
+from security.tenancy import DEFAULT_TENANT_ID
 
 # Re-exported for `tests/test_agent_nodes.py`'s
 # `monkeypatch.setattr("agent.nodes.execute_readonly_sql", ...)` seam -- the
@@ -506,7 +511,11 @@ def retrieve_schema_node(state: AgentState) -> dict[str, Any]:
     try:
         selected_database = state.get("selected_database")
         if selected_database is None:
-            db_selection = select_database(query_text, settings)
+            # Prompt 20: routing only ever considers databases this caller's
+            # tenant may query. `state["tenant_id"]` was resolved once, by
+            # `run_agent`, from the request's verified identity -- never from
+            # the question text or any client-supplied field.
+            db_selection = select_database(query_text, settings, tenant_id=state.get("tenant_id"))
             selected_database = db_selection.db_name
             logger.info(
                 "[retrieve_schema] auto-routed to database %r "
@@ -621,7 +630,14 @@ def retrieve_golden_examples_node(state: AgentState) -> dict[str, Any]:
     question = state["question"]
     db_name = state.get("selected_database") or "default"
     try:
-        examples: list[GoldenExample] = retrieve_golden_examples(question, db_name, settings)
+        # Prompt 20: only this tenant's own approved examples may reach this
+        # tenant's generation prompt, even when the database is shared.
+        examples: list[GoldenExample] = retrieve_golden_examples(
+            question,
+            db_name,
+            settings,
+            tenant_id=state.get("tenant_id") or DEFAULT_TENANT_ID,
+        )
     except Exception as exc:  # noqa: BLE001 - an accuracy aid must never block the run
         logger.warning("[retrieve_golden_examples] lookup failed, proceeding without: %s", exc)
         return {"golden_examples": None, "status": "generating"}
@@ -676,7 +692,16 @@ def retrieve_business_context_node(state: AgentState) -> dict[str, Any]:
     caller_roles = state.get("caller_roles", ())
 
     try:
-        result = retrieve_business_context(question, db_name, caller_roles, settings)
+        # Prompt 20: tenant-scoped -- a published semantic-catalog concept
+        # belongs to one tenant and must never reach another's prompt, even
+        # when both legitimately query the same database.
+        result = retrieve_business_context(
+            question,
+            db_name,
+            caller_roles,
+            settings,
+            tenant_id=state.get("tenant_id") or DEFAULT_TENANT_ID,
+        )
     except Exception as exc:  # noqa: BLE001 - an accuracy aid must never block the run
         logger.warning(
             "[retrieve_business_context] unexpected failure, proceeding without: %s", exc
@@ -1669,6 +1694,54 @@ def execute_sql_node(state: AgentState) -> dict[str, Any]:
         sql, db_config.db_schema, dialect=get_sqlglot_dialect(db_config.db_type)
     )
 
+    # Prompt 22 (scale/performance hardening): fast-fail once this
+    # database's own connection pool is already fully occupied by other
+    # in-flight executions, rather than blocking on `QueuePool` checkout
+    # for up to SQLAlchemy's own `pool_timeout` (30s default) only to fail
+    # anyway -- see `agent.rate_limit.get_database_execution_limiter`'s
+    # docstring. Never retried, same reasoning as the TIMEOUT category
+    # below: retrying into an already-saturated database wastes the retry
+    # budget on something a retry can't fix.
+    database_limiter = None
+    if settings.enable_database_concurrency_limit:
+        max_concurrent = (
+            settings.db_pool_size
+            + settings.db_max_overflow
+            + settings.database_concurrency_limit_overhead
+        )
+        database_limiter = get_database_execution_limiter(_selected_db_name(state), max_concurrent)
+        if not database_limiter.try_acquire():
+            get_default_metrics().record_database_concurrency_rejection(state.get("tenant_id"))
+            logger.warning(
+                "[execute_sql] attempt %d rejected -- database %r execution concurrency "
+                "limit reached",
+                attempt_number,
+                _selected_db_name(state),
+            )
+            busy_record: AttemptRecord = {
+                "attempt": attempt_number,
+                "sql": sql,
+                "outcome": "database_busy",
+                "error": "Database concurrency limit reached",
+                "will_retry": False,
+            }
+            return {
+                "execution_error": "Database concurrency limit reached",
+                "error_history": [
+                    "SQL execution error (database busy): too many concurrent queries "
+                    "against this database right now"
+                ],
+                "attempt_history": [busy_record],
+                "last_error_category": "database_busy",
+                "retry_count": attempt_number,
+                "status": "failed",
+                "failure_explanation": (
+                    "This database is already handling the maximum number of concurrent "
+                    "queries this deployment allows. This isn't a problem with your "
+                    "question -- please try again in a moment."
+                ),
+            }
+
     try:
         columns, rows = execute_readonly_sql(
             execution_sql,
@@ -1770,6 +1843,9 @@ def execute_sql_node(state: AgentState) -> dict[str, Any]:
                 state, f"Gave up after {attempt_number} attempts. Last error: {error_text}"
             )
         return update
+    finally:
+        if database_limiter is not None:
+            database_limiter.release()
 
     # Log shape, not content -- result sets may contain sensitive data.
     logger.info(
@@ -2104,7 +2180,11 @@ def generate_recommendations_node(state: AgentState) -> dict[str, Any]:
     restricted_hits = _restricted_column_hits_in_sql(sql, state, settings) if sql else ()
 
     try:
-        performance_snapshot = get_default_metrics().snapshot()
+        # Prompt 20: only this tenant's own performance window may inform a
+        # recommendation shown to this tenant -- a PERFORMANCE finding
+        # derived from another tenant's latency would both be wrong and leak
+        # their operational data.
+        performance_snapshot = get_default_metrics().snapshot(state.get("tenant_id"))
     except Exception as exc:  # noqa: BLE001 - an accuracy aid must never block the run
         logger.warning(
             "[generate_recommendations] could not read performance snapshot, proceeding "

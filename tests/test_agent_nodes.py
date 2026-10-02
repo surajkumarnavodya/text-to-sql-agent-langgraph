@@ -1860,6 +1860,88 @@ class TestExecuteSqlNode:
         assert result["status"] == "succeeded"
         assert result["low_confidence_notice"] is None
 
+    def test_database_concurrency_limit_rejects_without_executing_or_retrying(self, monkeypatch):
+        """Prompt 22 (scale/performance hardening): a saturated per-database
+        execution limiter fast-fails the attempt (never executes, never
+        retries) rather than blocking on `QueuePool` checkout."""
+
+        class _AlwaysBusyLimiter:
+            def try_acquire(self) -> bool:
+                return False
+
+            def release(self) -> None:
+                raise AssertionError("release() must not be called when try_acquire() failed")
+
+        monkeypatch.setattr(
+            "agent.nodes.get_database_execution_limiter",
+            lambda name, max_concurrent: _AlwaysBusyLimiter(),
+        )
+
+        def _fail(*args, **kwargs):
+            raise AssertionError("must not execute once the concurrency limiter rejects")
+
+        monkeypatch.setattr("agent.nodes.execute_readonly_sql", _fail)
+
+        state: AgentState = {
+            "sql": "SELECT id FROM customers",
+            "retry_count": 0,
+            "selected_database": "default",
+        }
+        result = execute_sql_node(state)
+
+        assert result["status"] == "failed"
+        assert result["last_error_category"] == "database_busy"
+        assert result["attempt_history"][0]["outcome"] == "database_busy"
+        assert result["attempt_history"][0]["will_retry"] is False
+        assert route_after_execution(result) == "failed"
+
+    def test_database_concurrency_limit_releases_the_slot_after_success(self, monkeypatch):
+        """The acquired slot must be released in a `finally`, not only on
+        the happy path, so a long-running process doesn't leak capacity."""
+        import agent.rate_limit as rate_limit_module
+
+        rate_limit_module._database_execution_limiters.clear()
+        monkeypatch.setattr(
+            "agent.nodes.execute_readonly_sql",
+            lambda sql, timeout, max_rows, engine=None: (["id"], [(1,)]),
+        )
+
+        state: AgentState = {
+            "sql": "SELECT id FROM customers",
+            "retry_count": 0,
+            "selected_database": "default",
+        }
+        execute_sql_node(state)
+
+        limiter = rate_limit_module.get_database_execution_limiter("default", max_concurrent=30)
+        assert len(limiter) == 0
+
+    def test_disabled_flag_never_consults_the_limiter(self, monkeypatch, _mock_settings):
+        monkeypatch.setattr(
+            "agent.nodes.get_settings",
+            lambda: Settings(
+                **{**_mock_settings.__dict__, "enable_database_concurrency_limit": False}
+            ),
+        )
+
+        def _fail_if_called(name, max_concurrent):
+            raise AssertionError("limiter must not even be constructed when the flag is off")
+
+        monkeypatch.setattr("agent.nodes.get_database_execution_limiter", _fail_if_called)
+        monkeypatch.setattr(
+            "agent.nodes.execute_readonly_sql",
+            lambda sql, timeout, max_rows, engine=None: (["id"], [(1,)]),
+        )
+
+        state: AgentState = {
+            "sql": "SELECT id FROM customers",
+            "retry_count": 0,
+            "selected_database": "default",
+        }
+        result = execute_sql_node(state)
+
+        assert result["status"] == "succeeded"
+
 
 class TestComputeAnalyticsNode:
     """Prompt 13 (`13_ANALYTICAL_RESULT_ENGINE_CONTRACT.md`)."""

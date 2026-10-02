@@ -1005,6 +1005,17 @@ class PerformanceMetricsResponse(BaseModel):
     requests: RequestMetricOut
     stages: list[StageMetricOut]
     status_counts: dict[str, int]
+    # Prompt 22 (scale/performance hardening) -- cumulative, process-
+    # lifetime counters, additive to the rolling-window fields above. See
+    # `observability.metrics.MetricsSnapshot`'s own docstring.
+    result_cache_hits: int = 0
+    result_cache_misses: int = 0
+    database_concurrency_rejections: int = 0
+    # Prompt 20 (multi-tenant) -- which tenant this rollup covers. Always
+    # the requesting caller's own tenant over HTTP; the field exists so a
+    # response is self-describing about its scope rather than leaving a
+    # reader to assume it is process-wide (which it no longer is).
+    tenant_id: str | None = None
 
 
 class ComponentHealth(BaseModel):

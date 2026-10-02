@@ -196,3 +196,83 @@ claiming without a defined workload and a successful load test at that
 scale. This baseline is Phase 0 of an 11-phase program — see that
 document for what each later phase is expected to move this number by,
 and re-run this exact harness (`make load-test MODE=full`) after each one.
+
+## Prompt 22 — result cache + per-database execution limiter (2026-10-02)
+
+Two additions measured in this pass: `agent.rate_limit
+.get_database_execution_limiter` (a per-database in-flight execution cap)
+and `db/result_cache.py` (an opt-in, short-TTL `POST /execute` result
+cache). See `CLAUDE.md`'s "Scale/performance hardening" section for the
+full design.
+
+**Honest scope disclosure — this is narrower than Run 1/Run 2 above, and
+deliberately not presented as a re-run of them.** `docker info` fails in
+this environment (`failed to connect to the docker API at
+npipe:////./pipe/dockerDesktopLinuxEngine` — Docker Desktop is not
+running here), so the real `eval/load/` k6-over-HTTP harness that
+produced Run 1/Run 2 could not be executed this pass. What follows
+instead is a **real, in-process, multi-threaded benchmark against the
+actual shipped classes** (`agent.rate_limit.ConcurrencyLimiter`,
+`db.result_cache.ResultCache` — imported and exercised directly, not
+reimplemented or mocked) under real `threading` contention. It measures
+the two new primitives' own behavior correctly, not this application's
+end-to-end HTTP request-path capacity — that still needs a real run of
+`make load-test` the next time a Docker-capable environment is available,
+and should be done before trusting any throughput number beyond what's
+below.
+
+**Method**: 40 concurrent callers (`ThreadPoolExecutor`), capacity 5,
+each simulated "query" sleeping 120ms. Scenario 1 compares the new
+`ConcurrencyLimiter.try_acquire()` (non-blocking) against a
+`threading.Semaphore`-based stand-in for what an exhausted SQLAlchemy
+`QueuePool` does today (blocking `acquire(timeout=...)`, shortened to a
+1s stand-in for the real 30s `pool_timeout` default so the run completes
+in reasonable time). Scenario 2 compares `ResultCache` cold (every call
+misses, pays the simulated 120ms round trip) against warm (identical
+SQL, already cached).
+
+| Scenario | p50 | p95 | p99 | throughput | errors/rejections |
+|---|---|---|---|---|---|
+| 1a. Baseline — blocking semaphore (today's QueuePool-exhaustion shape) | 540.7ms | 962.5ms | 962.7ms | 41.3 req/s | 0/40 |
+| 1b. New — `ConcurrencyLimiter.try_acquire()` | 0.8ms | 120.5ms | 120.7ms | 326.1 req/s | 35/40 rejected |
+| 2a. Result cache cold (always miss) | 120.6ms | 121.5ms | 122.3ms | 310.4 req/s | 0/40 |
+| 2b. Result cache warm (identical SQL) | 0.0ms | 0.0ms | 0.0ms | 15,425 req/s | 0/40 |
+
+**Reading scenario 1 honestly**: at this run's shortened 1s timeout, the
+blocking baseline happens to let all 40 callers eventually succeed (8
+batches of 5 × 120ms ≈ 960ms, just under the 1s cutoff) — zero rejections,
+but a p99 wall-wait of ~963ms per caller stuck behind a full pool. The new
+limiter instead rejects 35/40 **immediately** (p50 0.8ms) rather than
+making them wait, trading "eventually succeeds after sitting in a queue"
+for "fails fast with a clear, retryable error." At the real, unshortened
+30s `pool_timeout` default this project actually ships with, the
+baseline's tail would stretch toward 30 seconds per blocked caller under
+sustained saturation instead of under 1 — the gap this change closes gets
+materially larger, not smaller, outside this shortened benchmark. This
+matches the acceptance criterion in `config/settings.py`'s own
+`enable_database_concurrency_limit` docstring: below saturation the
+limiter never trips (0 rejections at capacity ≥ demand, unchanged from
+before this feature existed — not separately re-measured here since it's
+already covered by `tests/test_rate_limit.py`'s unit tests); at
+saturation it turns a long blocking wait into an immediate, clearly-worded
+rejection.
+
+**Reading scenario 2 honestly**: this demonstrates the cache's own
+mechanics (hit path is ~15,000x faster than a 120ms simulated round trip,
+and correct under concurrent access — no torn reads/writes across 40
+threads hammering the same key) — it says nothing about real-world hit
+rate, which depends entirely on how often a deployment's actual callers
+re-run byte-identical SQL, an application-usage question this benchmark
+cannot answer.
+
+**Not demonstrated by this pass**: end-to-end HTTP request-path
+throughput with either feature enabled (needs the real `make load-test`
+harness); real SQLAlchemy `QueuePool` behavior under the same contention
+(the blocking-semaphore baseline is a structural stand-in, not a measured
+`QueuePool` run); multi-replica behavior; any interaction between the two
+new features and the existing `/ask`-level concurrency limiters under
+combined load. Re-run `make load-test MODE=full` against both new flags
+enabled (`ENABLE_DATABASE_CONCURRENCY_LIMIT=true`,
+`ENABLE_RESULT_CACHE=true`) the next time Docker is available in the
+working environment, and append real HTTP-level numbers here alongside
+this entry rather than replacing it.

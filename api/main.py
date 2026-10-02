@@ -64,6 +64,7 @@ from agent.rate_limit import (
     BoundedLimiterCache,
     SlidingWindowRateLimiter,
     get_ask_concurrency_limiter,
+    get_database_execution_limiter,
     get_per_caller_ask_concurrency_limiter,
 )
 from agent.result_charting import classify_columns, recommend_chart
@@ -127,12 +128,12 @@ from api.voice import router as voice_router
 from config.settings import ConfigurationError, Settings, configure_logging, get_settings
 from db.connection import (
     check_write_privileges,
-    get_connection,
     get_read_only_engine,
     get_sqlglot_dialect,
     test_connection,
 )
 from db.execution import execute_readonly_sql
+from db.result_cache import get_result_cache, is_cacheable_sql
 from db.schema_introspection import introspect_schema
 from embeddings.golden_examples import save_golden_example
 from embeddings.schema_indexer import (
@@ -152,7 +153,7 @@ from security.audit_log import (
 from security.client_ip import resolve_client_ip
 from security.oidc import AuthIdentity, real_caller_subject
 from security.redaction import redact_configured_secrets, redact_secrets
-from security.tenancy import resolve_tenant_id_for_identity
+from security.tenancy import DEFAULT_TENANT_ID, resolve_tenant_id_for_identity
 
 configure_logging()
 logger = logging.getLogger(__name__)
@@ -1333,6 +1334,7 @@ def ask(
 def execute(
     payload: ExecuteRequest,
     request: Request,
+    response: Response,
     identity: AuthIdentity = Depends(require_permission(Permission.EXECUTE_SQL)),
 ) -> ExecuteResponse:
     """Validates and executes a specific SQL string read-only -- the exact
@@ -1343,22 +1345,36 @@ def execute(
     and re-executed exactly as supplied, never
     trusted because it happens to look like something `/ask` returned.
 
+    Prompt 22 (scale/performance hardening): may serve a cached result
+    (`X-Cache: HIT`/`MISS` response header, `db.result_cache`) and is
+    protected by a per-database execution concurrency limiter
+    (`agent.rate_limit.get_database_execution_limiter`) -- see this
+    function's body and `ExecuteResponse`'s own docstring is unchanged,
+    since neither feature alters the response schema.
+
     Rate-limited per client IP (`enforce_api_action_rate_limit`) -- unlike
     `/ask`, this route previously had no rate limit of its own at all.
     """
     settings = get_settings()
     enforce_api_action_rate_limit(request, "execute", settings, identity=identity)
-    if not settings.databases:
+    # Prompt 20: resolved against the connections *this caller's tenant* may
+    # query, not the raw `settings.databases` tuple. A tenant-restricted
+    # connection a different tenant asks for is reported as 404 "unknown
+    # database" -- the same response a genuinely nonexistent name gets, so
+    # the route never confirms another tenant's database even exists
+    # (anti-enumeration, matching `api/semantic_catalog.py`'s precedent).
+    tenant_id = resolve_tenant_id_for_identity(identity) or DEFAULT_TENANT_ID
+    visible_databases = settings.databases_for_tenant(tenant_id)
+    if not visible_databases:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="No database configured."
         )
-    database_name = payload.database or settings.databases[0].name
-    try:
-        db_config = get_connection(settings, database_name)
-    except ConfigurationError as exc:
+    database_name = payload.database or visible_databases[0].name
+    db_config = next((db for db in visible_databases if db.name == database_name), None)
+    if db_config is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail=f"Unknown database {database_name!r}."
-        ) from exc
+        )
 
     dialect = get_sqlglot_dialect(db_config.db_type)
     validation = validate_sql(payload.sql, dialect=dialect)
@@ -1383,23 +1399,88 @@ def execute(
     # convention (the box never shows the schema-qualified form).
     execution_sql = qualify_table_schema(safe_sql, db_config.db_schema, dialect=dialect)
 
-    try:
-        start = time.perf_counter()
-        columns, rows = execute_readonly_sql(
-            execution_sql,
-            settings.query_timeout_seconds,
-            settings.max_result_rows,
-            engine=get_read_only_engine(db_config),
+    # Prompt 22 (scale/performance hardening): an opt-in, short-TTL result
+    # cache (see db/result_cache.py's module docstring for the full
+    # design/scope) -- never for SQL referencing a restricted column, and
+    # computed once up front so the lookup and the later store decision
+    # (below) always agree.
+    metrics = get_default_metrics()
+    # `tenant_id` (resolved above, server-side from the verified identity --
+    # never from the request) also partitions the cache: two tenants running
+    # byte-identical SQL against the same shared database must never see
+    # each other's rows, and this cache sits after every authorization gate,
+    # so it cannot rely on one.
+    cache_enabled = settings.enable_result_cache
+    cacheable = cache_enabled and is_cacheable_sql(safe_sql, dialect)
+    cached = (
+        get_result_cache(settings.result_cache_max_entries).get(
+            tenant_id, database_name, execution_sql, settings.result_cache_ttl_seconds
         )
-        duration_ms = (time.perf_counter() - start) * 1000
-    except (SQLAlchemyError, TimeoutError) as exc:
-        # Passed db_config (not the global settings) so the exact password
-        # redacted is the one actually in play for this connection -- see
-        # security.redaction.redact_secrets' docstring.
-        safe_detail = redact_secrets(str(exc), db_config)
-        return ExecuteResponse(
-            status="failed", database=database_name, error=f"Execution failed: {safe_detail}"
-        )
+        if cacheable
+        else None
+    )
+
+    if cached is not None:
+        columns, rows = cached
+        duration_ms = 0.0  # no DB round trip happened; this is an honest zero, not a measurement
+        response.headers["X-Cache"] = "HIT"
+        metrics.record_result_cache_hit(tenant_id)
+    else:
+        # Prompt 22: fast-fail once this database's own connection pool is
+        # already fully occupied, rather than blocking on `QueuePool`
+        # checkout for up to SQLAlchemy's own `pool_timeout` -- see
+        # agent.rate_limit.get_database_execution_limiter's docstring.
+        database_limiter = None
+        if settings.enable_database_concurrency_limit:
+            max_concurrent = (
+                settings.db_pool_size
+                + settings.db_max_overflow
+                + settings.database_concurrency_limit_overhead
+            )
+            database_limiter = get_database_execution_limiter(database_name, max_concurrent)
+            if not database_limiter.try_acquire():
+                metrics.record_database_concurrency_rejection(tenant_id)
+                logger.warning(
+                    "[execute] rejected -- database %r execution concurrency limit reached",
+                    database_name,
+                )
+                raise HTTPException(
+                    status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                    detail=(
+                        "This database is handling too many queries right now -- please "
+                        "try again shortly."
+                    ),
+                    headers={"Retry-After": "2"},
+                )
+
+        try:
+            start = time.perf_counter()
+            columns, rows = execute_readonly_sql(
+                execution_sql,
+                settings.query_timeout_seconds,
+                settings.max_result_rows,
+                engine=get_read_only_engine(db_config),
+            )
+            duration_ms = (time.perf_counter() - start) * 1000
+        except (SQLAlchemyError, TimeoutError) as exc:
+            # Passed db_config (not the global settings) so the exact password
+            # redacted is the one actually in play for this connection -- see
+            # security.redaction.redact_secrets' docstring.
+            safe_detail = redact_secrets(str(exc), db_config)
+            return ExecuteResponse(
+                status="failed", database=database_name, error=f"Execution failed: {safe_detail}"
+            )
+        finally:
+            if database_limiter is not None:
+                database_limiter.release()
+
+        if cache_enabled:
+            response.headers["X-Cache"] = "MISS"
+            metrics.record_result_cache_miss(tenant_id)
+            if cacheable:
+                get_result_cache(settings.result_cache_max_entries).store(
+                    tenant_id, database_name, execution_sql, columns, rows
+                )
 
     result_df = pd.DataFrame(rows, columns=columns)
     column_types: dict[str, str] = dict(classify_columns(result_df)) if not result_df.empty else {}
@@ -1501,7 +1582,7 @@ def execute(
 )
 def feedback_golden_example(
     payload: GoldenExampleFeedbackRequest,
-    _identity: AuthIdentity = Depends(require_permission(Permission.GOLDEN_EXAMPLE_WRITE)),
+    identity: AuthIdentity = Depends(require_permission(Permission.GOLDEN_EXAMPLE_WRITE)),
 ) -> GoldenExampleFeedbackResponse:
     """Records a human-approved (question, SQL) pair for future few-shot
     retrieval -- the same `embeddings.golden_examples.save_golden_example`
@@ -1510,7 +1591,15 @@ def feedback_golden_example(
     correct (e.g. from a prior `/execute` call), not necessarily the
     original `/ask` draft if the caller edited it.
     """
-    save_golden_example(payload.question, payload.sql, payload.database, get_settings())
+    # Prompt 20: stamped with the saving caller's own tenant, resolved
+    # server-side -- the pair is only ever retrieved back for that tenant.
+    save_golden_example(
+        payload.question,
+        payload.sql,
+        payload.database,
+        get_settings(),
+        tenant_id=resolve_tenant_id_for_identity(identity) or DEFAULT_TENANT_ID,
+    )
     return GoldenExampleFeedbackResponse(saved=True)
 
 
@@ -1520,7 +1609,7 @@ def feedback_golden_example(
 )
 def feedback_message(
     payload: MessageFeedbackRequest,
-    _identity: AuthIdentity = Depends(require_permission(Permission.GOLDEN_EXAMPLE_WRITE)),
+    identity: AuthIdentity = Depends(require_permission(Permission.GOLDEN_EXAMPLE_WRITE)),
 ) -> MessageFeedbackResponse:
     """Records a like/dislike (plus an optional free-text comment) on any
     assistant answer -- SQL, document/policy RAG, web search, or media --
@@ -1544,6 +1633,10 @@ def feedback_message(
         comment=payload.comment,
         conversation_id=payload.conversation_id,
         settings=get_settings(),
+        # Prompt 20: stamped with the submitting caller's own tenant, resolved
+        # server-side, so this shared log stays partitionable per tenant when
+        # it is read back.
+        tenant_id=resolve_tenant_id_for_identity(identity) or DEFAULT_TENANT_ID,
     )
     return MessageFeedbackResponse(saved=True)
 
@@ -1593,7 +1686,7 @@ def schema_refresh(
 
 @app.get("/metrics/performance", response_model=PerformanceMetricsResponse)
 def metrics_performance(
-    _identity: AuthIdentity = Depends(require_permission(Permission.ADMIN_CONFIG)),
+    identity: AuthIdentity = Depends(require_permission(Permission.ADMIN_CONFIG)),
 ) -> PerformanceMetricsResponse:
     """A live rollup of per-LangGraph-stage timing across recent `/ask`
     requests (`observability.metrics`) -- turns the `[timing] stage=...`
@@ -1608,7 +1701,15 @@ def metrics_performance(
     `docs/DEEP_FEATURE_PERFORMANCE_ASSESSMENT.md` for the broader
     observability assessment this endpoint is the first concrete step of.
     """
-    snapshot = get_default_metrics().snapshot()
+    # Prompt 20: scoped to the caller's own tenant, not the whole process.
+    # This route is admin-gated, but this codebase has no platform-admin
+    # versus tenant-admin distinction, so one tenant's admin must not be
+    # able to read another tenant's latency/status/cache numbers. The merged
+    # process-wide view remains available to an operator calling
+    # `PerformanceMetrics.snapshot()` directly, never over HTTP.
+    snapshot = get_default_metrics().snapshot(
+        resolve_tenant_id_for_identity(identity) or DEFAULT_TENANT_ID
+    )
     return PerformanceMetricsResponse(
         started_at=snapshot["started_at"],
         window_requests=snapshot["window_requests"],
@@ -1616,6 +1717,10 @@ def metrics_performance(
         requests=RequestMetricOut(**snapshot["requests"]),
         stages=[StageMetricOut(**stage) for stage in snapshot["stages"]],
         status_counts=snapshot["status_counts"],
+        tenant_id=snapshot["tenant_id"],
+        result_cache_hits=snapshot["result_cache_hits"],
+        result_cache_misses=snapshot["result_cache_misses"],
+        database_concurrency_rejections=snapshot["database_concurrency_rejections"],
     )
 
 
@@ -1636,15 +1741,21 @@ def schema_tables(
             names a connection that isn't configured.
     """
     settings = get_settings()
-    if database is not None and database not in {config.name for config in settings.databases}:
+    # Prompt 20: schema *metadata* is tenant-scoped too -- table and column
+    # names are configuration a tenant should not learn about another
+    # tenant's database, and this route is the one place they are listed
+    # wholesale. Same 404-for-cross-tenant convention as `/execute`.
+    tenant_id = resolve_tenant_id_for_identity(_identity) or DEFAULT_TENANT_ID
+    visible_databases = settings.databases_for_tenant(tenant_id)
+    if database is not None and database not in {config.name for config in visible_databases}:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail=f"Unknown database {database!r}."
         )
 
     configs = (
-        [config for config in settings.databases if config.name == database]
+        [config for config in visible_databases if config.name == database]
         if database is not None
-        else settings.databases
+        else list(visible_databases)
     )
 
     tables_out: list[TableOut] = []

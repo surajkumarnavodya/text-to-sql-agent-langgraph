@@ -2677,6 +2677,48 @@ covered against an in-memory SQLite identity database.
 decision record, the per-resource isolation table, and every disclosed
 limitation.
 
+### Scale/performance hardening: result cache + per-database execution limiter (Prompt 22)
+Two additions, both aimed at behavior under saturation rather than at the
+common case:
+
+- **`agent.rate_limit.get_database_execution_limiter`** — a per-configured-
+  database in-flight execution cap, sized from that database's own
+  `db_pool_size + db_max_overflow + database_concurrency_limit_overhead`.
+  Distinct from the `/ask`-level limiters, which protect the API tier as a
+  whole; this protects one customer database's connection pool. Checked by
+  `agent.nodes.execute_sql_node` and `POST /execute` (both run real,
+  row-returning execution), never by `db.query_cost`'s plan-only round
+  trip. **Below saturation it never trips**, so it restricts nothing that
+  currently works; at saturation it turns a blocking `QueuePool` checkout
+  wait (up to SQLAlchemy's 30s `pool_timeout`) into an immediate, clearly
+  worded rejection. A rejection is **never retried** —
+  `last_error_category="database_busy"`, same reasoning as the TIMEOUT
+  category: retrying into an already-saturated database spends retry budget
+  on something a retry can't fix.
+- **`db/result_cache.py`** — an opt-in (`ENABLE_RESULT_CACHE`, default
+  **off**), short-TTL, bounded (TTL+LRU) cache for `POST /execute`'s
+  `(columns, rows)`, keyed by `(tenant_id, database_name, sql)` and surfaced
+  via an `X-Cache: HIT`/`MISS` response header. Off by default because
+  caching trades data freshness, which is an operator decision, not a
+  safe-by-default accuracy aid. **Never caches SQL referencing a
+  `config.sensitive_columns`-classified "restricted" column**, regardless of
+  the flag or the executing caller's own permission — the cache has no
+  per-caller partitioning, so anything sensitivity-classified is excluded
+  entirely rather than reasoning about who may see a hit. Never applied to
+  the agent's own internal self-correction retries (those aren't shown to
+  the user, and a retry changing the SQL text is the whole point of a
+  retry). Exact-text match only, not semantic — the narrow, safe slice of
+  `docs/SCALE_OUT_PROMPT.md` Phase 4's larger deferred idea.
+
+Both feed three new **cumulative** (not rolling-window) counters on
+`observability.metrics.MetricsSnapshot` — `result_cache_hits`/
+`result_cache_misses`/`database_concurrency_rejections` — reusing that
+module's existing singleton/lock rather than standing up a second metrics
+object. Cumulative deliberately: a cache's value proposition is its hit
+*rate* over the process's life, which a bounded window of the most recent
+`max_requests` would understate for a long-running, low-traffic deployment.
+
+
 ## How to run
 
 See `README.md` for full setup. Short version:

@@ -192,6 +192,29 @@ class DatabaseConnectionConfig(BaseModel):
     db_connection_string: SecretStr | None = None
     db_schema: str | None = None
     db_odbc_driver: str = "ODBC Driver 17 for SQL Server"
+    tenant_ids: tuple[str, ...] = ()
+    """Which tenants may query this connection (Prompt 20,
+    `DB_<NAME>_TENANT_IDS` in `.env`).
+
+    Empty (the default) means **shared by every tenant** -- which is
+    deliberately the backward-compatible behavior, since a single-tenant
+    deployment's one database is exactly that, and an existing `.env` that
+    says nothing about tenants must keep working identically. The moment an
+    operator lists even one tenant here, the connection becomes restricted
+    to that list: `Settings.databases_for_tenant` filters it out for
+    everybody else, and `api/main.py` resolves a requested database name
+    through that filtered view rather than the raw `databases` tuple, so a
+    caller in another tenant gets the same "unknown database" response a
+    genuinely nonexistent name gets (anti-enumeration, matching this
+    codebase's existing cross-tenant-denial-as-404 convention).
+
+    This is config, not data: it is read from the operator's `.env`, never
+    from a request. It is also deliberately a *connection*-level property
+    rather than a per-tenant copy of the connection -- one tenant per
+    customer database is the common shape, but a shared read-only reporting
+    database legitimately serves several, and expressing that as a list
+    avoids forcing an operator to duplicate credentials per tenant.
+    """
 
 
 def _parse_named_connections() -> tuple[DatabaseConnectionConfig, ...]:
@@ -263,10 +286,24 @@ def _parse_named_connections() -> tuple[DatabaseConnectionConfig, ...]:
                 db_odbc_driver=_env_str(
                     f"DB_{prefix}_ODBC_DRIVER", "ODBC Driver 17 for SQL Server"
                 ),
+                tenant_ids=_env_csv_tuple(f"DB_{prefix}_TENANT_IDS"),
             )
         )
 
     return tuple(connections)
+
+
+def _env_csv_tuple(key: str) -> tuple[str, ...]:
+    """Reads a comma-separated env var into a tuple of trimmed, non-empty
+    strings -- `()` for unset, blank, or all-whitespace.
+
+    Used for `DB_<NAME>_TENANT_IDS` (Prompt 20). Hand-written for the same
+    reason the rest of `_parse_named_connections` is: these keys carry a
+    runtime-determined `DB_<PREFIX>_` prefix, so Pydantic's own env decoding
+    can't reach them.
+    """
+    raw = _env_str(key, "")
+    return tuple(part.strip() for part in raw.split(",") if part.strip())
 
 
 def _format_validation_error(exc: ValidationError) -> str:
@@ -483,6 +520,47 @@ class Settings(BaseSettings):
             "a human clicks a button" action with a similar expected
             frequency, and splitting them out can be revisited if one
             route's real usage pattern needs a different budget.
+        enable_database_concurrency_limit: Whether `POST /execute` and
+            `agent.nodes.execute_sql_node` fast-fail once a configured
+            database already has `db_pool_size + db_max_overflow +
+            database_concurrency_limit_overhead` real executions in
+            flight against it, rather than letting the extra caller block
+            on `QueuePool` checkout for up to SQLAlchemy's own
+            `pool_timeout` (30s default) before failing anyway. Default
+            True: below saturation this changes nothing at all (the
+            limiter never trips); at saturation it turns a long blocking
+            wait into an immediate, clearly-worded rejection instead of an
+            opaque pool-timeout error, which is a strict improvement, not
+            a new restriction on any currently-working request. See
+            `agent.rate_limit.get_database_execution_limiter` and
+            `docs/SCALE_BASELINE.md`'s Prompt 22 entry.
+        database_concurrency_limit_overhead: Extra headroom added on top
+            of a database's own `db_pool_size + db_max_overflow` before
+            the limiter above trips -- 0 (default) means "fail exactly at
+            the point the pool itself would start blocking"; an operator
+            who'd rather let a few callers legitimately queue on the pool
+            before being fast-failed can widen this.
+        enable_result_cache: Whether `POST /execute` ("Confirm and Run")
+            may serve a cached `(columns, rows)` result for exact-text-
+            identical SQL against the same database instead of
+            re-executing it. Default False -- caching is a deliberate,
+            data-freshness-affecting operator opt-in, not a safe-by-default
+            accuracy aid (matching this codebase's convention for
+            `ENABLE_DOCUMENT_RAG`/`ENABLE_WEB_SEARCH`-class flags). Any SQL
+            referencing a `config.sensitive_columns`-classified restricted
+            column is never cached, regardless of this flag -- see
+            `db.result_cache.is_cacheable_sql`. Never applied to the
+            agent's own internal self-correction retry executions (those
+            aren't shown to the user and rarely repeat identical SQL
+            anyway) -- only to the user-facing "Confirm and Run" path.
+        result_cache_ttl_seconds: How long a cached result stays fresh
+            before it's treated as a miss and re-executed.
+        result_cache_max_entries: Bound on the number of distinct
+            (database, SQL) cache entries kept in memory at once,
+            LRU-evicted past this -- same bounded-cache shape as
+            `agent.rate_limit.BoundedLimiterCache`, for the same
+            unbounded-growth reason (a cache key here is derived from
+            caller-supplied SQL text).
         cost_estimation_enabled: Whether `db.query_cost` runs a proactive,
             non-executing cost estimate (EXPLAIN/SHOWPLAN) before running a
             validated query. Fails open regardless (see
@@ -558,6 +636,18 @@ class Settings(BaseSettings):
             server and the identity provider. Small and bounded
             deliberately -- a large value would meaningfully extend how
             long an expired token stays acceptable.
+        oidc_tenant_claim: Name of the IdP-signed JWT claim
+            `security.oidc.extract_tenant_id` reads a caller's tenant id
+            from (Prompt 20). `None` (the default) means the operator has
+            not mapped their IdP's own tenant concept onto this app's, so
+            every OIDC caller resolves to
+            `security.tenancy.DEFAULT_TENANT_ID` -- exactly this codebase's
+            pre-Prompt-20 behavior, so leaving it unset changes nothing.
+            Only ever read from a token whose signature has already been
+            verified against the issuer's live JWKS; a tenant id is never
+            accepted from a request header or body (see
+            `security/tenancy.py`'s rule 1 and
+            `reject_client_tenant_override`).
         oidc_role_claim: Name of the JWT claim `agent.authz` reads the
             caller's role(s) from (a single string or a list of strings,
             both accepted -- see `security/oidc.py::extract_roles`).
@@ -1649,6 +1739,11 @@ class Settings(BaseSettings):
     max_concurrent_ask_requests: int = Field(default=50, gt=0)
     max_concurrent_ask_requests_per_caller: int = Field(default=2, gt=0)
     api_action_rate_limit_per_minute: int = Field(default=20, gt=0)
+    enable_database_concurrency_limit: bool = True
+    database_concurrency_limit_overhead: int = Field(default=0, ge=0)
+    enable_result_cache: bool = False
+    result_cache_ttl_seconds: int = Field(default=30, gt=0)
+    result_cache_max_entries: int = Field(default=500, gt=0)
     cost_estimation_enabled: bool = True
     cost_estimation_timeout_seconds: int = Field(default=3, gt=0)
     cost_moderate_row_threshold: int = Field(default=50_000, gt=0)
@@ -1977,6 +2072,7 @@ class Settings(BaseSettings):
     oidc_algorithms: tuple[str, ...] = ("RS256",)
     oidc_clock_skew_seconds: int = Field(default=60, ge=0)
     oidc_role_claim: str = "roles"
+    oidc_tenant_claim: str | None = None
 
     # --- Google sign-in (identity/, security/google_oidc.py -- a specific
     # provider integrated into this app's own local accounts, distinct from
@@ -2484,6 +2580,37 @@ class Settings(BaseSettings):
             base = (self.ollama_model, *base)
         object.__setattr__(self, "ollama_allowed_models", base)
         return self
+
+    def databases_for_tenant(self, tenant_id: str | None) -> tuple[DatabaseConnectionConfig, ...]:
+        """Every configured connection this tenant may query, in
+        `databases`' own order (Prompt 20).
+
+        A connection with an empty `tenant_ids` is shared and always
+        included -- that is what keeps every existing single-tenant `.env`
+        behaving byte-for-byte as it did, since none of them set the new
+        variable. A connection with a non-empty `tenant_ids` is included
+        only for a tenant named in it.
+
+        `tenant_id=None` (no resolvable caller -- an anonymous request, or
+        one of the two indistinguishable-caller auth modes before a tenant
+        is resolved) returns **only the shared connections**, never a
+        tenant-restricted one: an unresolvable tenant must never be treated
+        as "matches everything," which is the deny-by-default posture every
+        ABAC check in this codebase already takes for an unknown tenant.
+
+        Deliberately a method on `Settings` rather than a free function in
+        `db/connection.py`: it is a pure question about configuration, and
+        keeping it here means `db/connection.py` (which must stay usable
+        with either a `Settings` or a single `DatabaseConnectionConfig` --
+        see `DbConnectionLike`) does not grow a tenant concept it has no
+        way to resolve.
+        """
+        return tuple(
+            connection
+            for connection in self.databases
+            if not connection.tenant_ids
+            or (tenant_id is not None and tenant_id in connection.tenant_ids)
+        )
 
     @property
     def auth_mode(self) -> Literal["none", "static_token", "oidc", "local"]:
