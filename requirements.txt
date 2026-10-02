@@ -82,6 +82,17 @@ pandas==2.3.3
 pydantic==2.13.5
 pydantic-settings==2.15.0
 
+# Already present transitively (pydantic's own dependency) but pinned
+# explicitly now that it's a genuine direct import too: every stdlib
+# typing.TypedDict used as a LangGraph node's state (agent/state.py,
+# agent/orchestrator/state.py, attachments/state.py, attachments/models.py,
+# rag/graph.py) needs typing_extensions.TypedDict instead on Python < 3.12
+# -- stdlib TypedDict lacks __orig_bases__ before 3.12, which pydantic v2's
+# schema builder requires when LangGraph's StateGraph.get_graph() walks a
+# compiled graph's state type. Production runs Python 3.11 (see Dockerfile),
+# so this is a real runtime fix, not just a test-only one.
+typing-extensions==4.16.0
+
 # REST API layer (api/) -- uvicorn was already present as a transitive dep
 # of langgraph/chromadb; fastapi (and its one real new transitive dep,
 # starlette) is the only genuinely new addition. httpx (already present,

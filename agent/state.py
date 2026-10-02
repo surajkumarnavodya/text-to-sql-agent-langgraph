@@ -11,7 +11,14 @@ prior failures on a retry.
 from __future__ import annotations
 
 import operator
-from typing import Annotated, Literal, TypedDict
+from typing import Annotated, Literal
+
+# typing_extensions.TypedDict (not stdlib typing.TypedDict) is required here:
+# this TypedDict is used as a LangGraph node's state, and LangGraph's
+# StateGraph.get_graph() triggers pydantic v2 to build a schema for it --
+# which raises PydanticUserError on Python < 3.12, where stdlib TypedDict
+# lacks __orig_bases__ (added in CPython 3.12). Production runs Python 3.11.
+from typing_extensions import TypedDict
 
 from agent.insight import ResultSummary
 from db.query_cost import CostEstimate

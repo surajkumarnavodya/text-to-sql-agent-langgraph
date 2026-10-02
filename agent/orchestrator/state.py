@@ -13,7 +13,14 @@ through `agent.graph.run_agent` directly or through the orchestrator -- see
 from __future__ import annotations
 
 import operator
-from typing import Annotated, TypedDict
+from typing import Annotated
+
+# typing_extensions.TypedDict (not stdlib typing.TypedDict) is required here:
+# this TypedDict is used as a LangGraph node's state, and LangGraph's
+# StateGraph.get_graph() triggers pydantic v2 to build a schema for it --
+# which raises PydanticUserError on Python < 3.12, where stdlib TypedDict
+# lacks __orig_bases__ (added in CPython 3.12). Production runs Python 3.11.
+from typing_extensions import TypedDict
 
 from agent.state import AgentState
 from rag.graph import Citation
