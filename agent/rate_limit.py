@@ -542,3 +542,32 @@ def get_share_invite_limiter(caller_key: str, max_per_hour: int) -> SlidingWindo
         window_seconds=3600.0,
         name=f"share_invite[{caller_key}]",
     )
+
+
+# Keyed by the authenticated caller's own user id (Prompt 21 -- enterprise
+# security & data governance hardening) -- `POST /onboarding/jobs`,
+# `.../discover`, and `.../publish` (api/onboarding.py) each open a live
+# outbound connection to a caller-supplied db_host/db_port, every one
+# already gated behind the admin-only ONBOARDING_MANAGE permission. That
+# permission check happens in the route body (`api/onboarding.py::_authorize`),
+# not as a FastAPI dependency, so this limiter's own key is the resolved
+# `user.id` rather than an `AuthIdentity` subject -- same shape as
+# `_share_invite_limiters` above, just keyed from the identity/session auth
+# system onboarding.py actually uses.
+_onboarding_connection_test_limiters = BoundedLimiterCache()
+
+
+def get_onboarding_connection_test_limiter(
+    caller_key: str, max_per_hour: int
+) -> SlidingWindowRateLimiter:
+    """Returns the per-caller limiter for `POST /onboarding/jobs`, `.../discover`,
+    and `.../publish` -- see `_onboarding_connection_test_limiters`'s own
+    comment for why this exists. Metered per-hour, same reasoning as
+    `get_share_invite_limiter`: a legitimate admin onboarding one database
+    tests/discovers/publishes it a handful of times, not dozens per hour."""
+    return _onboarding_connection_test_limiters.get_or_create(
+        caller_key,
+        max_events=max_per_hour,
+        window_seconds=3600.0,
+        name=f"onboarding_connection_test[{caller_key}]",
+    )

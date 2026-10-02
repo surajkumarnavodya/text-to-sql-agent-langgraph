@@ -44,6 +44,7 @@ from identity.repositories.users import get_user_permissions
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 
+from agent.rate_limit import get_onboarding_connection_test_limiter
 from api.identity_authz import require_local_user
 from api.onboarding_schemas import (
     CreateOnboardingJobRequest,
@@ -54,6 +55,7 @@ from api.onboarding_schemas import (
     PublishJobRequest,
     RunDiscoveryRequest,
 )
+from config.settings import get_settings
 from db.connection import DatabaseConnectionConfig, build_connection_url, test_connection
 from onboarding.jobs import OnboardingJobError, cancel_job, publish_job, retry_job
 from onboarding.jobs import run_discovery_stage as _run_discovery_stage
@@ -92,6 +94,29 @@ def _not_found() -> HTTPException:
 
 def _forbidden() -> HTTPException:
     return HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not permitted.")
+
+
+def _enforce_connection_test_rate_limit(user: User) -> None:
+    """Shared by `create_onboarding_job`/`run_discovery`/
+    `publish_onboarding_job` -- each opens a live outbound connection to a
+    caller-supplied `db_host`/`db_port`; see `agent.rate_limit
+    .get_onboarding_connection_test_limiter`'s own docstring for why this
+    exists (Prompt 21). Called *after* `_authorize` at every call site, so
+    an unauthorized caller is denied on its own terms first, never counted
+    against this budget."""
+    settings = get_settings()
+    limiter = get_onboarding_connection_test_limiter(
+        str(user.id), settings.onboarding_connection_rate_limit_per_hour
+    )
+    if not limiter.check().allowed:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail=(
+                "Too many database connection attempts from this account in the last "
+                "hour -- please wait before trying again."
+            ),
+            headers={"Retry-After": "60"},
+        )
 
 
 def _require_job(session: Session, job_id: uuid.UUID) -> OnboardingJob:
@@ -171,6 +196,7 @@ def create_onboarding_job(
     best-effort failure classification) ever leaves this function."""
     user, session = user_and_session
     _authorize(user, session, OnboardingAction.CREATE_JOB, job=None)
+    _enforce_connection_test_rate_limit(user)
 
     config = _connection_config(
         db_type=payload.db_type,
@@ -242,6 +268,7 @@ def run_discovery(
     user, session = user_and_session
     job = _require_job(session, job_id)
     _authorize(user, session, OnboardingAction.RUN_DISCOVERY, job)
+    _enforce_connection_test_rate_limit(user)
     if job.status not in ("pending",):
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
@@ -315,6 +342,7 @@ def publish_onboarding_job(
     user, session = user_and_session
     job = _require_job(session, job_id)
     _authorize(user, session, OnboardingAction.PUBLISH, job)
+    _enforce_connection_test_rate_limit(user)
     if job.status != "awaiting_review":
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,

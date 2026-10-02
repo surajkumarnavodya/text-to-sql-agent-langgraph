@@ -549,6 +549,47 @@ Regression tests: `tests/test_adversarial_input.py
 
 ---
 
+## 2026-10-02 — Prompt 21: onboarding connection-test rate limit added; SSRF rejections now audit-logged
+
+**Change:** Three additions, no existing threshold changed.
+
+0. `POST /feedback/golden-example` and `POST /feedback/message`
+   (`api/main.py`) are now covered by the existing
+   `API_ACTION_RATE_LIMIT_PER_MINUTE` control (`enforce_api_action_rate_limit`,
+   under new action names `"feedback_golden_example"`/`"feedback_message"`)
+   — previously the only mutating, store-writing routes in that file with
+   no rate limit at all, inconsistent with `/execute`/`/schema/refresh`.
+1. New `ONBOARDING_CONNECTION_RATE_LIMIT_PER_HOUR` (default `10`) —
+   `POST /onboarding/jobs`, `.../discover`, and `.../publish`
+   (`api/onboarding.py`) each open a live outbound connection to a
+   caller-supplied `db_host`/`db_port` and had no rate limit at all
+   before this. Per-user, hourly (`agent.rate_limit
+   .get_onboarding_connection_test_limiter`), same shape as the existing
+   `SHARE_INVITE_RATE_LIMIT_PER_HOUR`.
+2. `media_gen/download.py::_validate_download_url`'s three SSRF
+   rejection points (non-HTTPS scheme, no hostname, private/reserved
+   resolved address) now each call `security.audit_log
+   .log_security_event("ssrf_blocked", ...)` — the check itself is
+   unchanged, only the missing audit trail was added.
+
+**Why:** A comprehensive route-by-route security audit (Prompt 21,
+`21_ENTERPRISE_SECURITY_DATA_GOVERNANCE_CONTRACT.md`) found both as real,
+scoped gaps. The onboarding routes were already `ONBOARDING_MANAGE`
+(admin-only) gated, but `POST /onboarding/jobs` in particular was a
+repeatable TCP-connect oracle (its success/failure + classified error
+message leak host/port reachability) against any host/port an
+authenticated admin names — defense-in-depth, not a reported
+vulnerability. The SSRF audit-logging gap was `P1-6` from
+`docs/security/PRODUCTION_SECURITY_READINESS_REPORT.md` (dated
+2026-09-18), confirmed still open and closed here.
+
+**Status:** Permanent. Regression tests: `tests/test_api_feedback.py`
+(new file, 5 tests), `tests/test_api_onboarding.py
+::TestConnectionTestRateLimit` (3 tests), `tests/test_media_gen.py
+::TestDownloadMediaBytesAuditLogging` (5 tests).
+
+---
+
 <!--
 Template for new entries — copy this block:
 

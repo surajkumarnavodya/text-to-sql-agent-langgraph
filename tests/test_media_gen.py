@@ -646,6 +646,87 @@ class TestDownloadMediaBytes:
             _validate_download_url("https://cdn.example/img.png")  # must not raise
 
 
+class TestDownloadMediaBytesAuditLogging:
+    """Prompt 21 (enterprise security & data governance hardening): every
+    SSRF rejection in `_validate_download_url` must leave a structured
+    `security.audit_log` trail -- previously a real, disclosed gap (the
+    defense existed and was tested, but a blocked attempt left no signal
+    anywhere)."""
+
+    def test_non_https_scheme_is_audit_logged(self):
+        from media_gen.download import download_media_bytes
+
+        with (
+            patch("media_gen.download.log_security_event") as mock_log,
+            pytest.raises(MediaGenerationError),
+        ):
+            download_media_bytes("http://cdn.example/img.png")
+
+        mock_log.assert_called_once()
+        args, kwargs = mock_log.call_args
+        assert args[0] == "ssrf_blocked"
+        assert kwargs["reason"] == "non_https_scheme"
+
+    def test_no_hostname_is_audit_logged(self):
+        from media_gen.download import download_media_bytes
+
+        with (
+            patch("media_gen.download.log_security_event") as mock_log,
+            pytest.raises(MediaGenerationError),
+        ):
+            download_media_bytes("https:///img.png")
+
+        mock_log.assert_called_once()
+        args, kwargs = mock_log.call_args
+        assert args[0] == "ssrf_blocked"
+        assert kwargs["reason"] == "no_hostname"
+
+    def test_private_address_is_audit_logged(self):
+        from media_gen.download import download_media_bytes
+
+        with (
+            patch("socket.getaddrinfo", return_value=[(2, 1, 6, "", ("10.0.0.5", 0))]),
+            patch("media_gen.download.log_security_event") as mock_log,
+            pytest.raises(MediaGenerationError),
+        ):
+            download_media_bytes("https://malicious.example/img.png")
+
+        mock_log.assert_called_once()
+        args, kwargs = mock_log.call_args
+        assert args[0] == "ssrf_blocked"
+        assert kwargs["reason"] == "private_or_reserved_address"
+        assert kwargs["host"] == "malicious.example"
+        assert kwargs["resolved_ip"] == "10.0.0.5"
+
+    def test_unresolvable_host_is_not_logged_as_ssrf_blocked(self):
+        """A DNS resolution failure never evaluated any address against the
+        blocklist -- it must not be logged under the same event type as an
+        actual SSRF rejection."""
+        import socket as socket_module
+
+        from media_gen.download import download_media_bytes
+
+        with (
+            patch("socket.getaddrinfo", side_effect=socket_module.gaierror("nope")),
+            patch("media_gen.download.log_security_event") as mock_log,
+            pytest.raises(MediaGenerationError),
+        ):
+            download_media_bytes("https://does-not-exist.invalid/img.png")
+
+        mock_log.assert_not_called()
+
+    def test_allowed_url_never_logs(self):
+        from media_gen.download import _validate_download_url
+
+        with (
+            patch("socket.getaddrinfo", return_value=_PUBLIC_ADDRINFO),
+            patch("media_gen.download.log_security_event") as mock_log,
+        ):
+            _validate_download_url("https://cdn.example/img.png")
+
+        mock_log.assert_not_called()
+
+
 class TestDownloadMediaBytesRedirectHandling:
     """2026 Phase 3 security review: `_validate_download_url` on the
     *original* URL is moot if a redirect is then followed blindly -- these

@@ -2718,6 +2718,91 @@ object. Cumulative deliberately: a cache's value proposition is its hit
 *rate* over the process's life, which a bounded window of the most recent
 `max_requests` would understate for a long-running, low-traffic deployment.
 
+### Enterprise security & data governance hardening (Prompt 21)
+A comprehensive, route-by-route deterministic-security audit
+(`21_ENTERPRISE_SECURITY_DATA_GOVERNANCE_CONTRACT.md`) — not a new
+subsystem. The headline finding is reassuring rather than alarming: RBAC
+coverage across every route in `api/` is solid (every mutating/expensive
+route already has a real permission/identity dependency; no route is
+missing auth entirely, no sibling routes in the same router carry
+inconsistent permission levels), CORS wildcard-rejection, the SQL AST
+validator, and restricted-column enforcement are all unchanged and
+intact, and every langgraph/langchain/chromadb CVE already triaged in
+`docs/security/CVE_TRIAGE.md` was re-verified genuinely unreachable
+against the *current* codebase (zero new `CachePolicy`/`Checkpointer`/
+`ChatOpenAI` usage introduced since that triage) and already covered by
+CI's own justified `--ignore-vuln` allowlist.
+
+**Three real, scoped gaps were found and closed:**
+- **SSRF rejections weren't audit-logged**
+  (`media_gen/download.py::_validate_download_url`) — a real,
+  previously-disclosed gap (`docs/security/PRODUCTION_SECURITY_READINESS_REPORT.md`'s
+  P1-6, dated 2026-09-18), confirmed still open. The SSRF *defense* itself
+  was already correct and tested; a blocked attempt simply left no
+  `security.audit_log` trail, unlike every other rejection class in this
+  app. All three rejection points (non-HTTPS scheme, no hostname,
+  private/reserved resolved address) now call `log_security_event
+  ("ssrf_blocked", ...)` — covering both of this function's callers
+  (media generation and AI-guided image editing) from the one shared
+  implementation. A DNS resolution failure is deliberately **not** logged
+  under this event type — no address was ever evaluated against the
+  blocklist, so it isn't an SSRF rejection.
+- **`POST /feedback/golden-example`/`POST /feedback/message`**
+  (`api/main.py`) had no rate limit at all — the only mutating,
+  store-writing routes in that file inconsistent with `/execute`/
+  `/schema/refresh`'s existing `enforce_api_action_rate_limit` coverage, a
+  floodable data-poisoning vector against the golden-example/feedback
+  stores. Fixed by adding the identical call under two new action names
+  (`"feedback_golden_example"`/`"feedback_message"`), reusing the existing
+  `API_ACTION_RATE_LIMIT_PER_MINUTE` control — no new setting needed.
+- **`POST /onboarding/jobs`/`.../discover`/`.../publish`**
+  (`api/onboarding.py`) each open a live outbound connection to a
+  caller-supplied `db_host`/`db_port` with no rate limit at all.
+  `ONBOARDING_MANAGE`-gated (admin-only) already, but `POST
+  /onboarding/jobs` in particular was a repeatable TCP-connect oracle —
+  its success/failure plus classified failure-reason message leak
+  host/port reachability — against any host/port an authenticated admin
+  names. New `agent.rate_limit.get_onboarding_connection_test_limiter`
+  (identical shape to the existing `get_share_invite_limiter`: per-user,
+  hourly, a `BoundedLimiterCache`-backed `SlidingWindowRateLimiter`) +
+  `Settings.onboarding_connection_rate_limit_per_hour` (default `10`),
+  checked via a shared `api.onboarding._enforce_connection_test_rate_limit`
+  helper called immediately after each route's own `_authorize(...)` --
+  an unauthorized caller is denied on its own terms first, never counted
+  against this budget.
+
+**Found and re-verified, not fixed (already correct):** onboarding's own
+SQL-evaluation path (`onboarding/evaluation.py`) deliberately does **not**
+run generated SQL through `config.sensitive_columns`-restricted-column
+enforcement — correctly so, since at onboarding time the only caller is
+the admin who already supplied the raw database password directly (no
+narrower-permission role exists yet for a database still being onboarded,
+and the classification doesn't apply to an unprofiled database), unlike
+`validate_sql_node`'s restricted-column gate, which exists specifically to
+bound what an *under-privileged* caller's LLM-generated SQL may reach.
+
+**Known, disclosed limitations carried forward, not re-closed this
+pass** (already named in `docs/security/PRODUCTION_SECURITY_READINESS_REPORT.md`,
+confirmed still accurate as of this session): DAST has never been run
+against a live deployment; OIDC has never been verified end-to-end
+against a live Identity Provider; malware scanning (`clamav`) has never
+been verified against a real daemon; no backup/recovery procedure is
+documented. All four are environment-blocked (this sandboxed session has
+no live, network-reachable deployment, no real IdP, and no real ClamAV
+daemon to test against), not oversights. `mypy .`'s error count grew from
+117 (2026-09-19) to 340 across 56 files — confirmed via a fresh run that
+100% of the growth is confined to `tests/`/`eval/security_benchmark/`
+`AgentState`-vs-`dict` type-looseness (a pre-existing, disclosed category
+this project already scoped out as "a real, bounded, separate
+mypy-hygiene pass"), **zero new errors in any production security-relevant
+module** (`agent/`, `api/`, `db/`, `security/`, `identity/`).
+
+**Read [`docs/security-changelog.md`](docs/security-changelog.md)'s
+2026-10-02 entry** for the dated, audit-trail-formatted record of the two
+rate-limit additions, and
+[`21_ENTERPRISE_SECURITY_DATA_GOVERNANCE_CONTRACT.md`](21_ENTERPRISE_SECURITY_DATA_GOVERNANCE_CONTRACT.md)
+for the full prompt text and outcome summary.
+
 
 ## How to run
 

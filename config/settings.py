@@ -2064,6 +2064,18 @@ class Settings(BaseSettings):
     enable_pii_data_verification: bool = False
     pii_data_verification_sample_size: int = Field(default=100, gt=0)
 
+    # Prompt 21 (enterprise security & data governance hardening):
+    # `POST /onboarding/jobs`, `.../discover`, and `.../publish`
+    # (api/onboarding.py) each open a live outbound connection to a
+    # caller-supplied db_host/db_port -- ONBOARDING_MANAGE-gated (admin
+    # only) already, but with no rate limit at all before this, `POST
+    # /onboarding/jobs` in particular was a repeatable TCP-connect oracle
+    # (its success/failure + classified error message leak host/port
+    # reachability) against any host/port the caller names. Per-user,
+    # hourly, mirrors `share_invite_rate_limit_per_hour`'s identical shape
+    # -- see `agent.rate_limit.get_onboarding_connection_test_limiter`.
+    onboarding_connection_rate_limit_per_hour: int = Field(default=10, gt=0)
+
     api_auth_token: SecretStr | None = None
     environment: Literal["development", "production"] = "development"
     oidc_issuer: str | None = None

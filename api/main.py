@@ -1582,6 +1582,7 @@ def execute(
 )
 def feedback_golden_example(
     payload: GoldenExampleFeedbackRequest,
+    request: Request,
     identity: AuthIdentity = Depends(require_permission(Permission.GOLDEN_EXAMPLE_WRITE)),
 ) -> GoldenExampleFeedbackResponse:
     """Records a human-approved (question, SQL) pair for future few-shot
@@ -1590,14 +1591,22 @@ def feedback_golden_example(
     `sql` should be the exact SQL that was actually run and confirmed
     correct (e.g. from a prior `/execute` call), not necessarily the
     original `/ask` draft if the caller edited it.
+
+    Prompt 21 (enterprise security & data governance hardening): rate-limited
+    per caller (`enforce_api_action_rate_limit`) -- previously, this and
+    `/feedback/message` below were the only mutating, store-writing routes
+    in this file with no rate limit at all, which made both floodable as a
+    data-poisoning vector against the golden-example/feedback stores.
     """
+    settings = get_settings()
+    enforce_api_action_rate_limit(request, "feedback_golden_example", settings, identity=identity)
     # Prompt 20: stamped with the saving caller's own tenant, resolved
     # server-side -- the pair is only ever retrieved back for that tenant.
     save_golden_example(
         payload.question,
         payload.sql,
         payload.database,
-        get_settings(),
+        settings,
         tenant_id=resolve_tenant_id_for_identity(identity) or DEFAULT_TENANT_ID,
     )
     return GoldenExampleFeedbackResponse(saved=True)
@@ -1609,6 +1618,7 @@ def feedback_golden_example(
 )
 def feedback_message(
     payload: MessageFeedbackRequest,
+    request: Request,
     identity: AuthIdentity = Depends(require_permission(Permission.GOLDEN_EXAMPLE_WRITE)),
 ) -> MessageFeedbackResponse:
     """Records a like/dislike (plus an optional free-text comment) on any
@@ -1622,7 +1632,12 @@ def feedback_message(
     only; `feedback.store` here, every answer). A thumbs-up on a confirmed
     SQL answer still separately calls `/feedback/golden-example` too --
     this endpoint is purely additive, never a replacement.
+
+    Prompt 21: rate-limited per caller, same reasoning as `/feedback/
+    golden-example` above.
     """
+    settings = get_settings()
+    enforce_api_action_rate_limit(request, "feedback_message", settings, identity=identity)
     save_response_feedback(
         payload.question,
         payload.answer,
@@ -1632,7 +1647,7 @@ def feedback_message(
         sources_used=payload.sources_used,
         comment=payload.comment,
         conversation_id=payload.conversation_id,
-        settings=get_settings(),
+        settings=settings,
         # Prompt 20: stamped with the submitting caller's own tenant, resolved
         # server-side, so this shared log stays partitionable per tenant when
         # it is read back.
