@@ -2898,6 +2898,70 @@ the full `[trace]`/tenant-propagation design, and
 [`23_OBSERVABILITY_EVALUATION_RELIABILITY_CONTRACT.md`](23_OBSERVABILITY_EVALUATION_RELIABILITY_CONTRACT.md)
 for the full prompt text and outcome summary.
 
+### Full integration & regression (Prompt 24)
+A validation pass, not a new-feature pass — the mandatory review of
+Prompt 01's baseline against everything built since found one real,
+structural gap: **nothing in this codebase had ever proven the 18 real
+LangGraph nodes compose correctly through the actual compiled graph.**
+Every existing test either called one node function directly in
+isolation (`tests/test_agent_nodes.py`) or mocked `agent.graph.run_agent`
+itself at the API boundary (`tests/test_api_ask.py`,
+`tests/test_orchestrator.py`) — confirmed by grepping every `run_agent(`
+call site in the test suite, not assumed. New
+`tests/test_full_pipeline_integration.py` closes this: five tests that
+invoke the real, compiled graph end-to-end, mocking only the genuine
+network/DB boundary (`agent.nodes.retrieve_relevant_schema`/
+`retrieve_golden_examples`/`retrieve_business_context`, the seven
+`*_from_llm` functions in `agent/llm_client.py`, and
+`agent.nodes.execute_readonly_sql`) — covering the basic Text-to-SQL
+journey; the self-correction retry loop *actually looping* through the
+real conditional edges (not just `route_after_execution` returning the
+right string in isolation, already covered elsewhere); a declining-
+revenue result flowing through the real `analytics.engine
+.compute_analytics_result` → real `recommendation.engine
+.generate_recommendations` → real insight generation together in one
+run; `review_metric_conformance_node` actually engaging mid-run when a
+governing metric is retrieved; and an injection attempt being rejected
+before any generation/execution mock could even be reached. **All five
+passed without needing any production-code fix** — real, measured
+confirmation that the graph still composes correctly across every
+Prompt-9-through-23 feature at once, not an assumption.
+
+**Two further gaps found and closed while comparing against the Prompt
+01 baseline, both documentation/test-coverage drift, neither a behavior
+regression:**
+- `tests/test_sql_agent_integration.py
+  ::test_existing_nodes_are_all_still_present` had silently drifted out
+  of sync with the real graph — missing `retrieve_business_context`
+  (Prompt 9), `classify_analytical_intent` (Prompt 11),
+  `review_metric_conformance` (Prompt 10), and `generate_recommendations`
+  (Prompt 17) from its own checklist (a subset-containment check, so the
+  gap never failed, it just silently under-tested four of eighteen real
+  nodes). Now an exhaustive equality check instead, so a future added or
+  removed node must touch this test too.
+- `docs/ARCHITECTURE.md`'s `StateGraph` diagram and per-node prose
+  walkthrough were stale since roughly Prompt 8/9 — still describing
+  "the twelve nodes" and completely missing all six nodes added since.
+  Updated to the real, current eighteen-node graph, mermaid diagram
+  included, plus the two new retry-table rows (`metric_definition_not_used`,
+  `database_busy`) Prompts 10/22 added without ever reaching that table.
+
+**Confirmed already adequate, deliberately not duplicated:** the
+"new-client onboarding" journey (`tests/test_api_onboarding.py
+::TestFullLifecycle::test_create_discover_review_publish` — a real
+create → discover → review → publish lifecycle against a real SQLite
+target database) and the "unauthorized access" journey
+(`tests/test_api_authz.py`'s vertical/horizontal privilege-escalation,
+missing/invalid-role, and expired/invalid-credential suites) both
+already had real end-to-end coverage before this pass. The frontend
+test suite (292 tests, `frontend/`'s own `vitest`) and production build
+(`npm run build`) were both run fresh in this session and confirmed
+green/clean — zero backend-driven frontend regressions.
+
+**Read
+[`24_FULL_INTEGRATION_REGRESSION_CONTRACT.md`](24_FULL_INTEGRATION_REGRESSION_CONTRACT.md)**
+for the full prompt text and outcome summary.
+
 
 ## How to run
 

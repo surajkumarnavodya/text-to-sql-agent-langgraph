@@ -17,10 +17,12 @@ The agent is a small, explicit `StateGraph` (`agent/graph.py`), not a
 free-form ReAct-style agent. That's a deliberate choice: every possible
 transition is a named edge in a fixed graph, so the retry/error-feedback
 path is something you can read off the graph definition, not something
-that emerges from a model's own planning. The graph has **twelve nodes**,
-not just the four covering the "happy path" of retrieval → generation →
-validation → execution — the full picture, straight from
-`agent/graph.py::build_graph()`:
+that emerges from a model's own planning. The graph has **eighteen
+nodes** (grown from an original twelve across Prompts 9-18 of the
+Enterprise AI Analytics & Recommendation Platform initiative — see
+`00_MASTER_IMPLEMENTATION_CONTRACT.md`), not just the handful covering
+the "happy path" of retrieval → generation → validation → execution —
+the full picture, straight from `agent/graph.py::build_graph()`:
 
 ```mermaid
 flowchart TD
@@ -31,7 +33,9 @@ flowchart TD
     CF --> RS["retrieve_schema<br/>ChromaDB top-k + FK-adjacency bridge"]
     RS --> RGE["retrieve_golden_examples<br/>human-approved past (question, SQL) pairs"]
     RGE --> RBC["retrieve_business_context<br/>glossary/metric/relationship chunks, fails open"]
-    RBC --> PQ["plan_query<br/>LLM plan, only for complex questions"]
+    RBC --> CAI["classify_analytical_intent<br/>LOOKUP/TREND/COMPARISON/... classification"]
+    CAI --> BAP["build_analytical_plan<br/>structured, deterministically re-verified plan"]
+    BAP --> PQ["plan_query<br/>free-text LLM plan, tier-2 fallback"]
     PQ --> GS["generate_sql<br/>Ollama via agent/llm_client.py"]
     GS -->|off-topic sentinel| ENDREJ2(["END — rejected"])
     GS -->|LLM/Ollama error| ENDFAIL1(["END — failed"])
@@ -39,7 +43,10 @@ flowchart TD
     GS --> RV["review_sql<br/>plan-conformance check, only if planned"]
     RV -->|plan not satisfied, retries left| GS
     RV -->|plan not satisfied, budget exhausted| ENDFAIL6(["END — failed"])
-    RV --> VS["validate_sql<br/>sqlglot AST allowlist"]
+    RV --> RMC["review_metric_conformance<br/>governed-metric enforcement, only if governed"]
+    RMC -->|metric not honored, retries left| GS
+    RMC -->|metric not honored, budget exhausted| ENDFAIL7(["END — failed"])
+    RMC --> VS["validate_sql<br/>sqlglot AST allowlist"]
     VS -->|safety violation, no retry| ENDFAIL2(["END — failed"])
     VS -->|retryable parse error| GS
     VS --> CE["estimate_cost<br/>non-executing EXPLAIN / SHOWPLAN"]
@@ -47,12 +54,31 @@ flowchart TD
     CE -->|estimation budget exhausted| ENDFAIL3(["END — failed"])
     CE --> ES["execute_sql<br/>read-only engine, row cap, timeout"]
     ES -->|unknown table/column| RS
+    ES -->|database concurrency limit reached, no retry| ENDFAIL8(["END — failed"])
     ES -->|other error, retries left| GS
     ES -->|timeout, no retry| ENDFAIL4(["END — failed"])
     ES -->|retry budget exhausted| ENDFAIL5(["END — failed"])
-    ES -->|success| GI["generate_insight<br/>optional, grounded plain-English summary"]
+    ES -->|success| CA["compute_analytics<br/>deterministic shape/finding engine"]
+    CA --> GF["generate_forecast<br/>deterministic, only if FORECAST intent"]
+    GF --> GR["generate_recommendations<br/>evidence-first, only with real findings"]
+    GR --> GI["generate_insight<br/>optional, grounded plain-English summary"]
     GI --> ENDOK(["END — succeeded"])
 ```
+
+`classify_analytical_intent`, `build_analytical_plan`,
+`review_metric_conformance`, `compute_analytics`, `generate_forecast`,
+and `generate_recommendations` are the six nodes added since this
+document's diagram was first written — see their own paragraphs below,
+and CLAUDE.md's per-prompt sections (9-18) for the full design history
+each one came from. `estimate_cost` here is the graph's own node *key*
+(`agent/graph.py::build_graph`'s `add_node("estimate_cost", ...)`) — the
+same node's `_timed_node` *stage* name (used for `[timing]`/`[trace]`
+log lines and `AgentState["stage_timings"]`, see
+[`docs/OBSERVABILITY.md`](OBSERVABILITY.md)) is `estimate_query_cost`; a
+disclosed, harmless naming inconsistency between the two separate
+identifier spaces, not a bug — found and left alone (not renamed) during
+the Prompt 24 full-integration-and-regression pass, since renaming either
+one is a bigger, separate change than this pass's own scope.
 
 Three failure shapes go straight to `END (failed)`/`END (rejected)` and
 never loop back at all: a validator **safety violation** (non-SELECT,
@@ -81,7 +107,7 @@ lets `generate_sql` see the full trail of prior failures on a retry, and
 what lets the UI render a complete "Attempt 1: ..., Attempt 2: ..." timeline
 instead of just the latest attempt.
 
-### The twelve nodes
+### The eighteen nodes
 
 **`sanitize_input_node`** — the graph's true entry point, before anything
 else (including follow-up classification) touches the question. Runs
@@ -143,7 +169,51 @@ error, and the feature being off all resolve to "no extra context" plus a
 logged, state-visible warning (`state["retrieval_warnings"]`), never a
 reason a question can't be answered.
 
-**`plan_query_node`** — the agentic query-decomposition step. Reads
+**`classify_analytical_intent_node`** (Prompt 11) — classifies what *kind*
+of analytical question this is (LOOKUP, AGGREGATION, TREND, COMPARISON,
+RANKING, DISTRIBUTION, SEGMENTATION, FUNNEL, COHORT, FORECAST, ANOMALY,
+ROOT_CAUSE, RECOMMENDATION — `agent/intent.py`), one LLM call, on
+**every** question (gated only by `ENABLE_INTENT_CLASSIFICATION`, default
+on) — unlike every other LLM-calling node below it, not gated by
+complexity signals, since this is meant to be foundational to planning
+rather than an accuracy aid for hard questions specifically. Stored in
+`state["analytical_intent"]`; its only consumer is `plan_query_node`'s
+own gate (an intent like TREND/COMPARISON/RANKING additionally triggers
+planning even with zero `agent.complexity` signals). Fails open exactly
+like every other LLM-calling node here: a disabled flag, an unreachable
+Ollama server, or an unparseable response all resolve to
+`analytical_intent = None`, which collapses this gate back to exactly
+`agent.complexity`'s signals alone — byte-identical to this node's
+pre-Prompt-11 absence. Always `AI_INFERENCE` (`agent/provenance.py`),
+never itself a security/authorization control, and structurally cannot
+short-circuit the graph the way `classify_followup_node` can (a single,
+unconditional outgoing edge, no `END` branch).
+
+**`build_analytical_plan_node`** (Prompt 12) — the first of a three-tier
+fallback for turning a question into a plan: (1) a typed, structured
+`AnalyticalPlan` (`agent/analytical_plan.py`) built by one LLM call, then
+**deterministically re-verified** by `agent/plan_validator.py::validate_plan`
+— table/column existence against the already-retrieved schema,
+FK-declared join paths, sensitive-column policy against the caller's own
+permissions, time-range column-type feasibility, and per-database SQL-
+feature support — before it's ever trusted; (2) `plan_query_node`'s own
+pre-existing free-text plan, used unmodified whenever tier 1 leaves
+`state["analytical_plan"] = None` for *any* reason, including a
+syntactically-fine-but-deterministically-invalid plan (discarded in
+full, never partially trusted); (3) direct generation, when neither
+planning node fires at all. Gated by the same trigger `plan_query_node`
+already used (`ENABLE_QUERY_PLANNING` and (`complexity_signals` or the
+new intent-based trigger above)) plus `ENABLE_ANALYTICAL_PLANNING`
+(default on) — a pure, zero-LLM-call pass-through otherwise. On success,
+the validated plan is also rendered into `state["query_plan"]`
+(`render_plan_as_steps`) so `review_sql_node` right below keeps working
+against it unmodified — no second review node.
+
+**`plan_query_node`** — the agentic query-decomposition step, and (since
+Prompt 12) the three-tier fallback's tier 2: an early-return pass-through
+whenever `build_analytical_plan_node` right above it already produced and
+validated a structured plan this run (`state["analytical_plan"]` set),
+otherwise byte-identical to its pre-Prompt-12 behavior. Reads
 `state["complexity_signals"]` (computed once, up front, by `run_agent()` —
 see "Agentic query planning and plan-conformance review" below) and, only
 when that list is non-empty *and* `ENABLE_QUERY_PLANNING` is on, makes one
@@ -193,6 +263,23 @@ Ollama, an unparseable verdict): treated as a pass, since the validator and
 execution layers immediately downstream are still the real safety net
 regardless of what this step decides.
 
+**`review_metric_conformance_node`** (Prompt 10) — the enforcement half
+of "confirmed definitions take precedence over LLM-generated
+definitions." Structurally identical to `review_sql_node` right above
+(an LLM call producing a `PASS`/`FAIL` verdict, a `FAIL` sharing the same
+`retry_count` budget, fails open the same way) but **independently
+gated** on `state["governing_metrics"]` being non-empty rather than on
+`query_plan`/complexity signals — a simple KPI question like "what's our
+revenue?" has no complexity signal at all, but can still name a governed
+metric that must be enforced. Only ever checks SQL against a *published*,
+`CONFIRMED_BUSINESS_TRUTH` metric definition (`retrieval.retriever
+.extract_governing_metrics`, Prompt 9/10's governed semantic catalog) —
+never promotes an unreviewed draft. Deliberately **not** one of
+`agent/sql_validator.py`'s fail-closed safety checks: an LLM-judged
+accuracy aid (two SQL expressions can be functionally equivalent without
+being AST-identical), kept structurally separate per master-contract
+rule 5 (never let an LLM bypass a deterministic security control).
+
 **`validate_sql_node`** — runs the candidate through
 `agent/sql_validator.py`'s allowlist (§ below) in the dialect matching
 `state["selected_database"]`'s own `DB_TYPE` (`db.connection.get_connection`
@@ -219,10 +306,60 @@ own before the agent gives up.
 database's own read-only engine with a row cap and timeout (§ "Execution
 safety" below), classifies any failure (`agent/error_classification.py`)
 into `TIMEOUT` / `MISSING_REFERENCE` / `AGGREGATE_NESTING` / `SYNTAX` /
-`UNKNOWN`, and routes accordingly (§2). On success, results and row count
-go into state and the graph proceeds to `generate_insight`.
+`UNKNOWN`, and routes accordingly (§2). Before any of that (Prompt 22,
+scale/performance hardening): fast-fails with `last_error_category
+="database_busy"` — never retried — if the selected database's own
+connection pool is already at `db_pool_size + db_max_overflow (+
+overhead)` concurrent executions (`agent.rate_limit
+.get_database_execution_limiter`), turning what would otherwise be an
+open-ended `QueuePool` checkout wait into an immediate, clearly-worded
+failure. On success, results and row count go into state and the graph
+proceeds to `compute_analytics`.
 
-**`generate_insight_node`** — only reachable from `execute_sql_node`'s
+**`compute_analytics_node`** (Prompt 13) — a pure, deterministic
+computation, zero I/O, runs on **every** successful execution (unlike
+the narrative nodes around it, a shape-classification-plus-statistics
+pass has no narrative cost to gate on). `analytics/engine.py
+::compute_analytics_result` classifies the result into one of six
+`ResultShape`s (SCALAR/TIME_SERIES/CATEGORICAL_AGGREGATE/
+MULTIDIMENSIONAL/RAW_TABLE/EMPTY) and computes every applicable
+statistical finding (growth, ranking, variance, median, percentile,
+distinct count, outliers/anomalies for a time series) — each one
+carrying its own `formula`/engine-version metadata and always
+`DataTruthLevel.DATABASE_FACT`, never an LLM's own claim. Stored as a
+plain dict in `state["analytical_result"]`. Fails open on any
+unexpected error (`state["analytical_result"]` stays `None`) — an
+accuracy/presentation aid, never a reason a successful execution fails.
+
+**`generate_forecast_node`** (Prompt 16) — only ever attempts a forecast
+when `classify_analytical_intent_node` already classified this question
+FORECAST; a zero-cost pass-through for every other intent. Deterministic
+(five stdlib-only baseline models plus an `AUTO` mode that backtests each
+and picks the best), reusing `state["analytical_result"]`'s own
+already-computed time-series points — no second query. Always
+`AI_INFERENCE` with a non-empty `limitations` tuple when it produces a
+real forecast; a data-insufficient or untrusted-temporal-semantics series
+is a normal, typed rejection, never an exception. Stored in
+`state["forecast_result"]`.
+
+**`generate_recommendations_node`** (Prompt 17) — the evidence-first
+recommendation engine, drawing on `state["analytical_result"]`
+(REVENUE/CUSTOMER/PRODUCT/ANOMALY/DATA_QUALITY rules),
+`state["cost_estimate"]`/Query Store findings (DATABASE_PERFORMANCE),
+the live performance snapshot (PERFORMANCE), and already-detected
+restricted-column hits in this query (SECURITY) — zero new queries, zero
+new LLM calls, a pure Data → Finding → Evidence → Rule → Candidate →
+Validation → Confidence → Recommendation pipeline. **No recommendation
+is ever constructed without at least one evidence claim**, enforced in
+code (`recommendation.engine._finalize_candidate`), and a candidate
+whose evidence touches a restricted column is independently re-
+authorized against the *viewing* caller's own role, separate from
+whatever role the original query ran under. Stored as a list of plain
+dicts in `state["recommendations"]` — always `[]`, never `None`, when
+nothing qualifies.
+
+**`generate_insight_node`** — only reachable, via `compute_analytics` →
+`generate_forecast` → `generate_recommendations`, from `execute_sql_node`'s
 *success* path; a failed, needs-clarification, or rejected run never
 generates one. Generates a short, plain-English sentence about the result
 (`agent/insight.py::summarize_result`) — skipped entirely (no LLM call)
@@ -260,7 +397,9 @@ computed:
 | `generate_sql` LLM/Ollama error | **Never** | `END (failed)` | The LLM call itself never returned usable text — retrying the same call is unlikely to help within this run. |
 | LLM-call rate limit tripped | **Never** | `END (rate_limited)` | A load-shedding stop, not a correctness issue — retrying immediately would just re-trip the same limiter. |
 | `review_sql` plan-conformance `FAIL` verdict (only when `state["query_plan"]` is set) | Yes, up to `max_retries` | `generate_sql` | Treated exactly like a correctness mistake — the reviewer's critique (e.g. "missing the ROW_NUMBER() partition for the per-region ranking") becomes this attempt's error feedback. Shares the same budget as every other retryable category, not a separate loop. |
+| `review_metric_conformance` `FAIL` verdict, category `metric_definition_not_used` (only when `state["governing_metrics"]` is set, Prompt 10) | Yes, up to `max_retries` | `generate_sql` | Identical shape to the plan-conformance row above, independently gated: the reviewer's critique becomes error feedback, same shared budget. |
 | Query cost estimate: **high** severity | Yes, up to `max_retries` | `generate_sql` | Treated exactly like a correctness mistake — the model may be able to add a filter on its own. |
+| Execution rejected before running, category `database_busy` (the target database's own connection pool already at capacity, Prompt 22) | **Never** | `END (failed)` | Retrying into an already-saturated database spends retry budget on something a retry can't fix, the identical reasoning as the `TIMEOUT` row below. |
 | Execution error, category `SYNTAX`/`UNKNOWN`/`AGGREGATE_NESTING` | Yes, up to `max_retries` | `generate_sql` | Schema context was fine; the SQL text wasn't. `AGGREGATE_NESTING` is the execution-time backstop for a nested-aggregate shape the static validator check didn't catch (e.g. a dialect-specific aggregate `sqlglot` doesn't recognize) — same retry shape as a validation failure. |
 | Execution error, category `MISSING_REFERENCE` | Yes, up to `max_retries` | **`retrieve_schema`**, not `generate_sql` | If the SQL referenced a table/column that doesn't exist, the *wrong tables may have been retrieved* in the first place — re-running generation with the same (possibly wrong) schema context would likely repeat the mistake. This re-entry also folds the DB error text into the retrieval query and widens `top_k` (`settings.schema_top_k + 2`), since the error usually names the missing identifier — a genuinely useful extra signal for similarity search. Re-entering `retrieve_schema` also re-runs `plan_query` (schema may have changed), reusing the already-selected database. |
 | Execution error, category `TIMEOUT` | **Never** | `END (failed)` | Retrying an expensive query with the same shape wastes the whole retry budget on something a retry can't fix. The failure message suggests narrowing the question instead. |
@@ -301,18 +440,27 @@ the resulting budget (`state["max_retries"]`) — every retry-vs-give-up
 check in the table above reads `state["max_retries"]`, not the raw
 `Settings.max_retries`, via `agent.nodes._effective_max_retries`.
 
-Those same signals gate the two newest nodes (§1's diagram): `plan_query_node`
-only calls the LLM when `state["complexity_signals"]` is non-empty, and
-`review_sql_node` only calls the LLM when `plan_query_node` actually
-produced a plan (`state["query_plan"]` is a non-empty list). This is a
-deliberate design choice, not an accident of implementation: the same
-"non-trivial question" judgment that earns a question a wider retry budget
-is what earns it the extra planning + review LLM calls, so a plain question
+Those same signals gate this pair of nodes (§1's diagram): `plan_query_node`
+only calls the LLM when `state["complexity_signals"]` is non-empty (or,
+since Prompt 11, when `classify_analytical_intent_node` classified the
+question as a planning-implying intent — see that node's own paragraph
+above), and `review_sql_node` only calls the LLM when `plan_query_node`
+actually produced a plan (`state["query_plan"]` is a non-empty list).
+`build_analytical_plan_node` shares this exact gate too (plus its own
+`ENABLE_ANALYTICAL_PLANNING` switch), being tier 1 of the same
+plan-then-review pair's planning half. This is a deliberate design
+choice, not an accident of implementation: the same "non-trivial
+question" judgment that earns a question a wider retry budget is what
+earns it the extra planning + review LLM calls, so a plain question
 never pays for either — no new Chroma query, no new LLM call, no new
-latency, exactly as if `plan_query`/`review_sql` weren't in the graph at
-all. `ENABLE_QUERY_PLANNING` (default `true`) is a master switch on top of
-the signal gate — off means every question behaves exactly as it did before
-this feature existed, regardless of complexity signals.
+latency, exactly as if `build_analytical_plan`/`plan_query`/`review_sql`
+weren't in the graph at all. `ENABLE_QUERY_PLANNING` (default `true`) is
+a master switch on top of the signal gate — off means every question
+behaves exactly as it did before this feature existed, regardless of
+complexity signals. (`review_metric_conformance_node`, the other new
+reviewer, is deliberately **not** part of this same gate — see its own
+paragraph in §1 for why it's independently triggered by
+`state["governing_metrics"]` instead.)
 
 The two nodes are a decompose-then-check pair, not two independent
 features: `plan_query_node` produces the plan (a JSON array of step
