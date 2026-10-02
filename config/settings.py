@@ -961,6 +961,16 @@ class Settings(BaseSettings):
         recommendation_slow_stage_ms_threshold: `recommendation.engine`'s
             PERFORMANCE rule fires when a LangGraph pipeline stage's
             rolling p95 duration (milliseconds) is at least this.
+        enable_recommendation_persistence: Whether `POST /ask`
+            (`api/recommendation_persistence.py`) writes every
+            `AskResponse.recommendations` entry into the governed
+            recommendation store (`identity.models.RecommendationRecord`)
+            for a locally-authenticated caller. True by default; a no-op
+            regardless unless `local_auth_enabled` is also on (see that
+            module's own docstring) -- an operator escape hatch for a
+            deployment that wants Prompt 17's recommendations surfaced in
+            `/ask` without the extra identity-DB write per question. See
+            `18_RECOMMENDATION_GOVERNANCE_CONTRACT.md`.
         enable_golden_examples: Whether `agent.nodes
             .retrieve_golden_examples_node` looks up human-approved past
             (question, SQL) pairs (see `embeddings.golden_examples`) and
@@ -1805,6 +1815,11 @@ class Settings(BaseSettings):
     # a LangGraph pipeline stage's rolling p95 duration (milliseconds, from
     # observability.metrics.PerformanceMetrics.snapshot) is at least this.
     recommendation_slow_stage_ms_threshold: float = Field(default=2000.0, gt=0.0)
+    # Prompt 18 (18_RECOMMENDATION_GOVERNANCE_CONTRACT.md): gates
+    # api/recommendation_persistence.py's write of AskResponse
+    # .recommendations into the governed recommendation store -- a no-op
+    # regardless unless local_auth_enabled is also on.
+    enable_recommendation_persistence: bool = True
 
     enable_golden_examples: bool = True
     golden_examples_top_k: int = Field(default=3, gt=0)

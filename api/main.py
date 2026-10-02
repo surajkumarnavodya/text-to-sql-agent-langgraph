@@ -81,6 +81,8 @@ from api.media_library import router as media_library_router
 from api.media_search import router as media_search_router
 from api.onboarding import router as onboarding_router
 from api.rate_limit import enforce_api_action_rate_limit
+from api.recommendation_governance import router as recommendation_governance_router
+from api.recommendation_persistence import persist_ask_recommendations
 from api.schemas import (
     AccessibilityMetadataOut,
     AskRequest,
@@ -380,6 +382,7 @@ app.include_router(chat_history_router)
 app.include_router(shares_router)
 app.include_router(onboarding_router)
 app.include_router(semantic_catalog_router)
+app.include_router(recommendation_governance_router)
 
 # No-op when Settings.cors_allowed_origins is empty (the default) -- a
 # same-origin deployment (the built React app served by this same FastAPI
@@ -1302,6 +1305,21 @@ def ask(
     except Exception as exc:  # noqa: BLE001 - see api/chat_persistence.py's own docstring
         logger.warning(
             "[api] /ask: chat-history persistence failed unexpectedly (session_id=%s): %s",
+            session_id,
+            exc,
+        )
+
+    try:
+        persist_ask_recommendations(
+            identity=identity,
+            question=payload.question,
+            ask_response=ask_response,
+            settings=settings,
+        )
+    except Exception as exc:  # noqa: BLE001 - see api/recommendation_persistence.py's own docstring
+        logger.warning(
+            "[api] /ask: recommendation-governance persistence failed unexpectedly "
+            "(session_id=%s): %s",
             session_id,
             exc,
         )

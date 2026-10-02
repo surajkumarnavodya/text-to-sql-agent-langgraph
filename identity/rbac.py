@@ -68,6 +68,8 @@ class Permission(str, Enum):
     ONBOARDING_REVIEW = "onboarding.review"
     CATALOG_MANAGE = "catalog.manage"
     CATALOG_REVIEW = "catalog.review"
+    RECOMMENDATION_REVIEW = "recommendation.review"
+    RECOMMENDATION_MANAGE = "recommendation.manage"
 
 
 #: Every permission's seed description, for the `permissions` table.
@@ -118,6 +120,15 @@ SEED_PERMISSIONS: tuple[tuple[Permission, str], ...] = (
     (
         Permission.CATALOG_REVIEW,
         "Review (approve or request changes on) a semantic-catalog entry.",
+    ),
+    (
+        Permission.RECOMMENDATION_REVIEW,
+        "Give lifecycle feedback (reviewed/accepted/rejected/partially useful/incorrect) "
+        "on, or mark resolved, a persisted recommendation.",
+    ),
+    (
+        Permission.RECOMMENDATION_MANAGE,
+        "Force-expire a persisted recommendation (administrative override).",
     ),
 )
 
@@ -170,6 +181,11 @@ _ANALYST: frozenset[Permission] = _USER | {
     # identical reason ONBOARDING_REVIEW does -- domain judgment, not
     # account administration.
     Permission.CATALOG_REVIEW,
+    # RECOMMENDATION_REVIEW (judging whether a persisted recommendation
+    # was accurate/useful, or marking it resolved) is the identical
+    # domain-judgment call ONBOARDING_REVIEW/CATALOG_REVIEW already sit
+    # at this tier for -- Prompt 18 (18_RECOMMENDATION_GOVERNANCE_CONTRACT.md).
+    Permission.RECOMMENDATION_REVIEW,
 }
 _ADMIN: frozenset[Permission] = _ANALYST | {
     Permission.USERS_READ,
@@ -191,6 +207,10 @@ _ADMIN: frozenset[Permission] = _ANALYST | {
     # entry to CONFIRMED_BUSINESS_TRUTH and makes it live in retrieval)
     # is admin-tier for the identical reason ONBOARDING_MANAGE is.
     Permission.CATALOG_MANAGE,
+    # RECOMMENDATION_MANAGE (force-expiring a recommendation -- an
+    # administrative override, not a domain-judgment call) is admin-tier
+    # for the identical reason ONBOARDING_MANAGE/CATALOG_MANAGE are.
+    Permission.RECOMMENDATION_MANAGE,
 }
 # A read-focused compliance/oversight role -- can review any user's audit
 # trail and the admin dashboard, but cannot create/edit/deactivate users or

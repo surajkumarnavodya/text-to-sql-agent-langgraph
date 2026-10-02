@@ -1135,3 +1135,226 @@ class SemanticCatalogEntry(Base):
     published_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = _created_at()
     updated_at: Mapped[datetime] = _updated_at()
+
+
+class RecommendationRecord(Base):
+    """One persisted instance of a `recommendation.models.Recommendation`
+    Prompt 17's `recommendation.engine.generate_recommendations` produced
+    -- Prompt 18 (`18_RECOMMENDATION_GOVERNANCE_CONTRACT.md`).
+
+    **Content is immutable once created; only `status` ever changes.**
+    Unlike `identity.models.SemanticCatalogEntry` (one row per *version*
+    of evolving content), a recommendation's own finding/evidence/claim
+    is a fact about a specific point in time -- it never gets "edited,"
+    only judged. `status` (`recommendation.governance.RecommendationStatus`)
+    is mutated in place by `identity/repositories/recommendation_governance
+    .py::submit_feedback`, which also appends an immutable
+    `RecommendationFeedbackEvent` row recording exactly what changed, by
+    whom, and why -- the append-only audit trail this row's own mutable
+    `status` column, by itself, could not provide.
+
+    `evidence`/`limitations` are stored verbatim from the originating
+    `Recommendation.model_dump()` -- the literal content a human's later
+    feedback is about, preserved regardless of whether
+    `recommendation.engine`'s own rules change afterward.
+    `engine_version`/`evidence_version` are two independent, deliberately
+    separate snapshots of "what produced this": `engine_version` is
+    `Recommendation.engine_version` (`recommendation.models
+    .RECOMMENDATION_ENGINE_VERSION` at generation time); `evidence_version`
+    is a SHA-256 hex digest over the `evidence` JSON itself -- a concrete,
+    comparable, content-addressable identifier for the specific evidence
+    judged, independent of whichever analytics-engine version happened to
+    be running (that version isn't separately recorded anywhere on
+    `recommendation.models.Recommendation` itself today). Both are
+    re-snapshotted onto every `RecommendationFeedbackEvent` row at the
+    moment of that event -- Prompt 18's own "capture ... recommendation/
+    evidence versions" requirement, applied per-event so a quality
+    rollup can be sliced by exactly which version a piece of feedback was
+    actually about.
+
+    `tenant_id` follows the exact scoped, forward-compatible pattern
+    `OnboardingJob.tenant_id`/`SemanticCatalogEntry.tenant_id` already
+    established (see either model's own docstring) -- this app remains
+    deliberately single-tenant platform-wide; only this table's own rows
+    carry a real `tenant_id` with a real ABAC tenant-match check
+    (`recommendation.governance_policy.authorize_recommendation_action`).
+
+    `source_question`/`source_sql` are display-only context (what
+    question/query this recommendation was about), not foreign keys into
+    `identity.models.Conversation`/`Prompt` -- a recommendation can come
+    from a chat turn, a future standalone report, or a batch recompute,
+    and coupling this table to chat-history's own schema would be exactly
+    the kind of premature cross-feature dependency this codebase avoids
+    elsewhere (e.g. `OnboardingJob.discovery_summary`'s identical
+    "display-only, no FK" choice).
+    """
+
+    __tablename__ = "recommendation_records"
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    tenant_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    database_id: Mapped[str] = mapped_column(String(200), nullable=False, index=True)
+    category: Mapped[str] = mapped_column(
+        Enum(
+            "performance",
+            "anomaly",
+            "revenue",
+            "customer",
+            "product",
+            "operations",
+            "data_quality",
+            "security",
+            "database_performance",
+            name="recommendation_category",
+            native_enum=False,
+            validate_strings=True,
+        ),
+        nullable=True,
+        index=True,
+    )
+    kind: Mapped[str] = mapped_column(
+        Enum(
+            "next_question",
+            "action",
+            name="recommendation_kind",
+            native_enum=False,
+            validate_strings=True,
+        ),
+        nullable=False,
+    )
+    rule_or_model: Mapped[str] = mapped_column(String(200), nullable=True)
+    claim_text: Mapped[str] = mapped_column(Text, nullable=False)
+    rationale: Mapped[str] = mapped_column(Text, nullable=True)
+    affected_entity: Mapped[str] = mapped_column(String(500), nullable=True)
+    action: Mapped[str] = mapped_column(Text, nullable=True)
+    measurable_impact: Mapped[str] = mapped_column(Text, nullable=True)
+    confidence: Mapped[float] = mapped_column(Float, nullable=True)
+    evidence: Mapped[list] = mapped_column(_METADATA_JSON, nullable=False, default=list)
+    limitations: Mapped[list] = mapped_column(_METADATA_JSON, nullable=False, default=list)
+    engine_version: Mapped[str] = mapped_column(String(32), nullable=False)
+    evidence_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    status: Mapped[str] = mapped_column(
+        Enum(
+            "generated",
+            "reviewed",
+            "accepted",
+            "rejected",
+            "partially_useful",
+            "incorrect",
+            "resolved",
+            "expired",
+            name="recommendation_status",
+            native_enum=False,
+            validate_strings=True,
+        ),
+        nullable=False,
+        default="generated",
+        index=True,
+    )
+    generated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    source_question: Mapped[str] = mapped_column(Text, nullable=True)
+    source_sql: Mapped[str] = mapped_column(Text, nullable=True)
+    created_by_user_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    created_at: Mapped[datetime] = _created_at()
+    updated_at: Mapped[datetime] = _updated_at()
+
+    feedback_events: Mapped[list[RecommendationFeedbackEvent]] = relationship(
+        back_populates="record",
+        cascade="all, delete-orphan",
+        order_by="RecommendationFeedbackEvent.created_at",
+    )
+
+
+class RecommendationFeedbackEvent(Base):
+    """One immutable feedback/lifecycle-transition event against a
+    `RecommendationRecord` -- Prompt 18
+    (`18_RECOMMENDATION_GOVERNANCE_CONTRACT.md`)'s append-only audit
+    trail: "capture actor, reason, timestamp, recommendation/evidence
+    versions," applied per-event rather than as a handful of mutable
+    columns on the record itself (unlike `SemanticCatalogEntry`'s inline
+    `reviewed_by_user_id`/`reviewed_at`/`review_notes`, which only ever
+    remember the *most recent* review decision) -- a recommendation's
+    quality can be judged more than once over its life (e.g. reviewed,
+    then later resolved), and every one of those judgments stays
+    inspectable here, never overwritten.
+
+    `from_status` is `None` only for the very first event (the one
+    `create_record` itself inserts, `to_status="generated"`) -- every
+    later event always has a real `from_status`, since it's a transition
+    *from* whatever the record's status already was.
+
+    `actor_user_id`/`actor_label` are deliberately both optional and
+    mutually a fallback for each other: a real human reviewer sets
+    `actor_user_id` (and `actor_label` stays `None`); an automated
+    transition (e.g. a future scheduled expiry sweep) sets `actor_label`
+    (e.g. `"system:expiry_sweep"`) with `actor_user_id` left `None` --
+    the audit trail always names *something*, never silently blank, the
+    same "a system actor still gets a readable label" convention
+    `security.audit_log`'s own structured events already follow informally
+    via their `event_type` field.
+
+    **This table is never read by anything that changes
+    `recommendation.engine`'s own behavior.** Master-contract requirement
+    ("feedback must not automatically alter production rules from a
+    single event") is satisfied structurally: no code path in this
+    codebase reads `RecommendationFeedbackEvent` rows and writes back to
+    `config.settings.Settings` or any `recommendation.engine` rule
+    threshold. This table is write-and-report only -- an aggregate
+    rollup (`identity.repositories.recommendation_governance
+    .quality_metrics_for_tenant`) is the sole, read-only consumer, for a
+    future human-facing dashboard to act on deliberately.
+    """
+
+    __tablename__ = "recommendation_feedback_events"
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    recommendation_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("recommendation_records.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    from_status: Mapped[str] = mapped_column(
+        Enum(
+            "generated",
+            "reviewed",
+            "accepted",
+            "rejected",
+            "partially_useful",
+            "incorrect",
+            "resolved",
+            "expired",
+            name="recommendation_feedback_from_status",
+            native_enum=False,
+            validate_strings=True,
+        ),
+        nullable=True,
+    )
+    to_status: Mapped[str] = mapped_column(
+        Enum(
+            "generated",
+            "reviewed",
+            "accepted",
+            "rejected",
+            "partially_useful",
+            "incorrect",
+            "resolved",
+            "expired",
+            name="recommendation_feedback_to_status",
+            native_enum=False,
+            validate_strings=True,
+        ),
+        nullable=False,
+    )
+    actor_user_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    actor_label: Mapped[str] = mapped_column(String(200), nullable=True)
+    reason: Mapped[str] = mapped_column(Text, nullable=True)
+    recommendation_version: Mapped[str] = mapped_column(String(32), nullable=False)
+    evidence_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    created_at: Mapped[datetime] = _created_at()
+
+    record: Mapped[RecommendationRecord] = relationship(back_populates="feedback_events")

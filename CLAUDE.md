@@ -343,7 +343,13 @@ below, and `docs/MULTI_SOURCE_GUIDE.md` for how to configure each source.
   standalone module, not that Protocol's implementation — its own
   `recommend(summary: ResultSummary)` signature still doesn't fit this
   engine's own, richer multi-source input shape). See "Evidence-first
-  recommendation engine" below.
+  recommendation engine" below. **Prompt 18**
+  (`18_RECOMMENDATION_GOVERNANCE_CONTRACT.md`) added
+  `recommendation/governance.py` (the eight-state feedback lifecycle) and
+  `recommendation/governance_policy.py` (RBAC+ABAC) on top — a quality-
+  measurement layer over already-produced recommendations, not a change
+  to how/whether Prompt 17's engine produces them. See "Recommendation
+  governance & feedback" below.
 - `rag/` — document/policy agentic RAG, one implementation shared by both
   the "documents" and "policies" collections (parameterized by collection
   name, not two near-duplicate modules): `store.py` (SQL Server native
@@ -449,15 +455,19 @@ below, and `docs/MULTI_SOURCE_GUIDE.md` for how to configure each source.
   declarative) and the *only* real (Alembic) migrations anywhere in this
   codebase — see `identity/__init__.py`'s own docstring for why this is a
   deliberate exception to the rest of the codebase's "raw SQLAlchemy Core +
-  idempotent `ensure_schema()`" convention. `models.py` (23 tables:
+  idempotent `ensure_schema()`" convention. `models.py` (25 tables:
   accounts/RBAC, sessions/tokens, `Conversation`/`Prompt`/`AiOutput`
   for chat history, **Prompt 08**
   (`08_ONBOARDING_ENGINE_CONTRACT.md`)'s `OnboardingJob`/
   `OnboardingReviewItem`/`OnboardingArtifact` (see "Client-database
-  onboarding engine" below), and **Prompt 09**
+  onboarding engine" below), **Prompt 09**
   (`09_SEMANTIC_CATALOG_CONTRACT.md`)'s `SemanticCatalogEntry` — one row
   per **version** of one governed business concept, never mutated in
-  place once published (see "Tenant-aware semantic catalog" below)),
+  place once published (see "Tenant-aware semantic catalog" below)), and
+  **Prompt 18** (`18_RECOMMENDATION_GOVERNANCE_CONTRACT.md`)'s
+  `RecommendationRecord`/`RecommendationFeedbackEvent` — an immutable
+  recommendation snapshot plus its own append-only feedback/audit event
+  log (see "Recommendation governance & feedback" below),
   `security.py` (Argon2id hashing, JWT issue/validate,
   opaque refresh tokens), `password_policy.py` + `display_name.py`
   (mandatory-display-name + password-strength validation — see
@@ -468,10 +478,14 @@ below, and `docs/MULTI_SOURCE_GUIDE.md` for how to configure each source.
   own plain CRUD for the three tables above, zero authorization logic,
   mirroring `repositories/shares.py`'s own identical split; `semantic_catalog.py`
   — Prompt 09's identical-shape CRUD for `SemanticCatalogEntry`,
-  including version/supersession bookkeeping), `rbac.py`
+  including version/supersession bookkeeping; `recommendation_governance.py`
+  — Prompt 18's CRUD + enforced-transition logic for
+  `RecommendationRecord`/`RecommendationFeedbackEvent`, plus the one
+  read-only quality-metrics aggregate), `rbac.py`
   (granular permission codes bridging into `agent/authz.py`'s own base
   role names — Prompt 08 added `ONBOARDING_MANAGE`/`ONBOARDING_REVIEW`,
-  Prompt 09 added `CATALOG_MANAGE`/`CATALOG_REVIEW`),
+  Prompt 09 added `CATALOG_MANAGE`/`CATALOG_REVIEW`, Prompt 18 added
+  `RECOMMENDATION_REVIEW`/`RECOMMENDATION_MANAGE`),
   `migrations/` (Alembic, `identity/alembic.ini` — run via `alembic -c
   identity/alembic.ini upgrade head`). Tests against this package use a
   real in-memory SQLite engine (`Base.metadata.create_all`), never a mock
@@ -527,7 +541,14 @@ below, and `docs/MULTI_SOURCE_GUIDE.md` for how to configure each source.
   "Client-database onboarding engine" below. `api/semantic_catalog.py`
   (Prompt 09, `09_SEMANTIC_CATALOG_CONTRACT.md`) is the REST surface for
   the tenant-aware semantic catalog — 8 routes under `/semantic-catalog`;
-  see "Tenant-aware semantic catalog" below.
+  see "Tenant-aware semantic catalog" below. `api/recommendation_governance.py`
+  (Prompt 18, `18_RECOMMENDATION_GOVERNANCE_CONTRACT.md`) is the REST
+  surface for the governed recommendation lifecycle — 7 routes under
+  `/recommendations`, deliberately with no create route (only the live
+  `/ask` pipeline creates a record); `api/recommendation_persistence.py`
+  is that write path, wired into `POST /ask` right alongside
+  `api/chat_persistence.py`. See "Recommendation governance & feedback"
+  below.
 - `scripts/` — standalone entry points: `test_db_connection.py` (verify
   `.env` before booting anything else — prints pass/fail, DB version, table
   count, or a classified readable error, per configured database),
@@ -2408,6 +2429,74 @@ concepts (Prompt 9/10) instead.
 **Read [`17_RECOMMENDATION_ENGINE_CONTRACT.md`](17_RECOMMENDATION_ENGINE_CONTRACT.md)**
 for the full inspection findings, every category rule's design, the
 testing summary (3172/3172 backend tests passing, up from 3132 before
+this prompt), and the disclosed, honest scope boundaries.
+
+### Recommendation governance & feedback (Prompt 18)
+`recommendation/governance.py` (pure, mirrors `semantic.catalog`'s own
+typed-vocabulary split) defines the eight-state lifecycle a *persisted*
+recommendation instance moves through — `GENERATED` → optionally
+`REVIEWED` → a quality verdict (`ACCEPTED`/`PARTIALLY_USEFUL`/
+`REJECTED`/`INCORRECT`) → optionally `RESOLVED` (only from `ACCEPTED`/
+`PARTIALLY_USEFUL`) — with `EXPIRED` reachable from any non-terminal
+state. This gates nothing about whether a recommendation is *shown*
+(Prompt 17's own evidence/confidence/authorization checks already
+decided that); it exists purely to measure quality after the fact —
+"recommendation quality can be measured and improved through controlled
+feedback."
+
+`identity.models.RecommendationRecord` (one immutable snapshot of a
+Prompt-17 `Recommendation`, tenant-scoped, a mutable `status` column) +
+`RecommendationFeedbackEvent` (an append-only audit log — `from_status`/
+`to_status`, `actor_user_id` *or* `actor_label`, `reason`, and both
+`recommendation_version`/`evidence_version` re-snapshotted onto every
+single event, not just the parent record) persist what Prompt 17's
+engine produces live: `POST /ask` (`api/recommendation_persistence.py`,
+the identical fail-open/locally-authenticated-only contract
+`api/chat_persistence.py` already established) writes one record per
+`AskResponse.recommendations` entry. `identity/repositories
+/recommendation_governance.py` enforces every transition against
+`recommendation.governance.VALID_STATUS_TRANSITIONS` (defense in depth
+behind the API's own pre-flight check) and is the sole place
+`quality_metrics_for_tenant` reads feedback events back — a plain count
+rollup, never anything that writes to `config.settings.Settings` or a
+`recommendation.engine` rule.
+
+`api/recommendation_governance.py` exposes seven routes under
+`/recommendations` (list, get, get-events, feedback, resolve, expire,
+metrics), each gated by `recommendation.governance_policy
+.authorize_recommendation_action` — two new permissions,
+`Permission.RECOMMENDATION_REVIEW` (analyst+: view/feedback/resolve) and
+`Permission.RECOMMENDATION_MANAGE` (admin-only: expire), seeding
+automatically via the existing idempotent `identity.bootstrap.seed_rbac`.
+**There is no create/ingest route** — a record is only ever created by
+the already-`Permission.ASK`-gated `/ask` pipeline itself.
+
+**Invariants that must not regress:** no code path anywhere in this
+codebase reads a `RecommendationFeedbackEvent` row and writes back to an
+engine setting or rule threshold — "feedback must not automatically
+alter production rules from a single event" holds structurally, not by
+convention, since `quality_metrics_for_tenant` (plain counts) is the
+only read path over that table. `resolved`/`expired` are unreachable
+through the general `POST .../feedback` route (its own request schema
+rejects them, 422, before ever reaching the repository) — each has its
+own dedicated, more narrowly-permissioned route instead. Every action
+beyond none is ABAC-gated on `security.tenancy.resolve_actor_tenant_id`
+matching the record's own `tenant_id`; a cross-tenant or nonexistent
+record is denied identically and mapped to the same 404
+(anti-enumeration, matching `api/semantic_catalog.py`'s own precedent).
+
+**Live-verified, not just against SQLite:** `alembic -c identity/
+alembic.ini upgrade head` was run against the real, configured
+PostgreSQL identity database for this pass — which also revealed and
+applied three *prior* prompts' migrations that had never actually been
+applied to this real database before, alongside this prompt's own new
+`recommendation_records`/`recommendation_feedback_events` tables; both
+new RBAC permission codes were then confirmed seeded via a direct
+`identity.bootstrap.seed_rbac` run against that same database.
+
+**Read [`18_RECOMMENDATION_GOVERNANCE_CONTRACT.md`](18_RECOMMENDATION_GOVERNANCE_CONTRACT.md)**
+for the full inspection findings, every table/route's design, the
+testing summary (3272/3272 backend tests passing, up from 3172 before
 this prompt), and the disclosed, honest scope boundaries.
 
 ## How to run
