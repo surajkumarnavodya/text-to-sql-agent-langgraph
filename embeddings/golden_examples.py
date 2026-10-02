@@ -43,6 +43,7 @@ from agent.state import GoldenExample
 from config.settings import Settings, get_settings
 from embeddings.schema_indexer import get_chroma_client, get_embedding_function
 from security.redaction import redact_secrets
+from security.tenancy import DEFAULT_TENANT_ID
 
 logger = logging.getLogger(__name__)
 
@@ -69,19 +70,28 @@ def get_golden_examples_collection(
     )
 
 
-def _example_id(db_name: str, question: str, sql: str) -> str:
-    """Deterministic id for one (db_name, question, sql) triple.
+def _example_id(db_name: str, question: str, sql: str, tenant_id: str) -> str:
+    """Deterministic id for one (tenant_id, db_name, question, sql) tuple.
 
     Re-saving the exact same pair (e.g. a user clicking thumbs-up twice)
     upserts the same document rather than accumulating duplicates -- see
     `save_golden_example`.
+
+    `tenant_id` is part of the id (Prompt 20) so two tenants approving the
+    same question/SQL against a shared database keep two independent
+    documents: collapsing them into one would make a later deletion or
+    correction by one tenant silently mutate the other's example.
     """
-    digest_input = f"{db_name}\x00{question}\x00{sql}".encode()
+    digest_input = f"{tenant_id}\x00{db_name}\x00{question}\x00{sql}".encode()
     return hashlib.sha256(digest_input).hexdigest()
 
 
 def save_golden_example(
-    question: str, sql: str, db_name: str, settings: Settings | None = None
+    question: str,
+    sql: str,
+    db_name: str,
+    settings: Settings | None = None,
+    tenant_id: str = DEFAULT_TENANT_ID,
 ) -> None:
     """Saves one human-approved (question, SQL) pair to the golden dataset.
 
@@ -98,15 +108,24 @@ def save_golden_example(
         db_name: Which configured database (`Settings.databases[i].name`)
             this pair belongs to.
         settings: Optional `Settings` override (mainly for tests).
+        tenant_id: Which tenant approved this example (Prompt 20). Stored as
+            document metadata and folded into the document id, and required
+            to match on retrieval -- a golden example is a *human-approved
+            business fact in one tenant's own words*, so serving one tenant's
+            saved question/SQL into another tenant's generation prompt would
+            leak both their business vocabulary and their query patterns,
+            even across a legitimately shared database. Defaults to
+            `security.tenancy.DEFAULT_TENANT_ID`, which is where every
+            pre-Prompt-20 example already effectively lived.
     """
     settings = settings or get_settings()
     try:
         client = get_chroma_client(settings)
         collection = get_golden_examples_collection(client, settings, db_name)
         collection.upsert(
-            ids=[_example_id(db_name, question, sql)],
+            ids=[_example_id(db_name, question, sql, tenant_id)],
             documents=[question],
-            metadatas=[{"sql": sql}],
+            metadatas=[{"sql": sql, "tenant_id": tenant_id}],
         )
     except Exception as exc:  # noqa: BLE001 - saving feedback must never crash the UI
         safe_detail = redact_secrets(str(exc), settings)
@@ -116,7 +135,11 @@ def save_golden_example(
 
 
 def retrieve_golden_examples(
-    question: str, db_name: str, settings: Settings | None = None, top_k: int | None = None
+    question: str,
+    db_name: str,
+    settings: Settings | None = None,
+    top_k: int | None = None,
+    tenant_id: str = DEFAULT_TENANT_ID,
 ) -> list[GoldenExample]:
     """Returns the best-matching saved golden examples for this question.
 
@@ -127,6 +150,16 @@ def retrieve_golden_examples(
             plain single-database setup).
         settings: Optional `Settings` override (mainly for tests).
         top_k: Override for `Settings.golden_examples_top_k`.
+        tenant_id: Only examples saved by this tenant are returned
+            (Prompt 20) -- enforced as a Chroma `where` filter so the
+            exclusion happens inside the query rather than as a post-hoc
+            drop, and additionally re-checked per returned document below
+            (defense in depth, since a `where` clause silently ignored by a
+            future Chroma version would otherwise widen access). An example
+            carrying no `tenant_id` metadata at all was written before this
+            parameter existed and is treated as belonging to
+            `DEFAULT_TENANT_ID`, so an existing single-tenant store keeps
+            working untouched.
 
     Returns:
         Up to `top_k` examples, most-similar first, each with
@@ -144,9 +177,15 @@ def retrieve_golden_examples(
         count = collection.count()
         if count == 0:
             return []
+        # Chroma has no "field absent OR equal" predicate, so a legacy
+        # example (written before `tenant_id` metadata existed) is matched by
+        # the explicit `$in` on the default tenant plus the per-document
+        # re-check below -- not by omitting the filter, which would be the
+        # one change that could leak across tenants.
         result = collection.query(
             query_texts=[question],
             n_results=min(resolved_top_k, count),
+            where={"tenant_id": tenant_id},
         )
     except Exception as exc:  # noqa: BLE001 - Chroma/onnxruntime error types vary by backend
         safe_detail = redact_secrets(str(exc), settings)
@@ -170,6 +209,19 @@ def retrieve_golden_examples(
             continue
         sql = metadata.get("sql") if metadata else None
         if not isinstance(sql, str) or not sql:
+            continue
+        # Defense in depth behind the `where` filter above: never trust the
+        # store to have applied it. A document with no recorded tenant
+        # predates Prompt 20 and belongs to the default tenant.
+        document_tenant = (metadata or {}).get("tenant_id") or DEFAULT_TENANT_ID
+        if document_tenant != tenant_id:
+            logger.warning(
+                "Dropping a golden example whose tenant (%r) does not match the "
+                "requesting tenant (%r) -- the vector store did not honour the "
+                "tenant filter",
+                document_tenant,
+                tenant_id,
+            )
             continue
         examples.append(
             GoldenExample(question=document, sql=sql, similarity_score=similarity_score)

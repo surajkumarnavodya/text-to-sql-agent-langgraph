@@ -33,16 +33,24 @@ class TestCollectionName:
 
 
 class TestExampleId:
-    def test_deterministic_for_the_same_triple(self):
-        id1 = _example_id("default", "how many orders?", "SELECT COUNT(*) FROM orders")
-        id2 = _example_id("default", "how many orders?", "SELECT COUNT(*) FROM orders")
+    def test_deterministic_for_the_same_tuple(self):
+        id1 = _example_id("default", "how many orders?", "SELECT COUNT(*) FROM orders", "t1")
+        id2 = _example_id("default", "how many orders?", "SELECT COUNT(*) FROM orders", "t1")
         assert id1 == id2
 
     def test_differs_across_database_question_or_sql(self):
-        base = _example_id("default", "q", "SELECT 1")
-        assert base != _example_id("other_db", "q", "SELECT 1")
-        assert base != _example_id("default", "different question", "SELECT 1")
-        assert base != _example_id("default", "q", "SELECT 2")
+        base = _example_id("default", "q", "SELECT 1", "t1")
+        assert base != _example_id("other_db", "q", "SELECT 1", "t1")
+        assert base != _example_id("default", "different question", "SELECT 1", "t1")
+        assert base != _example_id("default", "q", "SELECT 2", "t1")
+
+    def test_differs_across_tenant(self):
+        """Prompt 20: two tenants approving the identical pair against a
+        shared database must keep two independent documents, so one tenant's
+        later correction can never silently rewrite the other's example."""
+        assert _example_id("default", "q", "SELECT 1", "tenant_a") != _example_id(
+            "default", "q", "SELECT 1", "tenant_b"
+        )
 
 
 class TestSaveGoldenExample:
@@ -63,10 +71,12 @@ class TestSaveGoldenExample:
         mock_collection.upsert.assert_called_once()
         _, kwargs = mock_collection.upsert.call_args
         assert kwargs["ids"] == [
-            _example_id("default", "how many orders?", "SELECT COUNT(*) FROM orders")
+            _example_id("default", "how many orders?", "SELECT COUNT(*) FROM orders", "default")
         ]
         assert kwargs["documents"] == ["how many orders?"]
-        assert kwargs["metadatas"] == [{"sql": "SELECT COUNT(*) FROM orders"}]
+        assert kwargs["metadatas"] == [
+            {"sql": "SELECT COUNT(*) FROM orders", "tenant_id": "default"}
+        ]
 
     def test_re_saving_the_same_pair_is_idempotent(self, monkeypatch):
         """Re-clicking the feedback widget must upsert the same document,
@@ -175,3 +185,75 @@ class TestRetrieveGoldenExamples:
         )
 
         assert retrieve_golden_examples("q", "default", settings=_mock_settings()) == []
+
+
+class TestGoldenExampleTenantIsolation:
+    """Prompt 20 cross-tenant negative tests: a golden example is a
+    human-approved question/SQL pair in one tenant's own business
+    vocabulary, so it must never reach another tenant's generation prompt
+    -- including when both tenants legitimately share one database."""
+
+    @staticmethod
+    def _collection_with(metadatas):
+        collection = MagicMock()
+        collection.count.return_value = len(metadatas)
+        collection.query.return_value = {
+            "documents": [["how many orders?"] * len(metadatas)],
+            "metadatas": [metadatas],
+            "distances": [[0.05] * len(metadatas)],
+        }
+        return collection
+
+    def _patch(self, monkeypatch, collection):
+        monkeypatch.setattr(
+            "embeddings.golden_examples.get_chroma_client", lambda settings: MagicMock()
+        )
+        monkeypatch.setattr(
+            "embeddings.golden_examples.get_golden_examples_collection",
+            lambda client, settings, db_name: collection,
+        )
+
+    def test_retrieval_filters_on_the_requesting_tenant(self, monkeypatch):
+        collection = self._collection_with([{"sql": "SELECT 1", "tenant_id": "tenant_a"}])
+        self._patch(monkeypatch, collection)
+
+        retrieve_golden_examples("q", "shared_db", settings=_mock_settings(), tenant_id="tenant_a")
+
+        assert collection.query.call_args.kwargs["where"] == {"tenant_id": "tenant_a"}
+
+    def test_another_tenants_example_is_dropped_even_if_the_store_returns_it(self, monkeypatch):
+        """Defense in depth: if the vector store ignored the `where` filter,
+        the per-document re-check must still exclude the row."""
+        collection = self._collection_with([{"sql": "SELECT 1", "tenant_id": "tenant_a"}])
+        self._patch(monkeypatch, collection)
+
+        examples = retrieve_golden_examples(
+            "q", "shared_db", settings=_mock_settings(), tenant_id="tenant_b"
+        )
+
+        assert examples == []
+
+    def test_a_legacy_example_without_tenant_metadata_belongs_to_the_default_tenant(
+        self, monkeypatch
+    ):
+        """An example written before Prompt 20 has no `tenant_id` metadata;
+        it must stay visible to the default tenant (no silent data loss on
+        upgrade) and invisible to any other."""
+        collection = self._collection_with([{"sql": "SELECT 1"}])
+        self._patch(monkeypatch, collection)
+
+        assert (
+            retrieve_golden_examples(
+                "q", "shared_db", settings=_mock_settings(), tenant_id="default"
+            )
+            != []
+        )
+
+        collection = self._collection_with([{"sql": "SELECT 1"}])
+        self._patch(monkeypatch, collection)
+        assert (
+            retrieve_golden_examples(
+                "q", "shared_db", settings=_mock_settings(), tenant_id="tenant_b"
+            )
+            == []
+        )

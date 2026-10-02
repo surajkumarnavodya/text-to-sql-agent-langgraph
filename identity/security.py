@@ -62,6 +62,7 @@ from argon2.exceptions import InvalidHashError, VerifyMismatchError
 
 from config.settings import Settings
 from identity.exceptions import LocalTokenValidationError
+from security.tenancy import DEFAULT_TENANT_ID
 
 # A single process-wide PasswordHasher, using argon2-cffi's own tuned
 # defaults (OWASP-recommended time/memory cost as of this library's current
@@ -119,7 +120,12 @@ def _verification_key(settings: Settings) -> str | bytes:
     return _load_key_file(str(settings.jwt_public_key_path))
 
 
-def create_access_token(subject: str, roles: tuple[str, ...], settings: Settings) -> str:
+def create_access_token(
+    subject: str,
+    roles: tuple[str, ...],
+    settings: Settings,
+    tenant_id: str = DEFAULT_TENANT_ID,
+) -> str:
     """Issues a short-lived access JWT for `subject` (the user's `id`, as a
     string) carrying `roles` -- deliberately only the base role names
     (`viewer`/`user`/`analyst`/`admin`/...), never the granular
@@ -128,17 +134,33 @@ def create_access_token(subject: str, roles: tuple[str, ...], settings: Settings
     so a revoked permission takes effect immediately rather than only
     after this token expires).
 
-    Claims: `sub`, `roles`, `token_type="access"`, `iat`, `exp` (from
+    Claims: `sub`, `roles`, `tid`, `token_type="access"`, `iat`, `exp` (from
     `Settings.access_token_expire_minutes`), `jti` (a fresh UUID per
     token), `iss`/`aud` (`Settings.jwt_issuer`/`jwt_audience`) -- exactly
     this feature's own required claim set, deliberately excluding anything
     that could be sensitive (no password, no email, no full identity
     record).
+
+    `tenant_id` (the `tid` claim, Prompt 20) is read by the caller from the
+    signing user's own `users.tenant_id` row and is **never** accepted from
+    a request -- see `security/tenancy.py`'s rule 1. It is carried in the
+    token rather than re-read from the database on every request for the
+    same reason `roles` is: it is a stable, server-asserted fact, and the
+    signature is what makes it trustworthy. A tenant *suspension* is the
+    one tenant fact that must not wait for a token to expire, which is why
+    `security.tenancy.resolve_tenant_context` reads status live from the
+    `tenants` table instead of trusting anything in here.
+
+    Defaults to `security.tenancy.DEFAULT_TENANT_ID` so a caller that
+    predates this parameter keeps minting exactly the token it did before
+    (`tid="default"` is the value every pre-Prompt-20 user already resolves
+    to) -- backward compatible by construction, not by convention.
     """
     now = datetime.now(UTC)
     claims = {
         "sub": subject,
         "roles": list(roles),
+        "tid": tenant_id,
         "token_type": "access",
         "iat": now,
         "exp": now + timedelta(minutes=settings.access_token_expire_minutes),
@@ -157,6 +179,12 @@ class LocalTokenClaims:
 
     subject: str
     roles: tuple[str, ...]
+    #: The `tid` claim (Prompt 20) -- which tenant the signing user belongs
+    #: to, asserted by this server when the token was minted. Defaults to
+    #: `security.tenancy.DEFAULT_TENANT_ID` for a token issued before that
+    #: claim existed, so an access token already in a user's browser keeps
+    #: working across the upgrade with exactly the tenant it implicitly had.
+    tenant_id: str = DEFAULT_TENANT_ID
 
 
 def looks_like_local_token(token: str, settings: Settings) -> bool:
@@ -228,7 +256,18 @@ def validate_local_token(token: str, settings: Settings) -> LocalTokenClaims:
 
     roles = claims.get("roles")
     role_tuple = tuple(str(r) for r in roles) if isinstance(roles, list) else ()
-    return LocalTokenClaims(subject=subject, roles=role_tuple)
+
+    # A missing/non-string `tid` resolves to the default tenant, never to
+    # "no tenant": the only tokens that can legitimately lack it are ones
+    # this server minted before Prompt 20, whose signers all belong to the
+    # default tenant anyway. A *forged* `tid` is impossible here -- this
+    # decode already verified the signature above, so every claim present
+    # is one this server wrote.
+    tenant_claim = claims.get("tid")
+    tenant_id = (
+        tenant_claim if isinstance(tenant_claim, str) and tenant_claim else DEFAULT_TENANT_ID
+    )
+    return LocalTokenClaims(subject=subject, roles=role_tuple, tenant_id=tenant_id)
 
 
 def generate_refresh_token() -> str:

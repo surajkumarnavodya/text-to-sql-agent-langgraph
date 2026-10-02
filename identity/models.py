@@ -132,6 +132,23 @@ class User(Base):
     __tablename__ = "users"
 
     id: Mapped[uuid.UUID] = _uuid_pk()
+    # The account's tenant -- the single server-side source of truth every
+    # tenant check in this codebase now resolves from (Prompt 20). Added
+    # with a `server_default` precisely so the migration that introduces
+    # it is non-destructive for an existing single-tenant deployment: every
+    # pre-existing row lands in `security.tenancy.DEFAULT_TENANT_ID`, which
+    # is exactly the value `resolve_actor_tenant_id` already returned for
+    # them before this column existed, so no behavior changes on upgrade.
+    # Never nullable: an account with no tenant would be an account no
+    # deny-by-default ABAC check could reason about.
+    tenant_id: Mapped[str] = mapped_column(
+        String(64),
+        ForeignKey("tenants.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+        default="default",
+        server_default="default",
+    )
     email: Mapped[str] = mapped_column(String(320), unique=True, index=True, nullable=False)
     username: Mapped[str] = mapped_column(String(64), unique=True, nullable=True)
     display_name: Mapped[str] = mapped_column(String(200), nullable=True)
@@ -386,6 +403,25 @@ class Conversation(Base):
     id: Mapped[uuid.UUID] = _uuid_pk()
     user_id: Mapped[uuid.UUID] = mapped_column(
         Uuid(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    # Defense in depth, not the primary boundary (Prompt 20): every
+    # `identity.repositories.history` query already folds `user_id` into
+    # its WHERE clause, and a user belongs to exactly one tenant, so a
+    # cross-tenant read was already impossible through that path. Storing
+    # the tenant on the row too means the repository layer can *also*
+    # filter on it directly -- which is what turns "impossible because of
+    # how the join happens to be written today" into an explicit,
+    # independently-testable invariant that a future query shape can't
+    # silently lose. Denormalized from `users.tenant_id` on purpose; set
+    # once at creation and never changed (a user is never moved between
+    # tenants by any code path in this repo -- see `docs/MULTI_TENANCY.md`).
+    tenant_id: Mapped[str] = mapped_column(
+        String(64),
+        ForeignKey("tenants.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+        default="default",
+        server_default="default",
     )
     title: Mapped[str] = mapped_column(String(300), nullable=True)
     feature_type: Mapped[str] = mapped_column(
@@ -1358,3 +1394,56 @@ class RecommendationFeedbackEvent(Base):
     created_at: Mapped[datetime] = _created_at()
 
     record: Mapped[RecommendationRecord] = relationship(back_populates="feedback_events")
+
+
+class Tenant(Base):
+    """One tenant -- the platform's first-class isolation boundary
+    (Prompt 20, `20_MULTI_TENANT_ENTERPRISE_ARCHITECTURE_CONTRACT.md`).
+
+    Before this table existed, `tenant_id` already appeared on five tables
+    (`ConversationShare`, `OnboardingJob`, `SemanticCatalogEntry`,
+    `RecommendationRecord`, `RecommendationFeedbackEvent`) and four
+    deny-by-default ABAC policy modules genuinely compared it -- but
+    `security.tenancy.resolve_actor_tenant_id` returned one hardcoded
+    constant for *every* user, so no two real callers could ever be in
+    different tenants and every one of those comparisons was vacuous in
+    practice. This table, plus `User.tenant_id` below, is what makes them
+    load-bearing: an actor's tenant is now a persisted, server-controlled
+    fact read from their own account row, never a value any client sends.
+
+    `id` is a short, operator-chosen slug (not a UUID) deliberately: every
+    pre-existing `tenant_id` column in this schema is already
+    `String(64)`, and `security.tenancy.DEFAULT_TENANT_ID` (`"default"`)
+    is already persisted in real rows written by Prompts 08/09/18. A UUID
+    primary key here would have required rewriting those rows -- a
+    destructive change this contract's rule 14 forbids without explicit
+    approval -- for no isolation benefit, since the column is never
+    client-supplied.
+
+    `status` is the one genuinely behavioral field: a `"suspended"` tenant
+    is refused at the tenant-resolution step
+    (`security.tenancy.resolve_tenant_context`), which fails closed for
+    every downstream check at once rather than needing each route to
+    remember a status check of its own.
+    """
+
+    __tablename__ = "tenants"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    name: Mapped[str] = mapped_column(String(200), nullable=False)
+    status: Mapped[str] = mapped_column(
+        Enum(
+            "active",
+            "suspended",
+            name="tenant_status",
+            native_enum=False,
+            validate_strings=True,
+        ),
+        nullable=False,
+        default="active",
+        server_default="active",
+    )
+    created_at: Mapped[datetime] = _created_at()
+    updated_at: Mapped[datetime] = _updated_at()
+    deleted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=True)
+    metadata_json: Mapped[dict] = mapped_column("metadata", _METADATA_JSON, nullable=True)

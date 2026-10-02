@@ -483,7 +483,9 @@ class DatabaseSelection:
     scores_by_db: dict[str, float] = field(default_factory=dict)
 
 
-def select_database(question: str, settings: Settings | None = None) -> DatabaseSelection:
+def select_database(
+    question: str, settings: Settings | None = None, tenant_id: str | None = None
+) -> DatabaseSelection:
     """Auto-routes `question` to the single best-matching configured database.
 
     With exactly one configured database (`Settings.databases`, the default
@@ -508,16 +510,38 @@ def select_database(question: str, settings: Settings | None = None) -> Database
     Args:
         question: The user's natural-language question.
         settings: Optional `Settings` override (mainly for tests).
+        tenant_id: Which tenant the asking caller belongs to (Prompt 20).
+            Routing only ever considers the connections that tenant may
+            query (`Settings.databases_for_tenant`), so a tenant-restricted
+            database can never be selected for -- and therefore never have
+            its schema retrieved into a prompt for, or be queried on behalf
+            of -- a caller in a different tenant. `None` (the default, and
+            what every pre-Prompt-20 caller passes) means "shared
+            connections only," which is the full set in any deployment that
+            hasn't restricted any connection, so this is behavior-preserving
+            for every existing `.env`.
 
     Returns:
         A `DatabaseSelection`.
 
     Raises:
         SchemaRetrievalError: if every configured database's index is
-            missing/empty, or every query fails.
+            missing/empty, every query fails, or this tenant may query no
+            configured database at all.
     """
     settings = settings or get_settings()
-    databases = settings.databases
+    databases = settings.databases_for_tenant(tenant_id)
+
+    if not databases:
+        # Deliberately the same exception type a missing index raises: from
+        # the caller's perspective both mean "no schema is available to
+        # answer this," and distinguishing them in a user-facing message
+        # would disclose that a database exists which this tenant may not
+        # use.
+        raise SchemaRetrievalError(
+            "No configured database is available for this caller. Check DB_CONNECTIONS "
+            "and any DB_<NAME>_TENANT_IDS restrictions in .env."
+        )
 
     if len(databases) == 1:
         only_name = databases[0].name

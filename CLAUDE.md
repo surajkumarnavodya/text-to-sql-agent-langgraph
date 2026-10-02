@@ -109,7 +109,10 @@ below, and `docs/MULTI_SOURCE_GUIDE.md` for how to configure each source.
 
 - `config/` — all tunables (model name, Ollama host, DB connection fields,
   Chroma path, row limit, timeout, max retries) live in `config/settings.py`,
-  sourced from `.env`. Never hardcode a model name, path, or connection
+  sourced from `.env`. `DatabaseConnectionConfig.tenant_ids`
+  (`DB_<NAME>_TENANT_IDS`) and `Settings.databases_for_tenant` are Prompt
+  20's per-tenant connection binding; empty means shared by every tenant,
+  which is what every existing `.env` gets. Never hardcode a model name, path, or connection
   detail anywhere else — import from here. `Settings` (a
   `pydantic_settings.BaseSettings` — see "Pydantic-based configuration and
   validation" below) is a passive config bag; it validates *individual*
@@ -463,9 +466,14 @@ below, and `docs/MULTI_SOURCE_GUIDE.md` for how to configure each source.
 - `identity/` — this app's own self-hosted user accounts (optional, off by
   default — `Settings.local_auth_enabled`), the *only* ORM (SQLAlchemy 2.0
   declarative) and the *only* real (Alembic) migrations anywhere in this
-  codebase — see `identity/__init__.py`'s own docstring for why this is a
+  codebase. **Prompt 20** added `identity.models.Tenant` (26 tables now)
+  plus `users.tenant_id`/`conversations.tenant_id` and
+  `identity/repositories/tenants.py` — see "Multi-tenant enterprise
+  architecture" below — see `identity/__init__.py`'s own docstring for why this is a
   deliberate exception to the rest of the codebase's "raw SQLAlchemy Core +
-  idempotent `ensure_schema()`" convention. `models.py` (25 tables:
+  idempotent `ensure_schema()`" convention. `models.py` (26 tables:
+  `Tenant` (Prompt 20 -- the isolation boundary every tenant check now
+  resolves from),
   accounts/RBAC, sessions/tokens, `Conversation`/`Prompt`/`AiOutput`
   for chat history, **Prompt 08**
   (`08_ONBOARDING_ENGINE_CONTRACT.md`)'s `OnboardingJob`/
@@ -2557,6 +2565,117 @@ summary (3308/3308 backend tests passing, up from 3272 before this
 prompt), and the disclosed, honest scope boundaries (most notably: no
 live SQL Server instance with Query Store enabled was available to
 verify the DMV queries against real data in this pass).
+
+### Multi-tenant enterprise architecture (Prompt 20)
+Tenant isolation became a first-class platform boundary. Before this,
+`tenant_id` already existed on five tables and four deny-by-default ABAC
+policy modules genuinely compared it — but `security.tenancy
+.resolve_actor_tenant_id` returned **one hardcoded constant for every
+user**, so no two real callers could ever be in different tenants and every
+one of those comparisons was vacuous in practice. The *shape* of tenant
+isolation existed; the *fact* of it did not. `identity.models.Tenant` is now
+a real table, `users.tenant_id` a real `RESTRICT` foreign key onto it, and
+an actor's tenant is read from their own account row — **no call site of
+either resolver function had to change** for those four policy modules to
+become load-bearing, which was the entire reason resolution was routed
+through one module in the first place.
+
+**Invariants that must not regress:**
+- **A tenant id is never read from anything a client sends.** It comes only
+  from a `User` row this server loaded, this app's own signature-verified
+  JWT `tid` claim (minted by `identity.security.create_access_token` from
+  that row), or an IdP-signed claim named by `Settings.oidc_tenant_claim`.
+  `security.tenancy.reject_client_tenant_override` additionally **refuses**
+  (400) any request carrying `X-Tenant-Id`/`X-Tenant`/`Tenant-Id`/
+  `X-Tenant-Override`, at `api/auth.py`'s single authentication chokepoint,
+  before anything is authenticated — including in `AUTH_MODE=none`.
+  Refusing rather than ignoring is deliberate: ignoring is safe today but
+  leaves no signal if a future proxy config starts forwarding one.
+- **Unknown means deny, never "default".**
+  `security.tenancy.resolve_tenant_context` is the one gate, failing closed
+  on a missing/soft-deleted/`"suspended"` tenant and on `None`, so a
+  suspension takes effect across every tenant-scoped route at once rather
+  than needing a per-route check. Every failure logs the real reason
+  server-side but raises one generic `safe_message` — a caller must not be
+  able to tell "no such tenant" from "suspended" from "not yours".
+- **Status is read live, never cached.** Login *and* refresh both re-check
+  it, bounding a suspension's effect to one access-token lifetime rather
+  than the much longer refresh-token lifetime.
+- **A shared database still needs per-tenant caches and retrieval.** Two
+  tenants may legitimately share one configured connection, which is what
+  makes these partitions load-bearing rather than redundant: the
+  `POST /execute` result cache key is `(tenant_id, database_name, sql)` (it
+  sits *after* every authorization gate, so it cannot rely on one), a golden
+  example carries `tenant_id` in both its document id and filterable
+  metadata (plus a per-document re-check behind the Chroma `where` filter —
+  never trust the store to have applied it), and a published
+  semantic-catalog chunk now records `tenant_id` in queryable metadata
+  rather than only inside an opaque `source_id` string nothing parsed (the
+  one real cross-tenant leak this prompt found and closed).
+  Operator-authored chunks — live schema introspection and
+  `data/knowledge/*.yaml` — deliberately carry no tenant and stay shared:
+  that is deployment configuration, not one tenant's private content.
+- **`observability.metrics.PerformanceMetrics` partitions per tenant** and
+  `GET /metrics/performance` returns only the caller's own slice. The route
+  is admin-gated, but this codebase has no platform-admin-versus-tenant-admin
+  distinction, so admin-gating alone would have let one tenant's admin read
+  another's latency/status/cache numbers. `snapshot()` with no argument keeps
+  its merged, process-wide meaning for operator use and is deliberately not
+  reachable over HTTP.
+- **`DB_<NAME>_TENANT_IDS` binds a connection to specific tenants.** Unset
+  (the default, and what every existing `.env` has) means shared by every
+  tenant — so the upgrade changes nothing. Once set,
+  `Settings.databases_for_tenant` filters it out everywhere:
+  `POST /execute` and `GET /schema/tables` resolve names through that view
+  (cross-tenant name → the same 404 a nonexistent name gets,
+  anti-enumeration), and `embeddings.retriever.select_database` never even
+  scores it, so a question can't be routed to — or have schema retrieved
+  from — a database the asking tenant may not use.
+- **The migration is non-destructive.**
+  `a4c7e2b9d6f5_multi_tenant_boundary` seeds the `default` tenant row
+  *before* either new column exists (no window in which an existing row
+  violates the new FKs), and both columns are `NOT NULL` with
+  `server_default='default'` — precisely the value
+  `resolve_actor_tenant_id` already returned. `identity.bootstrap
+  .ensure_default_tenant` is called from `seed_rbac` (deliberately folded
+  in, so none of the dozen callers can forget it) to keep a
+  `create_all`-built database consistent with a migrated one.
+
+- **Shared model infrastructure carries no tenant context.** The cached
+  `ollama.Client` and the compiled LangGraph graph are process-wide
+  singletons; a tenant is a plain value in the per-request `AgentState`
+  dict (the identical `selected_database`/`selected_model` pattern), never a
+  field on the graph or a mutation of the cached `Settings`. The one piece
+  of ambient state this prompt adds — `security.audit_log
+  .set_audit_tenant_id`, which stamps `tenant_id=` onto every security event
+  without touching ~40 call sites — is a `ContextVar` bound and reset in a
+  `try`/`finally` around the graph invocation. Proven under **real
+  concurrency** (`tests/security/test_cross_tenant_shared_infrastructure.py`),
+  mirroring `tests/test_model_selection_concurrency.py`'s own threading
+  regression test for the identical bug class: a sequential test would pass
+  even with a global-mutation bug.
+
+**Known limitations, named rather than left to be rediscovered:** the five
+pre-existing `tenant_id` columns still have no FK onto `tenants` (adding one
+could fail mid-upgrade on a real deployment for a modest integrity gain);
+`AUTH_MODE=none`/`static_token` are not meaningful tenant boundaries (every
+caller under either is indistinguishable by design); there is no
+self-service tenant assignment and no admin route for tenants (CRUD exists
+in `identity/repositories/tenants.py`, unexposed); no code path moves a user
+between tenants, and `identity.repositories.history._tenant_matches_owner`
+fails *closed* if a conversation's tenant ever disagrees with its owner's;
+attachments/rate limits/concurrency limits are keyed by caller identity, not
+tenant, so a noisy-neighbour tenant can still consume a shared global
+budget; **PII classification (`config/sensitive_columns.yaml`) and RBAC
+role/permission *definitions* remain global** — both are deliberately scoped
+out rather than half-done, since making either per-tenant means moving it
+out of shared seed data into a governed, reviewable store; and **no live
+two-tenant deployment has been exercised** — every invariant above is
+covered against an in-memory SQLite identity database.
+
+**Read [`docs/MULTI_TENANCY.md`](docs/MULTI_TENANCY.md)** for the full
+decision record, the per-resource isolation table, and every disclosed
+limitation.
 
 ## How to run
 

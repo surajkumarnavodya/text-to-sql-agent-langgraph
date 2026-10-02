@@ -162,7 +162,7 @@ class TestRetrieveSchemaNodeDatabaseRouting:
     def test_first_pass_calls_select_database_and_records_the_choice(self, monkeypatch):
         monkeypatch.setattr(
             "agent.nodes.select_database",
-            lambda question, settings: DatabaseSelection(
+            lambda question, settings, tenant_id=None: DatabaseSelection(
                 db_name="hr", top_table_score=0.9, scores_by_db={"hr": 0.9}
             ),
         )

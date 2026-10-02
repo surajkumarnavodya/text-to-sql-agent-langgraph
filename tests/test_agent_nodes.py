@@ -296,7 +296,7 @@ class TestRetrieveGoldenExamplesNode:
         ]
         monkeypatch.setattr(
             "agent.nodes.retrieve_golden_examples",
-            lambda question, db_name, settings: fake_examples,
+            lambda question, db_name, settings, tenant_id=None: fake_examples,
         )
 
         result = retrieve_golden_examples_node(
@@ -308,7 +308,8 @@ class TestRetrieveGoldenExamplesNode:
 
     def test_no_matches_returns_none_not_empty_list(self, monkeypatch):
         monkeypatch.setattr(
-            "agent.nodes.retrieve_golden_examples", lambda question, db_name, settings: []
+            "agent.nodes.retrieve_golden_examples",
+            lambda question, db_name, settings, tenant_id=None: [],
         )
 
         result = retrieve_golden_examples_node({"question": "anything", "selected_database": None})
@@ -338,7 +339,7 @@ class TestRetrieveGoldenExamplesNode:
         accuracy aid, not a required step (same philosophy as
         plan_query_node)."""
 
-        def _raise(question, db_name, settings):
+        def _raise(question, db_name, settings, tenant_id=None):
             raise RuntimeError("chroma unavailable")
 
         monkeypatch.setattr("agent.nodes.retrieve_golden_examples", _raise)
@@ -353,8 +354,9 @@ class TestRetrieveGoldenExamplesNode:
     def test_defaults_to_the_default_database_when_none_selected(self, monkeypatch):
         captured = {}
 
-        def _capture(question, db_name, settings):
+        def _capture(question, db_name, settings, tenant_id=None):
             captured["db_name"] = db_name
+            captured["tenant_id"] = tenant_id
             return []
 
         monkeypatch.setattr("agent.nodes.retrieve_golden_examples", _capture)
@@ -362,6 +364,40 @@ class TestRetrieveGoldenExamplesNode:
         retrieve_golden_examples_node({"question": "anything", "selected_database": None})
 
         assert captured["db_name"] == "default"
+
+    def test_passes_the_requests_tenant_through_to_retrieval(self, monkeypatch):
+        """Prompt 20: the node must forward `state["tenant_id"]` (resolved
+        once by `run_agent` from the verified identity) so only this
+        tenant's own approved examples can reach the generation prompt."""
+        captured = {}
+
+        def _capture(question, db_name, settings, tenant_id=None):
+            captured["tenant_id"] = tenant_id
+            return []
+
+        monkeypatch.setattr("agent.nodes.retrieve_golden_examples", _capture)
+
+        retrieve_golden_examples_node(
+            {"question": "anything", "selected_database": "default", "tenant_id": "tenant_a"}
+        )
+
+        assert captured["tenant_id"] == "tenant_a"
+
+    def test_a_state_without_a_tenant_falls_back_to_the_default_tenant(self, monkeypatch):
+        """Never `None`: an absent tenant must resolve to the default tenant,
+        not to "no filter," which would be the one value that could widen
+        retrieval across tenants."""
+        captured = {}
+
+        def _capture(question, db_name, settings, tenant_id=None):
+            captured["tenant_id"] = tenant_id
+            return []
+
+        monkeypatch.setattr("agent.nodes.retrieve_golden_examples", _capture)
+
+        retrieve_golden_examples_node({"question": "anything", "selected_database": "default"})
+
+        assert captured["tenant_id"] == "default"
 
 
 class TestClassifyAnalyticalIntentNode:

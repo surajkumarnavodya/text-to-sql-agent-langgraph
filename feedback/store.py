@@ -44,6 +44,7 @@ from chromadb.api.models.Collection import Collection
 from config.settings import Settings, get_settings
 from embeddings.schema_indexer import get_chroma_client, get_embedding_function
 from security.redaction import redact_secrets
+from security.tenancy import DEFAULT_TENANT_ID
 
 logger = logging.getLogger(__name__)
 
@@ -83,6 +84,7 @@ def save_response_feedback(
     comment: str | None = None,
     conversation_id: str | None = None,
     settings: Settings | None = None,
+    tenant_id: str = DEFAULT_TENANT_ID,
 ) -> None:
     """Records one like/dislike event against an assistant answer.
 
@@ -105,6 +107,18 @@ def save_response_feedback(
             feedback modal.
         conversation_id: The conversation this turn belongs to, if known.
         settings: Optional `Settings` override (mainly for tests).
+        tenant_id: Which tenant submitted this feedback (Prompt 20),
+            resolved server-side from the caller's verified identity. This
+            collection is deliberately shared across databases (unlike
+            `embeddings.golden_examples`'), so recording the tenant is what
+            makes a later per-tenant read of the log possible at all --
+            every row here holds a real user's question and the answer text
+            they read. Note the asymmetry with golden examples, and why it
+            is safe: nothing ever *retrieves* from this collection into a
+            prompt (it is a read-later log, see this module's docstring), so
+            there is no retrieval path a tenant filter would need to guard.
+            The tenant is stored so that reading the log back stays
+            partitionable; it is not a runtime access control.
 
     Never raises -- see this module's docstring.
     """
@@ -123,6 +137,7 @@ def save_response_feedback(
                     "sources_used": ",".join(sources_used) if sources_used else "",
                     "comment": _truncate(comment),
                     "conversation_id": conversation_id or "",
+                    "tenant_id": tenant_id,
                     "created_at": datetime.now(UTC).isoformat(),
                 }
             ],

@@ -53,10 +53,11 @@ from typing import Any
 
 from config.settings import Settings
 from retrieval.embeddings import EmbeddingError, EmbeddingProvider, get_embedding_provider
-from retrieval.models import ChunkType, ScoredChunk
+from retrieval.models import Chunk, ChunkType, ScoredChunk
 from retrieval.reranker import rerank
 from retrieval.vector_store import VectorStore, VectorStoreError, get_vector_store
 from security.redaction import redact_secrets
+from security.tenancy import DEFAULT_TENANT_ID
 
 logger = logging.getLogger(__name__)
 
@@ -138,16 +139,50 @@ def _per_type_top_k(settings: Settings) -> dict[ChunkType, int]:
     }
 
 
+def _chunk_tenant_id(chunk: Chunk) -> str:
+    """Which tenant a chunk belongs to (Prompt 20).
+
+    `DEFAULT_TENANT_ID` whenever no tenant is recorded, which covers every
+    chunk this codebase derives from *operator-authored* sources -- live
+    schema introspection and the `data/knowledge/*.yaml` files -- since
+    those are deployment configuration shared by every tenant permitted to
+    query that database, not one tenant's private content. The only chunks
+    that carry a real tenant are `BUSINESS_CONCEPT` ones, rendered from a
+    published `semantic.catalog.CatalogEntrySnapshot`, which is itself
+    tenant-scoped at rest.
+    """
+    recorded = chunk.extra.get("tenant_id") if chunk.extra else None
+    return recorded if isinstance(recorded, str) and recorded else DEFAULT_TENANT_ID
+
+
 def _filter_candidates(
     candidates: list[ScoredChunk],
     caller_roles: tuple[str, ...],
     similarity_threshold: float,
     top_k: int,
+    tenant_id: str,
 ) -> list[ScoredChunk]:
+    """Drops candidates below the similarity threshold, invisible to the
+    caller's roles, or belonging to another tenant.
+
+    The tenant check is applied here -- alongside the pre-existing role
+    check, before reranking and before the context budget -- rather than at
+    the vector-store query: `retrieval.vector_store.VectorStore
+    .similarity_search` is a shared interface whose implementations this
+    module does not own, and threading a new metadata predicate through it
+    would have changed a contract several callers depend on. Filtering the
+    returned candidates is equivalent here because `_OVER_FETCH_MULTIPLIER`
+    already fetches well past `top_k`, so excluded rows cost recall only in
+    the pathological case where another tenant's concepts outscore every one
+    of this tenant's -- in which case the correct result really is "fewer
+    chunks," never "someone else's."
+    """
     filtered = [
         c
         for c in candidates
-        if c.vector_similarity >= similarity_threshold and c.chunk.is_visible_to(caller_roles)
+        if c.vector_similarity >= similarity_threshold
+        and c.chunk.is_visible_to(caller_roles)
+        and _chunk_tenant_id(c.chunk) == tenant_id
     ]
     filtered.sort(key=lambda c: c.vector_similarity, reverse=True)
     return filtered[:top_k]
@@ -203,6 +238,7 @@ def retrieve_business_context(
     settings: Settings,
     vector_store: VectorStore | None = None,
     embedding_provider: EmbeddingProvider | None = None,
+    tenant_id: str = DEFAULT_TENANT_ID,
 ) -> RetrievalResult:
     """Retrieves and ranks business-context chunks for one question.
 
@@ -221,6 +257,14 @@ def retrieve_business_context(
             `retrieval.vector_store.get_vector_store(settings)`.
         embedding_provider: Optional override (mainly for tests) -- defaults
             to `retrieval.embeddings.get_embedding_provider(settings)`.
+        tenant_id: Which tenant is asking (Prompt 20,
+            `AgentState["tenant_id"]`). Only chunks belonging to this tenant
+            -- plus the operator-authored schema/knowledge chunks every
+            tenant permitted to query this database shares -- are ever
+            returned; see `_chunk_tenant_id`. Defaults to
+            `security.tenancy.DEFAULT_TENANT_ID`, which is where every
+            pre-Prompt-20 chunk already effectively lived, so an existing
+            index keeps behaving identically.
 
     Returns:
         A `RetrievalResult` -- always, never raises. `warnings` is non-empty
@@ -276,7 +320,7 @@ def retrieve_business_context(
                 database_id, query_vector, top_k=over_fetch, chunk_types=[chunk_type]
             )
             selected = _filter_candidates(
-                raw, caller_roles, settings.retrieval_similarity_threshold, top_k
+                raw, caller_roles, settings.retrieval_similarity_threshold, top_k, tenant_id
             )
             counts_by_type[chunk_type.value] = len(selected)
             all_candidates.extend(selected)
@@ -313,6 +357,7 @@ def retrieve_business_context(
             warnings=warnings,
             metadata={
                 "database_id": database_id,
+                "tenant_id": tenant_id,
                 "candidate_count": len(all_candidates),
                 "final_count": len(final_items),
                 "counts_by_type": counts_by_type,
