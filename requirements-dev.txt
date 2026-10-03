@@ -39,7 +39,7 @@ pytest==9.1.1
 # force through. UPSTREAM FIX REQUIRED for a 24.x-line patch; re-evaluate
 # the 26.x reformat as its own reviewed change, not bundled with a security
 # pass.
-black==24.10.0
+black==26.3.1
 ruff==0.8.4
 mypy==1.13.0
 types-PyYAML==6.0.12.20260815
