@@ -3494,6 +3494,36 @@ proven directly (`tests/test_api_tenant_admin.py
 **Read [`29_TENANT_ADMIN_DASHBOARD_CONTRACT.md`](29_TENANT_ADMIN_DASHBOARD_CONTRACT.md)**
 for the full prompt text and outcome summary.
 
+### Analytics & Insights panels in the answered turn (Prompt 30)
+No new page: the analysis renders under each answered question's insight
+in `TurnCard.tsx` (`frontend/src/components/analytics/AnalyticsSummary.tsx`),
+gated like the insight itself (after "Confirm and Run", and only while the
+SQL box still holds the SQL that produced the answer). It is lazy-loaded
+like `ChartSection`, so Chart.js stays out of the main bundle -- do not
+statically import any analytics panel from `TurnCard.tsx`.
+
+It renders only from already-computed backend state and never recomputes a
+statistic. `AskResponse` gained four additive pass-through fields
+(`analytical_intent`, `analytical_plan`, `governing_metrics`,
+`restricted_field_notice`); `ExecuteResponse.cache_status` mirrors the
+`X-Cache` header into the JSON body. The restricted notice is a presentation
+translation of an existing failure category; the restricted-column gate and
+its retry behavior are unchanged.
+
+Every database-originated label goes through `lib/analyticsCharts.ts`'s
+`sanitizeLabel` before it is shown or fed into a drill-down question (master
+rule 8). Every claim shows its truth level (`TruthLevelBadge`). Charts reuse
+`ResultChart`/`PreparedChart`; no second chart engine.
+
+Known gaps (see the contract for detail): reloaded past turns show no
+analysis (analytics fields are not in persisted message metadata);
+`cache_status` is session-only; `visualization_spec` is still not consumed;
+root-cause attribution is not wired into the live graph; query scope is
+read-only.
+
+**Read [`30_ANALYTICS_INSIGHTS_DASHBOARD_CONTRACT.md`](30_ANALYTICS_INSIGHTS_DASHBOARD_CONTRACT.md)**
+for the full prompt text and outcome summary.
+
 
 ## How to run
 

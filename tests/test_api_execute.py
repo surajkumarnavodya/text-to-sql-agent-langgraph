@@ -400,6 +400,28 @@ class TestResultCache:
         assert second.headers["X-Cache"] == "HIT"
         assert second.json()["result_rows"] == first.json()["result_rows"]
 
+    def test_cache_status_in_body_mirrors_the_x_cache_header(self, monkeypatch, client):
+        """Prompt 30 -- the JSON-body mirror of X-Cache, so a client that
+        reads only JSON (the frontend's request() helper discards headers)
+        can still tell a cache hit from a live result."""
+        settings = Settings(**{**_BASE_SETTINGS.__dict__, "enable_result_cache": True})
+        monkeypatch.setattr("api.main.get_settings", lambda: settings)
+        monkeypatch.setattr("db.result_cache.load_sensitive_columns", lambda: {})
+        monkeypatch.setattr("api.main.execute_readonly_sql", lambda *a, **k: (["a"], [(1,)]))
+
+        first = client.post("/execute", json={"sql": "SELECT a FROM t"}).json()
+        second = client.post("/execute", json={"sql": "SELECT a FROM t"}).json()
+
+        assert first["cache_status"] == "miss"
+        assert second["cache_status"] == "hit"
+
+    def test_cache_status_is_null_when_the_cache_is_disabled(self, monkeypatch, client):
+        monkeypatch.setattr("api.main.execute_readonly_sql", lambda *a, **k: (["a"], [(1,)]))
+
+        body = client.post("/execute", json={"sql": "SELECT a FROM t"}).json()
+
+        assert body["cache_status"] is None
+
     def test_restricted_column_sql_is_never_cached_even_when_enabled(self, monkeypatch, client):
         settings = Settings(**{**_BASE_SETTINGS.__dict__, "enable_result_cache": True})
         monkeypatch.setattr("api.main.get_settings", lambda: settings)

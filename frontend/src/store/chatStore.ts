@@ -252,6 +252,13 @@ function emptyAskResponse(message: string): AskResponse {
     followup_classification: null,
     followup_resolved_against: null,
     permission_denied_notice: null,
+    analytical_result: null,
+    forecast_result: null,
+    recommendations: [],
+    analytical_intent: null,
+    analytical_plan: null,
+    governing_metrics: [],
+    restricted_field_notice: null,
   }
 }
 
@@ -505,6 +512,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
               response.chart_recommendation,
               response.truncated,
               durationMs,
+              response.cache_status,
             )
           : withConfirmedError(entry, response.error ?? 'Execution failed.')
       set((state) => commitQueryHistory(state, replaceEntry(state.queryHistory, entryId, updated)))

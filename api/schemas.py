@@ -553,6 +553,122 @@ class ForecastResultOut(BaseModel):
     engine_version: str
 
 
+class AnalyticalIntentOut(BaseModel):
+    """Mirrors `agent.intent.AnalyticalIntentClassification` -- Prompt 11's
+    per-question classification, always `ai_inference`. Surfaced so the
+    analytics dashboard can choose which panels to emphasize (a TREND
+    question leads with the trend panel, a RANKING question with the
+    ranking panel) and show an honest ambiguity notice -- never a
+    confirmed fact."""
+
+    model_config = ConfigDict(frozen=True)
+
+    intent: str
+    confidence: float
+    metric_candidates: tuple[str, ...] = ()
+    dimensions: tuple[str, ...] = ()
+    time_requirement: str | None = None
+    comparison: str | None = None
+    filters: tuple[str, ...] = ()
+    expected_result_shape: str | None = None
+    ambiguity_flags: tuple[str, ...] = ()
+    truth_level: str
+
+
+class PlanMetricOut(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    name: str
+    table: str | None = None
+    column: str | None = None
+    aggregation: str = "none"
+    governed_metric_key: str | None = None
+
+
+class PlanDimensionOut(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    name: str
+    table: str
+    column: str
+
+
+class PlanFilterOut(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    table: str
+    column: str
+    operator: str
+    value: str
+
+
+class PlanTimeRangeOut(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    table: str
+    column: str
+    description: str
+
+
+class PlanComparisonOut(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    kind: str
+    description: str
+
+
+class PlanRankingOut(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    order_by: str
+    direction: str = "desc"
+    top_n: int | None = None
+    per_group: tuple[str, ...] = ()
+
+
+class PlanSortOut(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    field: str
+    direction: str = "desc"
+
+
+class AnalyticalPlanOut(BaseModel):
+    """Mirrors `agent.analytical_plan.AnalyticalPlan` -- Prompt 12's
+    deterministically re-verified plan. Read-only context for the analytics
+    dashboard's "query scope" display (metrics, breakdown dimensions,
+    filters, time window, ranking) -- never a way to change the query."""
+
+    model_config = ConfigDict(frozen=True)
+
+    metrics: tuple[PlanMetricOut, ...] = ()
+    dimensions: tuple[PlanDimensionOut, ...] = ()
+    filters: tuple[PlanFilterOut, ...] = ()
+    time_range: PlanTimeRangeOut | None = None
+    grain: str | None = None
+    comparison: PlanComparisonOut | None = None
+    ranking: PlanRankingOut | None = None
+    sort: tuple[PlanSortOut, ...] = ()
+    limit: int | None = None
+    required_operations: tuple[str, ...] = ()
+    truth_level: str
+
+
+class GoverningMetricOut(BaseModel):
+    """One published, `CONFIRMED_BUSINESS_TRUTH` metric definition this
+    question was answered against -- mirrors the dicts
+    `retrieval.retriever.extract_governing_metrics` returns. `approved_expression`
+    is the reviewed definition itself, shown as the semantic definition the
+    answer is grounded in."""
+
+    model_config = ConfigDict(frozen=True)
+
+    business_name: str
+    approved_expression: str | None = None
+    aggregation: str | None = None
+    text: str
+
+
 class ConversationExchangeOut(BaseModel):
     """Mirrors `agent.state.ConversationExchange` -- the specific prior turn
     a "followup" question was resolved against, for a client to render a
@@ -714,6 +830,45 @@ class AskResponse(BaseModel):
             "analyst/admin) -- that source was dropped and the question was answered "
             "from whatever remained instead, which may not match what was asked. "
             "None when nothing was denied."
+        ),
+    )
+    # Prompt 30 (30_ANALYTICS_INSIGHTS_DASHBOARD_CONTRACT.md) -- all four are
+    # additive, all default to "nothing to report," and every one is a
+    # pass-through of state a prior prompt already computed and never exposed.
+    analytical_intent: AnalyticalIntentOut | None = Field(
+        default=None,
+        description=(
+            "Prompt 11's classification of what kind of analytical question this was "
+            "(agent.intent.AnalyticalIntentClassification). Always ai_inference -- a "
+            "classification, never a confirmed fact. None when intent classification "
+            "is disabled or unavailable."
+        ),
+    )
+    analytical_plan: AnalyticalPlanOut | None = Field(
+        default=None,
+        description=(
+            "Prompt 12's deterministically validated plan (metrics, dimensions, filters, "
+            "time range, ranking). Read-only context for display -- never a way to change "
+            "the executed query. None when planning was skipped or the plan failed "
+            "deterministic validation (in which case no plan was ever trusted)."
+        ),
+    )
+    governing_metrics: list[GoverningMetricOut] = Field(
+        default_factory=list,
+        description=(
+            "Published, CONFIRMED_BUSINESS_TRUTH metric definitions this question was "
+            "answered against (Prompt 10). Empty when no governed metric matched -- the "
+            "common case."
+        ),
+    )
+    restricted_field_notice: str | None = Field(
+        default=None,
+        description=(
+            "Set when this question's generated SQL repeatedly referenced a column the "
+            "caller's role may not view (VIEW_RESTRICTED_COLUMNS), so the answer could "
+            "not be produced. A presentation-only translation of an already-computed "
+            "failure category -- the restricted-column check itself and its retry "
+            "behavior are unchanged. None otherwise."
         ),
     )
 
@@ -885,6 +1040,16 @@ class ExecuteResponse(BaseModel):
             "result may be missing rows beyond that cap. The UI must show a "
             "visible notice (and a chart, if the user requests one, must "
             "disclose it only reflects the returned/possibly-truncated rows)."
+        ),
+    )
+    cache_status: Literal["hit", "miss"] | None = Field(
+        default=None,
+        description=(
+            "Prompt 30 -- the same signal as the X-Cache response header (Prompt 22's "
+            "result cache), mirrored into the JSON body so a client that reads only "
+            "JSON can tell a served-from-cache result from a live one. 'hit' means no "
+            "database round trip happened for this response. None when the result "
+            "cache is disabled or this SQL is not cacheable."
         ),
     )
     visualization_spec: VisualizationSpecOut | None = Field(

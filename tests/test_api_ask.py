@@ -522,6 +522,133 @@ class TestAsk:
         assert right_token.status_code == 200
 
 
+class TestAnalyticsFieldPassThrough:
+    """Prompt 30 -- the analytics dashboard's new AskResponse fields are pure
+    pass-throughs of state earlier prompts already computed. These tests pin
+    the wiring (state key -> typed response field), not the computations
+    themselves, which each have their own dedicated test suites."""
+
+    def _state(self, **overrides: object) -> AgentState:
+        base: dict = {
+            "status": "succeeded",
+            "sql": "SELECT region, SUM(x) FROM t GROUP BY region",
+            "result_columns": ["region", "x"],
+            "result_rows": [("West", 5)],
+            "row_count": 1,
+            "retry_count": 0,
+            "attempt_history": [],
+            "error_history": [],
+        }
+        base.update(overrides)
+        return base  # type: ignore[return-value]
+
+    def test_intent_plan_and_governing_metrics_are_surfaced(self, monkeypatch, client):
+        intent = {
+            "intent": "ranking",
+            "confidence": 0.9,
+            "metric_candidates": ("revenue",),
+            "dimensions": ("region",),
+            "time_requirement": None,
+            "comparison": None,
+            "filters": (),
+            "expected_result_shape": "ranked_list",
+            "ambiguity_flags": (),
+            "truth_level": "ai_inference",
+        }
+        plan = {
+            "metrics": [
+                {
+                    "name": "revenue",
+                    "table": "sales",
+                    "column": "amount",
+                    "aggregation": "sum",
+                    "governed_metric_key": None,
+                }
+            ],
+            "dimensions": [{"name": "region", "table": "sales", "column": "region"}],
+            "filters": [],
+            "time_range": None,
+            "grain": None,
+            "comparison": None,
+            "ranking": {"order_by": "revenue", "direction": "desc", "top_n": 5, "per_group": []},
+            "sort": [],
+            "limit": None,
+            "required_operations": [],
+            "truth_level": "ai_inference",
+        }
+        governing = [
+            {
+                "business_name": "Revenue",
+                "approved_expression": "SUM(sales.amount)",
+                "aggregation": "sum",
+                "text": "Revenue is the sum of sales amounts.",
+            }
+        ]
+        monkeypatch.setattr(
+            "api.main.run_orchestrated",
+            lambda *a, **k: self._state(
+                analytical_intent=intent,
+                analytical_plan=plan,
+                governing_metrics=governing,
+            ),
+        )
+
+        body = client.post("/ask", json={"question": "Top regions by revenue"}).json()
+
+        assert body["analytical_intent"]["intent"] == "ranking"
+        assert body["analytical_intent"]["expected_result_shape"] == "ranked_list"
+        assert body["analytical_plan"]["metrics"][0]["aggregation"] == "sum"
+        assert body["analytical_plan"]["ranking"]["top_n"] == 5
+        assert body["governing_metrics"] == [
+            {
+                "business_name": "Revenue",
+                "approved_expression": "SUM(sales.amount)",
+                "aggregation": "sum",
+                "text": "Revenue is the sum of sales amounts.",
+            }
+        ]
+
+    def test_new_fields_default_to_empty_for_a_state_that_predates_them(self, monkeypatch, client):
+        monkeypatch.setattr("api.main.run_orchestrated", lambda *a, **k: self._state())
+
+        body = client.post("/ask", json={"question": "How many rows?"}).json()
+
+        assert body["analytical_intent"] is None
+        assert body["analytical_plan"] is None
+        assert body["governing_metrics"] == []
+        assert body["restricted_field_notice"] is None
+
+    def test_restricted_column_failure_sets_a_plain_language_notice(self, monkeypatch, client):
+        monkeypatch.setattr(
+            "api.main.run_orchestrated",
+            lambda *a, **k: self._state(
+                status="failed",
+                last_error_category="restricted_column",
+                failure_explanation="Agent could not produce a working query.",
+            ),
+        )
+
+        body = client.post("/ask", json={"question": "Show salaries"}).json()
+
+        assert body["status"] == "failed"
+        assert body["restricted_field_notice"] is not None
+        assert "access-restricted" in body["restricted_field_notice"]
+
+    def test_an_unrelated_failure_gets_no_restricted_notice(self, monkeypatch, client):
+        monkeypatch.setattr(
+            "api.main.run_orchestrated",
+            lambda *a, **k: self._state(
+                status="failed",
+                last_error_category="invalid_sql",
+                failure_explanation="Agent could not produce a working query.",
+            ),
+        )
+
+        body = client.post("/ask", json={"question": "Something broken"}).json()
+
+        assert body["restricted_field_notice"] is None
+
+
 def _fake_request(host: str | None, headers: list[tuple[bytes, bytes]] | None = None) -> Request:
     """A minimal duck-typed stand-in for `fastapi.Request` -- `_rate_limit_key`
     only ever reads `request.client.host` (and, since the trusted-proxy
