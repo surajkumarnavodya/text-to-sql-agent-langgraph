@@ -1093,7 +1093,9 @@ class TestReviewSqlNode:
         assert result["plan_review_feedback"] is None
         assert result["status"] == "validating"
 
-    def test_fail_verdict_retries_via_generate_sql_when_budget_remains(self, monkeypatch):
+    def test_fail_verdict_retries_via_generate_sql_when_blocking_and_budget_remains(
+        self, monkeypatch
+    ):
         monkeypatch.setattr(
             "agent.nodes.review_sql_against_plan_from_llm",
             lambda *a, **k: (
@@ -1101,6 +1103,7 @@ class TestReviewSqlNode:
                 "Missing ROW_NUMBER() -- TOP 3 with GROUP BY is not per-group.",
             ),
         )
+        monkeypatch.setattr("agent.nodes.get_settings", lambda: Settings(plan_review_blocking=True))
 
         state: AgentState = {
             "sql": "SELECT TOP 3 region, SUM(rev) FROM t GROUP BY region",
@@ -1118,14 +1121,38 @@ class TestReviewSqlNode:
         assert result["retry_count"] == 1
         assert "Plan review" in result["error_history"][0]
 
-    def test_fail_verdict_is_advisory_once_retries_are_exhausted(self, monkeypatch):
-        """Budget exhausted on a plan-review FAIL alone: the query is carried
-        forward to validation (validator + read-only execution remain the gate),
-        not reported as "could not produce a working query"."""
+    def test_fail_verdict_is_advisory_by_default_and_never_consumes_the_budget(self, monkeypatch):
+        """The default. A reviewer FAIL alone must not block or retry -- the
+        reviewer rejected correct SQL on every attempt in production. The query
+        goes to validation with the critique recorded."""
         monkeypatch.setattr(
             "agent.nodes.review_sql_against_plan_from_llm",
             lambda *a, **k: (False, "Still missing the window function."),
         )
+        monkeypatch.setattr("agent.nodes.get_settings", lambda: Settings())
+
+        state: AgentState = {
+            "sql": "SELECT TOP 3 region, SUM(rev) FROM t GROUP BY region",
+            "retry_count": 0,
+            "query_plan": ["Group by region", "Use ROW_NUMBER() partitioned by region"],
+        }
+        result = review_sql_node(state)
+
+        assert result["status"] == "validating"
+        assert "retry_count" not in result
+        assert result["attempt_history"][0]["outcome"] == "plan_not_satisfied_advisory"
+        assert result["attempt_history"][0]["will_retry"] is False
+        assert "failure_explanation" not in result
+        assert result["plan_review_feedback"] == "Still missing the window function."
+
+    def test_fail_verdict_is_advisory_once_blocking_retries_are_exhausted(self, monkeypatch):
+        """Blocking mode, budget spent: still carried forward to validation, not
+        reported as "could not produce a working query"."""
+        monkeypatch.setattr(
+            "agent.nodes.review_sql_against_plan_from_llm",
+            lambda *a, **k: (False, "Still missing the window function."),
+        )
+        monkeypatch.setattr("agent.nodes.get_settings", lambda: Settings(plan_review_blocking=True))
 
         state: AgentState = {
             "sql": "SELECT TOP 3 region, SUM(rev) FROM t GROUP BY region",
@@ -1135,7 +1162,7 @@ class TestReviewSqlNode:
         result = review_sql_node(state)
 
         assert result["status"] == "validating"
-        assert result["attempt_history"][0]["outcome"] == "plan_not_satisfied_advisory"
+        assert result["attempt_history"][0]["outcome"] == "plan_not_satisfied"
         assert result["attempt_history"][0]["will_retry"] is False
         assert "failure_explanation" not in result
         assert result["plan_review_feedback"] == "Still missing the window function."
@@ -1173,6 +1200,7 @@ class TestReviewSqlNode:
             "agent.nodes.review_sql_against_plan_from_llm",
             lambda *a, **k: (False, "still wrong"),
         )
+        monkeypatch.setattr("agent.nodes.get_settings", lambda: Settings(plan_review_blocking=True))
 
         state: AgentState = {
             "sql": "SELECT TOP 3 region, SUM(rev) FROM t GROUP BY region",

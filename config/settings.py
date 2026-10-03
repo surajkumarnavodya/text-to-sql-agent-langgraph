@@ -1764,6 +1764,17 @@ class Settings(BaseSettings):
     enable_query_planning: bool = True
     query_plan_max_tokens: int = Field(default=300, gt=0)
     sql_review_max_tokens: int = Field(default=200, gt=0)
+    # Whether a plan-review FAIL verdict (`agent.nodes.review_sql_node`)
+    # blocks the query and triggers a regeneration. False (advisory) by
+    # default: the reviewer is a local LLM and was observed rejecting correct
+    # SQL on every attempt (a bare `Region` judged against a plan step written
+    # as `vDMPrep.Region`, and a semantically-equivalent filter placement),
+    # so a blocking review turned runnable queries into "could not produce a
+    # working query" with no data. Advisory mode still records the critique
+    # on the response, and the deterministic validator plus read-only
+    # execution remain the safety gate. Set PLAN_REVIEW_BLOCKING=true to
+    # restore strict, retrying review.
+    plan_review_blocking: bool = False
     # Prompt 10 (10_GOVERNED_METRICS_CONTRACT.md): gates
     # agent.nodes.review_metric_conformance_node's LLM call. True by
     # default -- the node is already a pure pass-through with zero cost

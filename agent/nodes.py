@@ -1237,9 +1237,11 @@ def review_sql_node(state: AgentState) -> dict[str, Any]:
     critique becomes this attempt's error feedback for the next
     `generate_sql` call, sharing the same `retry_count`/`state["max_retries"]`
     budget as every other retryable failure category -- not a separate,
-    unbounded critique loop layered on top. Once that budget is spent, a
-    FAIL alone no longer blocks: the query proceeds to validation with the
-    critique recorded as advisory (see the branch below).
+    unbounded critique loop layered on top -- but only when
+    `Settings.plan_review_blocking` is on. By default (advisory) a FAIL never
+    blocks or retries: the query proceeds to validation with the critique
+    recorded, because the reviewer is a local LLM that has rejected correct
+    SQL. The validator and read-only execution remain the gate either way.
 
     Fails open on any review failure -- an unreachable Ollama server, or a
     verdict `agent.llm_client._parse_review_response` couldn't parse as a
@@ -1273,10 +1275,16 @@ def review_sql_node(state: AgentState) -> dict[str, Any]:
 
     retry_count = state.get("retry_count", 0)
     max_retries = _effective_max_retries(state, settings)
-    can_retry = retry_count < max_retries
+    # Advisory unless the operator opted into blocking review. The reviewer is
+    # a local LLM and was observed rejecting correct SQL on every attempt, so
+    # a FAIL alone never consumes the retry budget by default. The critique is
+    # still recorded and the validator plus read-only execution still gate.
+    blocking = settings.plan_review_blocking
+    can_retry = blocking and retry_count < max_retries
     logger.warning(
-        "[review_sql] attempt %d: plan not satisfied (retry %d/%d, will_retry=%s): %s",
+        "[review_sql] attempt %d: plan not satisfied (blocking=%s, retry %d/%d, will_retry=%s): %s",
         attempt_number,
+        blocking,
         retry_count,
         max_retries,
         can_retry,
@@ -1285,25 +1293,20 @@ def review_sql_node(state: AgentState) -> dict[str, Any]:
     record: AttemptRecord = {
         "attempt": attempt_number,
         "sql": sql,
-        "outcome": "plan_not_satisfied",
+        "outcome": "plan_not_satisfied" if blocking else "plan_not_satisfied_advisory",
         "error": feedback,
         "will_retry": can_retry,
     }
     if not can_retry:
-        # Budget exhausted on a review verdict alone. The reviewer is an LLM
-        # accuracy aid and can reject a correct query (e.g. judging a bare
-        # `Region` against a plan step written as `vDMPrep.Region`). Blocking
-        # here turned a runnable query into "could not produce a working
-        # query". The deterministic validator and read-only execution still run
-        # next, so the query is carried forward with the objection recorded.
-        logger.warning(
-            "[review_sql] plan review budget exhausted; proceeding to validation with advisory feedback"
-        )
+        # Advisory (or budget exhausted on a review verdict alone): carry the
+        # query forward to validation with the critique recorded, rather than
+        # reporting "could not produce a working query" for SQL the reviewer
+        # merely disagreed with.
         return {
             "plan_review_passed": False,
             "plan_review_feedback": feedback,
             "error_history": [f"Plan review (advisory, not blocking): {feedback}"],
-            "attempt_history": [{**record, "outcome": "plan_not_satisfied_advisory"}],
+            "attempt_history": [record],
             "status": "validating",
         }
     return {
