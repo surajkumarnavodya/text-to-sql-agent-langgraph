@@ -1,4 +1,13 @@
-import { BookOpen, Database, ImageIcon, MessageSquare, Plug, ShieldAlert, ShieldCheck } from 'lucide-react'
+import {
+  BookOpen,
+  Building2,
+  Database,
+  ImageIcon,
+  MessageSquare,
+  Plug,
+  ShieldAlert,
+  ShieldCheck,
+} from 'lucide-react'
 import { useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { NavLink, Outlet } from 'react-router-dom'
@@ -59,6 +68,17 @@ export function AppShell() {
   // folded into `canSeeReviewTabs`, specifically so a tenant's own admin
   // never sees a tab that would 403 for them.
   const canSeePlatformAdmin = Boolean(localUser?.roles.includes('platform_admin'))
+  // Tenant Admin (Prompt 29) introduces no new permission/role at all --
+  // it's visible to the same roles `identity.rbac
+  // .Permission.ADMIN_DASHBOARD_READ` already grants (admin/auditor/
+  // manager), a different set from `canSeeReviewTabs`'s admin/analyst
+  // (an analyst has no business-administration capability; an
+  // auditor/manager has no onboarding/catalog-review capability).
+  const canSeeTenantAdmin = Boolean(
+    localUser?.roles.includes('admin') ||
+      localUser?.roles.includes('auditor') ||
+      localUser?.roles.includes('manager'),
+  )
   const sidebarCollapsed = useSettingsStore((state) => state.sidebarCollapsed)
   // Passed to both UserMenu (attaches it to the avatar button) and
   // SettingsDialog (restores focus there on close) -- see
@@ -112,6 +132,9 @@ export function AppShell() {
               )}
               {canSeePlatformAdmin && (
                 <NavTab to="/platform-admin" icon={ShieldAlert} label={t('nav.platformAdmin')} />
+              )}
+              {canSeeTenantAdmin && (
+                <NavTab to="/tenant-admin" icon={Building2} label={t('nav.tenantAdmin')} />
               )}
             </nav>
 

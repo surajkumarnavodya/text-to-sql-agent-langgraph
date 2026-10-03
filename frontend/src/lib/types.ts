@@ -1165,3 +1165,89 @@ export interface PerformanceMetricsResponse {
   result_cache_misses: number
   database_concurrency_rejections: number
 }
+
+// --- Tenant/client admin dashboard (api/tenant_admin.py, Prompt 29) --
+// mirrors api/tenant_admin_schemas.py's own new shapes. Every other type
+// this dashboard needs (TenantOut, PlatformUserOut, RoleOut,
+// DatabaseStatusOut, SecurityEventOut, AssignRoleRequest) is the exact
+// same type the platform-admin dashboard already defined above, reused
+// as-is -- only the query scope differs, enforced server-side. ---
+
+export interface SemanticCatalogStatusOut {
+  draft_count: number
+  reviewed_count: number
+  published_count: number
+  superseded_count: number
+}
+
+export interface PendingReviewsOut {
+  onboarding_pending_by_type: Record<string, number>
+  catalog_pending_count: number
+  total_pending: number
+}
+
+export interface GoldenQuestionsSummaryOut {
+  job_id: string
+  database_label: string
+  question_count: number
+}
+
+export interface EvaluationSummaryOut {
+  job_id: string
+  database_label: string
+  pass_count: number
+  total_count: number
+  evaluated_at: string
+}
+
+// --- Recommendation governance (api/recommendation_governance.py,
+// Prompt 17/18) -- the first frontend consumer of this API; mirrors
+// api/recommendation_governance_schemas.py. Reused read-only by this
+// dashboard (list + quality metrics only); the fuller feedback/resolve/
+// expire governance workflow is a disclosed, deliberately deferred
+// follow-up, matching this codebase's own "compute + test, defer
+// deepest UI wiring" precedent already used elsewhere (e.g. Prompt 15's
+// visualization_spec). ---
+
+export type RecommendationStatus =
+  | 'generated'
+  | 'reviewed'
+  | 'accepted'
+  | 'rejected'
+  | 'partially_useful'
+  | 'incorrect'
+  | 'resolved'
+  | 'expired'
+
+export interface RecommendationRecordOut {
+  id: string
+  tenant_id: string
+  database_id: string
+  category: string | null
+  kind: string
+  rule_or_model: string | null
+  claim_text: string
+  rationale: string | null
+  affected_entity: string | null
+  action: string | null
+  measurable_impact: string | null
+  confidence: number | null
+  evidence: Record<string, unknown>[]
+  limitations: string[]
+  engine_version: string
+  evidence_version: string
+  status: RecommendationStatus
+  generated_at: string
+  source_question: string | null
+  source_sql: string | null
+  created_at: string
+  updated_at: string
+}
+
+export interface RecommendationQualityMetricsOut {
+  total: number
+  by_status: Record<string, number>
+  by_category: Record<string, Record<string, number>>
+  judged_total: number
+  acceptance_rate: number | null
+}

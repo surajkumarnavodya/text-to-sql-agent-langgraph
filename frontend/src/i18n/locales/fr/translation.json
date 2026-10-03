@@ -50,7 +50,8 @@
     "mediaSearch": "Recherche de médias",
     "dbOnboarding": "Intégration de base de données",
     "semanticReview": "Revue sémantique (expert)",
-    "platformAdmin": "Administration de la plateforme"
+    "platformAdmin": "Administration de la plateforme",
+    "tenantAdmin": "Administration du client"
   },
   "header": {
     "openHistory": "Ouvrir l'historique du chat",

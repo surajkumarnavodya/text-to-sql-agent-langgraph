@@ -50,7 +50,8 @@
     "mediaSearch": "Búsqueda de medios",
     "dbOnboarding": "Incorporación de bases de datos",
     "semanticReview": "Revisión semántica (SME)",
-    "platformAdmin": "Administración de la plataforma"
+    "platformAdmin": "Administración de la plataforma",
+    "tenantAdmin": "Administración del inquilino"
   },
   "header": {
     "openHistory": "Abrir historial de chat",

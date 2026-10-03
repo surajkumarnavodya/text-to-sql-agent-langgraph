@@ -3385,6 +3385,115 @@ silently worked around:**
 **Read [`28_GLOBAL_PLATFORM_ADMIN_DASHBOARD_CONTRACT.md`](28_GLOBAL_PLATFORM_ADMIN_DASHBOARD_CONTRACT.md)**
 for the full prompt text and outcome summary.
 
+### Client/Tenant Admin Dashboard (Prompt 29)
+The tenant-scoped counterpart to Prompt 28's platform-wide dashboard --
+`frontend/src/pages/TenantAdmin.tsx` + `api/tenant_admin.py`. **Unlike
+Prompt 28, this prompt introduces no new RBAC permission or role at
+all** -- a tenant admin is exactly what the existing, tenant-scoped
+`admin` role already means. Every route resolves `tenant_id` exactly
+once, from `security.tenancy.resolve_actor_tenant_id(user)`, and **no
+route signature in `api/tenant_admin.py` accepts a `tenant_id` parameter
+at all** -- not a check that could be forgotten on one route, but a
+shape no route in the file can violate. This is the structural guarantee
+behind "tenant admins cannot access platform-wide or other-tenant data,"
+proven directly (`tests/test_api_tenant_admin.py::TestTenantIsolation`,
+including a test that a client-supplied `tenant_id` query parameter is
+simply ignored).
+
+**Even heavier reuse than Prompt 28:** `identity.repositories.tenants
+.get_tenant`, `identity.repositories.users.list_users`/
+`list_roles_with_permissions`/`assign_role`/`remove_role`,
+`identity.repositories.semantic_catalog.list_entries`,
+`identity.repositories.onboarding.list_jobs_for_tenant`/
+`list_review_items`/`list_artifacts`, and `Settings.databases_for_tenant`
+all already existed and were already tenant-aware -- every route here is
+a thin aggregation over them. `api/platform_admin_schemas.py`'s
+`TenantOut`/`PlatformUserOut`/`RoleOut`/`DatabaseStatusOut`/
+`SecurityEventOut`/`AssignRoleRequest` are imported and reused directly
+rather than redefined, since the shape a tenant admin needs is identical
+to what the platform dashboard already returns -- only the query scope
+differs, and that's enforced in `api/tenant_admin.py`, not in the schema.
+
+**Two existing routes were confirmed, by reading them, to already be
+tenant-scoped -- so this dashboard calls them directly instead of
+duplicating them:**
+- `GET /metrics/performance` already resolves and scopes to the
+  caller's own tenant (unchanged since it was built) -- but had **zero
+  frontend consumer anywhere in this codebase** before this prompt. New
+  `lib/api.ts::getPerformanceMetrics` + `useTenantPerformanceMetrics` is
+  the first one, for the "AI usage" tab.
+- `GET /recommendations` and `GET /recommendations/metrics`
+  (Prompt 17/18) were already tenant-scoped too, and likewise had **zero
+  frontend consumer** -- their own schema module's docstring literally
+  says "the literal 'expose APIs for later dashboards' requirement."
+  New `lib/tenantAdminApi.ts` functions are that dashboard, for the
+  "Recommendations" tab (list + quality metrics only -- the fuller
+  feedback/resolve/expire governance workflow is a disclosed,
+  deliberately deferred follow-up, matching this codebase's own
+  "compute + test, defer deepest UI wiring" precedent).
+
+**One real, newly-relevant tenant-isolation gap found and closed:**
+`POST /schema/refresh` (`api/main.py`) refreshes *every* configured
+database with no tenant filter at all -- correct for its existing,
+unrelated platform-operator use (gated on `agent.authz
+.Permission.SCHEMA_REFRESH`, a base-role check with no tenant-scoping
+concept at all), but wrong to hand a tenant-admin dashboard as-is: a
+tenant admin triggering it would re-introspect and re-embed *other*
+tenants' databases too. Rather than change that existing route (master-
+contract rule 4: preserve working behavior), a new, genuinely
+tenant-scoped `POST /tenant-admin/databases/refresh` loops only
+`Settings.databases_for_tenant(caller_tenant_id)`, reusing the exact same
+`embeddings.schema_indexer.refresh_schema_index` function per database --
+proven directly (`tests/test_api_tenant_admin.py
+::TestSchemaRefreshIsTenantScoped::test_refresh_only_touches_the_callers_own_databases`).
+
+**Invariants that must not regress:**
+- **The `platform_admin` role can never be seen or assigned from this
+  dashboard.** `_RESTRICTED_ROLE_NAMES` excludes it from both
+  `GET /tenant-admin/roles`'s own list and
+  `POST /tenant-admin/users/{id}/roles`'s own validation (403, not a
+  silent no-op) -- a cross-tenant role has no legitimate place in a
+  tenant-scoped surface. Proven directly (`tests/test_api_tenant_admin.py
+  ::TestRoleSpecificAccess`).
+- **A cross-tenant role-assignment target is a 404, not a 403 or a
+  success.** `_require_same_tenant_user` 404s both a genuinely
+  nonexistent account and one that exists in a *different* tenant --
+  the identical anti-enumeration posture `api/semantic_catalog.py`/
+  `api/onboarding.py` already established.
+- **Viewing and acting are two different tiers, both pre-existing.**
+  `ADMIN_DASHBOARD_READ` (admin/auditor/manager) gates every `GET` route;
+  `USERS_ASSIGN_ROLES`/`ONBOARDING_MANAGE` (admin only) additionally gate
+  the two write actions (role assignment, schema refresh). The frontend
+  mirrors this: `canSeeTenantAdmin` (admin/auditor/manager) controls the
+  nav tab and page visibility; a separate `canManage` (admin only) inside
+  `TenantAdmin.tsx` controls whether the Users/Databases tabs render
+  their own action controls at all -- UX-only in both cases, the real
+  enforcement is entirely server-side.
+- **Managing an onboarding job's own lifecycle is not re-implemented
+  here.** The Pending Reviews/Golden Questions/Evaluation tabs are
+  read-only summaries that link to the existing `/db-onboarding` and
+  `/semantic-review` pages for the actual review workflow -- the same
+  "link, don't duplicate" precedent `SemanticReview.tsx` already set.
+
+**Known, disclosed limitations:**
+- The Recommendations tab is read-only (list + quality metrics) --
+  submitting feedback, resolving, or expiring a recommendation from this
+  dashboard is not built; an operator uses the underlying
+  `/recommendations/*` routes directly for that today.
+- `identity.repositories.users.list_users`/
+  `identity.repositories.semantic_catalog.list_entries`/
+  `identity.repositories.onboarding.list_jobs_for_tenant` (all reused
+  from Prompt 20/26/27/28) remain simple limit-bounded queries with no
+  cursor/offset pagination -- the identical, already-disclosed limitation
+  Prompt 28 named for its own platform-wide equivalents.
+- The free-text role-name input on the Users tab is not constrained to a
+  dropdown of real role names (same disclosed rough edge Prompt 28's own
+  equivalent control has) -- server-side validation (400 on an unknown
+  role, 403 on `platform_admin`) is the real guardrail.
+
+**Read [`29_TENANT_ADMIN_DASHBOARD_CONTRACT.md`](29_TENANT_ADMIN_DASHBOARD_CONTRACT.md)**
+for the full prompt text and outcome summary.
+
 
 ## How to run
 

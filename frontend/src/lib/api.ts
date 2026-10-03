@@ -23,6 +23,7 @@ import type {
   MessageFeedbackRequest,
   ModelsResponse,
   OcrExtractResponse,
+  PerformanceMetricsResponse,
   SchemaRefreshResponse,
   SensitivityCategory,
   TablesResponse,
@@ -202,6 +203,18 @@ export function getSchemaTables(database?: string): Promise<TablesResponse> {
 
 export function getHealth(): Promise<HealthResponse> {
   return request<HealthResponse>('/health')
+}
+
+/** `GET /metrics/performance` -- a live rollup of this *caller's own
+ * tenant's* recent `/ask` request timings (`observability/metrics.py`).
+ * Had no frontend consumer at all before Prompt 29's tenant-admin
+ * dashboard -- the route itself predates this by several prompts
+ * (originally built "operator-only," reachable only via curl/a direct
+ * tool). Admin-gated server-side (`Permission.ADMIN_CONFIG`); nothing
+ * here is question/answer content, only stage names and aggregate
+ * durations. */
+export function getPerformanceMetrics(): Promise<PerformanceMetricsResponse> {
+  return request<PerformanceMetricsResponse>('/metrics/performance')
 }
 
 /** The Ollama Text-to-SQL model registry (`GET /models`) -- every

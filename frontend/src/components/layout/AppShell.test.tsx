@@ -133,3 +133,45 @@ describe('AppShell Platform Admin nav gating', () => {
     expect(screen.queryByRole('link', { name: /platform admin/i })).not.toBeInTheDocument()
   })
 })
+
+// Prompt 29: Tenant Admin introduces no new role at all -- it's visible to
+// admin/auditor/manager (identity.rbac.Permission.ADMIN_DASHBOARD_READ's
+// own real grant set), a different set from canSeeReviewTabs's
+// admin/analyst (an analyst has no business-administration capability).
+describe('AppShell Tenant Admin nav gating', () => {
+  const initialAuthState = useLocalAuthStore.getState()
+
+  afterEach(() => {
+    useLocalAuthStore.setState(initialAuthState, true)
+  })
+
+  it('shows the Tenant Admin tab for an admin', () => {
+    useLocalAuthStore.setState({ user: { roles: ['admin'] } } as never)
+    renderAppShell()
+    expect(screen.getByRole('link', { name: /tenant admin/i })).toBeInTheDocument()
+  })
+
+  it('shows the Tenant Admin tab for an auditor', () => {
+    useLocalAuthStore.setState({ user: { roles: ['auditor'] } } as never)
+    renderAppShell()
+    expect(screen.getByRole('link', { name: /tenant admin/i })).toBeInTheDocument()
+  })
+
+  it('shows the Tenant Admin tab for a manager', () => {
+    useLocalAuthStore.setState({ user: { roles: ['manager'] } } as never)
+    renderAppShell()
+    expect(screen.getByRole('link', { name: /tenant admin/i })).toBeInTheDocument()
+  })
+
+  it('hides the Tenant Admin tab for a plain user or analyst', () => {
+    useLocalAuthStore.setState({ user: { roles: ['analyst'] } } as never)
+    renderAppShell()
+    expect(screen.queryByRole('link', { name: /tenant admin/i })).not.toBeInTheDocument()
+  })
+
+  it('hides the Tenant Admin tab when signed out', () => {
+    useLocalAuthStore.setState({ user: null } as never)
+    renderAppShell()
+    expect(screen.queryByRole('link', { name: /tenant admin/i })).not.toBeInTheDocument()
+  })
+})

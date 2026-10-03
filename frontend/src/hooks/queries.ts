@@ -4,6 +4,7 @@ import {
   getAttachmentCapabilities,
   getAvailableModels,
   getHealth,
+  getPerformanceMetrics,
   getSchemaTables,
   listDocuments,
   refreshSchema,
@@ -47,6 +48,22 @@ import {
   reviewCatalogEntry,
   updateCatalogEntry,
 } from '@/lib/semanticCatalogApi'
+import {
+  assignTenantUserRole,
+  getTenantPendingReviews,
+  getTenantProfile,
+  getTenantRecommendationQualityMetrics,
+  getTenantSemanticCatalogStatus,
+  listTenantAssignableRoles,
+  listTenantAuditEvents,
+  listTenantDatabases,
+  listTenantEvaluationResults,
+  listTenantGoldenQuestions,
+  listTenantRecommendations,
+  listTenantUsers,
+  refreshTenantDatabases,
+  removeTenantUserRole,
+} from '@/lib/tenantAdminApi'
 import type {
   AssignRoleRequest,
   Collection,
@@ -420,4 +437,96 @@ export function useAuditLogs(params?: { action?: string; resourceType?: string; 
 
 export function useConfigStatus() {
   return useQuery({ queryKey: ['platform-admin-config-status'], queryFn: getConfigStatus })
+}
+
+// --- Tenant/client admin dashboard (api/tenant_admin.py, Prompt 29) ---
+
+export function useTenantProfile() {
+  return useQuery({ queryKey: ['tenant-admin-profile'], queryFn: getTenantProfile })
+}
+
+export function useTenantDatabases() {
+  return useQuery({ queryKey: ['tenant-admin-databases'], queryFn: listTenantDatabases })
+}
+
+export function useRefreshTenantDatabases() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: refreshTenantDatabases,
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: ['tenant-admin-databases'] })
+    },
+  })
+}
+
+export function useTenantUsers() {
+  return useQuery({ queryKey: ['tenant-admin-users'], queryFn: listTenantUsers })
+}
+
+export function useAssignTenantUserRole(userId: string) {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (payload: AssignRoleRequest) => assignTenantUserRole(userId, payload),
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: ['tenant-admin-users'] })
+    },
+  })
+}
+
+export function useRemoveTenantUserRole(userId: string) {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (roleName: string) => removeTenantUserRole(userId, roleName),
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: ['tenant-admin-users'] })
+    },
+  })
+}
+
+export function useTenantAssignableRoles() {
+  return useQuery({ queryKey: ['tenant-admin-roles'], queryFn: listTenantAssignableRoles })
+}
+
+export function useTenantSemanticCatalogStatus() {
+  return useQuery({
+    queryKey: ['tenant-admin-semantic-catalog-status'],
+    queryFn: getTenantSemanticCatalogStatus,
+  })
+}
+
+export function useTenantPendingReviews() {
+  return useQuery({ queryKey: ['tenant-admin-pending-reviews'], queryFn: getTenantPendingReviews })
+}
+
+export function useTenantGoldenQuestions() {
+  return useQuery({ queryKey: ['tenant-admin-golden-questions'], queryFn: listTenantGoldenQuestions })
+}
+
+export function useTenantEvaluationResults() {
+  return useQuery({
+    queryKey: ['tenant-admin-evaluation'],
+    queryFn: listTenantEvaluationResults,
+  })
+}
+
+export function useTenantAuditEvents() {
+  return useQuery({ queryKey: ['tenant-admin-audit'], queryFn: listTenantAuditEvents })
+}
+
+export function useTenantRecommendations() {
+  return useQuery({ queryKey: ['tenant-admin-recommendations'], queryFn: listTenantRecommendations })
+}
+
+export function useTenantRecommendationQualityMetrics() {
+  return useQuery({
+    queryKey: ['tenant-admin-recommendation-metrics'],
+    queryFn: getTenantRecommendationQualityMetrics,
+  })
+}
+
+/** `GET /metrics/performance` -- already tenant-scoped server-side (see
+ * `lib/api.ts::getPerformanceMetrics`'s own docstring), reused directly
+ * rather than duplicated under `/tenant-admin/*`. */
+export function useTenantPerformanceMetrics() {
+  return useQuery({ queryKey: ['tenant-admin-performance-metrics'], queryFn: getPerformanceMetrics })
 }

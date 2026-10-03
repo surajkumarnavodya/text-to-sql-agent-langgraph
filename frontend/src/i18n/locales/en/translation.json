@@ -50,7 +50,8 @@
     "mediaSearch": "Media Search",
     "dbOnboarding": "Database Onboarding",
     "semanticReview": "SME Semantic Review",
-    "platformAdmin": "Platform Admin"
+    "platformAdmin": "Platform Admin",
+    "tenantAdmin": "Tenant Admin"
   },
   "header": {
     "openHistory": "Open chat history",

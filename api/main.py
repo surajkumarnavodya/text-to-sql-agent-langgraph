@@ -125,6 +125,7 @@ from api.schemas import (
 )
 from api.semantic_catalog import router as semantic_catalog_router
 from api.shares import router as shares_router
+from api.tenant_admin import router as tenant_admin_router
 from api.voice import router as voice_router
 from config.settings import ConfigurationError, Settings, configure_logging, get_settings
 from db.connection import (
@@ -386,6 +387,7 @@ app.include_router(onboarding_router)
 app.include_router(semantic_catalog_router)
 app.include_router(recommendation_governance_router)
 app.include_router(platform_admin_router)
+app.include_router(tenant_admin_router)
 
 # No-op when Settings.cors_allowed_origins is empty (the default) -- a
 # same-origin deployment (the built React app served by this same FastAPI

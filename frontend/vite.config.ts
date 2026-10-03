@@ -46,6 +46,8 @@ const BACKEND_ROUTES = [
   // immediately before this one; added here up front rather than found
   // the hard way again.
   '/platform-admin',
+  // Tenant/client admin dashboard (api/tenant_admin.py, Prompt 29).
+  '/tenant-admin',
 ]
 
 export default defineConfig({
