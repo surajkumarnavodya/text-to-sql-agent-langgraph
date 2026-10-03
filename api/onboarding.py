@@ -55,7 +55,7 @@ from api.onboarding_schemas import (
     PublishJobRequest,
     RunDiscoveryRequest,
 )
-from config.settings import get_settings
+from config.settings import ConfigurationError, get_settings
 from db.connection import DatabaseConnectionConfig, build_connection_url, test_connection
 from onboarding.jobs import OnboardingJobError, cancel_job, publish_job, retry_job
 from onboarding.jobs import run_discovery_stage as _run_discovery_stage
@@ -260,6 +260,37 @@ def get_onboarding_job(
     return _job_out(job)
 
 
+def _engine_for_job(job, db_password: str | None):
+    """Builds the throwaway engine a discover/publish call runs against.
+
+    A job created without its connection details (no host, no database name)
+    previously raised a bare `ConfigurationError` here, which surfaced as a
+    generic 500. It is a client-correctable state, so it now answers 422 with a
+    message that names no settings or internals. The job stays where it is, so
+    the caller can see why nothing started.
+    """
+    try:
+        config = _connection_config(
+            db_type=job.db_type,
+            db_host=job.db_host,
+            db_port=job.db_port,
+            db_name=job.db_name,
+            db_user=job.db_user,
+            db_password=db_password,
+            db_schema=job.db_schema,
+        )
+        url = build_connection_url(config)
+    except ConfigurationError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=(
+                "This job is missing connection details (for example the host or database "
+                "name), so it cannot connect to the database."
+            ),
+        ) from exc
+    return create_engine(url, pool_pre_ping=True)
+
+
 @router.post("/jobs/{job_id}/discover", response_model=OnboardingJobOut)
 def run_discovery(
     job_id: uuid.UUID,
@@ -276,16 +307,7 @@ def run_discovery(
             detail=f"Cannot run discovery on a job in status {job.status!r}.",
         )
 
-    config = _connection_config(
-        db_type=job.db_type,
-        db_host=job.db_host,
-        db_port=job.db_port,
-        db_name=job.db_name,
-        db_user=job.db_user,
-        db_password=payload.db_password,
-        db_schema=job.db_schema,
-    )
-    engine = create_engine(build_connection_url(config), pool_pre_ping=True)
+    engine = _engine_for_job(job, payload.db_password)
     try:
         job = _run_discovery_stage(
             session,
@@ -323,6 +345,17 @@ def decide_review_item_route(
     user, session = user_and_session
     job = _require_job(session, job_id)
     _authorize(user, session, OnboardingAction.DECIDE_REVIEW_ITEM, job)
+    # Decisions are frozen once the job leaves review: the published semantic
+    # contract is built from them, so editing one afterward would silently
+    # diverge the recorded decision from what was actually published.
+    if job.status != "awaiting_review":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                "Review decisions can only be recorded while a job is awaiting review "
+                f"(this job is {job.status!r})."
+            ),
+        )
 
     item = get_review_item_by_id(session, item_id)
     if item is None or item.job_id != job.id:
@@ -360,16 +393,7 @@ def publish_onboarding_job(
             detail=f"Cannot publish a job in status {job.status!r}.",
         )
 
-    config = _connection_config(
-        db_type=job.db_type,
-        db_host=job.db_host,
-        db_port=job.db_port,
-        db_name=job.db_name,
-        db_user=job.db_user,
-        db_password=payload.db_password,
-        db_schema=job.db_schema,
-    )
-    engine = create_engine(build_connection_url(config), pool_pre_ping=True)
+    engine = _engine_for_job(job, payload.db_password)
     try:
         try:
             job = publish_job(session, job, engine)

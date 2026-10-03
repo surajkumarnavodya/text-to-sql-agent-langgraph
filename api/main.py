@@ -23,13 +23,13 @@ import logging
 import sys
 import time
 import uuid
-from collections.abc import AsyncIterator, Callable, Mapping
+from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FuturesTimeoutError
 from contextlib import asynccontextmanager
 from functools import cache
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import urlparse
 
 import pandas as pd
@@ -80,12 +80,16 @@ from api.identity_auth import router as identity_auth_router
 from api.media import router as media_router
 from api.media_library import router as media_library_router
 from api.media_search import router as media_search_router
+from api.navigation import router as navigation_router
 from api.onboarding import router as onboarding_router
+from api.platform_admin import router as platform_admin_router
 from api.rate_limit import enforce_api_action_rate_limit
 from api.recommendation_governance import router as recommendation_governance_router
 from api.recommendation_persistence import persist_ask_recommendations
 from api.schemas import (
     AccessibilityMetadataOut,
+    AnalyticalIntentOut,
+    AnalyticalPlanOut,
     AskRequest,
     AskResponse,
     AttachmentResultOut,
@@ -103,6 +107,7 @@ from api.schemas import (
     ForecastResultOut,
     GoldenExampleFeedbackRequest,
     GoldenExampleFeedbackResponse,
+    GoverningMetricOut,
     HealthResponse,
     MediaGenerationResultOut,
     MediaSearchHitOut,
@@ -124,6 +129,7 @@ from api.schemas import (
 )
 from api.semantic_catalog import router as semantic_catalog_router
 from api.shares import router as shares_router
+from api.tenant_admin import router as tenant_admin_router
 from api.voice import router as voice_router
 from config.settings import ConfigurationError, Settings, configure_logging, get_settings
 from db.connection import (
@@ -384,6 +390,9 @@ app.include_router(shares_router)
 app.include_router(onboarding_router)
 app.include_router(semantic_catalog_router)
 app.include_router(recommendation_governance_router)
+app.include_router(platform_admin_router)
+app.include_router(tenant_admin_router)
+app.include_router(navigation_router)
 
 # No-op when Settings.cors_allowed_origins is empty (the default) -- a
 # same-origin deployment (the built React app served by this same FastAPI
@@ -785,6 +794,58 @@ def _forecast_result_out(result: Mapping[str, Any] | None) -> ForecastResultOut 
     return ForecastResultOut(**result)
 
 
+def _analytical_intent_out(intent: Mapping[str, Any] | None) -> AnalyticalIntentOut | None:
+    """Converts `AgentState["analytical_intent"]` (an
+    `agent.intent.AnalyticalIntentClassification.model_dump()` dict) to its
+    API shape. Pass-through of already-validated typed data -- no redaction
+    applied, since its only free-text fields are LLM-produced phrases from
+    the question itself, and the same question text is already echoed back
+    to the caller verbatim in every response."""
+    if intent is None:
+        return None
+    return AnalyticalIntentOut(**intent)
+
+
+def _analytical_plan_out(plan: Mapping[str, Any] | None) -> AnalyticalPlanOut | None:
+    """Converts `AgentState["analytical_plan"]` (an
+    `agent.analytical_plan.AnalyticalPlan.model_dump()` dict) to its API
+    shape. Only ever a plan `agent.plan_validator.validate_plan` already
+    accepted (`build_analytical_plan_node` discards an invalid one entirely,
+    leaving this `None`) -- so every table/column name here has already
+    been checked against the retrieved schema."""
+    if plan is None:
+        return None
+    return AnalyticalPlanOut(**plan)
+
+
+def _governing_metrics_out(metrics: Sequence[Mapping[str, Any]] | None) -> list[GoverningMetricOut]:
+    """Converts `AgentState["governing_metrics"]` (plain dicts from
+    `retrieval.retriever.extract_governing_metrics`) -- every entry is a
+    published `CONFIRMED_BUSINESS_TRUTH` definition by construction. An empty
+    list (the common case, no governed metric matched) passes through as
+    `[]`, never `None`."""
+    return [
+        GoverningMetricOut(
+            business_name=str(metric.get("business_name") or ""),
+            approved_expression=metric.get("approved_expression"),
+            aggregation=metric.get("aggregation"),
+            text=str(metric.get("text") or ""),
+        )
+        for metric in (metrics or [])
+    ]
+
+
+#: Prompt 30 -- presentation-only mapping of an already-computed failure
+#: category (`agent.nodes`'s restricted-column gate, retry-exhausted) to a
+#: plain-language notice. The check, its retry behavior, and what it blocks
+#: are all unchanged; this only names the cause in a way a business user can
+#: act on (ask an admin for access) instead of a generic failure.
+_RESTRICTED_FIELD_NOTICE = (
+    "One or more fields this question needs are access-restricted for your role, "
+    "so the answer could not be produced. Ask an administrator if you need access."
+)
+
+
 def _followup_resolved_against_out(
     exchange: Mapping[str, Any] | None,
 ) -> ConversationExchangeOut | None:
@@ -860,6 +921,15 @@ def _ask_response_from_state(
             state.get("followup_resolved_against")
         ),
         permission_denied_notice=_redact_text(state.get("permission_denied_notice"), settings),
+        analytical_intent=_analytical_intent_out(state.get("analytical_intent")),
+        analytical_plan=_analytical_plan_out(state.get("analytical_plan")),
+        governing_metrics=_governing_metrics_out(state.get("governing_metrics")),
+        restricted_field_notice=(
+            _RESTRICTED_FIELD_NOTICE
+            if state.get("last_error_category") == "restricted_column"
+            and state.get("status") == "failed"
+            else None
+        ),
     )
 
 
@@ -1420,10 +1490,12 @@ def execute(
         else None
     )
 
+    cache_status: Literal["hit", "miss"] | None = None
     if cached is not None:
         columns, rows = cached
         duration_ms = 0.0  # no DB round trip happened; this is an honest zero, not a measurement
         response.headers["X-Cache"] = "HIT"
+        cache_status = "hit"
         metrics.record_result_cache_hit(tenant_id)
     else:
         # Prompt 22: fast-fail once this database's own connection pool is
@@ -1476,6 +1548,7 @@ def execute(
 
         if cache_enabled:
             response.headers["X-Cache"] = "MISS"
+            cache_status = "miss"
             metrics.record_result_cache_miss(tenant_id)
             if cacheable:
                 get_result_cache(settings.result_cache_max_entries).store(
@@ -1549,6 +1622,7 @@ def execute(
         # ExecuteResponse.truncated's own docstring for why this app never
         # runs a separate COUNT(*) query to know the true total.
         truncated=len(rows) >= settings.max_result_rows,
+        cache_status=cache_status,
     )
 
     if payload.message_id:

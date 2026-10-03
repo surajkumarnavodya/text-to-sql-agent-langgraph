@@ -49,6 +49,7 @@ from db.relationship_inference import (
     verify_candidates_with_data,
 )
 from db.schema_introspection import TableSchemaInfo, introspect_schema
+from onboarding.catalog_bridge import draft_catalog_entries_for_job
 from onboarding.evaluation import evaluate_candidates
 from onboarding.golden_questions import GoldenQuestionCandidate, generate_candidate_questions
 from onboarding.pii_detection import PiiFinding, detect_pii_columns, verify_pii_with_data
@@ -323,6 +324,11 @@ def publish_job(
                 "total_count": len(evaluation_results),
             },
         )
+
+        # Prompt 32: confirmed tables become DRAFT catalog entries so the SME
+        # Semantic Review dashboard can approve them. Drafts only, and idempotent
+        # on a retried publish (see `onboarding.catalog_bridge`).
+        draft_catalog_entries_for_job(session, job, all_items)
 
         return update_job_status(session, job, status="published", current_stage=None)
     except OnboardingJobError:

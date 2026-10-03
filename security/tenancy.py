@@ -188,9 +188,15 @@ def resolve_tenant_context(session: Session, tenant_id: str | None) -> TenantCon
     row. This is the single chokepoint rule 2 in this module's docstring
     describes -- suspending a tenant via
     `identity.repositories.tenants.set_tenant_status` takes effect for
-    every one of its users on their next request, across every
-    tenant-scoped route at once, without any route needing a status check
-    of its own.
+    every one of its users on their next request on every identity-backed
+    route, because `api.identity_authz.require_local_user` calls this on
+    every request (not just at login/refresh).
+
+    Known bound: `/ask` and other routes that authenticate via
+    `api.auth.verify_api_key` without holding an identity session do not
+    call this function, so a suspended tenant's still-valid access token
+    keeps working there until it expires (`Settings.access_token_expire_minutes`,
+    15 minutes by default). Refresh is refused immediately either way.
 
     Reads the status live rather than caching it, deliberately: a
     suspension that only took effect once an access token expired would be

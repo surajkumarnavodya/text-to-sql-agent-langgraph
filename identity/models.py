@@ -1293,6 +1293,13 @@ class RecommendationRecord(Base):
     created_by_user_id: Mapped[uuid.UUID] = mapped_column(
         Uuid(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True
     )
+    # Prompt 31 -- the one mutable field besides `status`: who is responsible
+    # for acting on this recommendation. Changes are recorded as
+    # `RecommendationFeedbackEvent(event_type="owner_assigned")`, never
+    # silently overwritten. `NULL` = unassigned.
+    owner_user_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True
+    )
     created_at: Mapped[datetime] = _created_at()
     updated_at: Mapped[datetime] = _updated_at()
 
@@ -1391,6 +1398,25 @@ class RecommendationFeedbackEvent(Base):
     reason: Mapped[str] = mapped_column(Text, nullable=True)
     recommendation_version: Mapped[str] = mapped_column(String(32), nullable=False)
     evidence_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    # Prompt 31 -- what kind of event this is. `status_change` (the only kind
+    # before Prompt 31; from_status != to_status), `note` (from == to, the
+    # reason field holds the note text), or `owner_assigned` (from == to,
+    # `detail` holds the new owner). Keeps notes and ownership changes in the
+    # same append-only trail without a second audit table.
+    event_type: Mapped[str] = mapped_column(
+        Enum(
+            "status_change",
+            "note",
+            "owner_assigned",
+            name="recommendation_feedback_event_type",
+            native_enum=False,
+            validate_strings=True,
+        ),
+        nullable=False,
+        default="status_change",
+        server_default="status_change",
+    )
+    detail: Mapped[dict] = mapped_column(_METADATA_JSON, nullable=True)
     created_at: Mapped[datetime] = _created_at()
 
     record: Mapped[RecommendationRecord] = relationship(back_populates="feedback_events")

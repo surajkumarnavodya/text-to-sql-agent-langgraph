@@ -82,6 +82,12 @@ export interface QueryHistoryEntry {
    * alongside the chart, per this feature's own "never chart a subset as
    * though it's the full data" requirement. */
   confirmedTruncated: boolean
+  /** Prompt 30 -- ExecuteResponse.cache_status for the confirmed result, so the
+   * analytics panel can say "served from a recent cached result" instead of
+   * implying a live query. Session-only like every other confirmed* field
+   * (never restored on reload). Optional so every existing literal that
+   * predates it keeps type-checking unchanged. */
+  confirmedCacheStatus?: 'hit' | 'miss' | null
   confirmedDurationMs: number | null
   /** The user's own chart selection for this confirmed result, or `null`
    * if no chart has been generated (the default -- see ChartSection.tsx).
@@ -244,6 +250,17 @@ function askResponseFromPersistedMessage(
     followup_classification: null,
     followup_resolved_against: null,
     permission_denied_notice: metadata?.permission_denied_notice ?? null,
+    // Prompt 30's analytics fields are not part of the persisted message
+    // metadata today, so a reloaded past turn shows no analytics panels --
+    // the same disclosed reconstruction gap as the rest of this function's
+    // own "not a byte-for-byte reconstruction" note (CLAUDE.md, chat history).
+    analytical_result: null,
+    forecast_result: null,
+    recommendations: [],
+    analytical_intent: null,
+    analytical_plan: null,
+    governing_metrics: [],
+    restricted_field_notice: null,
   }
   return { response, sql, resultSnapshot }
 }
@@ -436,6 +453,7 @@ export function withConfirmedResult(
   chartRecommendation: ChartRecommendation | null,
   truncated: boolean,
   durationMs: number,
+  cacheStatus: 'hit' | 'miss' | null = null,
 ): QueryHistoryEntry {
   return {
     ...entry,
@@ -445,6 +463,7 @@ export function withConfirmedResult(
     confirmedColumnTypes: columnTypes,
     confirmedChartRecommendation: chartRecommendation,
     confirmedTruncated: truncated,
+    confirmedCacheStatus: cacheStatus,
     confirmedDurationMs: durationMs,
     confirmedError: null,
     // A fresh confirmed result may have a different shape than whatever
@@ -484,6 +503,7 @@ export function withConfirmedError(entry: QueryHistoryEntry, error: string): Que
   return {
     ...entry,
     confirmedError: error,
+    confirmedCacheStatus: null,
     confirmedColumns: null,
     confirmedRows: null,
     confirmedSql: null,

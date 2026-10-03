@@ -49,7 +49,10 @@
     "knowledgeSources": "Sources de connaissances",
     "mediaSearch": "Recherche de médias",
     "dbOnboarding": "Intégration de base de données",
-    "semanticReview": "Revue sémantique (expert)"
+    "semanticReview": "Revue sémantique (expert)",
+    "recommendations": "Recommandations",
+    "platformAdmin": "Administration de la plateforme",
+    "tenantAdmin": "Administration du client"
   },
   "header": {
     "openHistory": "Ouvrir l'historique du chat",

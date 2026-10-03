@@ -1,4 +1,4 @@
-import { AlertTriangle, Loader2, Play, Sparkles } from 'lucide-react'
+import { AlertTriangle, Loader2, Play, ShieldAlert, Sparkles } from 'lucide-react'
 import { lazy, Suspense } from 'react'
 import { useTranslation } from 'react-i18next'
 import { GoldenFeedbackWidget } from '@/components/sql/GoldenFeedbackWidget'
@@ -33,6 +33,13 @@ const ChartSection = lazy(() =>
   import('@/components/sql/ChartSection').then((m) => ({ default: m.ChartSection })),
 )
 
+// Prompt 30's analysis panels render through the same chart renderer
+// (ResultChart -> Chart.js), so they get the identical lazy boundary --
+// reading a turn must not pull Chart.js into the main bundle.
+const AnalyticsSummary = lazy(() =>
+  import('@/components/analytics/AnalyticsSummary').then((m) => ({ default: m.AnalyticsSummary })),
+)
+
 const BLOCKED_STATUSES = new Set([
   'failed',
   'needs_clarification',
@@ -58,6 +65,7 @@ export function TurnCard({ entry, isMultiDb }: { entry: QueryHistoryEntry; isMul
   const confirmAndRun = useChatStore((state) => state.confirmAndRun)
   const confirmingEntryId = useChatStore((state) => state.confirmingEntryId)
   const setChartOptions = useChatStore((state) => state.setChartOptions)
+  const askQuestion = useChatStore((state) => state.askQuestion)
 
   const state = entry.finalState
   const showSqlPanel = isSqlResult(state.sources_used) && !BLOCKED_STATUSES.has(entry.agentStatus)
@@ -136,6 +144,12 @@ export function TurnCard({ entry, isMultiDb }: { entry: QueryHistoryEntry; isMul
         )}
         {entry.agentStatus === 'failed' && (
           <div className="flex flex-col gap-2">
+            {state.restricted_field_notice && (
+              <p className="flex items-center gap-1.5 text-sm text-[var(--warning)]">
+                <ShieldAlert className="h-4 w-4 shrink-0" aria-hidden="true" />
+                {state.restricted_field_notice}
+              </p>
+            )}
             <p className="text-sm text-[var(--danger)]">
               {isSqlResult(state.sources_used) ? (
                 <>
@@ -227,6 +241,17 @@ export function TurnCard({ entry, isMultiDb }: { entry: QueryHistoryEntry; isMul
                     <Sparkles className="mt-0.5 h-4 w-4 shrink-0" />
                     <Markdown className="inline">{state.insight}</Markdown>
                   </div>
+                )}
+                {entry.editableSql === state.sql && (
+                  <Suspense
+                    fallback={<p className="text-xs text-[var(--muted-foreground)]">{t('common.loading')}</p>}
+                  >
+                    <AnalyticsSummary
+                      state={state}
+                      cacheStatus={entry.confirmedCacheStatus ?? null}
+                      onAsk={(question) => void askQuestion(question)}
+                    />
+                  </Suspense>
                 )}
                 <ResultsTable columns={entry.confirmedColumns} rows={entry.confirmedRows} />
                 <Suspense

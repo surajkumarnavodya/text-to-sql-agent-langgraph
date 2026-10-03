@@ -3245,6 +3245,312 @@ against the API).
 **Read [`27_SME_SEMANTIC_REVIEW_DASHBOARD_CONTRACT.md`](27_SME_SEMANTIC_REVIEW_DASHBOARD_CONTRACT.md)**
 for the full prompt text and outcome summary.
 
+**Addendum (Prompt 28, same session):** while stabilizing the full test
+suite for the next prompt's own new tests, this fix's real-threading
+test (`TestConcurrentPublish`) turned out to itself be flaky under full-
+suite load -- not because the fix was wrong, but because the test
+fixture's `StaticPool` SQLite engine shares one single physical
+`sqlite3.Connection` object across both "concurrent" threads (required so
+multiple `Session`s can see one `:memory:` database at all), and
+`sqlite3` connections are not documented as safe for genuinely
+concurrent multi-threaded statement execution even with
+`check_same_thread=False`. Replaced with a deterministic two-`Session`
+test that interleaves explicitly (session 1 publishes and commits;
+session 2's own stale, already-loaded object -- still saying
+`"reviewed"` -- then attempts the same transition and must be rejected
+by the atomic `WHERE status = expected_current` guard) -- this proves
+the exact same property without depending on real OS-thread scheduling
+against a test-only shared connection. The fix in `identity.repositories
+.semantic_catalog._apply_transition` itself is unchanged.
+
+### Global Platform Admin Dashboard (Prompt 28)
+The first platform-wide operations surface in this codebase --
+`frontend/src/pages/PlatformAdmin.tsx` + `api/platform_admin.py` -- and
+the prompt that finally closes a gap named explicitly, as a known
+limitation, back in Prompt 20: **this application had no platform-admin-
+versus-tenant-admin distinction**. Every existing `admin`-gated route
+(`/schema/refresh`, `/metrics/performance`, `ONBOARDING_MANAGE`,
+`CATALOG_MANAGE`, ...) is correctly scoped to the actor's own tenant by
+design -- a tenant's own admin must never see or act on another tenant's
+data. This prompt's entire purpose is the deliberate exception: a new
+`identity.rbac.Permission.PLATFORM_ADMIN`, granted only to a new
+`platform_admin` role (`_PLATFORM_ADMIN = _ADMIN | {PLATFORM_ADMIN}` --
+a genuine superset, so holding it also grants every tenant-admin
+capability, but holding plain `admin` never grants this one), enforced
+by a new `api.identity_authz.require_platform_admin` dependency
+(`require_identity_permission(PLATFORM_ADMIN)`, literally the same
+factory every other granular permission already uses -- no new
+mechanism) on every route in the new `api/platform_admin.py` router.
+
+**Heavy reuse, almost nothing built from scratch:**
+- `identity/repositories/tenants.py`'s full CRUD (list/create/suspend/
+  soft-delete) existed since Prompt 20 and was never exposed by any
+  route until now -- this dashboard is exactly what it was waiting for.
+- `identity.repositories.users.assign_role`/`remove_role` are the exact
+  same functions every other role-assignment call site already uses.
+- `observability.metrics.get_default_metrics().snapshot(tenant_id=None)`
+  already supported the merged, cross-tenant view, "deliberately not
+  reachable through the HTTP route" per that module's own docstring --
+  `GET /platform-admin/metrics` is that route, finally.
+- `GET /health`/`GET /models` are deliberately **not** duplicated under
+  `/platform-admin/*` -- both are already public/unscoped, so the
+  dashboard's Health & Models tab calls the existing `useHealth`/
+  `useAvailableModels` hooks directly, same as every other page.
+
+**Two further real, found-and-closed gaps, both disclosed rather than
+silently worked around:**
+- **`identity.models.AuditLog` was dead code.** The `audit_logs` table,
+  with `Permission.AUDIT_READ_ANY`/`AUDIT_READ_OWN` seeded since this
+  project's identity schema was first built, had never been written to
+  or read from by anything in this codebase -- confirmed by grep: zero
+  `AuditLog(` construction sites anywhere. New `identity/repositories
+  /audit.py` (`record_audit_event`/`list_audit_events`) is the first real
+  write/read path, wired into this prompt's own new mutating actions
+  (tenant status changes, role assignment) only -- a disclosed, narrower
+  scope than "every mutation in this application," named as a known
+  limitation rather than implied complete. The table also has **no
+  `tenant_id` column** (it predates Prompt 20 and was never retrofitted),
+  so `list_audit_events` cannot be scoped to one tenant -- not a new leak,
+  since its only caller is already `PLATFORM_ADMIN`-gated for
+  cross-tenant visibility, but a real structural limit on ever reusing it
+  for a future *tenant*-scoped audit view without a migration first.
+- **"Security Events" had no queryable backing at all.**
+  `security.audit_log.log_security_event`'s ~40 existing call sites only
+  ever wrote to a Python logger -- no DB, no aggregation, nothing a
+  dashboard could read. A bounded (`_MAX_RECENT_EVENTS = 1000`),
+  thread-safe, in-process ring buffer now hooks inside that one function
+  itself (`_record_recent_event`), so every one of those ~40 call sites
+  started feeding `GET /platform-admin/security-events` with **zero
+  changes to any of them** -- the identical "instrument the one shared
+  chokepoint" approach `CorrelationIdLogFilter`/`TenantIdLogFilter`
+  already use for ordinary log lines in the same module.
+
+**Invariants that must not regress:**
+- **Never exposes a credential.** `DatabaseStatusOut` has no
+  `db_user`/`db_password`/`db_connection_string` field at all (not a
+  redacted one -- the field simply doesn't exist in the response shape),
+  and `GET /platform-admin/config-status` only ever reports `Settings`
+  fields that are already plain Python `bool` -- a `pydantic.SecretStr`-
+  typed field can never satisfy `isinstance(value, bool)`, so this is
+  safe by construction, not by a redaction step that could be forgotten
+  or bypassed.
+- **`PLATFORM_ADMIN` is never implied by `admin` alone.** Proven directly
+  (`tests/test_identity_rbac.py
+  ::test_platform_admin_permission_is_granted_only_to_platform_admin_role`)
+  and end-to-end (`tests/test_api_platform_admin.py
+  ::TestPlatformAdminVsTenantAdminAccess` -- a tenant admin gets 403 on
+  every route this router defines). The frontend nav tab mirrors this:
+  `AppShell.tsx`'s `canSeePlatformAdmin` is a separate boolean from
+  `canSeeReviewTabs` (Database Onboarding/SME Semantic Review's own
+  admin-or-analyst gate), not folded into it -- a tenant's own admin must
+  never see a tab that would 403 for them.
+- **Cross-tenant visibility is proven, not assumed.** `tests/test_api_platform_admin.py
+  ::TestCrossTenantDataVisibility` creates two real tenants with real
+  accounts bound to each (via `identity.repositories.tenants
+  .create_tenant`/`identity.repositories.users.create_user`'s own
+  `tenant_id` parameter -- there is still no self-service tenant
+  selection anywhere in this app to abuse) and confirms a single
+  `GET /platform-admin/users`/`/tenants` call genuinely spans both.
+- **A platform admin account is deliberately still subject to
+  `agent.authz`'s own base-role bridge for ordinary AI/chat use.**
+  `platform_admin` is not one of `identity.rbac.BASE_ROLE_NAMES`, so an
+  account holding *only* that role (with no `admin`/`user`/`analyst`
+  alongside it) would get zero permissions from `agent.authz
+  .permissions_for` for the chat/SQL features themselves -- the exact
+  same disclosed, intentional tradeoff `identity/rbac.py`'s own docstring
+  already states for `auditor`/`manager`/`support`. An operator wanting
+  both capabilities from one account assigns both roles.
+
+**Known, disclosed limitations:**
+- Audit-log coverage is narrow (this prompt's own new actions only, see
+  above) -- a genuinely complete audit trail across every mutating route
+  in this application remains a larger, separate undertaking.
+- Security events reset on process restart and are single-process (a
+  multi-worker deployment has one independent buffer per worker) -- the
+  identical, already-disclosed limit `observability.metrics
+  .PerformanceMetrics` carries, for the same reason (no shared store like
+  Redis is part of this application's current architecture).
+- `identity/repositories/users.py::list_users`/`identity/repositories
+  /semantic_catalog.py::list_entries_across_tenants`/`identity/repositories
+  /onboarding.py::list_jobs_across_tenants` are all simple
+  limit-bounded queries with no cursor/offset pagination -- fine for this
+  dashboard's realistic scale today, a disclosed gap for a much larger
+  user/job/catalog-entry count.
+- The frontend's role-assignment control on the Users tab is a free-text
+  role-name input, not a dropdown constrained to real seeded role names
+  -- `POST /platform-admin/users/{id}/roles` already validates server-side
+  (400 on an unknown role), so this is a UX rough edge, not a security
+  gap.
+
+**Read [`28_GLOBAL_PLATFORM_ADMIN_DASHBOARD_CONTRACT.md`](28_GLOBAL_PLATFORM_ADMIN_DASHBOARD_CONTRACT.md)**
+for the full prompt text and outcome summary.
+
+### Client/Tenant Admin Dashboard (Prompt 29)
+The tenant-scoped counterpart to Prompt 28's platform-wide dashboard --
+`frontend/src/pages/TenantAdmin.tsx` + `api/tenant_admin.py`. **Unlike
+Prompt 28, this prompt introduces no new RBAC permission or role at
+all** -- a tenant admin is exactly what the existing, tenant-scoped
+`admin` role already means. Every route resolves `tenant_id` exactly
+once, from `security.tenancy.resolve_actor_tenant_id(user)`, and **no
+route signature in `api/tenant_admin.py` accepts a `tenant_id` parameter
+at all** -- not a check that could be forgotten on one route, but a
+shape no route in the file can violate. This is the structural guarantee
+behind "tenant admins cannot access platform-wide or other-tenant data,"
+proven directly (`tests/test_api_tenant_admin.py::TestTenantIsolation`,
+including a test that a client-supplied `tenant_id` query parameter is
+simply ignored).
+
+**Even heavier reuse than Prompt 28:** `identity.repositories.tenants
+.get_tenant`, `identity.repositories.users.list_users`/
+`list_roles_with_permissions`/`assign_role`/`remove_role`,
+`identity.repositories.semantic_catalog.list_entries`,
+`identity.repositories.onboarding.list_jobs_for_tenant`/
+`list_review_items`/`list_artifacts`, and `Settings.databases_for_tenant`
+all already existed and were already tenant-aware -- every route here is
+a thin aggregation over them. `api/platform_admin_schemas.py`'s
+`TenantOut`/`PlatformUserOut`/`RoleOut`/`DatabaseStatusOut`/
+`SecurityEventOut`/`AssignRoleRequest` are imported and reused directly
+rather than redefined, since the shape a tenant admin needs is identical
+to what the platform dashboard already returns -- only the query scope
+differs, and that's enforced in `api/tenant_admin.py`, not in the schema.
+
+**Two existing routes were confirmed, by reading them, to already be
+tenant-scoped -- so this dashboard calls them directly instead of
+duplicating them:**
+- `GET /metrics/performance` already resolves and scopes to the
+  caller's own tenant (unchanged since it was built) -- but had **zero
+  frontend consumer anywhere in this codebase** before this prompt. New
+  `lib/api.ts::getPerformanceMetrics` + `useTenantPerformanceMetrics` is
+  the first one, for the "AI usage" tab.
+- `GET /recommendations` and `GET /recommendations/metrics`
+  (Prompt 17/18) were already tenant-scoped too, and likewise had **zero
+  frontend consumer** -- their own schema module's docstring literally
+  says "the literal 'expose APIs for later dashboards' requirement."
+  New `lib/tenantAdminApi.ts` functions are that dashboard, for the
+  "Recommendations" tab (list + quality metrics only -- the fuller
+  feedback/resolve/expire governance workflow is a disclosed,
+  deliberately deferred follow-up, matching this codebase's own
+  "compute + test, defer deepest UI wiring" precedent).
+
+**One real, newly-relevant tenant-isolation gap found and closed:**
+`POST /schema/refresh` (`api/main.py`) refreshes *every* configured
+database with no tenant filter at all -- correct for its existing,
+unrelated platform-operator use (gated on `agent.authz
+.Permission.SCHEMA_REFRESH`, a base-role check with no tenant-scoping
+concept at all), but wrong to hand a tenant-admin dashboard as-is: a
+tenant admin triggering it would re-introspect and re-embed *other*
+tenants' databases too. Rather than change that existing route (master-
+contract rule 4: preserve working behavior), a new, genuinely
+tenant-scoped `POST /tenant-admin/databases/refresh` loops only
+`Settings.databases_for_tenant(caller_tenant_id)`, reusing the exact same
+`embeddings.schema_indexer.refresh_schema_index` function per database --
+proven directly (`tests/test_api_tenant_admin.py
+::TestSchemaRefreshIsTenantScoped::test_refresh_only_touches_the_callers_own_databases`).
+
+**Invariants that must not regress:**
+- **The `platform_admin` role can never be seen or assigned from this
+  dashboard.** `_RESTRICTED_ROLE_NAMES` excludes it from both
+  `GET /tenant-admin/roles`'s own list and
+  `POST /tenant-admin/users/{id}/roles`'s own validation (403, not a
+  silent no-op) -- a cross-tenant role has no legitimate place in a
+  tenant-scoped surface. Proven directly (`tests/test_api_tenant_admin.py
+  ::TestRoleSpecificAccess`).
+- **A cross-tenant role-assignment target is a 404, not a 403 or a
+  success.** `_require_same_tenant_user` 404s both a genuinely
+  nonexistent account and one that exists in a *different* tenant --
+  the identical anti-enumeration posture `api/semantic_catalog.py`/
+  `api/onboarding.py` already established.
+- **Viewing and acting are two different tiers, both pre-existing.**
+  `ADMIN_DASHBOARD_READ` (admin/auditor/manager) gates every `GET` route;
+  `USERS_ASSIGN_ROLES`/`ONBOARDING_MANAGE` (admin only) additionally gate
+  the two write actions (role assignment, schema refresh). The frontend
+  mirrors this: `canSeeTenantAdmin` (admin/auditor/manager) controls the
+  nav tab and page visibility; a separate `canManage` (admin only) inside
+  `TenantAdmin.tsx` controls whether the Users/Databases tabs render
+  their own action controls at all -- UX-only in both cases, the real
+  enforcement is entirely server-side.
+- **Managing an onboarding job's own lifecycle is not re-implemented
+  here.** The Pending Reviews/Golden Questions/Evaluation tabs are
+  read-only summaries that link to the existing `/db-onboarding` and
+  `/semantic-review` pages for the actual review workflow -- the same
+  "link, don't duplicate" precedent `SemanticReview.tsx` already set.
+
+**Known, disclosed limitations:**
+- The Recommendations tab is read-only (list + quality metrics) --
+  submitting feedback, resolving, or expiring a recommendation from this
+  dashboard is not built; an operator uses the underlying
+  `/recommendations/*` routes directly for that today.
+- `identity.repositories.users.list_users`/
+  `identity.repositories.semantic_catalog.list_entries`/
+  `identity.repositories.onboarding.list_jobs_for_tenant` (all reused
+  from Prompt 20/26/27/28) remain simple limit-bounded queries with no
+  cursor/offset pagination -- the identical, already-disclosed limitation
+  Prompt 28 named for its own platform-wide equivalents.
+- The free-text role-name input on the Users tab is not constrained to a
+  dropdown of real role names (same disclosed rough edge Prompt 28's own
+  equivalent control has) -- server-side validation (400 on an unknown
+  role, 403 on `platform_admin`) is the real guardrail.
+
+**Read [`29_TENANT_ADMIN_DASHBOARD_CONTRACT.md`](29_TENANT_ADMIN_DASHBOARD_CONTRACT.md)**
+for the full prompt text and outcome summary.
+
+### Analytics & Insights panels in the answered turn (Prompt 30)
+No new page: the analysis renders under each answered question's insight
+in `TurnCard.tsx` (`frontend/src/components/analytics/AnalyticsSummary.tsx`),
+gated like the insight itself (after "Confirm and Run", and only while the
+SQL box still holds the SQL that produced the answer). It is lazy-loaded
+like `ChartSection`, so Chart.js stays out of the main bundle -- do not
+statically import any analytics panel from `TurnCard.tsx`.
+
+It renders only from already-computed backend state and never recomputes a
+statistic. `AskResponse` gained four additive pass-through fields
+(`analytical_intent`, `analytical_plan`, `governing_metrics`,
+`restricted_field_notice`); `ExecuteResponse.cache_status` mirrors the
+`X-Cache` header into the JSON body. The restricted notice is a presentation
+translation of an existing failure category; the restricted-column gate and
+its retry behavior are unchanged.
+
+Every database-originated label goes through `lib/analyticsCharts.ts`'s
+`sanitizeLabel` before it is shown or fed into a drill-down question (master
+rule 8). Every claim shows its truth level (`TruthLevelBadge`). Charts reuse
+`ResultChart`/`PreparedChart`; no second chart engine.
+
+Known gaps (see the contract for detail): reloaded past turns show no
+analysis (analytics fields are not in persisted message metadata);
+`cache_status` is session-only; `visualization_spec` is still not consumed;
+root-cause attribution is not wired into the live graph; query scope is
+read-only.
+
+**Read [`30_ANALYTICS_INSIGHTS_DASHBOARD_CONTRACT.md`](30_ANALYTICS_INSIGHTS_DASHBOARD_CONTRACT.md)**
+for the full prompt text and outcome summary.
+
+
+### Recommendation & action dashboard (Prompt 31)
+`frontend/src/pages/Recommendations.tsx` (route `/recommended-actions`, not `/recommendations`, which is the API list path; nav tab shown by the server's navigation policy) is the reviewer-facing surface over the governed recommendation APIs from Prompts 18/31. Read `31_RECOMMENDATION_ACTION_DASHBOARD_CONTRACT.md` before changing it.
+
+**Invariants that must not regress:**
+- Every recommendation is shown as an **AI estimate**, with its evidence and each claim's truth level. Nothing is presented as a confirmed fact (master rule 10).
+- Status transitions are **race-safe**: `identity/repositories/recommendation_governance.py::_apply_conditional_status_update` is a conditional `UPDATE ... WHERE status = expected`. Do not replace it with a read-check-then-write. `tests/test_recommendation_actions_repository.py`'s race test fails if the guard is removed.
+- **Notes and owner changes never change `status`.** They are `RecommendationFeedbackEvent` rows with `event_type` `note` / `owner_assigned`, in the same append-only trail.
+- An owner must be an active, same-tenant user who holds a recommendation-review permission. A refused owner gets the same 404 whether the user is missing, cross-tenant, inactive, or not a reviewer.
+- Every governed mutation is logged (`event=recommendation_action`) without claim, evidence, or note text, and is rate-limited after authorization.
+- Button visibility on the frontend mirrors the lifecycle for UX only. The server re-checks every request.
+
+**Known gaps:** local accounts only (`require_local_user`); the list is capped at 200 with no pagination; owner changes are last-writer-wins; the rate limit is per IP.
+
+### Role-based navigation, server-driven access & the onboarding→SME bridge (Prompt 32)
+`32_ROLE_BASED_NAVIGATION_CONTRACT.md` is the full record. The short version a future session needs:
+
+- **Screens and actions come from the server.** `security/navigation.py` (pure policy) decides which screens and capabilities a caller has, from the same permission checks the real routes make. `GET /navigation` returns them (`api/navigation.py`). The frontend draws the header tabs from `items`, guards each route with `components/auth/RequireNavItem.tsx`, and reads named actions from `capabilities` through `useCapabilities()`. **Never add a role-name check in the frontend.** Add a `CapabilityRule`, and a test that pins it.
+- **Hiding a tab is not access control.** A URL typed directly shows the forbidden page, and `POST /navigation/access-denied` audit-logs the refusal (`event=ui_route_denied`), but only for a real screen path. Every API route still enforces its own permission on the server.
+- **Platform operators need both `platform_admin` and `admin`.** `platform_admin` is not a base role (`agent.authz.ROLE_PERMISSIONS`), so on its own it has no AI workspace. The navigation test pins this on purpose.
+- **Recommendations live at `/recommended-actions`.** `/recommendations` is the governance API's JSON list route. A reload of the page there would have hit JSON. The Vite dev proxy also skips HTML requests now, so a reload of any page path that is also an API prefix reaches the app.
+- **Onboarding publish now creates DRAFT catalog entities** (`onboarding/catalog_bridge.py`), one per table with SME-confirmed items, under a slug of the job's label (`My Warehouse` → `My_Warehouse_<id8>`). The slug is a vector-store collection name, which rejects spaces. The bridge never publishes. A retried publish creates nothing new.
+- **A job missing its connection details** answers 422 on discover and publish, not a generic 500 (`api/onboarding.py::_engine_for_job`).
+
+**Known gaps:** a "Confirm and run" button is shown to any user who can ask a question, including a viewer who lacks `execute_sql`; the server refuses it, but the button is not gated on the capability yet. The "viewer" role has no screen of its own: "read-only viewer" maps to `auditor`. Browser-level end-to-end tests are not part of the project (no Playwright); the journey test is at the HTTP API layer.
+
+---
 
 ## How to run
 

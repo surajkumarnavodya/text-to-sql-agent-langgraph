@@ -237,6 +237,38 @@ def list_entries(
     return list(session.scalars(stmt.order_by(SemanticCatalogEntry.created_at.desc())))
 
 
+def list_entries_across_tenants(
+    session: Session,
+    *,
+    status: str | None = None,
+    concept_type: str | None = None,
+    limit: int = 500,
+) -> list[SemanticCatalogEntry]:
+    """Every catalog entry, across every tenant -- Prompt 28
+    (`28_GLOBAL_PLATFORM_ADMIN_DASHBOARD_CONTRACT.md`)'s own "semantic
+    review queue" dashboard section, which needs to show the platform
+    operator how much SME review work is outstanding everywhere, not one
+    tenant at a time.
+
+    Deliberately named/shaped differently from `list_entries` above
+    (which always requires `tenant_id`, correctly, for every other
+    caller) rather than making that function's own `tenant_id` parameter
+    optional -- an `Optional[str]` default of `None` meaning "ignore
+    tenant scoping entirely" on the one function every tenant-scoped
+    route in this codebase calls would have been a genuinely dangerous
+    footgun for a future caller that forgot to pass one. This function's
+    only caller is `api/platform_admin.py`, already gated on
+    `identity.rbac.Permission.PLATFORM_ADMIN`.
+    """
+    statement = select(SemanticCatalogEntry)
+    if status is not None:
+        statement = statement.where(SemanticCatalogEntry.status == status)
+    if concept_type is not None:
+        statement = statement.where(SemanticCatalogEntry.concept_type == concept_type)
+    statement = statement.order_by(SemanticCatalogEntry.created_at.desc()).limit(limit)
+    return list(session.scalars(statement))
+
+
 def list_versions_for_concept_key(
     session: Session,
     *,

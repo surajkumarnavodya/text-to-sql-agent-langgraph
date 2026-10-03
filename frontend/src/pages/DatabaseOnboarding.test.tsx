@@ -6,6 +6,8 @@ import * as onboardingApi from '@/lib/onboardingApi'
 import type { OnboardingJob, OnboardingReviewItem } from '@/lib/types'
 import { useLocalAuthStore } from '@/store/localAuthStore'
 import { DatabaseOnboarding } from './DatabaseOnboarding'
+import * as navigationApi from '@/lib/navigationApi'
+import { serveNavigation } from '@/test/navigationFixtures'
 
 vi.mock('@/lib/onboardingApi', async (importOriginal) => {
   const actual = await importOriginal<typeof import('@/lib/onboardingApi')>()
@@ -23,6 +25,13 @@ vi.mock('@/lib/onboardingApi', async (importOriginal) => {
     listOnboardingArtifacts: vi.fn(),
   }
 })
+
+vi.mock('@/lib/navigationApi', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/lib/navigationApi')>()
+  return { ...actual, getNavigation: vi.fn(), reportAccessDenied: vi.fn() }
+})
+
+beforeEach(() => serveNavigation(vi.mocked(navigationApi.getNavigation), null))
 
 const initialAuthState = useLocalAuthStore.getState()
 
@@ -91,6 +100,7 @@ function setUserRole(roles: string[]) {
       last_login_at: null,
     },
   } as never)
+  serveNavigation(vi.mocked(navigationApi.getNavigation), roles)
 }
 
 describe('DatabaseOnboarding', () => {

@@ -304,6 +304,226 @@ export interface AskRequest {
   model?: string | null
 }
 
+/** Mirrors `agent.provenance.DataTruthLevel`. Every analytics panel renders
+ * a claim's level visibly (see TruthLevelBadge.tsx) -- a DATABASE_FACT is a
+ * computed value, an AI_INFERENCE is this platform's own suggestion, and a
+ * CONFIRMED_BUSINESS_TRUTH is a human-approved definition. Never conflated. */
+export type TruthLevel = 'database_fact' | 'ai_inference' | 'confirmed_business_truth'
+
+export interface ProvenancedClaim {
+  value: string
+  level: TruthLevel
+  grounded_in: string[]
+  source: string | null
+}
+
+/** Mirrors api.schemas.AnalyticalIntentOut -- Prompt 11's classification. */
+export interface AnalyticalIntent {
+  intent:
+    | 'lookup'
+    | 'aggregation'
+    | 'trend'
+    | 'comparison'
+    | 'ranking'
+    | 'distribution'
+    | 'segmentation'
+    | 'funnel'
+    | 'cohort'
+    | 'forecast'
+    | 'anomaly'
+    | 'root_cause'
+    | 'recommendation'
+  confidence: number
+  metric_candidates: string[]
+  dimensions: string[]
+  time_requirement: string | null
+  comparison: string | null
+  filters: string[]
+  expected_result_shape: string | null
+  ambiguity_flags: string[]
+  truth_level: TruthLevel
+}
+
+/** Mirrors api.schemas.AnalyticalPlanOut -- Prompt 12's validated plan. */
+export interface AnalyticalPlanMetric {
+  name: string
+  table: string | null
+  column: string | null
+  aggregation: string
+  governed_metric_key: string | null
+}
+
+export interface AnalyticalPlanDimension {
+  name: string
+  table: string
+  column: string
+}
+
+export interface AnalyticalPlanFilter {
+  table: string
+  column: string
+  operator: string
+  value: string
+}
+
+export interface AnalyticalPlan {
+  metrics: AnalyticalPlanMetric[]
+  dimensions: AnalyticalPlanDimension[]
+  filters: AnalyticalPlanFilter[]
+  time_range: { table: string; column: string; description: string } | null
+  grain: string | null
+  comparison: { kind: string; description: string } | null
+  ranking: { order_by: string; direction: string; top_n: number | null; per_group: string[] } | null
+  sort: { field: string; direction: string }[]
+  limit: number | null
+  required_operations: string[]
+  truth_level: TruthLevel
+}
+
+/** Mirrors api.schemas.GoverningMetricOut -- a published, human-approved
+ * metric definition the answer was grounded in (CONFIRMED_BUSINESS_TRUTH). */
+export interface GoverningMetric {
+  business_name: string
+  approved_expression: string | null
+  aggregation: string | null
+  text: string
+}
+
+/** Mirrors analytics.models.AnalyticsResult -- the deterministic statistical
+ * breakdown of one result (Prompt 13), plus its anomaly/recommendation
+ * extensions. Only the fields the analytics panels actually read are typed
+ * here; the backend's full shape is a superset. */
+export interface GrowthPoint {
+  period: string
+  value: number
+  change_percent_from_previous: number | null
+}
+
+export interface GrowthStat {
+  label_column: string
+  value_column: string
+  points: GrowthPoint[]
+  overall_change_percent: number | null
+  direction: 'up' | 'down' | 'flat' | null
+  missing_periods: string[]
+  formula: string
+}
+
+export interface RankingEntry {
+  label: string
+  value: number
+  rank: number
+  share_percent: number | null
+}
+
+export interface RankingStat {
+  label_column: string
+  value_column: string
+  entries: RankingEntry[]
+  truncated: boolean
+  formula: string
+}
+
+export interface AnomalySignal {
+  method: 'threshold' | 'percent_change' | 'rolling_zscore' | 'iqr' | 'seasonal'
+  baseline_value: number
+  actual_value: number
+  deviation: number
+  threshold_used: number
+  formula: string
+}
+
+export interface AnomalyPoint {
+  period: string
+  value: number
+  signals: AnomalySignal[]
+}
+
+export interface ColumnSummaryStat {
+  column: string
+  count: number
+  null_count: number
+  is_numeric: boolean
+  minimum: number | null
+  maximum: number | null
+  mean: number | null
+}
+
+export interface AnalyticsFinding {
+  kind: string
+  claim: ProvenancedClaim
+  growth: GrowthStat | null
+  ranking: RankingStat | null
+  anomaly: AnomalyPoint | null
+  column_summary: ColumnSummaryStat | null
+}
+
+export interface AnalyticsResult {
+  row_count: number
+  findings: AnalyticsFinding[]
+  shape: 'scalar' | 'time_series' | 'categorical_aggregate' | 'multidimensional' | 'raw_table' | 'empty' | null
+  engine_version: string
+  insufficient_data_reasons: string[]
+}
+
+/** Mirrors api.schemas.ForecastResultOut (Prompt 16). Always ai_inference. */
+export interface ForecastPoint {
+  period: string
+  forecast: number
+  lower_bound: number | null
+  upper_bound: number | null
+  horizon_step: number
+}
+
+export interface ForecastEvaluation {
+  holdout_size: number
+  mae: number
+  rmse: number
+  mape: number | null
+  formula: string
+}
+
+export interface ForecastResult {
+  status: 'ok' | 'rejected'
+  rejection_reasons: string[]
+  horizon: number
+  model: {
+    model: string
+    version: string
+    training_window_start: string
+    training_window_end: string
+    training_point_count: number
+    period_kind: string
+    supports_interval: boolean
+    confidence_level: number
+  } | null
+  points: ForecastPoint[]
+  evaluation: ForecastEvaluation | null
+  limitations: string[]
+  truth_level: TruthLevel
+  summary: string
+  engine_version: string
+}
+
+/** Mirrors recommendation.models.Recommendation's model_dump(). `kind` of
+ * 'next_question' is a suggested follow-up the user can ask in one click
+ * (the "related questions" affordance); 'action' is a suggested next step. */
+export interface Recommendation {
+  kind: 'next_question' | 'action'
+  claim: ProvenancedClaim
+  rationale: string | null
+  category: string | null
+  evidence: ProvenancedClaim[]
+  affected_entity: string | null
+  action: string | null
+  measurable_impact: string | null
+  confidence: number | null
+  rule_or_model: string | null
+  limitations: string[]
+  generated_at: string
+  engine_version: string
+}
+
 export interface AskResponse {
   session_id: string
   // Set only for a locally-authenticated caller whose turn was actually
@@ -353,6 +573,15 @@ export interface AskResponse {
   // needs analyst/admin) -- the question was answered from whatever
   // remained instead, which may not match what was actually asked.
   permission_denied_notice: string | null
+  // Prompt 30 -- analytics dashboard fields. See the type declarations above
+  // and api/schemas.py's own field descriptions for each one's guarantees.
+  analytical_result: AnalyticsResult | null
+  forecast_result: ForecastResult | null
+  recommendations: Recommendation[]
+  analytical_intent: AnalyticalIntent | null
+  analytical_plan: AnalyticalPlan | null
+  governing_metrics: GoverningMetric[]
+  restricted_field_notice: string | null
 }
 
 export interface ExecuteRequest {
@@ -391,6 +620,10 @@ export interface ExecuteResponse {
   column_types: Record<string, string>
   chart_recommendation: ChartRecommendation | null
   truncated: boolean
+  /** Prompt 30 -- the JSON mirror of the X-Cache header. 'hit' means this
+   * result was served from the server's short-TTL result cache (no database
+   * round trip). Null when the cache is disabled or this SQL isn't cacheable. */
+  cache_status: 'hit' | 'miss' | null
   error: string | null
 }
 
@@ -418,6 +651,8 @@ export interface MessageFeedbackRequest {
 export interface SchemaRefreshResult {
   database: string
   table_count: number
+  /** Tenant-admin route only: set when this one database's refresh failed. */
+  error?: string | null
 }
 
 export interface SchemaRefreshResponse {
@@ -1022,4 +1257,300 @@ export interface CatalogEntryOut {
   aggregation: string | null
   conflicting_entry_ids: string[]
   conflicting_entry_names: string[]
+}
+
+// --- Global platform admin dashboard (api/platform_admin.py, Prompt 28) --
+// mirrors api/platform_admin_schemas.py exactly. Every route here is
+// gated on identity.rbac.Permission.PLATFORM_ADMIN, a genuinely different
+// dimension from the tenant-scoped "admin" role every other admin surface
+// in this app uses. ---
+
+export type TenantStatus = 'active' | 'suspended'
+export type AuditOutcome = 'success' | 'failure' | 'denied'
+export type SecuritySeverity = 'info' | 'warning' | 'critical'
+
+export interface CreateTenantRequest {
+  tenant_id: string
+  name: string
+}
+
+export interface SetTenantStatusRequest {
+  status: TenantStatus
+}
+
+export interface AssignRoleRequest {
+  role_name: string
+}
+
+export interface TenantOut {
+  id: string
+  name: string
+  status: TenantStatus
+  user_count: number
+  created_at: string
+  updated_at: string
+}
+
+export interface PlatformUserOut {
+  id: string
+  email: string
+  display_name: string | null
+  tenant_id: string
+  status: string
+  roles: string[]
+  created_at: string
+  last_login_at: string | null
+}
+
+export interface RoleOut {
+  name: string
+  description: string | null
+  is_system_role: boolean
+  permissions: string[]
+}
+
+export interface DatabaseStatusOut {
+  name: string
+  db_type: string
+  db_host: string | null
+  db_port: number | null
+  db_name: string | null
+  db_schema: string | null
+  tenant_ids: string[]
+  healthy: boolean
+  detail: string
+}
+
+export interface SemanticReviewQueueOut {
+  catalog_draft_count: number
+  catalog_reviewed_count: number
+  catalog_published_count: number
+  onboarding_pending_by_type: Record<string, number>
+  total_pending: number
+}
+
+export interface PlatformOnboardingJobOut {
+  id: string
+  tenant_id: string
+  database_label: string
+  status: string
+  created_at: string
+  updated_at: string
+}
+
+export interface SecurityEventOut {
+  timestamp: string
+  event_type: string
+  severity: SecuritySeverity
+  detail: string
+  correlation_id: string | null
+  tenant_id: string | null
+  context: Record<string, string>
+}
+
+export interface AuditLogOut {
+  id: string
+  actor_user_id: string | null
+  subject_user_id: string | null
+  action: string
+  resource_type: string
+  resource_id: string | null
+  outcome: AuditOutcome
+  created_at: string
+  metadata: Record<string, unknown> | null
+}
+
+export interface ConfigStatusOut {
+  flags: Record<string, boolean>
+}
+
+// Mirrors api/schemas.py's StageMetricOut/RequestMetricOut/
+// PerformanceMetricsResponse -- no frontend consumer existed before
+// Prompt 28, since GET /metrics/performance was deliberately
+// operator-only (see observability/metrics.py's own docstring);
+// GET /platform-admin/metrics is the first route this type serves.
+
+export interface StageMetricOut {
+  stage: string
+  count: number
+  mean_ms: number
+  p50_ms: number
+  p95_ms: number
+  max_ms: number
+  total_ms: number
+}
+
+export interface RequestMetricOut {
+  count: number
+  mean_ms: number
+  p50_ms: number
+  p95_ms: number
+  max_ms: number
+}
+
+export interface PerformanceMetricsResponse {
+  started_at: string
+  window_requests: number
+  max_window_requests: number
+  requests: RequestMetricOut
+  stages: StageMetricOut[]
+  status_counts: Record<string, number>
+  tenant_id: string | null
+  result_cache_hits: number
+  result_cache_misses: number
+  database_concurrency_rejections: number
+}
+
+// --- Tenant/client admin dashboard (api/tenant_admin.py, Prompt 29) --
+// mirrors api/tenant_admin_schemas.py's own new shapes. Every other type
+// this dashboard needs (TenantOut, PlatformUserOut, RoleOut,
+// DatabaseStatusOut, SecurityEventOut, AssignRoleRequest) is the exact
+// same type the platform-admin dashboard already defined above, reused
+// as-is -- only the query scope differs, enforced server-side. ---
+
+export interface SemanticCatalogStatusOut {
+  draft_count: number
+  reviewed_count: number
+  published_count: number
+  superseded_count: number
+}
+
+export interface PendingReviewsOut {
+  onboarding_pending_by_type: Record<string, number>
+  catalog_pending_count: number
+  total_pending: number
+}
+
+export interface GoldenQuestionsSummaryOut {
+  job_id: string
+  database_label: string
+  question_count: number
+}
+
+export interface EvaluationSummaryOut {
+  job_id: string
+  database_label: string
+  pass_count: number
+  total_count: number
+  evaluated_at: string
+}
+
+// --- Recommendation governance (api/recommendation_governance.py,
+// Prompt 17/18) -- the first frontend consumer of this API; mirrors
+// api/recommendation_governance_schemas.py. Reused read-only by this
+// dashboard (list + quality metrics only); the fuller feedback/resolve/
+// expire governance workflow is a disclosed, deliberately deferred
+// follow-up, matching this codebase's own "compute + test, defer
+// deepest UI wiring" precedent already used elsewhere (e.g. Prompt 15's
+// visualization_spec). ---
+
+export type RecommendationStatus =
+  | 'generated'
+  | 'reviewed'
+  | 'accepted'
+  | 'rejected'
+  | 'partially_useful'
+  | 'incorrect'
+  | 'resolved'
+  | 'expired'
+
+/** One supporting claim behind a recommendation -- a serialized
+ * `agent.provenance.ProvenancedClaim`. Evidence is only ever `database_fact`
+ * or `confirmed_business_truth` (`recommendation.models.Recommendation`
+ * enforces that), so a reviewer can always tell what the claim rests on. */
+export interface RecommendationEvidenceItem {
+  value: string
+  level: TruthLevel
+  grounded_in: string[]
+  source: string | null
+}
+
+export type RecommendationCategory =
+  | 'performance'
+  | 'anomaly'
+  | 'revenue'
+  | 'customer'
+  | 'product'
+  | 'operations'
+  | 'data_quality'
+  | 'security'
+  | 'database_performance'
+
+/** The verdicts `POST /recommendations/{id}/feedback` accepts. `resolved`
+ * and `expired` each have their own route (`.../resolve`, `.../expire`). */
+export type RecommendationVerdict =
+  | 'reviewed'
+  | 'accepted'
+  | 'rejected'
+  | 'partially_useful'
+  | 'incorrect'
+
+export interface RecommendationRecordOut {
+  id: string
+  tenant_id: string
+  database_id: string
+  category: RecommendationCategory | string | null
+  kind: string
+  rule_or_model: string | null
+  claim_text: string
+  rationale: string | null
+  affected_entity: string | null
+  action: string | null
+  measurable_impact: string | null
+  confidence: number | null
+  evidence: RecommendationEvidenceItem[]
+  limitations: string[]
+  engine_version: string
+  evidence_version: string
+  status: RecommendationStatus
+  generated_at: string
+  source_question: string | null
+  source_sql: string | null
+  created_at: string
+  updated_at: string
+  /** Prompt 31 -- `null` when unassigned, or when the owner has no display
+   * name set (never an email address). */
+  owner_user_id?: string | null
+  owner_display_name?: string | null
+}
+
+/** Prompt 32 -- one screen this caller may open (`security/navigation.py`). */
+export interface NavItemOut {
+  id: string
+  path: string
+  group: 'workspace' | 'review' | 'administration'
+}
+
+/** Prompt 32 -- the server's decision for the signed-in caller: which screens
+ * they may open, and which named actions they may offer. */
+export interface NavigationOut {
+  items: NavItemOut[]
+  capabilities: Record<string, boolean>
+  roles: string[]
+  tenant_id: string | null
+}
+
+export type RecommendationEventType = 'status_change' | 'note' | 'owner_assigned'
+
+export interface RecommendationFeedbackEventOut {
+  id: string
+  recommendation_id: string
+  from_status: RecommendationStatus | null
+  to_status: RecommendationStatus
+  event_type?: RecommendationEventType
+  actor_user_id: string | null
+  actor_label: string | null
+  reason: string | null
+  detail?: { owner_user_id: string | null; previous_owner_user_id: string | null } | null
+  recommendation_version: string
+  evidence_version: string
+  created_at: string
+}
+
+export interface RecommendationQualityMetricsOut {
+  total: number
+  by_status: Record<string, number>
+  by_category: Record<string, Record<string, number>>
+  judged_total: number
+  acceptance_rate: number | null
 }

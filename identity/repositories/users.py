@@ -7,7 +7,7 @@ from __future__ import annotations
 import uuid
 from datetime import UTC, datetime, timedelta
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from identity.exceptions import AccountLockedError, DuplicateUserError
@@ -235,6 +235,93 @@ def change_password(session: Session, user: User, new_password: str) -> None:
     user.password_hash = hash_password(new_password)
     user.password_changed_at = datetime.now(UTC)
     session.commit()
+
+
+def count_users_by_tenant(session: Session) -> dict[str, int]:
+    """`{tenant_id: active_account_count}` across every tenant -- one
+    grouped query, not N `list_users` calls, feeding Prompt 28's platform-
+    admin tenants listing."""
+    rows = session.execute(
+        select(User.tenant_id, func.count())
+        .where(User.deleted_at.is_(None))
+        .group_by(User.tenant_id)
+    ).all()
+    return {tenant_id: count for tenant_id, count in rows}
+
+
+def list_users(
+    session: Session,
+    *,
+    tenant_id: str | None = None,
+    role_name: str | None = None,
+    status: str | None = None,
+    limit: int = 200,
+) -> list[User]:
+    """Lists accounts, newest first -- Prompt 28
+    (`28_GLOBAL_PLATFORM_ADMIN_DASHBOARD_CONTRACT.md`), the platform-admin
+    dashboard's own Users section.
+
+    `tenant_id=None` (the default) lists **across every tenant** -- unlike
+    every other tenant-aware query in this codebase, which filters to one
+    tenant by default. This is intentional: the only caller of this
+    function is `api/platform_admin.py`, already gated on
+    `identity.rbac.Permission.PLATFORM_ADMIN`, and that permission's
+    entire purpose is cross-tenant visibility (see that permission's own
+    docstring). A route for an *ordinary* tenant-scoped admin would need
+    to pass its own `tenant_id` explicitly -- this function does not
+    default to "safe," it defaults to "complete," because its one caller
+    already proved it may see everything.
+
+    `limit` bounds a single page (no cursor/offset pagination yet -- a
+    disclosed, narrower scope than a production user-management screen
+    would eventually want for a very large user base).
+    """
+    statement = select(User).where(User.deleted_at.is_(None))
+    if tenant_id is not None:
+        statement = statement.where(User.tenant_id == tenant_id)
+    if status is not None:
+        statement = statement.where(User.status == status)
+    if role_name is not None:
+        statement = (
+            statement.join(UserRole, UserRole.user_id == User.id)
+            .join(Role, Role.id == UserRole.role_id)
+            .where(Role.name == role_name)
+        )
+    statement = statement.order_by(User.created_at.desc()).limit(limit)
+    return list(session.scalars(statement))
+
+
+class RoleWithPermissions:
+    """A plain, ORM-independent read shape -- `role` plus its granted
+    `permissions`, exactly what `GET /platform-admin/roles` needs and
+    nothing a response schema would have to strip back out."""
+
+    __slots__ = ("role", "permissions")
+
+    def __init__(self, role: Role, permissions: tuple[str, ...]) -> None:
+        self.role = role
+        self.permissions = permissions
+
+
+def list_roles_with_permissions(session: Session) -> list[RoleWithPermissions]:
+    """Every role, each with its granted permission codes -- Prompt 28's
+    Roles & Permissions dashboard section. Read-only: this codebase has
+    no route that edits a role's own permission grants (only which roles
+    a *user* holds, via `assign_role`/`remove_role` below), matching
+    `identity/rbac.py`'s own docstring that `SEED_ROLES` is initial data
+    an operator may extend by hand, not something this app's UI manages.
+    """
+    roles = list(session.scalars(select(Role).order_by(Role.name)))
+    results = []
+    for role in roles:
+        codes = session.scalars(
+            select(PermissionModel.code)
+            .join(RolePermission, RolePermission.permission_id == PermissionModel.id)
+            .where(RolePermission.role_id == role.id)
+            .order_by(PermissionModel.code)
+        ).all()
+        results.append(RoleWithPermissions(role=role, permissions=tuple(codes)))
+    return results
 
 
 def update_display_name(session: Session, user: User, display_name: str) -> User:

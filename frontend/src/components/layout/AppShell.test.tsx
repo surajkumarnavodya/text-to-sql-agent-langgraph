@@ -1,8 +1,11 @@
-import { render, screen } from '@testing-library/react'
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
+import { act, render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { MemoryRouter, Route, Routes } from 'react-router-dom'
-import { afterEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { useLocalAuthStore } from '@/store/localAuthStore'
+import * as navigationApi from '@/lib/navigationApi'
+import { serveNavigation } from '@/test/navigationFixtures'
 import { AppShell } from './AppShell'
 
 // Sidebar/MobileNav pull in chatStore/localAuthStore and a fair amount of
@@ -12,6 +15,10 @@ import { AppShell } from './AppShell'
 // SettingsDialog are stubbed too, replaced with a minimal harness that lets
 // the test trigger the exact same `onOpenSettings`/`open` wiring AppShell
 // itself owns, without needing real auth/query-client context.
+vi.mock('@/lib/navigationApi', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/lib/navigationApi')>()
+  return { ...actual, getNavigation: vi.fn(), reportAccessDenied: vi.fn() }
+})
 vi.mock('./Sidebar', () => ({ Sidebar: () => <div>Sidebar stub</div> }))
 vi.mock('./MobileNav', () => ({ MobileNav: () => <div>MobileNav stub</div> }))
 vi.mock('./UserMenu', () => ({
@@ -24,13 +31,41 @@ vi.mock('./SettingsDialog', () => ({
     open ? <div role="dialog">Settings stub</div> : null,
 }))
 
+/** Signs a caller in with `roles` and serves the server's navigation for them. */
+function signInAs(roles: string[]) {
+  useLocalAuthStore.setState({ user: { roles } } as never)
+  serveNavigation(vi.mocked(navigationApi.getNavigation), roles)
+}
+
+/** Signed out: no user, and an empty navigation response. */
+function signOut() {
+  useLocalAuthStore.setState({ user: null } as never)
+  serveNavigation(vi.mocked(navigationApi.getNavigation), null)
+}
+
+beforeEach(() => serveNavigation(vi.mocked(navigationApi.getNavigation), null))
+
+/** Renders and waits until the server navigation response has been applied.
+ * Without this, a `queryByRole(...).not` assertion passes before any tab data
+ * has arrived, which proves nothing. */
+async function renderAndSettle() {
+  renderAppShell()
+  await waitFor(() => expect(vi.mocked(navigationApi.getNavigation)).toHaveBeenCalled())
+  await act(async () => {
+    await new Promise((resolve) => setTimeout(resolve, 0))
+  })
+}
+
 function renderAppShell() {
+  const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } })
   return render(
-    <MemoryRouter initialEntries={['/']}>
-      <Routes>
-        <Route path="/" element={<AppShell />} />
-      </Routes>
-    </MemoryRouter>,
+    <QueryClientProvider client={queryClient}>
+      <MemoryRouter initialEntries={['/']}>
+        <Routes>
+          <Route path="/" element={<AppShell />} />
+        </Routes>
+      </MemoryRouter>
+    </QueryClientProvider>,
   )
 }
 
@@ -73,31 +108,105 @@ describe('AppShell role-gated review-tool nav gating', () => {
     useLocalAuthStore.setState(initialAuthState, true)
   })
 
-  it('shows both review tabs for an admin', () => {
-    useLocalAuthStore.setState({ user: { roles: ['admin'] } } as never)
-    renderAppShell()
+  it('shows both review tabs for an admin', async () => {
+    signInAs(['admin'])
+    await renderAndSettle()
     expect(screen.getByRole('link', { name: /database onboarding/i })).toBeInTheDocument()
     expect(screen.getByRole('link', { name: /sme semantic review/i })).toBeInTheDocument()
   })
 
-  it('shows both review tabs for an analyst', () => {
-    useLocalAuthStore.setState({ user: { roles: ['analyst'] } } as never)
-    renderAppShell()
+  it('shows both review tabs for an analyst', async () => {
+    signInAs(['analyst'])
+    await renderAndSettle()
     expect(screen.getByRole('link', { name: /database onboarding/i })).toBeInTheDocument()
     expect(screen.getByRole('link', { name: /sme semantic review/i })).toBeInTheDocument()
   })
 
-  it('hides both review tabs for a plain user', () => {
-    useLocalAuthStore.setState({ user: { roles: ['user'] } } as never)
-    renderAppShell()
+  it('hides both review tabs for a plain user', async () => {
+    signInAs(['user'])
+    await renderAndSettle()
     expect(screen.queryByRole('link', { name: /database onboarding/i })).not.toBeInTheDocument()
     expect(screen.queryByRole('link', { name: /sme semantic review/i })).not.toBeInTheDocument()
   })
 
-  it('hides both review tabs when signed out', () => {
-    useLocalAuthStore.setState({ user: null } as never)
-    renderAppShell()
+  it('hides both review tabs when signed out', async () => {
+    signOut()
+    await renderAndSettle()
     expect(screen.queryByRole('link', { name: /database onboarding/i })).not.toBeInTheDocument()
     expect(screen.queryByRole('link', { name: /sme semantic review/i })).not.toBeInTheDocument()
+  })
+})
+
+// Prompt 28: Platform Admin is gated on a *different* dimension than the
+// two review tabs above -- the `platform_admin` role, never satisfied by
+// `admin` alone (see `identity.rbac.Permission.PLATFORM_ADMIN`'s own
+// docstring for the full "platform-admin versus tenant-admin" rationale).
+// A regression here that folded this into `canSeeReviewTabs` would show a
+// tenant's own admin a tab that 403s for them every time.
+describe('AppShell Platform Admin nav gating', () => {
+  const initialAuthState = useLocalAuthStore.getState()
+
+  afterEach(() => {
+    useLocalAuthStore.setState(initialAuthState, true)
+  })
+
+  it('hides the Platform Admin tab for a plain tenant admin', async () => {
+    signInAs(['admin'])
+    await renderAndSettle()
+    expect(screen.queryByRole('link', { name: /platform admin/i })).not.toBeInTheDocument()
+  })
+
+  it('shows the Platform Admin tab only for the platform_admin role', async () => {
+    signInAs(['platform_admin'])
+    await renderAndSettle()
+    expect(screen.getByRole('link', { name: /platform admin/i })).toBeInTheDocument()
+  })
+
+  it('hides the Platform Admin tab when signed out', async () => {
+    signOut()
+    await renderAndSettle()
+    expect(screen.queryByRole('link', { name: /platform admin/i })).not.toBeInTheDocument()
+  })
+})
+
+// Prompt 29: Tenant Admin introduces no new role at all -- it's visible to
+// admin/auditor/manager (identity.rbac.Permission.ADMIN_DASHBOARD_READ's
+// own real grant set), a different set from canSeeReviewTabs's
+// admin/analyst (an analyst has no business-administration capability).
+describe('AppShell Tenant Admin nav gating', () => {
+  const initialAuthState = useLocalAuthStore.getState()
+
+  afterEach(() => {
+    useLocalAuthStore.setState(initialAuthState, true)
+  })
+
+  it('shows the Tenant Admin tab for an admin', async () => {
+    signInAs(['admin'])
+    await renderAndSettle()
+    expect(screen.getByRole('link', { name: /tenant admin/i })).toBeInTheDocument()
+  })
+
+  it('shows the Tenant Admin tab for an auditor', async () => {
+    signInAs(['auditor'])
+    await renderAndSettle()
+    expect(screen.getByRole('link', { name: /tenant admin/i })).toBeInTheDocument()
+  })
+
+  it('shows the Tenant Admin tab for a manager', async () => {
+    signInAs(['manager'])
+    await renderAndSettle()
+    expect(screen.getByRole('link', { name: /tenant admin/i })).toBeInTheDocument()
+  })
+
+  it('hides the Tenant Admin tab for a plain user or analyst', async () => {
+    signInAs(['analyst'])
+    await renderAndSettle()
+    expect(screen.queryByRole('link', { name: /tenant admin/i })).not.toBeInTheDocument()
+  })
+
+  it('hides the Tenant Admin tab when signed out', async () => {
+    signOut()
+    await renderAndSettle()
+    expect(screen.queryByRole('link', { name: /tenant admin/i })).not.toBeInTheDocument()
   })
 })

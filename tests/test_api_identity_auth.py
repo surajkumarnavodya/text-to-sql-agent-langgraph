@@ -299,6 +299,33 @@ class TestMeAndChangePassword:
         assert new_login.status_code == 200
 
 
+class TestChangePasswordRevokesOtherDevices:
+    """A voluntary password change revokes every other live session -- the
+    same reasoning the reset path already applies -- while keeping the
+    device that made the change signed in."""
+
+    def test_other_device_is_signed_out_and_this_device_stays_signed_in(self, client):
+        from fastapi.testclient import TestClient
+
+        tokens = _register(client)
+        other_device = TestClient(client.app)
+        login = other_device.post(
+            "/auth/login", json={"email": "alice@example.com", "password": "correcthorse1"}
+        )
+        assert login.status_code == 200
+        assert other_device.post("/auth/refresh").status_code == 200
+
+        response = client.post(
+            "/auth/change-password",
+            json={"current_password": "correcthorse1", "new_password": "a-new-password-1"},
+            headers={"Authorization": f"Bearer {tokens['access_token']}"},
+        )
+        assert response.status_code == 200
+
+        assert other_device.post("/auth/refresh").status_code == 401
+        assert client.post("/auth/refresh").status_code == 200
+
+
 class TestRefreshRotationAndReuseDetection:
     def test_refresh_issues_a_new_access_token(self, client):
         _register(client)

@@ -24,8 +24,11 @@ ordinary retry-loop logs.
 from __future__ import annotations
 
 import logging
+import threading
+import time
+from collections import deque
 from contextvars import ContextVar, Token
-from typing import Literal
+from typing import Literal, TypedDict
 
 from security.sanitization import truncate_for_log
 
@@ -187,6 +190,92 @@ _LEVEL_MAP: dict[Severity, int] = {
 _MAX_CONTEXT_VALUE_LENGTH = 200
 
 
+class SecurityEventRecord(TypedDict):
+    """One entry in the in-process ring buffer below -- the shape
+    `GET /platform-admin/security-events` (Prompt 28) returns."""
+
+    timestamp: str
+    event_type: str
+    severity: Severity
+    detail: str
+    correlation_id: str | None
+    tenant_id: str | None
+    context: dict[str, str]
+
+
+#: Prompt 28 (`28_GLOBAL_PLATFORM_ADMIN_DASHBOARD_CONTRACT.md`): a bounded,
+#: thread-safe, in-process ring buffer of the most recent security events,
+#: fed from inside `log_security_event` itself -- every one of this
+#: codebase's ~40 existing call sites starts populating it with zero
+#: changes to any of them, the same "instrument the one shared chokepoint,
+#: not every call site" approach `security/audit_log.py`'s own
+#: `CorrelationIdLogFilter`/`TenantIdLogFilter` already use for ordinary
+#: log lines. Before this, a security event was visible only by reading
+#: the live process log stream (or whatever external log pipeline an
+#: operator has wired up) -- there was no queryable "what just happened"
+#: view at all, unlike `observability.metrics.PerformanceMetrics`'s
+#: equivalent rollup for ordinary request timings.
+#:
+#: **Deliberate limits, matching `PerformanceMetrics`'s own disclosed
+#: posture for the identical reason**: single-process, in-memory only (a
+#: multi-worker deployment has one independent buffer per worker), resets
+#: on restart, bounded by count (`_MAX_RECENT_EVENTS`), not time. This is
+#: an operational "what just happened" view, not a durable SIEM -- a real
+#: deployment wanting long-term retention still needs a real log
+#: pipeline, which this app does not attempt to replace.
+_MAX_RECENT_EVENTS = 1000
+_recent_events: deque[SecurityEventRecord] = deque(maxlen=_MAX_RECENT_EVENTS)
+_recent_events_lock = threading.Lock()
+
+
+def _record_recent_event(
+    event_type: str, severity: Severity, detail: str, context: dict[str, object]
+) -> None:
+    """Appends one entry to the ring buffer. Never raises -- called from
+    inside `log_security_event`'s own outer `try`, but kept defensive on
+    its own too, since a ring-buffer write must never be why a security
+    event fails to reach the log line that already carries it."""
+    try:
+        rendered_context = {
+            key: truncate_for_log(repr(value), _MAX_CONTEXT_VALUE_LENGTH)
+            for key, value in context.items()
+        }
+        with _recent_events_lock:
+            _recent_events.append(
+                {
+                    "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                    "event_type": event_type,
+                    "severity": severity,
+                    "detail": detail,
+                    "correlation_id": _correlation_id.get(),
+                    "tenant_id": _tenant_id.get(),
+                    "context": rendered_context,
+                }
+            )
+    except Exception:  # noqa: BLE001 - must never break the caller
+        pass
+
+
+def recent_security_events(
+    *, limit: int = 100, severity: Severity | None = None, event_type: str | None = None
+) -> list[SecurityEventRecord]:
+    """Returns the most recent security events, newest first, optionally
+    filtered -- `GET /platform-admin/security-events`'s own query.
+
+    `limit` caps how many are returned, never how many are scanned (the
+    buffer itself is already bounded to `_MAX_RECENT_EVENTS`, so a filtered
+    query is always a cheap, fixed-size scan).
+    """
+    with _recent_events_lock:
+        events = list(_recent_events)
+    events.reverse()
+    if severity is not None:
+        events = [event for event in events if event["severity"] == severity]
+    if event_type is not None:
+        events = [event for event in events if event["event_type"] == event_type]
+    return events[:limit]
+
+
 def log_security_event(
     event_type: str,
     severity: Severity,
@@ -237,5 +326,6 @@ def log_security_event(
         if rendered_context:
             message = f"{message} {rendered_context}"
         logger.log(_LEVEL_MAP[severity], message)
+        _record_recent_event(event_type, severity, detail, context)
     except Exception:  # noqa: BLE001 - logging must never break the caller
         logger.exception("[audit_log] failed to emit security event event_type=%r", event_type)

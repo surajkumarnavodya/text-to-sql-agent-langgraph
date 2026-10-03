@@ -49,7 +49,10 @@
     "knowledgeSources": "Fuentes de conocimiento",
     "mediaSearch": "Búsqueda de medios",
     "dbOnboarding": "Incorporación de bases de datos",
-    "semanticReview": "Revisión semántica (SME)"
+    "semanticReview": "Revisión semántica (SME)",
+    "recommendations": "Recomendaciones",
+    "platformAdmin": "Administración de la plataforma",
+    "tenantAdmin": "Administración del inquilino"
   },
   "header": {
     "openHistory": "Abrir historial de chat",

@@ -49,7 +49,10 @@
     "knowledgeSources": "ज्ञान स्रोत",
     "mediaSearch": "मीडिया शोध",
     "dbOnboarding": "डेटाबेस ऑनबोर्डिंग",
-    "semanticReview": "विषय-तज्ज्ञ सिमेंटिक पुनरावलोकन"
+    "semanticReview": "विषय-तज्ज्ञ सिमेंटिक पुनरावलोकन",
+    "recommendations": "शिफारसी",
+    "platformAdmin": "प्लॅटफॉर्म प्रशासन",
+    "tenantAdmin": "टेनंट प्रशासन"
   },
   "header": {
     "openHistory": "चॅट इतिहास उघडा",

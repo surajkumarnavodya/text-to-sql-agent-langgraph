@@ -985,6 +985,16 @@ def change_password_route(
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=violations)
 
     change_password(session, user, payload.new_password)
+    # Every *other* live session is revoked -- the same reasoning the reset
+    # path applies: a session established under the old password may be the
+    # very compromise the user is changing it to escape. The caller's own
+    # session (matched by the refresh cookie) is kept so this device stays
+    # signed in.
+    current_raw = request.cookies.get(_REFRESH_COOKIE_NAME)
+    current = get_session_by_refresh_token(session, current_raw) if current_raw else None
+    for other in list_active_sessions_for_user(session, user.id):
+        if current is None or other.id != current.id:
+            revoke_session(session, other, reason="password_changed")
     record_signin_event(
         session, user_id=user.id, event_type="password_reset_completed", success=True
     )

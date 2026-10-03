@@ -1,9 +1,19 @@
-import { BookOpen, Database, ImageIcon, MessageSquare, Plug, ShieldCheck } from 'lucide-react'
+import {
+  BookOpen,
+  Building2,
+  Database,
+  ImageIcon,
+  Lightbulb,
+  MessageSquare,
+  Plug,
+  ShieldAlert,
+  ShieldCheck,
+} from 'lucide-react'
 import { useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { NavLink, Outlet } from 'react-router-dom'
 import { cn } from '@/lib/utils'
-import { useLocalAuthStore } from '@/store/localAuthStore'
+import { useNavigation } from '@/hooks/queries'
 import { useSettingsStore } from '@/store/settingsStore'
 import { MobileNav } from './MobileNav'
 import { SettingsDialog } from './SettingsDialog'
@@ -12,6 +22,20 @@ import { SidebarToggle } from './SidebarToggle'
 import { UserMenu } from './UserMenu'
 
 const SIDEBAR_ID = 'app-sidebar'
+
+/** How each screen the server may list is drawn: an icon and a translated label.
+ * Presentation only. Whether a screen appears at all is the server's decision
+ * (`GET /navigation`). A screen with no entry here is simply not drawn. */
+const SCREEN_PRESENTATION: Record<string, { icon: typeof MessageSquare; labelKey: string }> = {
+  chat: { icon: MessageSquare, labelKey: 'nav.chat' },
+  knowledge_sources: { icon: BookOpen, labelKey: 'nav.knowledgeSources' },
+  media_search: { icon: ImageIcon, labelKey: 'nav.mediaSearch' },
+  recommendations: { icon: Lightbulb, labelKey: 'nav.recommendations' },
+  db_onboarding: { icon: Plug, labelKey: 'nav.dbOnboarding' },
+  semantic_review: { icon: ShieldCheck, labelKey: 'nav.semanticReview' },
+  tenant_admin: { icon: Building2, labelKey: 'nav.tenantAdmin' },
+  platform_admin: { icon: ShieldAlert, labelKey: 'nav.platformAdmin' },
+}
 
 /** Full-viewport application shell: a persistent left conversation-history
  * sidebar (>=lg viewports, collapsible to an icon rail) + main workspace.
@@ -30,27 +54,12 @@ const SIDEBAR_ID = 'app-sidebar'
 export function AppShell() {
   const { t } = useTranslation()
   const [isSettingsOpen, setIsSettingsOpen] = useState(false)
-  // Database Onboarding and SME Semantic Review are the two nav tabs
-  // gated on role, rather than always visible like the others -- UX only
-  // (the real enforcement is server-side, see each page's own
-  // docstring), chosen here because unlike Chat/Knowledge Sources/Media
-  // Search, these pages are entirely non-functional for an account with
-  // neither role (they have no "read-only" use for a plain user), so
-  // showing a tab that leads nowhere useful would be worse UX than
-  // omitting it. Both share the identical admin/analyst role gate
-  // (ONBOARDING_MANAGE/ONBOARDING_REVIEW and CATALOG_MANAGE/
-  // CATALOG_REVIEW sit at the same two RBAC tiers -- see
-  // `identity/rbac.py`), so one boolean serves both.
-  // Selects the already-stable `user` object itself, not a derived array --
-  // a selector returning a freshly-allocated `[]` fallback on every call
-  // (an earlier version of this line did exactly that) breaks Zustand's
-  // snapshot-equality check and triggers React's "Maximum update depth
-  // exceeded" infinite-loop guard, a real regression this app's own test
-  // suite caught (AppShell.test.tsx).
-  const localUser = useLocalAuthStore((state) => state.user)
-  const canSeeReviewTabs = Boolean(
-    localUser?.roles.includes('admin') || localUser?.roles.includes('analyst'),
-  )
+  // Role-based navigation (Prompt 32): the screens this caller may open come
+  // from the server (`GET /navigation`, `security/navigation.py`), never from a
+  // role name read in the browser. While that loads, no review or admin tab is
+  // shown rather than guessed at.
+  const navigation = useNavigation()
+  const screens = navigation.data?.items ?? []
   const sidebarCollapsed = useSettingsStore((state) => state.sidebarCollapsed)
   // Passed to both UserMenu (attaches it to the avatar button) and
   // SettingsDialog (restores focus there on close) -- see
@@ -92,17 +101,20 @@ export function AppShell() {
               </span>
             </div>
 
-            <nav className="flex gap-1">
-              <NavTab to="/" icon={MessageSquare} label={t('nav.chat')} />
-              <NavTab to="/knowledge-sources" icon={BookOpen} label={t('nav.knowledgeSources')} />
-              <NavTab to="/media-search" icon={ImageIcon} label={t('nav.mediaSearch')} />
-              {canSeeReviewTabs && (
-                <NavTab to="/db-onboarding" icon={Plug} label={t('nav.dbOnboarding')} />
-              )}
-              {canSeeReviewTabs && (
-                <NavTab to="/semantic-review" icon={ShieldCheck} label={t('nav.semanticReview')} />
-              )}
-            </nav>
+              <nav aria-label="Primary navigation" className="flex gap-1">
+                {screens.map((screen) => {
+                  const presentation = SCREEN_PRESENTATION[screen.id]
+                  if (!presentation) return null
+                  return (
+                    <NavTab
+                      key={screen.id}
+                      to={screen.path}
+                      icon={presentation.icon}
+                      label={t(presentation.labelKey)}
+                    />
+                  )
+                })}
+              </nav>
 
             <div className="ml-auto flex items-center gap-1.5">
               <UserMenu onOpenSettings={() => setIsSettingsOpen(true)} triggerRef={userMenuTriggerRef} />

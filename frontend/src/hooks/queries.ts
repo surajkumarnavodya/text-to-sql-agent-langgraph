@@ -1,9 +1,22 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import { getNavigation } from '@/lib/navigationApi'
+import { useLocalAuthStore } from '@/store/localAuthStore'
+import {
+  addRecommendationNote,
+  assignRecommendationOwner,
+  expireRecommendation,
+  listRecommendationEvents,
+  listRecommendations,
+  resolveRecommendation,
+  submitRecommendationVerdict,
+  type RecommendationListFilters,
+} from '@/lib/recommendationApi'
 import {
   deleteDocument,
   getAttachmentCapabilities,
   getAvailableModels,
   getHealth,
+  getPerformanceMetrics,
   getSchemaTables,
   listDocuments,
   refreshSchema,
@@ -22,6 +35,22 @@ import {
   runOnboardingDiscovery,
 } from '@/lib/onboardingApi'
 import {
+  assignUserRole,
+  createTenant,
+  getConfigStatus,
+  getPlatformMetrics,
+  getSemanticReviewQueue,
+  listAuditLogs,
+  listPlatformDatabases,
+  listPlatformJobs,
+  listPlatformUsers,
+  listRoles,
+  listSecurityEvents,
+  listTenants,
+  removeUserRole,
+  setTenantStatus,
+} from '@/lib/platformAdminApi'
+import {
   createCatalogEntry,
   getCatalogEntry,
   getCatalogEntryVersions,
@@ -31,14 +60,33 @@ import {
   reviewCatalogEntry,
   updateCatalogEntry,
 } from '@/lib/semanticCatalogApi'
+import {
+  assignTenantUserRole,
+  getTenantPendingReviews,
+  getTenantProfile,
+  getTenantRecommendationQualityMetrics,
+  getTenantSemanticCatalogStatus,
+  listTenantAssignableRoles,
+  listTenantAuditEvents,
+  listTenantDatabases,
+  listTenantEvaluationResults,
+  listTenantGoldenQuestions,
+  listTenantRecommendations,
+  listTenantUsers,
+  refreshTenantDatabases,
+  removeTenantUserRole,
+} from '@/lib/tenantAdminApi'
 import type {
+  AssignRoleRequest,
   Collection,
   CreateCatalogEntryRequest,
+  CreateTenantRequest,
   DecideReviewItemRequest,
   PublishJobRequest,
   ReviewDecisionRequest,
   RunDiscoveryRequest,
   SensitivityCategory,
+  SetTenantStatusRequest,
   UpdateCatalogEntryRequest,
 } from '@/lib/types'
 
@@ -296,6 +344,307 @@ export function usePublishCatalogEntry(entryId: string) {
   const invalidate = useInvalidateCatalogQueries(entryId)
   return useMutation({
     mutationFn: () => publishCatalogEntry(entryId),
+    onSuccess: invalidate,
+  })
+}
+
+// --- Global platform admin dashboard (api/platform_admin.py, Prompt 28) ---
+// No `refetchInterval` anywhere below -- this is an operator dashboard a
+// human opens and reads, not a live-polling view; React Query's own
+// manual `refetch`/`invalidateQueries` after a mutation is enough.
+
+export function usePlatformTenants() {
+  return useQuery({ queryKey: ['platform-admin-tenants'], queryFn: listTenants })
+}
+
+export function useCreateTenant() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (payload: CreateTenantRequest) => createTenant(payload),
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: ['platform-admin-tenants'] })
+    },
+  })
+}
+
+export function useSetTenantStatus(tenantId: string) {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (payload: SetTenantStatusRequest) => setTenantStatus(tenantId, payload),
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: ['platform-admin-tenants'] })
+      void queryClient.invalidateQueries({ queryKey: ['platform-admin-audit-logs'] })
+    },
+  })
+}
+
+export function usePlatformUsers(params?: { tenantId?: string; roleName?: string; status?: string }) {
+  return useQuery({
+    queryKey: ['platform-admin-users', params ?? null],
+    queryFn: () => listPlatformUsers(params),
+  })
+}
+
+export function useAssignUserRole(userId: string) {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (payload: AssignRoleRequest) => assignUserRole(userId, payload),
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: ['platform-admin-users'] })
+      void queryClient.invalidateQueries({ queryKey: ['platform-admin-audit-logs'] })
+    },
+  })
+}
+
+export function useRemoveUserRole(userId: string) {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (roleName: string) => removeUserRole(userId, roleName),
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: ['platform-admin-users'] })
+      void queryClient.invalidateQueries({ queryKey: ['platform-admin-audit-logs'] })
+    },
+  })
+}
+
+export function usePlatformRoles() {
+  return useQuery({ queryKey: ['platform-admin-roles'], queryFn: listRoles })
+}
+
+export function usePlatformDatabases() {
+  return useQuery({ queryKey: ['platform-admin-databases'], queryFn: listPlatformDatabases })
+}
+
+export function useSemanticReviewQueue() {
+  return useQuery({
+    queryKey: ['platform-admin-semantic-review-queue'],
+    queryFn: getSemanticReviewQueue,
+  })
+}
+
+export function usePlatformJobs(status?: string) {
+  return useQuery({
+    queryKey: ['platform-admin-jobs', status ?? null],
+    queryFn: () => listPlatformJobs(status),
+  })
+}
+
+export function usePlatformMetrics() {
+  return useQuery({ queryKey: ['platform-admin-metrics'], queryFn: getPlatformMetrics })
+}
+
+export function useSecurityEvents(params?: { limit?: number; severity?: string; eventType?: string }) {
+  return useQuery({
+    queryKey: ['platform-admin-security-events', params ?? null],
+    queryFn: () => listSecurityEvents(params),
+  })
+}
+
+export function useAuditLogs(params?: { action?: string; resourceType?: string; outcome?: string }) {
+  return useQuery({
+    queryKey: ['platform-admin-audit-logs', params ?? null],
+    queryFn: () => listAuditLogs(params),
+  })
+}
+
+export function useConfigStatus() {
+  return useQuery({ queryKey: ['platform-admin-config-status'], queryFn: getConfigStatus })
+}
+
+// --- Tenant/client admin dashboard (api/tenant_admin.py, Prompt 29) ---
+
+export function useTenantProfile() {
+  return useQuery({ queryKey: ['tenant-admin-profile'], queryFn: getTenantProfile })
+}
+
+export function useTenantDatabases() {
+  return useQuery({ queryKey: ['tenant-admin-databases'], queryFn: listTenantDatabases })
+}
+
+export function useRefreshTenantDatabases() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: refreshTenantDatabases,
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: ['tenant-admin-databases'] })
+    },
+  })
+}
+
+export function useTenantUsers() {
+  return useQuery({ queryKey: ['tenant-admin-users'], queryFn: listTenantUsers })
+}
+
+export function useAssignTenantUserRole(userId: string) {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (payload: AssignRoleRequest) => assignTenantUserRole(userId, payload),
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: ['tenant-admin-users'] })
+    },
+  })
+}
+
+export function useRemoveTenantUserRole(userId: string) {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (roleName: string) => removeTenantUserRole(userId, roleName),
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: ['tenant-admin-users'] })
+    },
+  })
+}
+
+export function useTenantAssignableRoles() {
+  return useQuery({ queryKey: ['tenant-admin-roles'], queryFn: listTenantAssignableRoles })
+}
+
+export function useTenantSemanticCatalogStatus() {
+  return useQuery({
+    queryKey: ['tenant-admin-semantic-catalog-status'],
+    queryFn: getTenantSemanticCatalogStatus,
+  })
+}
+
+export function useTenantPendingReviews() {
+  return useQuery({ queryKey: ['tenant-admin-pending-reviews'], queryFn: getTenantPendingReviews })
+}
+
+export function useTenantGoldenQuestions() {
+  return useQuery({ queryKey: ['tenant-admin-golden-questions'], queryFn: listTenantGoldenQuestions })
+}
+
+export function useTenantEvaluationResults() {
+  return useQuery({
+    queryKey: ['tenant-admin-evaluation'],
+    queryFn: listTenantEvaluationResults,
+  })
+}
+
+export function useTenantAuditEvents() {
+  return useQuery({ queryKey: ['tenant-admin-audit'], queryFn: listTenantAuditEvents })
+}
+
+export function useTenantRecommendations() {
+  return useQuery({ queryKey: ['tenant-admin-recommendations'], queryFn: listTenantRecommendations })
+}
+
+export function useTenantRecommendationQualityMetrics() {
+  return useQuery({
+    queryKey: ['tenant-admin-recommendation-metrics'],
+    queryFn: getTenantRecommendationQualityMetrics,
+  })
+}
+
+/** `GET /metrics/performance` -- already tenant-scoped server-side (see
+ * `lib/api.ts::getPerformanceMetrics`'s own docstring), reused directly
+ * rather than duplicated under `/tenant-admin/*`. */
+export function useTenantPerformanceMetrics() {
+  return useQuery({ queryKey: ['tenant-admin-performance-metrics'], queryFn: getPerformanceMetrics })
+}
+
+// --- Role-based navigation (Prompt 32, `api/navigation.py`). The server decides
+// every screen and action; nothing here reads a role name. Keyed by the local
+// user id when there is one, and by a session key otherwise (OIDC, static token,
+// auth off), so a different person on the same browser never reuses another's
+// entry. `staleTime: 0` refetches on every mount: a changed role or a suspended
+// tenant must take effect immediately, not after a cache window. ---
+
+export function useNavigation() {
+  const userKey = useLocalAuthStore((state) => state.user?.id ?? 'session')
+  return useQuery({
+    queryKey: ['navigation', userKey],
+    queryFn: getNavigation,
+    staleTime: 0,
+    retry: false,
+  })
+}
+
+/** The server's named-action map for this caller (`security/navigation.py`'s
+ * `CAPABILITY_RULES`). Empty until navigation loads, so every action is hidden
+ * by default rather than shown on a guess. */
+export function useCapabilities(): Record<string, boolean> {
+  return useNavigation().data?.capabilities ?? {}
+}
+
+// --- Recommendation & action dashboard (Prompt 31,
+// `frontend/src/pages/Recommendations.tsx`). No `refetchInterval` -- a
+// reviewer acts on a record and the mutations below invalidate what changed. ---
+
+export function useRecommendations(filters: RecommendationListFilters = {}) {
+  return useQuery({
+    queryKey: ['recommendations', filters],
+    queryFn: () => listRecommendations(filters),
+  })
+}
+
+export function useRecommendationEvents(recordId: string | null) {
+  return useQuery({
+    queryKey: ['recommendation-events', recordId],
+    queryFn: () => listRecommendationEvents(recordId as string),
+    enabled: recordId !== null,
+  })
+}
+
+/** Every recommendation action changes the list (status/owner) and the
+ * selected record's audit trail, so all of them invalidate both. */
+function useInvalidateRecommendationQueries() {
+  const queryClient = useQueryClient()
+  return () => {
+    void queryClient.invalidateQueries({ queryKey: ['recommendations'] })
+    void queryClient.invalidateQueries({ queryKey: ['recommendation-events'] })
+    void queryClient.invalidateQueries({ queryKey: ['tenant-admin-recommendation-metrics'] })
+  }
+}
+
+export function useSubmitRecommendationVerdict() {
+  const invalidate = useInvalidateRecommendationQueries()
+  return useMutation({
+    mutationFn: ({
+      recordId,
+      status,
+      reason,
+    }: {
+      recordId: string
+      status: Parameters<typeof submitRecommendationVerdict>[1]['status']
+      reason?: string | null
+    }) => submitRecommendationVerdict(recordId, { status, reason: reason ?? null }),
+    onSuccess: invalidate,
+  })
+}
+
+export function useResolveRecommendation() {
+  const invalidate = useInvalidateRecommendationQueries()
+  return useMutation({
+    mutationFn: ({ recordId, reason }: { recordId: string; reason?: string | null }) =>
+      resolveRecommendation(recordId, reason ?? null),
+    onSuccess: invalidate,
+  })
+}
+
+export function useExpireRecommendation() {
+  const invalidate = useInvalidateRecommendationQueries()
+  return useMutation({
+    mutationFn: ({ recordId, reason }: { recordId: string; reason?: string | null }) =>
+      expireRecommendation(recordId, reason ?? null),
+    onSuccess: invalidate,
+  })
+}
+
+export function useAddRecommendationNote() {
+  const invalidate = useInvalidateRecommendationQueries()
+  return useMutation({
+    mutationFn: ({ recordId, note }: { recordId: string; note: string }) =>
+      addRecommendationNote(recordId, note),
+    onSuccess: invalidate,
+  })
+}
+
+export function useAssignRecommendationOwner() {
+  const invalidate = useInvalidateRecommendationQueries()
+  return useMutation({
+    mutationFn: ({ recordId, ownerUserId }: { recordId: string; ownerUserId: string | null }) =>
+      assignRecommendationOwner(recordId, ownerUserId),
     onSuccess: invalidate,
   })
 }

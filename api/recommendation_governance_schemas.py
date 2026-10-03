@@ -31,6 +31,11 @@ FeedbackVerdictLiteral = Literal[
 ]
 
 
+#: Prompt 31 -- what a feedback event records. `status_change` is every
+#: event that existed before Prompt 31 (the migration's server default).
+FeedbackEventTypeLiteral = Literal["status_change", "note", "owner_assigned"]
+
+
 class RecommendationFeedbackEventOut(BaseModel):
     model_config = ConfigDict(frozen=True)
 
@@ -38,9 +43,16 @@ class RecommendationFeedbackEventOut(BaseModel):
     recommendation_id: uuid.UUID
     from_status: RecommendationStatusLiteral | None
     to_status: RecommendationStatusLiteral
+    #: Prompt 31 -- additive, defaulted, so existing clients are unaffected.
+    event_type: FeedbackEventTypeLiteral = "status_change"
     actor_user_id: uuid.UUID | None
     actor_label: str | None
+    #: For `status_change` this is the verdict's reason; for `note` it is the
+    #: note text itself.
     reason: str | None
+    #: Typed payload for non-status events (`owner_assigned` carries the
+    #: new and previous owner ids). `None` for status changes.
+    detail: dict[str, Any] | None = None
     recommendation_version: str
     evidence_version: str
     created_at: datetime
@@ -71,6 +83,26 @@ class RecommendationRecordOut(BaseModel):
     source_sql: str | None
     created_at: datetime
     updated_at: datetime
+    #: Prompt 31 -- additive. `owner_display_name` is `None` when the owner
+    #: has no display name set, never an email address.
+    owner_user_id: uuid.UUID | None = None
+    owner_display_name: str | None = None
+
+
+class AddNoteRequest(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    note: str = Field(min_length=1, max_length=4000)
+
+
+class AssignOwnerRequest(BaseModel):
+    """`owner_user_id: null` clears the owner. The named user must be an
+    active account in the same tenant -- anything else is the same 404 a
+    nonexistent user gets (see `api/recommendation_governance.py`)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    owner_user_id: uuid.UUID | None = None
 
 
 class SubmitFeedbackRequest(BaseModel):
