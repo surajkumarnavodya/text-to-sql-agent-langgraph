@@ -21,6 +21,11 @@ from api.auth import verify_api_key
 from api.authz import get_auth_identity
 from config.settings import Settings, get_settings
 from security.audit_log import log_security_event
+from security.tenancy import (
+    TenantResolutionError,
+    resolve_actor_tenant_id,
+    resolve_tenant_context,
+)
 
 
 def require_local_auth_enabled(settings: Settings | None = None) -> Settings:
@@ -96,6 +101,17 @@ def require_local_user(
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED, detail="Account no longer exists."
         )
+    # Checked on every request, not only at login/refresh: a suspended or
+    # deleted tenant must lose access on its very next request, not when
+    # this access token happens to expire (`security/tenancy.py` rule 3).
+    # Every route that reaches here already holds an identity session, which
+    # is the one place that round trip is affordable.
+    try:
+        resolve_tenant_context(session, resolve_actor_tenant_id(user))
+    except TenantResolutionError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED, detail=exc.safe_message
+        ) from exc
     return user, session
 
 

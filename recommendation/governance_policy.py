@@ -48,6 +48,13 @@ class RecommendationAction(str, Enum):
     SUBMIT_FEEDBACK = "submit_feedback"
     MARK_RESOLVED = "mark_resolved"
     EXPIRE = "expire"
+    #: Prompt 31 -- append a free-text note to a record's audit trail.
+    ADD_NOTE = "add_note"
+    #: Prompt 31 -- set or clear who is responsible for acting on a record.
+    #: The assignee's own tenant/active status is checked by the repository
+    #: (`identity.repositories.recommendation_governance.assign_owner`), not
+    #: here, because this policy never loads a user row.
+    ASSIGN_OWNER = "assign_owner"
 
 
 _REVIEW_OR_MANAGE_ACTIONS: frozenset[RecommendationAction] = frozenset(
@@ -55,6 +62,8 @@ _REVIEW_OR_MANAGE_ACTIONS: frozenset[RecommendationAction] = frozenset(
         RecommendationAction.VIEW,
         RecommendationAction.SUBMIT_FEEDBACK,
         RecommendationAction.MARK_RESOLVED,
+        RecommendationAction.ADD_NOTE,
+        RecommendationAction.ASSIGN_OWNER,
     }
 )
 _MANAGE_ONLY_ACTIONS: frozenset[RecommendationAction] = frozenset({RecommendationAction.EXPIRE})

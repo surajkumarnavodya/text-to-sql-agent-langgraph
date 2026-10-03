@@ -2,6 +2,7 @@ import { useEffect } from 'react'
 import { useTranslation } from 'react-i18next'
 import { Route, Routes } from 'react-router-dom'
 import { AuthGate } from '@/components/auth/AuthGate'
+import { RequireNavItem } from '@/components/auth/RequireNavItem'
 import { AppShell } from '@/components/layout/AppShell'
 import { PwaUpdateBanner } from '@/components/layout/PwaUpdateBanner'
 import { ToastProvider } from '@/components/ui/toast'
@@ -10,6 +11,7 @@ import { AcceptInvitation } from '@/pages/AcceptInvitation'
 import { AuthCallback } from '@/pages/AuthCallback'
 import { Chat } from '@/pages/Chat'
 import { DatabaseOnboarding } from '@/pages/DatabaseOnboarding'
+import { Recommendations } from '@/pages/Recommendations'
 import { KnowledgeSources } from '@/pages/KnowledgeSources'
 import { MediaSearch } from '@/pages/MediaSearch'
 import { PlatformAdmin } from '@/pages/PlatformAdmin'
@@ -61,13 +63,72 @@ export function App() {
             </AuthGate>
           }
         >
-          <Route path="/" element={<Chat />} />
-          <Route path="/knowledge-sources" element={<KnowledgeSources />} />
-          <Route path="/media-search" element={<MediaSearch />} />
-          <Route path="/db-onboarding" element={<DatabaseOnboarding />} />
-          <Route path="/semantic-review" element={<SemanticReview />} />
-          <Route path="/platform-admin" element={<PlatformAdmin />} />
-          <Route path="/tenant-admin" element={<TenantAdmin />} />
+          <Route
+            path="/"
+            element={
+              <RequireNavItem screen="chat">
+                <Chat />
+              </RequireNavItem>
+            }
+          />
+          <Route
+            path="/knowledge-sources"
+            element={
+              <RequireNavItem screen="knowledge_sources">
+                <KnowledgeSources />
+              </RequireNavItem>
+            }
+          />
+          <Route
+            path="/media-search"
+            element={
+              <RequireNavItem screen="media_search">
+                <MediaSearch />
+              </RequireNavItem>
+            }
+          />
+          <Route
+            path="/db-onboarding"
+            element={
+              <RequireNavItem screen="db_onboarding">
+                <DatabaseOnboarding />
+              </RequireNavItem>
+            }
+          />
+          {/* Not `/recommendations`: that exact path is also the governance API's
+              list route, so a hard refresh here would hit JSON, not this page. */}
+          <Route
+            path="/recommended-actions"
+            element={
+              <RequireNavItem screen="recommendations">
+                <Recommendations />
+              </RequireNavItem>
+            }
+          />
+          <Route
+            path="/semantic-review"
+            element={
+              <RequireNavItem screen="semantic_review">
+                <SemanticReview />
+              </RequireNavItem>
+            }
+          />
+          <Route
+            path="/platform-admin"
+            element={
+              <RequireNavItem screen="platform_admin">
+                <PlatformAdmin />
+              </RequireNavItem>
+            }
+          />
+          <Route
+            path="/tenant-admin"
+            element={
+              <RequireNavItem screen="tenant_admin">
+                <TenantAdmin />
+              </RequireNavItem>
+            }
+          />
           {/* Accepting an invitation requires being signed in -- placed
               inside AuthGate so an unauthenticated visitor sees the
               ordinary sign-in screen first, then lands here once

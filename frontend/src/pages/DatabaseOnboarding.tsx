@@ -8,6 +8,7 @@ import { ReviewItemsSection } from '@/components/onboarding/ReviewItemsSection'
 import { useElapsedSeconds } from '@/hooks/useElapsedSeconds'
 import {
   useCancelOnboardingJob,
+  useCapabilities,
   useDecideOnboardingReviewItem,
   useOnboardingArtifacts,
   useOnboardingJob,
@@ -19,7 +20,6 @@ import {
 } from '@/hooks/queries'
 import { ApiError } from '@/lib/api'
 import type { OnboardingJob, OnboardingJobStatus, OnboardingReviewItem } from '@/lib/types'
-import { useLocalAuthStore } from '@/store/localAuthStore'
 
 const STATUS_TONE: Record<OnboardingJobStatus, 'neutral' | 'success' | 'warning' | 'danger' | 'accent'> = {
   pending: 'neutral',
@@ -81,9 +81,10 @@ const STATUS_TONE: Record<OnboardingJobStatus, 'neutral' | 'success' | 'warning'
  *   shown in the discovery summary below, honestly labeled.
  */
 export function DatabaseOnboarding() {
-  const localUser = useLocalAuthStore((state) => state.user)
-  const canManage = Boolean(localUser?.roles.includes('admin'))
-  const canReview = canManage || Boolean(localUser?.roles.includes('analyst'))
+  // Server-decided (Prompt 32): see `useCapabilities`. Never a role-name check.
+  const capabilities = useCapabilities()
+  const canManage = Boolean(capabilities.manage_onboarding)
+  const canReview = canManage || Boolean(capabilities.review_onboarding)
 
   const jobs = useOnboardingJobs()
   const [selectedJobId, setSelectedJobId] = useState<string | null>(null)

@@ -1237,7 +1237,9 @@ def review_sql_node(state: AgentState) -> dict[str, Any]:
     critique becomes this attempt's error feedback for the next
     `generate_sql` call, sharing the same `retry_count`/`state["max_retries"]`
     budget as every other retryable failure category -- not a separate,
-    unbounded critique loop layered on top.
+    unbounded critique loop layered on top. Once that budget is spent, a
+    FAIL alone no longer blocks: the query proceeds to validation with the
+    critique recorded as advisory (see the branch below).
 
     Fails open on any review failure -- an unreachable Ollama server, or a
     verdict `agent.llm_client._parse_review_response` couldn't parse as a
@@ -1287,20 +1289,32 @@ def review_sql_node(state: AgentState) -> dict[str, Any]:
         "error": feedback,
         "will_retry": can_retry,
     }
-    update: dict[str, Any] = {
+    if not can_retry:
+        # Budget exhausted on a review verdict alone. The reviewer is an LLM
+        # accuracy aid and can reject a correct query (e.g. judging a bare
+        # `Region` against a plan step written as `vDMPrep.Region`). Blocking
+        # here turned a runnable query into "could not produce a working
+        # query". The deterministic validator and read-only execution still run
+        # next, so the query is carried forward with the objection recorded.
+        logger.warning(
+            "[review_sql] plan review budget exhausted; proceeding to validation with advisory feedback"
+        )
+        return {
+            "plan_review_passed": False,
+            "plan_review_feedback": feedback,
+            "error_history": [f"Plan review (advisory, not blocking): {feedback}"],
+            "attempt_history": [{**record, "outcome": "plan_not_satisfied_advisory"}],
+            "status": "validating",
+        }
+    return {
         "plan_review_passed": False,
         "plan_review_feedback": feedback,
         "error_history": [f"Plan review: {feedback}"],
         "attempt_history": [record],
         "last_error_category": "plan_not_satisfied",
         "retry_count": retry_count + 1,
-        "status": "generating" if can_retry else "failed",
+        "status": "generating",
     }
-    if not can_retry:
-        update["failure_explanation"] = _give_up_explanation(
-            state, f"Gave up after {attempt_number} attempts. Last error (plan review): {feedback}"
-        )
-    return update
 
 
 @_timed_node("review_metric_conformance")

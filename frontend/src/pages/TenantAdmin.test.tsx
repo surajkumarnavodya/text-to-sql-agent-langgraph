@@ -1,7 +1,7 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
-import { afterEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, describe, expect, it, vi, beforeEach } from 'vitest'
 import * as api from '@/lib/api'
 import * as tenantAdminApi from '@/lib/tenantAdminApi'
 import type {
@@ -17,6 +17,8 @@ import type {
 } from '@/lib/types'
 import { useLocalAuthStore } from '@/store/localAuthStore'
 import { TenantAdmin } from './TenantAdmin'
+import * as navigationApi from '@/lib/navigationApi'
+import { serveNavigation } from '@/test/navigationFixtures'
 
 vi.mock('@/lib/tenantAdminApi', async (importOriginal) => {
   const actual = await importOriginal<typeof import('@/lib/tenantAdminApi')>()
@@ -44,6 +46,13 @@ vi.mock('@/lib/api', async (importOriginal) => {
   return { ...actual, getPerformanceMetrics: vi.fn() }
 })
 
+vi.mock('@/lib/navigationApi', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/lib/navigationApi')>()
+  return { ...actual, getNavigation: vi.fn(), reportAccessDenied: vi.fn() }
+})
+
+beforeEach(() => serveNavigation(vi.mocked(navigationApi.getNavigation), null))
+
 const initialAuthState = useLocalAuthStore.getState()
 
 function setUserRole(roles: string[]) {
@@ -62,6 +71,7 @@ function setUserRole(roles: string[]) {
       last_login_at: null,
     },
   } as never)
+  serveNavigation(vi.mocked(navigationApi.getNavigation), roles)
 }
 
 function renderPage() {
@@ -201,6 +211,38 @@ describe('TenantAdmin', () => {
 
     await userEvent.click(screen.getByRole('button', { name: /refresh schema/i }))
     await waitFor(() => expect(tenantAdminApi.refreshTenantDatabases).toHaveBeenCalled())
+  })
+
+  it("shows each database's refresh outcome, including a per-database failure", async () => {
+    setUserRole(['admin'])
+    mockAllSections()
+    const database: DatabaseStatusOut = {
+      name: 'db-a',
+      db_type: 'postgresql',
+      db_host: 'h',
+      db_port: 5432,
+      db_name: 'warehouse',
+      db_schema: null,
+      tenant_ids: ['tenant-a'],
+      healthy: true,
+      detail: 'Connected.',
+    }
+    vi.mocked(tenantAdminApi.listTenantDatabases).mockResolvedValue([database])
+    vi.mocked(tenantAdminApi.refreshTenantDatabases).mockResolvedValue({
+      databases: [
+        { database: 'db-a', table_count: 0, error: 'Schema refresh failed for this database.' },
+        { database: 'db-shared', table_count: 7, error: null },
+      ],
+    } as SchemaRefreshResponse)
+
+    renderPage()
+    await userEvent.click(await screen.findByRole('tab', { name: /databases/i }))
+    await userEvent.click(await screen.findByRole('button', { name: /refresh schema/i }))
+
+    expect(
+      await screen.findByText(/db-a: Schema refresh failed for this database\./),
+    ).toBeInTheDocument()
+    expect(screen.getByText('db-shared: 7 table(s) indexed')).toBeInTheDocument()
   })
 
   it('lets an admin assign a role to a tenant member', async () => {

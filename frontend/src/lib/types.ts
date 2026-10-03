@@ -651,6 +651,8 @@ export interface MessageFeedbackRequest {
 export interface SchemaRefreshResult {
   database: string
   table_count: number
+  /** Tenant-admin route only: set when this one database's refresh failed. */
+  error?: string | null
 }
 
 export interface SchemaRefreshResponse {
@@ -1452,11 +1454,42 @@ export type RecommendationStatus =
   | 'resolved'
   | 'expired'
 
+/** One supporting claim behind a recommendation -- a serialized
+ * `agent.provenance.ProvenancedClaim`. Evidence is only ever `database_fact`
+ * or `confirmed_business_truth` (`recommendation.models.Recommendation`
+ * enforces that), so a reviewer can always tell what the claim rests on. */
+export interface RecommendationEvidenceItem {
+  value: string
+  level: TruthLevel
+  grounded_in: string[]
+  source: string | null
+}
+
+export type RecommendationCategory =
+  | 'performance'
+  | 'anomaly'
+  | 'revenue'
+  | 'customer'
+  | 'product'
+  | 'operations'
+  | 'data_quality'
+  | 'security'
+  | 'database_performance'
+
+/** The verdicts `POST /recommendations/{id}/feedback` accepts. `resolved`
+ * and `expired` each have their own route (`.../resolve`, `.../expire`). */
+export type RecommendationVerdict =
+  | 'reviewed'
+  | 'accepted'
+  | 'rejected'
+  | 'partially_useful'
+  | 'incorrect'
+
 export interface RecommendationRecordOut {
   id: string
   tenant_id: string
   database_id: string
-  category: string | null
+  category: RecommendationCategory | string | null
   kind: string
   rule_or_model: string | null
   claim_text: string
@@ -1465,7 +1498,7 @@ export interface RecommendationRecordOut {
   action: string | null
   measurable_impact: string | null
   confidence: number | null
-  evidence: Record<string, unknown>[]
+  evidence: RecommendationEvidenceItem[]
   limitations: string[]
   engine_version: string
   evidence_version: string
@@ -1475,6 +1508,43 @@ export interface RecommendationRecordOut {
   source_sql: string | null
   created_at: string
   updated_at: string
+  /** Prompt 31 -- `null` when unassigned, or when the owner has no display
+   * name set (never an email address). */
+  owner_user_id?: string | null
+  owner_display_name?: string | null
+}
+
+/** Prompt 32 -- one screen this caller may open (`security/navigation.py`). */
+export interface NavItemOut {
+  id: string
+  path: string
+  group: 'workspace' | 'review' | 'administration'
+}
+
+/** Prompt 32 -- the server's decision for the signed-in caller: which screens
+ * they may open, and which named actions they may offer. */
+export interface NavigationOut {
+  items: NavItemOut[]
+  capabilities: Record<string, boolean>
+  roles: string[]
+  tenant_id: string | null
+}
+
+export type RecommendationEventType = 'status_change' | 'note' | 'owner_assigned'
+
+export interface RecommendationFeedbackEventOut {
+  id: string
+  recommendation_id: string
+  from_status: RecommendationStatus | null
+  to_status: RecommendationStatus
+  event_type?: RecommendationEventType
+  actor_user_id: string | null
+  actor_label: string | null
+  reason: string | null
+  detail?: { owner_user_id: string | null; previous_owner_user_id: string | null } | null
+  recommendation_version: string
+  evidence_version: string
+  created_at: string
 }
 
 export interface RecommendationQualityMetricsOut {

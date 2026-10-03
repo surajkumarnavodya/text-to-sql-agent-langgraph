@@ -6,8 +6,6 @@ import type {
   GoldenQuestionsSummaryOut,
   PendingReviewsOut,
   PlatformUserOut,
-  RecommendationQualityMetricsOut,
-  RecommendationRecordOut,
   RoleOut,
   SchemaRefreshResponse,
   SecurityEventOut,
@@ -78,14 +76,12 @@ export function listTenantAuditEvents(): Promise<SecurityEventOut[]> {
   return request<SecurityEventOut[]>('/tenant-admin/audit')
 }
 
-// --- Reused as-is from the pre-existing recommendation-governance API
-// (api/recommendation_governance.py) -- already tenant-scoped server-side,
-// so no /tenant-admin/* equivalent exists for these two. ---
+// --- Reused as-is from the recommendation-governance API -- already
+// tenant-scoped server-side, so no /tenant-admin/* equivalent exists. Re-exported
+// from `recommendationApi` (Prompt 31's single home for these calls) rather than
+// duplicated here. ---
 
-export function listTenantRecommendations(): Promise<RecommendationRecordOut[]> {
-  return request<RecommendationRecordOut[]>('/recommendations')
-}
-
-export function getTenantRecommendationQualityMetrics(): Promise<RecommendationQualityMetricsOut> {
-  return request<RecommendationQualityMetricsOut>('/recommendations/metrics')
-}
+export {
+  getRecommendationQualityMetrics as getTenantRecommendationQualityMetrics,
+  listRecommendations as listTenantRecommendations,
+} from './recommendationApi'

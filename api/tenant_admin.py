@@ -55,6 +55,7 @@ genuinely tenant-scoped refresh action that loops only
 
 from __future__ import annotations
 
+import logging
 import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -83,12 +84,13 @@ from api.platform_admin_schemas import (
     SecurityEventOut,
     TenantOut,
 )
-from api.schemas import SchemaRefreshResponse, SchemaRefreshResult
 from api.tenant_admin_schemas import (
     EvaluationSummaryOut,
     GoldenQuestionsSummaryOut,
     PendingReviewsOut,
     SemanticCatalogStatusOut,
+    TenantSchemaRefreshResponse,
+    TenantSchemaRefreshResult,
 )
 from config.settings import get_settings
 from db.connection import get_read_only_engine, test_connection
@@ -96,6 +98,8 @@ from embeddings.schema_indexer import get_last_discovery_diff, refresh_schema_in
 from security.audit_log import log_security_event, recent_security_events
 from security.redaction import redact_secrets
 from security.tenancy import resolve_actor_tenant_id
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/tenant-admin", tags=["tenant-admin"])
 
@@ -186,13 +190,13 @@ def list_tenant_databases(
     return results
 
 
-@router.post("/databases/refresh", response_model=SchemaRefreshResponse)
+@router.post("/databases/refresh", response_model=TenantSchemaRefreshResponse)
 def refresh_tenant_databases(
     triple: tuple[User, Session, str] = Depends(_require_tenant),
     _permission_check: tuple[User, Session] = Depends(
         require_identity_permission(IdentityPermission.ONBOARDING_MANAGE)
     ),
-) -> SchemaRefreshResponse:
+) -> TenantSchemaRefreshResponse:
     """Re-introspects and re-embeds only *this tenant's own* configured
     databases -- see this module's own docstring for why the existing,
     unscoped `POST /schema/refresh` is never reused for this action.
@@ -204,11 +208,30 @@ def refresh_tenant_databases(
     settings = get_settings()
     databases = []
     for config in settings.databases_for_tenant(tenant_id):
-        engine = get_read_only_engine(config)
-        tables = refresh_schema_index(engine, config.name, settings=settings)
-        diff = get_last_discovery_diff(config.name, settings)
+        # One database failing (unreachable, bad credentials) is reported on
+        # its own row and must not abort the refresh of this tenant's other
+        # databases. The raw driver text is redacted before it is logged and
+        # never returned to the caller.
+        try:
+            engine = get_read_only_engine(config)
+            tables = refresh_schema_index(engine, config.name, settings=settings)
+            diff = get_last_discovery_diff(config.name, settings)
+        except Exception as exc:  # noqa: BLE001 - per-database isolation is the point
+            logger.warning(
+                "[tenant-admin] schema refresh failed for database %r: %s",
+                config.name,
+                redact_secrets(str(exc), config),
+            )
+            databases.append(
+                TenantSchemaRefreshResult(
+                    database=config.name,
+                    table_count=0,
+                    error="Schema refresh failed for this database. See server logs for details.",
+                )
+            )
+            continue
         databases.append(
-            SchemaRefreshResult(
+            TenantSchemaRefreshResult(
                 database=config.name,
                 table_count=len(tables),
                 view_count=sum(1 for table in tables if table.is_view),
@@ -226,7 +249,7 @@ def refresh_tenant_databases(
         actor_user_id=str(user.id),
         database_count=len(databases),
     )
-    return SchemaRefreshResponse(databases=databases)
+    return TenantSchemaRefreshResponse(databases=databases)
 
 
 @router.get("/users", response_model=list[PlatformUserOut])
@@ -315,6 +338,13 @@ def remove_tenant_user_role(
     ),
 ) -> PlatformUserOut:
     user, session, tenant_id = triple
+    # Symmetric with assignment: a tenant admin must not be able to strip the
+    # cross-tenant `platform_admin` role from a same-tenant account either.
+    if role_name in _RESTRICTED_ROLE_NAMES:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=f"The {role_name!r} role cannot be changed from this dashboard.",
+        )
     target = _require_same_tenant_user(session, tenant_id, user_id)
     _remove_role(session, user_id=target.id, role_name=role_name)
     log_security_event(

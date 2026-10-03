@@ -14,6 +14,8 @@ leakage would be directly observable rather than merely assumed absent.
 
 from __future__ import annotations
 
+import uuid
+
 import identity.db as identity_db_mod
 import pytest
 from fastapi.testclient import TestClient
@@ -345,3 +347,102 @@ class TestUnauthenticated:
     def test_every_route_requires_authentication(self, client: TestClient):
         response = client.get("/tenant-admin/profile")
         assert response.status_code in (401, 403)
+
+
+class TestSuspendedTenantLosesAccessImmediately:
+    """`security/tenancy.py` rule 3 and `identity/repositories/tenants.py`
+    both promise that suspending a tenant takes effect on the very next
+    request across every tenant-scoped route. Before this regression test
+    existed, `resolve_tenant_context` only ran at login/refresh -- a
+    still-valid access token kept working on every identity-backed route
+    for up to its full lifetime."""
+
+    def test_suspended_tenant_user_is_refused_on_the_next_request(self, client: TestClient):
+        from identity.repositories.tenants import set_tenant_status
+
+        admin_a = _register_in_tenant(
+            client, "suspend-me@tenant-a.example.com", "admin", "tenant-a"
+        )
+        assert client.get("/auth/me", headers=_headers(admin_a)).status_code == 200
+
+        session = identity_db_mod.get_identity_session(_SETTINGS)
+        try:
+            set_tenant_status(session, tenant_id="tenant-a", status="suspended")
+        finally:
+            session.close()
+
+        assert client.get("/auth/me", headers=_headers(admin_a)).status_code == 401
+        assert client.get("/tenant-admin/profile", headers=_headers(admin_a)).status_code == 401
+
+    def test_other_tenants_are_unaffected_by_a_suspension(self, client: TestClient):
+        from identity.repositories.tenants import set_tenant_status
+
+        admin_b = _register_in_tenant(client, "stays-up@tenant-b.example.com", "admin", "tenant-b")
+        session = identity_db_mod.get_identity_session(_SETTINGS)
+        try:
+            set_tenant_status(session, tenant_id="tenant-a", status="suspended")
+        finally:
+            session.close()
+
+        assert client.get("/auth/me", headers=_headers(admin_b)).status_code == 200
+
+
+class TestPlatformAdminRoleIsProtectedOnRemoval:
+    """A tenant admin may not *assign* `platform_admin` (already enforced),
+    and must not be able to *remove* it from a same-tenant account either --
+    otherwise a tenant admin could strip a platform operator's cross-tenant
+    access, a tenant-scoped action with a cross-tenant effect."""
+
+    def test_tenant_admin_cannot_remove_platform_admin_from_a_same_tenant_user(
+        self, client: TestClient
+    ):
+        from identity.repositories.users import get_user_roles
+
+        tenant_admin = _register_in_tenant(
+            client, "pa-guard-admin@tenant-a.example.com", "admin", "tenant-a"
+        )
+        operator = _register_in_tenant(
+            client, "pa-guard-op@tenant-a.example.com", "platform_admin", "tenant-a"
+        )
+        operator_id = client.get("/auth/me", headers=_headers(operator)).json()["id"]
+
+        response = client.delete(
+            f"/tenant-admin/users/{operator_id}/roles/platform_admin",
+            headers=_headers(tenant_admin),
+        )
+        assert response.status_code == 403
+
+        session = identity_db_mod.get_identity_session(_SETTINGS)
+        try:
+            assert "platform_admin" in get_user_roles(session, uuid.UUID(operator_id))
+        finally:
+            session.close()
+
+
+class TestSchemaRefreshIsolatesDatabaseFailures:
+    """One unreachable database must not abort the refresh of the tenant's
+    other databases, and must not leak the raw driver error to the caller."""
+
+    def test_a_failing_database_is_reported_and_the_rest_still_refresh(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ):
+        admin_a = _register_in_tenant(
+            client, "refresh-iso@tenant-a.example.com", "admin", "tenant-a"
+        )
+
+        def fake_refresh(engine, db_name, settings=None, force=False):
+            if db_name == "db-a":
+                raise RuntimeError("could not connect to 10.0.0.5 password=hunter2")
+            return []
+
+        monkeypatch.setattr(tenant_admin_mod, "refresh_schema_index", fake_refresh)
+        monkeypatch.setattr(tenant_admin_mod, "get_read_only_engine", lambda config: object())
+
+        response = client.post("/tenant-admin/databases/refresh", headers=_headers(admin_a))
+        assert response.status_code == 200, response.text
+        by_name = {entry["database"]: entry for entry in response.json()["databases"]}
+        assert set(by_name) == {"db-a", "db-shared"}
+        assert by_name["db-shared"]["error"] is None
+        assert by_name["db-a"]["error"]
+        assert "hunter2" not in response.text
+        assert "10.0.0.5" not in response.text

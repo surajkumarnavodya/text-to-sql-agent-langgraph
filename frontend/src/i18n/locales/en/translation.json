@@ -50,6 +50,7 @@
     "mediaSearch": "Media Search",
     "dbOnboarding": "Database Onboarding",
     "semanticReview": "SME Semantic Review",
+    "recommendations": "Recommendations",
     "platformAdmin": "Platform Admin",
     "tenantAdmin": "Tenant Admin"
   },

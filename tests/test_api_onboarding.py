@@ -493,3 +493,46 @@ class TestReviewDecisionAudit:
         assert kwargs["decision"] == "confirmed"
         assert kwargs["job_id"] == job["id"]
         assert kwargs["item_id"] == items[0]["id"]
+
+
+class TestReviewDecisionsAreFrozenOnceJobLeavesReview:
+    """A review decision is the input the published semantic contract was
+    built from (`onboarding/semantic_contract.py` only includes `"confirmed"`
+    items). Changing a decision after publish would silently diverge the
+    recorded decisions from the artifact actually published -- so the route
+    must refuse it once the job is no longer `awaiting_review`."""
+
+    def test_deciding_an_item_on_a_published_job_is_a_conflict(self, client: TestClient):
+        admin_headers = _headers(_register(client, "admin30@tenant-a.example.com", role="admin"))
+        job_id = _create_job(client, admin_headers)["id"]
+        client.post(
+            f"/onboarding/jobs/{job_id}/discover",
+            json={"db_password": "unused"},
+            headers=admin_headers,
+        )
+        items = client.get(f"/onboarding/jobs/{job_id}/review-items", headers=admin_headers).json()
+        assert items
+
+        analyst_headers = _headers(
+            _register(client, "analyst30@tenant-a.example.com", role="analyst")
+        )
+        for item in items:
+            client.post(
+                f"/onboarding/jobs/{job_id}/review-items/{item['id']}/decide",
+                json={"decision": "confirmed"},
+                headers=analyst_headers,
+            )
+        publish = client.post(f"/onboarding/jobs/{job_id}/publish", json={}, headers=admin_headers)
+        assert publish.status_code == 200, publish.text
+
+        target = items[0]
+        response = client.post(
+            f"/onboarding/jobs/{job_id}/review-items/{target['id']}/decide",
+            json={"decision": "rejected"},
+            headers=analyst_headers,
+        )
+        assert response.status_code == 409
+
+        after = client.get(f"/onboarding/jobs/{job_id}/review-items", headers=admin_headers).json()
+        recorded = next(item for item in after if item["id"] == target["id"])
+        assert recorded["decision"] == "confirmed"

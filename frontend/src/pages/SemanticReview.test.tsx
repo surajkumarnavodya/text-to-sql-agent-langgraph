@@ -1,12 +1,14 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
-import { afterEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, describe, expect, it, vi, beforeEach } from 'vitest'
 import * as onboardingApi from '@/lib/onboardingApi'
 import * as catalogApi from '@/lib/semanticCatalogApi'
 import type { CatalogEntryOut, OnboardingJob } from '@/lib/types'
 import { useLocalAuthStore } from '@/store/localAuthStore'
 import { SemanticReview } from './SemanticReview'
+import * as navigationApi from '@/lib/navigationApi'
+import { serveNavigation } from '@/test/navigationFixtures'
 
 vi.mock('@/lib/semanticCatalogApi', async (importOriginal) => {
   const actual = await importOriginal<typeof import('@/lib/semanticCatalogApi')>()
@@ -31,6 +33,13 @@ vi.mock('@/lib/onboardingApi', async (importOriginal) => {
     listOnboardingReviewItems: vi.fn(),
   }
 })
+
+vi.mock('@/lib/navigationApi', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/lib/navigationApi')>()
+  return { ...actual, getNavigation: vi.fn(), reportAccessDenied: vi.fn() }
+})
+
+beforeEach(() => serveNavigation(vi.mocked(navigationApi.getNavigation), null))
 
 const initialAuthState = useLocalAuthStore.getState()
 
@@ -125,6 +134,7 @@ function setUserRole(roles: string[]) {
       last_login_at: null,
     },
   } as never)
+  serveNavigation(vi.mocked(navigationApi.getNavigation), roles)
 }
 
 describe('SemanticReview', () => {

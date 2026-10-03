@@ -1,7 +1,7 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
-import { afterEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, describe, expect, it, vi, beforeEach } from 'vitest'
 import * as api from '@/lib/api'
 import * as platformAdminApi from '@/lib/platformAdminApi'
 import type {
@@ -20,6 +20,8 @@ import type {
 } from '@/lib/types'
 import { useLocalAuthStore } from '@/store/localAuthStore'
 import { PlatformAdmin } from './PlatformAdmin'
+import * as navigationApi from '@/lib/navigationApi'
+import { serveNavigation } from '@/test/navigationFixtures'
 
 vi.mock('@/lib/platformAdminApi', async (importOriginal) => {
   const actual = await importOriginal<typeof import('@/lib/platformAdminApi')>()
@@ -47,6 +49,13 @@ vi.mock('@/lib/api', async (importOriginal) => {
   return { ...actual, getHealth: vi.fn(), getAvailableModels: vi.fn() }
 })
 
+vi.mock('@/lib/navigationApi', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/lib/navigationApi')>()
+  return { ...actual, getNavigation: vi.fn(), reportAccessDenied: vi.fn() }
+})
+
+beforeEach(() => serveNavigation(vi.mocked(navigationApi.getNavigation), null))
+
 const initialAuthState = useLocalAuthStore.getState()
 
 function setUserRole(roles: string[]) {
@@ -65,6 +74,7 @@ function setUserRole(roles: string[]) {
       last_login_at: null,
     },
   } as never)
+  serveNavigation(vi.mocked(navigationApi.getNavigation), roles)
 }
 
 function renderPage() {

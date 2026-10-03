@@ -1118,7 +1118,10 @@ class TestReviewSqlNode:
         assert result["retry_count"] == 1
         assert "Plan review" in result["error_history"][0]
 
-    def test_fail_verdict_fails_when_retries_exhausted(self, monkeypatch):
+    def test_fail_verdict_is_advisory_once_retries_are_exhausted(self, monkeypatch):
+        """Budget exhausted on a plan-review FAIL alone: the query is carried
+        forward to validation (validator + read-only execution remain the gate),
+        not reported as "could not produce a working query"."""
         monkeypatch.setattr(
             "agent.nodes.review_sql_against_plan_from_llm",
             lambda *a, **k: (False, "Still missing the window function."),
@@ -1131,9 +1134,22 @@ class TestReviewSqlNode:
         }
         result = review_sql_node(state)
 
-        assert result["status"] == "failed"
+        assert result["status"] == "validating"
+        assert result["attempt_history"][0]["outcome"] == "plan_not_satisfied_advisory"
         assert result["attempt_history"][0]["will_retry"] is False
-        assert result["failure_explanation"] is not None
+        assert "failure_explanation" not in result
+        assert result["plan_review_feedback"] == "Still missing the window function."
+
+    def test_equivalent_qualified_column_reference_passes_the_review_prompt_rule(self):
+        """The reviewer must be told a bare column and its qualified form are the
+        same column -- the prompt is the only guard against the false FAIL seen
+        with `Region` vs `vDMPrep.Region`."""
+        from agent.llm_client import _REVIEW_SYSTEM_PROMPT
+
+        assert "qualified" in _REVIEW_SYSTEM_PROMPT
+        assert (
+            "Never FAIL a step only because of qualification or aliasing" in _REVIEW_SYSTEM_PROMPT
+        )
 
     def test_fails_open_when_ollama_unavailable(self, monkeypatch):
         def _raise(*a, **k):

@@ -151,10 +151,11 @@ def set_platform_tenant_status(
     payload: SetTenantStatusRequest,
     user_and_session: tuple[User, Session] = Depends(_require_platform_admin_pair),
 ) -> TenantOut:
-    """Suspends or re-activates a tenant -- `security.tenancy
-    .resolve_tenant_context` reads this status live, so a suspension
-    takes effect for every one of that tenant's users on their very next
-    request (see that function's own docstring)."""
+    """Suspends or re-activates a tenant. Takes effect on the very next
+    request for every identity-backed route (`require_local_user` re-checks
+    the tenant's status live), and blocks refresh immediately. The one
+    exception is `/ask`'s token-only path, bounded by access-token lifetime
+    -- see `security.tenancy.resolve_tenant_context`'s own docstring."""
     user, session = user_and_session
     tenant = set_tenant_status(session, tenant_id=tenant_id, status=payload.status)
     if tenant is None:
@@ -258,6 +259,14 @@ def remove_platform_user_role(
     target = get_user_by_id(session, user_id)
     if target is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found.")
+    # A platform admin revoking their own cross-tenant access in one click is
+    # the easiest way to lock the whole operator dashboard out with no one
+    # left to undo it from the UI. Another platform admin can still do it.
+    if target.id == user.id and role_name == "platform_admin":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="You cannot remove your own platform_admin role. Ask another platform admin.",
+        )
     _remove_role(session, user_id=target.id, role_name=role_name)
     record_audit_event(
         session,

@@ -8,6 +8,7 @@ import {
   useAssignUserRole,
   useAuditLogs,
   useAvailableModels,
+  useCapabilities,
   useConfigStatus,
   useCreateTenant,
   useHealth,
@@ -62,9 +63,9 @@ export function PlatformAdmin() {
   // enforcement is entirely server-side -- every route in
   // `api/platform_admin.py` independently checks
   // `identity.rbac.Permission.PLATFORM_ADMIN`.
-  const isPlatformAdmin = Boolean(
-    useLocalAuthStore((state) => state.user?.roles.includes('platform_admin')),
-  )
+  // Server-decided (Prompt 32): the same `platform_admin` capability the route
+  // guard uses, never a role-name check of its own.
+  const isPlatformAdmin = Boolean(useCapabilities().platform_admin)
   if (!isPlatformAdmin) {
     return (
       <div className="flex h-full items-center justify-center p-6 text-center text-sm text-[var(--muted-foreground)]">

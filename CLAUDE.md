@@ -3525,6 +3525,33 @@ read-only.
 for the full prompt text and outcome summary.
 
 
+### Recommendation & action dashboard (Prompt 31)
+`frontend/src/pages/Recommendations.tsx` (route `/recommended-actions`, not `/recommendations`, which is the API list path; nav tab shown by the server's navigation policy) is the reviewer-facing surface over the governed recommendation APIs from Prompts 18/31. Read `31_RECOMMENDATION_ACTION_DASHBOARD_CONTRACT.md` before changing it.
+
+**Invariants that must not regress:**
+- Every recommendation is shown as an **AI estimate**, with its evidence and each claim's truth level. Nothing is presented as a confirmed fact (master rule 10).
+- Status transitions are **race-safe**: `identity/repositories/recommendation_governance.py::_apply_conditional_status_update` is a conditional `UPDATE ... WHERE status = expected`. Do not replace it with a read-check-then-write. `tests/test_recommendation_actions_repository.py`'s race test fails if the guard is removed.
+- **Notes and owner changes never change `status`.** They are `RecommendationFeedbackEvent` rows with `event_type` `note` / `owner_assigned`, in the same append-only trail.
+- An owner must be an active, same-tenant user who holds a recommendation-review permission. A refused owner gets the same 404 whether the user is missing, cross-tenant, inactive, or not a reviewer.
+- Every governed mutation is logged (`event=recommendation_action`) without claim, evidence, or note text, and is rate-limited after authorization.
+- Button visibility on the frontend mirrors the lifecycle for UX only. The server re-checks every request.
+
+**Known gaps:** local accounts only (`require_local_user`); the list is capped at 200 with no pagination; owner changes are last-writer-wins; the rate limit is per IP.
+
+### Role-based navigation, server-driven access & the onboarding→SME bridge (Prompt 32)
+`32_ROLE_BASED_NAVIGATION_CONTRACT.md` is the full record. The short version a future session needs:
+
+- **Screens and actions come from the server.** `security/navigation.py` (pure policy) decides which screens and capabilities a caller has, from the same permission checks the real routes make. `GET /navigation` returns them (`api/navigation.py`). The frontend draws the header tabs from `items`, guards each route with `components/auth/RequireNavItem.tsx`, and reads named actions from `capabilities` through `useCapabilities()`. **Never add a role-name check in the frontend.** Add a `CapabilityRule`, and a test that pins it.
+- **Hiding a tab is not access control.** A URL typed directly shows the forbidden page, and `POST /navigation/access-denied` audit-logs the refusal (`event=ui_route_denied`), but only for a real screen path. Every API route still enforces its own permission on the server.
+- **Platform operators need both `platform_admin` and `admin`.** `platform_admin` is not a base role (`agent.authz.ROLE_PERMISSIONS`), so on its own it has no AI workspace. The navigation test pins this on purpose.
+- **Recommendations live at `/recommended-actions`.** `/recommendations` is the governance API's JSON list route. A reload of the page there would have hit JSON. The Vite dev proxy also skips HTML requests now, so a reload of any page path that is also an API prefix reaches the app.
+- **Onboarding publish now creates DRAFT catalog entities** (`onboarding/catalog_bridge.py`), one per table with SME-confirmed items, under a slug of the job's label (`My Warehouse` → `My_Warehouse_<id8>`). The slug is a vector-store collection name, which rejects spaces. The bridge never publishes. A retried publish creates nothing new.
+- **A job missing its connection details** answers 422 on discover and publish, not a generic 500 (`api/onboarding.py::_engine_for_job`).
+
+**Known gaps:** a "Confirm and run" button is shown to any user who can ask a question, including a viewer who lacks `execute_sql`; the server refuses it, but the button is not gated on the capability yet. The "viewer" role has no screen of its own: "read-only viewer" maps to `auditor`. Browser-level end-to-end tests are not part of the project (no Playwright); the journey test is at the HTTP API layer.
+
+---
+
 ## How to run
 
 See `README.md` for full setup. Short version:

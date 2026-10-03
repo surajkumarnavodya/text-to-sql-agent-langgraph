@@ -18,6 +18,8 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict
 
+from api.schemas import SchemaRefreshResult
+
 CatalogStatusLiteral = Literal["draft", "reviewed", "published", "superseded"]
 
 
@@ -54,3 +56,24 @@ class EvaluationSummaryOut(BaseModel):
     pass_count: int
     total_count: int
     evaluated_at: datetime
+
+
+class TenantSchemaRefreshResult(SchemaRefreshResult):
+    """`api.schemas.SchemaRefreshResult` plus a per-database failure marker.
+
+    Kept separate from the shared model on purpose: `POST /schema/refresh`'s
+    response contract is pinned by an exact-equality test, and an extra
+    always-present key there would be a silent public-API change. Only the
+    tenant-admin route, which can fail one database without failing the rest,
+    needs this field.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    error: str | None = None
+
+
+class TenantSchemaRefreshResponse(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    databases: list[TenantSchemaRefreshResult]

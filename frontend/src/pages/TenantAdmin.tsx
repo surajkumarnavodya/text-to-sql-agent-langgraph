@@ -5,6 +5,7 @@ import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import {
   useAssignTenantUserRole,
+  useCapabilities,
   useRefreshTenantDatabases,
   useRemoveTenantUserRole,
   useTenantAssignableRoles,
@@ -21,8 +22,7 @@ import {
   useTenantUsers,
 } from '@/hooks/queries'
 import { ApiError } from '@/lib/api'
-import type { PlatformUserOut } from '@/lib/types'
-import { useLocalAuthStore } from '@/store/localAuthStore'
+import type { PlatformUserOut, SchemaRefreshResponse } from '@/lib/types'
 
 /** The tenant/client admin dashboard -- Prompt 29, the tenant-scoped
  * counterpart to `PlatformAdmin.tsx`. Introduces **no new permission or
@@ -55,11 +55,12 @@ import { useLocalAuthStore } from '@/store/localAuthStore'
  * The real enforcement is entirely server-side regardless.
  */
 export function TenantAdmin() {
-  const localUser = useLocalAuthStore((state) => state.user)
-  const canManage = Boolean(localUser?.roles.includes('admin'))
-  const canView = Boolean(
-    canManage || localUser?.roles.includes('auditor') || localUser?.roles.includes('manager'),
-  )
+  // Server-decided (Prompt 32): see `useCapabilities`. `manage_tenant_users` is
+  // the role-assignment grant (USERS_ASSIGN_ROLES), which only the tenant admin
+  // holds among the dashboard roles.
+  const capabilities = useCapabilities()
+  const canManage = Boolean(capabilities.manage_tenant_users)
+  const canView = Boolean(capabilities.view_tenant_dashboard)
 
   if (!canView) {
     return (
@@ -157,11 +158,12 @@ function DatabasesSection({ canManage }: { canManage: boolean }) {
   const databases = useTenantDatabases()
   const refresh = useRefreshTenantDatabases()
   const [error, setError] = useState<string | null>(null)
+  const [result, setResult] = useState<SchemaRefreshResponse | null>(null)
 
   const handleRefresh = async () => {
     setError(null)
     try {
-      await refresh.mutateAsync()
+      setResult(await refresh.mutateAsync())
     } catch (err) {
       setError(err instanceof ApiError ? err.message : 'Could not refresh schema.')
     }
@@ -178,6 +180,15 @@ function DatabasesSection({ canManage }: { canManage: boolean }) {
         )}
       </div>
       {error && <p className="text-sm text-[var(--danger)]">{error}</p>}
+      {result && (
+        <ul className="flex flex-col gap-1 text-sm" aria-live="polite">
+          {result.databases.map((entry) => (
+            <li key={entry.database} className={entry.error ? 'text-[var(--danger)]' : 'text-[var(--muted-foreground)]'}>
+              {entry.database}: {entry.error ?? `${entry.table_count} table(s) indexed`}
+            </li>
+          ))}
+        </ul>
+      )}
       {databases.data?.map((database) => (
         <Card key={database.name}>
           <CardHeader className="flex flex-row items-center justify-between">

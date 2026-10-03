@@ -48,6 +48,13 @@ const BACKEND_ROUTES = [
   '/platform-admin',
   // Tenant/client admin dashboard (api/tenant_admin.py, Prompt 29).
   '/tenant-admin',
+  // Recommendation governance API (api/recommendation_governance.py, Prompt
+  // 18/31) -- missing from this list before Prompt 32, the same recurring
+  // dev-only gap Prompts 26/27/28/29 each found. The React page itself lives at
+  // `/recommended-actions` (a path no API route uses), not here.
+  '/recommendations',
+  // Role-based navigation (api/navigation.py, Prompt 32).
+  '/navigation',
 ]
 
 export default defineConfig({
@@ -110,7 +117,19 @@ export default defineConfig({
   },
   server: {
     proxy: Object.fromEntries(
-      BACKEND_ROUTES.map((route) => [route, { target: 'http://localhost:8000', changeOrigin: true }]),
+      BACKEND_ROUTES.map((route) => [
+        route,
+        {
+          target: 'http://localhost:8000',
+          changeOrigin: true,
+          // A browser page load (Accept: text/html) of a route that is ALSO a
+          // React page path -- e.g. `/platform-admin` or `/tenant-admin` -- must
+          // reach the app, not the API. Prefix proxying would otherwise send the
+          // reload to the backend, which has no such page and answers 404 JSON.
+          // API calls (fetch/XHR, which never send text/html) still proxy.
+          bypass: (req) => (req.headers.accept?.includes('text/html') ? req.url : undefined),
+        },
+      ]),
     ),
   },
 })

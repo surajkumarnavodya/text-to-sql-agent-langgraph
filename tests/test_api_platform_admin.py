@@ -329,6 +329,21 @@ class TestRoleAssignmentAndRemoval:
         )
         assert response.status_code == 404
 
+    def test_platform_admin_cannot_remove_their_own_platform_admin_role(self, client):
+        operator = _register_in_tenant(
+            client, "self-lockout@default.example.com", "platform_admin", "default"
+        )
+        operator_id = client.get("/auth/me", headers=_headers(operator)).json()["id"]
+
+        response = client.delete(
+            f"/platform-admin/users/{operator_id}/roles/platform_admin",
+            headers=_headers(operator),
+        )
+        assert response.status_code == 409
+        assert (
+            "platform_admin" in client.get("/auth/me", headers=_headers(operator)).json()["roles"]
+        )
+
 
 class TestRolesEndpoint:
     def test_lists_every_seeded_role_with_its_permissions(self, client: TestClient):

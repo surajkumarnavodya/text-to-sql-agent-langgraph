@@ -1,4 +1,16 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import { getNavigation } from '@/lib/navigationApi'
+import { useLocalAuthStore } from '@/store/localAuthStore'
+import {
+  addRecommendationNote,
+  assignRecommendationOwner,
+  expireRecommendation,
+  listRecommendationEvents,
+  listRecommendations,
+  resolveRecommendation,
+  submitRecommendationVerdict,
+  type RecommendationListFilters,
+} from '@/lib/recommendationApi'
 import {
   deleteDocument,
   getAttachmentCapabilities,
@@ -529,4 +541,110 @@ export function useTenantRecommendationQualityMetrics() {
  * rather than duplicated under `/tenant-admin/*`. */
 export function useTenantPerformanceMetrics() {
   return useQuery({ queryKey: ['tenant-admin-performance-metrics'], queryFn: getPerformanceMetrics })
+}
+
+// --- Role-based navigation (Prompt 32, `api/navigation.py`). The server decides
+// every screen and action; nothing here reads a role name. Keyed by the local
+// user id when there is one, and by a session key otherwise (OIDC, static token,
+// auth off), so a different person on the same browser never reuses another's
+// entry. `staleTime: 0` refetches on every mount: a changed role or a suspended
+// tenant must take effect immediately, not after a cache window. ---
+
+export function useNavigation() {
+  const userKey = useLocalAuthStore((state) => state.user?.id ?? 'session')
+  return useQuery({
+    queryKey: ['navigation', userKey],
+    queryFn: getNavigation,
+    staleTime: 0,
+    retry: false,
+  })
+}
+
+/** The server's named-action map for this caller (`security/navigation.py`'s
+ * `CAPABILITY_RULES`). Empty until navigation loads, so every action is hidden
+ * by default rather than shown on a guess. */
+export function useCapabilities(): Record<string, boolean> {
+  return useNavigation().data?.capabilities ?? {}
+}
+
+// --- Recommendation & action dashboard (Prompt 31,
+// `frontend/src/pages/Recommendations.tsx`). No `refetchInterval` -- a
+// reviewer acts on a record and the mutations below invalidate what changed. ---
+
+export function useRecommendations(filters: RecommendationListFilters = {}) {
+  return useQuery({
+    queryKey: ['recommendations', filters],
+    queryFn: () => listRecommendations(filters),
+  })
+}
+
+export function useRecommendationEvents(recordId: string | null) {
+  return useQuery({
+    queryKey: ['recommendation-events', recordId],
+    queryFn: () => listRecommendationEvents(recordId as string),
+    enabled: recordId !== null,
+  })
+}
+
+/** Every recommendation action changes the list (status/owner) and the
+ * selected record's audit trail, so all of them invalidate both. */
+function useInvalidateRecommendationQueries() {
+  const queryClient = useQueryClient()
+  return () => {
+    void queryClient.invalidateQueries({ queryKey: ['recommendations'] })
+    void queryClient.invalidateQueries({ queryKey: ['recommendation-events'] })
+    void queryClient.invalidateQueries({ queryKey: ['tenant-admin-recommendation-metrics'] })
+  }
+}
+
+export function useSubmitRecommendationVerdict() {
+  const invalidate = useInvalidateRecommendationQueries()
+  return useMutation({
+    mutationFn: ({
+      recordId,
+      status,
+      reason,
+    }: {
+      recordId: string
+      status: Parameters<typeof submitRecommendationVerdict>[1]['status']
+      reason?: string | null
+    }) => submitRecommendationVerdict(recordId, { status, reason: reason ?? null }),
+    onSuccess: invalidate,
+  })
+}
+
+export function useResolveRecommendation() {
+  const invalidate = useInvalidateRecommendationQueries()
+  return useMutation({
+    mutationFn: ({ recordId, reason }: { recordId: string; reason?: string | null }) =>
+      resolveRecommendation(recordId, reason ?? null),
+    onSuccess: invalidate,
+  })
+}
+
+export function useExpireRecommendation() {
+  const invalidate = useInvalidateRecommendationQueries()
+  return useMutation({
+    mutationFn: ({ recordId, reason }: { recordId: string; reason?: string | null }) =>
+      expireRecommendation(recordId, reason ?? null),
+    onSuccess: invalidate,
+  })
+}
+
+export function useAddRecommendationNote() {
+  const invalidate = useInvalidateRecommendationQueries()
+  return useMutation({
+    mutationFn: ({ recordId, note }: { recordId: string; note: string }) =>
+      addRecommendationNote(recordId, note),
+    onSuccess: invalidate,
+  })
+}
+
+export function useAssignRecommendationOwner() {
+  const invalidate = useInvalidateRecommendationQueries()
+  return useMutation({
+    mutationFn: ({ recordId, ownerUserId }: { recordId: string; ownerUserId: string | null }) =>
+      assignRecommendationOwner(recordId, ownerUserId),
+    onSuccess: invalidate,
+  })
 }

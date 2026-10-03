@@ -5,6 +5,7 @@ import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Expander } from '@/components/ui/expander'
 import { Select } from '@/components/ui/select'
 import {
+  useCapabilities,
   useCatalogEntries,
   useCatalogEntryVersions,
   useCreateCatalogEntry,
@@ -17,7 +18,6 @@ import {
 } from '@/hooks/queries'
 import { ApiError } from '@/lib/api'
 import type { CatalogConceptType, CatalogEntryOut, CatalogStatus } from '@/lib/types'
-import { useLocalAuthStore } from '@/store/localAuthStore'
 
 const STATUS_TONE: Record<CatalogStatus, 'neutral' | 'success' | 'warning' | 'danger' | 'accent'> = {
   draft: 'neutral',
@@ -76,9 +76,10 @@ const STATUS_TONE: Record<CatalogStatus, 'neutral' | 'success' | 'warning' | 'da
  * `onboarding/semantic_inference.py`'s own ambiguity flag already uses.
  */
 export function SemanticReview() {
-  const localUser = useLocalAuthStore((state) => state.user)
-  const canManage = Boolean(localUser?.roles.includes('admin'))
-  const canReview = canManage || Boolean(localUser?.roles.includes('analyst'))
+  // Server-decided (Prompt 32): see `useCapabilities`. Never a role-name check.
+  const capabilities = useCapabilities()
+  const canManage = Boolean(capabilities.manage_catalog)
+  const canReview = canManage || Boolean(capabilities.review_catalog)
 
   const [databaseId, setDatabaseId] = useState('')
   const [conceptType, setConceptType] = useState<'' | CatalogConceptType>('')
