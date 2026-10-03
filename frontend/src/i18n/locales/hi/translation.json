@@ -49,7 +49,8 @@
     "knowledgeSources": "ज्ञान स्रोत",
     "mediaSearch": "मीडिया खोज",
     "dbOnboarding": "डेटाबेस ऑनबोर्डिंग",
-    "semanticReview": "विषय-विशेषज्ञ सिमेंटिक समीक्षा"
+    "semanticReview": "विषय-विशेषज्ञ सिमेंटिक समीक्षा",
+    "platformAdmin": "प्लेटफ़ॉर्म व्यवस्थापन"
   },
   "header": {
     "openHistory": "चैट इतिहास खोलें",

@@ -12,6 +12,7 @@ import { Chat } from '@/pages/Chat'
 import { DatabaseOnboarding } from '@/pages/DatabaseOnboarding'
 import { KnowledgeSources } from '@/pages/KnowledgeSources'
 import { MediaSearch } from '@/pages/MediaSearch'
+import { PlatformAdmin } from '@/pages/PlatformAdmin'
 import { SemanticReview } from '@/pages/SemanticReview'
 import { SharedConversation } from '@/pages/SharedConversation'
 import { useSettingsStore } from '@/store/settingsStore'
@@ -64,6 +65,7 @@ export function App() {
           <Route path="/media-search" element={<MediaSearch />} />
           <Route path="/db-onboarding" element={<DatabaseOnboarding />} />
           <Route path="/semantic-review" element={<SemanticReview />} />
+          <Route path="/platform-admin" element={<PlatformAdmin />} />
           {/* Accepting an invitation requires being signed in -- placed
               inside AuthGate so an unauthenticated visitor sees the
               ordinary sign-in screen first, then lands here once

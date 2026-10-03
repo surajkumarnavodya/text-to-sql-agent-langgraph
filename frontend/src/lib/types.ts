@@ -1023,3 +1023,145 @@ export interface CatalogEntryOut {
   conflicting_entry_ids: string[]
   conflicting_entry_names: string[]
 }
+
+// --- Global platform admin dashboard (api/platform_admin.py, Prompt 28) --
+// mirrors api/platform_admin_schemas.py exactly. Every route here is
+// gated on identity.rbac.Permission.PLATFORM_ADMIN, a genuinely different
+// dimension from the tenant-scoped "admin" role every other admin surface
+// in this app uses. ---
+
+export type TenantStatus = 'active' | 'suspended'
+export type AuditOutcome = 'success' | 'failure' | 'denied'
+export type SecuritySeverity = 'info' | 'warning' | 'critical'
+
+export interface CreateTenantRequest {
+  tenant_id: string
+  name: string
+}
+
+export interface SetTenantStatusRequest {
+  status: TenantStatus
+}
+
+export interface AssignRoleRequest {
+  role_name: string
+}
+
+export interface TenantOut {
+  id: string
+  name: string
+  status: TenantStatus
+  user_count: number
+  created_at: string
+  updated_at: string
+}
+
+export interface PlatformUserOut {
+  id: string
+  email: string
+  display_name: string | null
+  tenant_id: string
+  status: string
+  roles: string[]
+  created_at: string
+  last_login_at: string | null
+}
+
+export interface RoleOut {
+  name: string
+  description: string | null
+  is_system_role: boolean
+  permissions: string[]
+}
+
+export interface DatabaseStatusOut {
+  name: string
+  db_type: string
+  db_host: string | null
+  db_port: number | null
+  db_name: string | null
+  db_schema: string | null
+  tenant_ids: string[]
+  healthy: boolean
+  detail: string
+}
+
+export interface SemanticReviewQueueOut {
+  catalog_draft_count: number
+  catalog_reviewed_count: number
+  catalog_published_count: number
+  onboarding_pending_by_type: Record<string, number>
+  total_pending: number
+}
+
+export interface PlatformOnboardingJobOut {
+  id: string
+  tenant_id: string
+  database_label: string
+  status: string
+  created_at: string
+  updated_at: string
+}
+
+export interface SecurityEventOut {
+  timestamp: string
+  event_type: string
+  severity: SecuritySeverity
+  detail: string
+  correlation_id: string | null
+  tenant_id: string | null
+  context: Record<string, string>
+}
+
+export interface AuditLogOut {
+  id: string
+  actor_user_id: string | null
+  subject_user_id: string | null
+  action: string
+  resource_type: string
+  resource_id: string | null
+  outcome: AuditOutcome
+  created_at: string
+  metadata: Record<string, unknown> | null
+}
+
+export interface ConfigStatusOut {
+  flags: Record<string, boolean>
+}
+
+// Mirrors api/schemas.py's StageMetricOut/RequestMetricOut/
+// PerformanceMetricsResponse -- no frontend consumer existed before
+// Prompt 28, since GET /metrics/performance was deliberately
+// operator-only (see observability/metrics.py's own docstring);
+// GET /platform-admin/metrics is the first route this type serves.
+
+export interface StageMetricOut {
+  stage: string
+  count: number
+  mean_ms: number
+  p50_ms: number
+  p95_ms: number
+  max_ms: number
+  total_ms: number
+}
+
+export interface RequestMetricOut {
+  count: number
+  mean_ms: number
+  p50_ms: number
+  p95_ms: number
+  max_ms: number
+}
+
+export interface PerformanceMetricsResponse {
+  started_at: string
+  window_requests: number
+  max_window_requests: number
+  requests: RequestMetricOut
+  stages: StageMetricOut[]
+  status_counts: Record<string, number>
+  tenant_id: string | null
+  result_cache_hits: number
+  result_cache_misses: number
+  database_concurrency_rejections: number
+}

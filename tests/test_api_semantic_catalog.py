@@ -21,7 +21,6 @@ ChromaDB/embedding runtime.
 
 from __future__ import annotations
 
-import threading
 import uuid
 from collections.abc import Iterator
 
@@ -31,6 +30,11 @@ import retrieval.ingestion as ingestion_mod
 from fastapi.testclient import TestClient
 from identity.bootstrap import seed_rbac
 from identity.models import Base, User
+from identity.repositories.semantic_catalog import (
+    InvalidCatalogStatusTransitionError,
+    get_entry_by_id,
+)
+from identity.repositories.semantic_catalog import publish_entry as _publish_entry
 from identity.repositories.users import assign_role
 from retrieval.embeddings import FakeEmbeddingProvider
 from sqlalchemy import create_engine
@@ -674,14 +678,38 @@ class TestConcurrentPublish:
     "succeed," silently losing the "only one should win" guarantee a 409
     is supposed to provide. Fixed via `identity.repositories
     .semantic_catalog._apply_transition`'s conditional `UPDATE ... WHERE
-    status = expected_current`; this test proves the fix holds under
-    real `threading.Thread`s, not just sequential calls (a sequential
-    test would pass even with the original bug, since there'd be no
-    window for both calls to read the same pre-transition status)."""
+    status = expected_current`.
 
-    def test_two_concurrent_publish_calls_on_the_same_entry_only_one_succeeds(
-        self, client: TestClient
-    ):
+    **Why this is a deterministic two-session test, not real
+    `threading.Thread`s**: an earlier version of this test used real
+    threads racing two `TestClient` HTTP calls, which genuinely proved the
+    fix -- but also turned out to be a real, found-and-fixed *test*
+    problem: this fixture's in-memory SQLite database uses `StaticPool`
+    specifically so multiple `Session`s can share one `:memory:` database
+    at all (a bare `:memory:` SQLite database is otherwise invisible
+    across connections) -- which means both "concurrent" threads were
+    actually sharing one single physical `sqlite3.Connection` object, and
+    `sqlite3` connections are not documented as safe for genuinely
+    concurrent multi-threaded statement execution even with
+    `check_same_thread=False` (that flag only disables an assertion, it
+    does not add real thread-safety). Under full-suite load this produced
+    rare, genuinely non-deterministic outcomes (two 409s, or a published
+    row flipping to `"superseded"` against itself) that were an artifact
+    of the test harness's shared connection, not of the fix being wrong.
+    This version instead opens two independent `Session`s against the
+    same test engine (exactly what two real concurrent HTTP requests would
+    each get in production, where every request's dependency opens its
+    own connection) and interleaves them explicitly and deterministically:
+    session 1 publishes first and commits; session 2 -- holding a stale,
+    already-loaded `entry` object that still says `"reviewed"`, exactly
+    what a second request that read the row *before* session 1's commit
+    would have -- then attempts the identical transition and must be
+    rejected by `_apply_transition`'s `WHERE status = expected_current`
+    guard, not merely by `_assert_transition_valid`'s in-memory check
+    (which `entry.status` would still satisfy, since it was never
+    refreshed)."""
+
+    def test_a_stale_concurrent_caller_is_rejected_by_the_atomic_guard(self, client: TestClient):
         admin_tokens = _register(client, "admin23@tenant-a.example.com", role="admin")
         admin_headers = _headers(admin_tokens)
         analyst_tokens = _register(client, "analyst16@tenant-a.example.com", role="analyst")
@@ -691,27 +719,37 @@ class TestConcurrentPublish:
         client.post(
             f"/semantic-catalog/entries/{entry['id']}/review", json={}, headers=analyst_headers
         )
+        entry_id = uuid.UUID(entry["id"])
 
-        results: list[int] = []
-        results_lock = threading.Lock()
+        # Two independent sessions, each loading its own copy of the same
+        # row -- exactly what two concurrent requests each get.
+        session_1 = identity_db_mod.get_identity_session(_SETTINGS)
+        session_2 = identity_db_mod.get_identity_session(_SETTINGS)
+        try:
+            entry_view_1 = get_entry_by_id(session_1, entry_id)
+            entry_view_2 = get_entry_by_id(session_2, entry_id)
+            assert entry_view_1 is not None and entry_view_2 is not None
+            assert entry_view_1.status == "reviewed"
+            assert entry_view_2.status == "reviewed"  # both still see the pre-publish state
 
-        def _publish() -> None:
-            response = client.post(
-                f"/semantic-catalog/entries/{entry['id']}/publish", headers=admin_headers
+            # Session 1 "wins the race" -- publishes and commits first.
+            published, _ = _publish_entry(
+                session_1, entry_view_1, published_by_user_id=uuid.uuid4()
             )
-            with results_lock:
-                results.append(response.status_code)
+            assert published.status == "published"
 
-        threads = [threading.Thread(target=_publish) for _ in range(2)]
-        for thread in threads:
-            thread.start()
-        for thread in threads:
-            thread.join(timeout=10)
-
-        assert sorted(results) == [200, 409]
+            # Session 2's own `entry_view_2` is still the stale object --
+            # its own in-memory `.status` is still `"reviewed"`, exactly
+            # the bug this fix closes. The atomic guard, not the
+            # in-memory check, is what must catch this now.
+            with pytest.raises(InvalidCatalogStatusTransitionError):
+                _publish_entry(session_2, entry_view_2, published_by_user_id=uuid.uuid4())
+        finally:
+            session_1.close()
+            session_2.close()
 
         # Exactly one published row for this concept -- never two, and
-        # never zero.
+        # never corrupted into some third state.
         get_response = client.get(f"/semantic-catalog/entries/{entry['id']}", headers=admin_headers)
         assert get_response.json()["status"] == "published"
 

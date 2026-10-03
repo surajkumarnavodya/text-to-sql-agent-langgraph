@@ -3245,6 +3245,146 @@ against the API).
 **Read [`27_SME_SEMANTIC_REVIEW_DASHBOARD_CONTRACT.md`](27_SME_SEMANTIC_REVIEW_DASHBOARD_CONTRACT.md)**
 for the full prompt text and outcome summary.
 
+**Addendum (Prompt 28, same session):** while stabilizing the full test
+suite for the next prompt's own new tests, this fix's real-threading
+test (`TestConcurrentPublish`) turned out to itself be flaky under full-
+suite load -- not because the fix was wrong, but because the test
+fixture's `StaticPool` SQLite engine shares one single physical
+`sqlite3.Connection` object across both "concurrent" threads (required so
+multiple `Session`s can see one `:memory:` database at all), and
+`sqlite3` connections are not documented as safe for genuinely
+concurrent multi-threaded statement execution even with
+`check_same_thread=False`. Replaced with a deterministic two-`Session`
+test that interleaves explicitly (session 1 publishes and commits;
+session 2's own stale, already-loaded object -- still saying
+`"reviewed"` -- then attempts the same transition and must be rejected
+by the atomic `WHERE status = expected_current` guard) -- this proves
+the exact same property without depending on real OS-thread scheduling
+against a test-only shared connection. The fix in `identity.repositories
+.semantic_catalog._apply_transition` itself is unchanged.
+
+### Global Platform Admin Dashboard (Prompt 28)
+The first platform-wide operations surface in this codebase --
+`frontend/src/pages/PlatformAdmin.tsx` + `api/platform_admin.py` -- and
+the prompt that finally closes a gap named explicitly, as a known
+limitation, back in Prompt 20: **this application had no platform-admin-
+versus-tenant-admin distinction**. Every existing `admin`-gated route
+(`/schema/refresh`, `/metrics/performance`, `ONBOARDING_MANAGE`,
+`CATALOG_MANAGE`, ...) is correctly scoped to the actor's own tenant by
+design -- a tenant's own admin must never see or act on another tenant's
+data. This prompt's entire purpose is the deliberate exception: a new
+`identity.rbac.Permission.PLATFORM_ADMIN`, granted only to a new
+`platform_admin` role (`_PLATFORM_ADMIN = _ADMIN | {PLATFORM_ADMIN}` --
+a genuine superset, so holding it also grants every tenant-admin
+capability, but holding plain `admin` never grants this one), enforced
+by a new `api.identity_authz.require_platform_admin` dependency
+(`require_identity_permission(PLATFORM_ADMIN)`, literally the same
+factory every other granular permission already uses -- no new
+mechanism) on every route in the new `api/platform_admin.py` router.
+
+**Heavy reuse, almost nothing built from scratch:**
+- `identity/repositories/tenants.py`'s full CRUD (list/create/suspend/
+  soft-delete) existed since Prompt 20 and was never exposed by any
+  route until now -- this dashboard is exactly what it was waiting for.
+- `identity.repositories.users.assign_role`/`remove_role` are the exact
+  same functions every other role-assignment call site already uses.
+- `observability.metrics.get_default_metrics().snapshot(tenant_id=None)`
+  already supported the merged, cross-tenant view, "deliberately not
+  reachable through the HTTP route" per that module's own docstring --
+  `GET /platform-admin/metrics` is that route, finally.
+- `GET /health`/`GET /models` are deliberately **not** duplicated under
+  `/platform-admin/*` -- both are already public/unscoped, so the
+  dashboard's Health & Models tab calls the existing `useHealth`/
+  `useAvailableModels` hooks directly, same as every other page.
+
+**Two further real, found-and-closed gaps, both disclosed rather than
+silently worked around:**
+- **`identity.models.AuditLog` was dead code.** The `audit_logs` table,
+  with `Permission.AUDIT_READ_ANY`/`AUDIT_READ_OWN` seeded since this
+  project's identity schema was first built, had never been written to
+  or read from by anything in this codebase -- confirmed by grep: zero
+  `AuditLog(` construction sites anywhere. New `identity/repositories
+  /audit.py` (`record_audit_event`/`list_audit_events`) is the first real
+  write/read path, wired into this prompt's own new mutating actions
+  (tenant status changes, role assignment) only -- a disclosed, narrower
+  scope than "every mutation in this application," named as a known
+  limitation rather than implied complete. The table also has **no
+  `tenant_id` column** (it predates Prompt 20 and was never retrofitted),
+  so `list_audit_events` cannot be scoped to one tenant -- not a new leak,
+  since its only caller is already `PLATFORM_ADMIN`-gated for
+  cross-tenant visibility, but a real structural limit on ever reusing it
+  for a future *tenant*-scoped audit view without a migration first.
+- **"Security Events" had no queryable backing at all.**
+  `security.audit_log.log_security_event`'s ~40 existing call sites only
+  ever wrote to a Python logger -- no DB, no aggregation, nothing a
+  dashboard could read. A bounded (`_MAX_RECENT_EVENTS = 1000`),
+  thread-safe, in-process ring buffer now hooks inside that one function
+  itself (`_record_recent_event`), so every one of those ~40 call sites
+  started feeding `GET /platform-admin/security-events` with **zero
+  changes to any of them** -- the identical "instrument the one shared
+  chokepoint" approach `CorrelationIdLogFilter`/`TenantIdLogFilter`
+  already use for ordinary log lines in the same module.
+
+**Invariants that must not regress:**
+- **Never exposes a credential.** `DatabaseStatusOut` has no
+  `db_user`/`db_password`/`db_connection_string` field at all (not a
+  redacted one -- the field simply doesn't exist in the response shape),
+  and `GET /platform-admin/config-status` only ever reports `Settings`
+  fields that are already plain Python `bool` -- a `pydantic.SecretStr`-
+  typed field can never satisfy `isinstance(value, bool)`, so this is
+  safe by construction, not by a redaction step that could be forgotten
+  or bypassed.
+- **`PLATFORM_ADMIN` is never implied by `admin` alone.** Proven directly
+  (`tests/test_identity_rbac.py
+  ::test_platform_admin_permission_is_granted_only_to_platform_admin_role`)
+  and end-to-end (`tests/test_api_platform_admin.py
+  ::TestPlatformAdminVsTenantAdminAccess` -- a tenant admin gets 403 on
+  every route this router defines). The frontend nav tab mirrors this:
+  `AppShell.tsx`'s `canSeePlatformAdmin` is a separate boolean from
+  `canSeeReviewTabs` (Database Onboarding/SME Semantic Review's own
+  admin-or-analyst gate), not folded into it -- a tenant's own admin must
+  never see a tab that would 403 for them.
+- **Cross-tenant visibility is proven, not assumed.** `tests/test_api_platform_admin.py
+  ::TestCrossTenantDataVisibility` creates two real tenants with real
+  accounts bound to each (via `identity.repositories.tenants
+  .create_tenant`/`identity.repositories.users.create_user`'s own
+  `tenant_id` parameter -- there is still no self-service tenant
+  selection anywhere in this app to abuse) and confirms a single
+  `GET /platform-admin/users`/`/tenants` call genuinely spans both.
+- **A platform admin account is deliberately still subject to
+  `agent.authz`'s own base-role bridge for ordinary AI/chat use.**
+  `platform_admin` is not one of `identity.rbac.BASE_ROLE_NAMES`, so an
+  account holding *only* that role (with no `admin`/`user`/`analyst`
+  alongside it) would get zero permissions from `agent.authz
+  .permissions_for` for the chat/SQL features themselves -- the exact
+  same disclosed, intentional tradeoff `identity/rbac.py`'s own docstring
+  already states for `auditor`/`manager`/`support`. An operator wanting
+  both capabilities from one account assigns both roles.
+
+**Known, disclosed limitations:**
+- Audit-log coverage is narrow (this prompt's own new actions only, see
+  above) -- a genuinely complete audit trail across every mutating route
+  in this application remains a larger, separate undertaking.
+- Security events reset on process restart and are single-process (a
+  multi-worker deployment has one independent buffer per worker) -- the
+  identical, already-disclosed limit `observability.metrics
+  .PerformanceMetrics` carries, for the same reason (no shared store like
+  Redis is part of this application's current architecture).
+- `identity/repositories/users.py::list_users`/`identity/repositories
+  /semantic_catalog.py::list_entries_across_tenants`/`identity/repositories
+  /onboarding.py::list_jobs_across_tenants` are all simple
+  limit-bounded queries with no cursor/offset pagination -- fine for this
+  dashboard's realistic scale today, a disclosed gap for a much larger
+  user/job/catalog-entry count.
+- The frontend's role-assignment control on the Users tab is a free-text
+  role-name input, not a dropdown constrained to real seeded role names
+  -- `POST /platform-admin/users/{id}/roles` already validates server-side
+  (400 on an unknown role), so this is a UX rough edge, not a security
+  gap.
+
+**Read [`28_GLOBAL_PLATFORM_ADMIN_DASHBOARD_CONTRACT.md`](28_GLOBAL_PLATFORM_ADMIN_DASHBOARD_CONTRACT.md)**
+for the full prompt text and outcome summary.
+
 
 ## How to run
 

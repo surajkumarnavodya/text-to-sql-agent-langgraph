@@ -41,6 +41,11 @@ const BACKEND_ROUTES = [
   // had before Prompt 26 found and fixed it (`npm run dev` would 404 every
   // call despite `npm run build`'s production output working fine).
   '/semantic-catalog',
+  // Global platform admin dashboard (api/platform_admin.py, Prompt 28) --
+  // the same recurring dev-proxy gap found and fixed for both prompts
+  // immediately before this one; added here up front rather than found
+  // the hard way again.
+  '/platform-admin',
 ]
 
 export default defineConfig({

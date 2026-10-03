@@ -101,3 +101,35 @@ describe('AppShell role-gated review-tool nav gating', () => {
     expect(screen.queryByRole('link', { name: /sme semantic review/i })).not.toBeInTheDocument()
   })
 })
+
+// Prompt 28: Platform Admin is gated on a *different* dimension than the
+// two review tabs above -- the `platform_admin` role, never satisfied by
+// `admin` alone (see `identity.rbac.Permission.PLATFORM_ADMIN`'s own
+// docstring for the full "platform-admin versus tenant-admin" rationale).
+// A regression here that folded this into `canSeeReviewTabs` would show a
+// tenant's own admin a tab that 403s for them every time.
+describe('AppShell Platform Admin nav gating', () => {
+  const initialAuthState = useLocalAuthStore.getState()
+
+  afterEach(() => {
+    useLocalAuthStore.setState(initialAuthState, true)
+  })
+
+  it('hides the Platform Admin tab for a plain tenant admin', () => {
+    useLocalAuthStore.setState({ user: { roles: ['admin'] } } as never)
+    renderAppShell()
+    expect(screen.queryByRole('link', { name: /platform admin/i })).not.toBeInTheDocument()
+  })
+
+  it('shows the Platform Admin tab only for the platform_admin role', () => {
+    useLocalAuthStore.setState({ user: { roles: ['platform_admin'] } } as never)
+    renderAppShell()
+    expect(screen.getByRole('link', { name: /platform admin/i })).toBeInTheDocument()
+  })
+
+  it('hides the Platform Admin tab when signed out', () => {
+    useLocalAuthStore.setState({ user: null } as never)
+    renderAppShell()
+    expect(screen.queryByRole('link', { name: /platform admin/i })).not.toBeInTheDocument()
+  })
+})

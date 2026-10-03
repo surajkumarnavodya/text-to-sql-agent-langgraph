@@ -62,7 +62,12 @@ class TestPermissionProgression:
     def test_admin_is_a_superset_of_analyst(self):
         assert self._granted("analyst") <= self._granted("admin")
 
-    def test_only_admin_gets_user_management_permissions(self):
+    def test_only_admin_and_platform_admin_get_user_management_permissions(self):
+        """`platform_admin` (Prompt 28) is a deliberate superset of `admin`
+        (see `identity.rbac._PLATFORM_ADMIN`'s own docstring) -- the only
+        other role allowed to carry these permissions, since every other
+        non-admin role granting them would be a real privilege-escalation
+        regression."""
         management_perms = {
             Permission.USERS_CREATE,
             Permission.USERS_UPDATE,
@@ -70,12 +75,28 @@ class TestPermissionProgression:
             Permission.USERS_ASSIGN_ROLES,
         }
         for name, _d, _s, granted in SEED_ROLES:
-            if name == "admin":
+            if name in ("admin", "platform_admin"):
                 assert management_perms <= granted
             else:
                 assert not (
                     management_perms & granted
                 ), f"{name} should not have {management_perms}"
+
+    def test_platform_admin_is_a_superset_of_admin(self):
+        assert self._granted("admin") <= self._granted("platform_admin")
+
+    def test_platform_admin_permission_is_granted_only_to_platform_admin_role(self):
+        """`PLATFORM_ADMIN` is the one permission deliberately exempt from
+        the ordinary tenant-scoped admin set -- a tenant's own `admin`
+        account must never hold it without a separate, explicit role
+        grant (see `identity.rbac.Permission.PLATFORM_ADMIN`'s own
+        docstring for the full "platform-admin versus tenant-admin"
+        rationale)."""
+        for name, _d, _s, granted in SEED_ROLES:
+            if name == "platform_admin":
+                assert Permission.PLATFORM_ADMIN in granted
+            else:
+                assert Permission.PLATFORM_ADMIN not in granted, f"{name} should not have it"
 
 
 class TestPermissionsForRoles:

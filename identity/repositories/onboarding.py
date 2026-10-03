@@ -20,7 +20,7 @@ import uuid
 from datetime import UTC, datetime
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from identity.models import OnboardingArtifact, OnboardingJob, OnboardingReviewItem
@@ -72,6 +72,43 @@ def list_jobs_for_tenant(session: Session, tenant_id: str) -> list[OnboardingJob
             .order_by(OnboardingJob.created_at.desc())
         )
     )
+
+
+def list_jobs_across_tenants(
+    session: Session, *, status: str | None = None, limit: int = 500
+) -> list[OnboardingJob]:
+    """Every onboarding job, across every tenant -- Prompt 28
+    (`28_GLOBAL_PLATFORM_ADMIN_DASHBOARD_CONTRACT.md`)'s own "jobs"
+    dashboard section. See `identity.repositories.semantic_catalog
+    .list_entries_across_tenants`'s own docstring for why this is a
+    separate, differently-named function rather than an optional
+    `tenant_id` on `list_jobs_for_tenant` above -- identical reasoning,
+    same single caller (`api/platform_admin.py`, already
+    `PLATFORM_ADMIN`-gated).
+    """
+    statement = select(OnboardingJob)
+    if status is not None:
+        statement = statement.where(OnboardingJob.status == status)
+    statement = statement.order_by(OnboardingJob.created_at.desc()).limit(limit)
+    return list(session.scalars(statement))
+
+
+def count_pending_review_items_across_tenants(session: Session) -> dict[str, int]:
+    """`{item_type: pending_count}` across every job in every tenant --
+    the literal number this dashboard's "semantic review queue" section
+    needs for onboarding's own half of that queue (the other half is
+    `identity.repositories.semantic_catalog.list_entries_across_tenants`'s
+    draft/reviewed counts). A plain grouped count, not a full row fetch,
+    since the dashboard only needs the number here, not each item's own
+    detail (an operator drills into a specific job's own review items via
+    the existing `GET /onboarding/jobs/{id}/review-items` route instead).
+    """
+    rows = session.execute(
+        select(OnboardingReviewItem.item_type, func.count())
+        .where(OnboardingReviewItem.decision == "pending")
+        .group_by(OnboardingReviewItem.item_type)
+    ).all()
+    return {item_type: count for item_type, count in rows}
 
 
 def update_job_status(

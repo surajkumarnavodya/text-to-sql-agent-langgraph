@@ -22,6 +22,22 @@ import {
   runOnboardingDiscovery,
 } from '@/lib/onboardingApi'
 import {
+  assignUserRole,
+  createTenant,
+  getConfigStatus,
+  getPlatformMetrics,
+  getSemanticReviewQueue,
+  listAuditLogs,
+  listPlatformDatabases,
+  listPlatformJobs,
+  listPlatformUsers,
+  listRoles,
+  listSecurityEvents,
+  listTenants,
+  removeUserRole,
+  setTenantStatus,
+} from '@/lib/platformAdminApi'
+import {
   createCatalogEntry,
   getCatalogEntry,
   getCatalogEntryVersions,
@@ -32,13 +48,16 @@ import {
   updateCatalogEntry,
 } from '@/lib/semanticCatalogApi'
 import type {
+  AssignRoleRequest,
   Collection,
   CreateCatalogEntryRequest,
+  CreateTenantRequest,
   DecideReviewItemRequest,
   PublishJobRequest,
   ReviewDecisionRequest,
   RunDiscoveryRequest,
   SensitivityCategory,
+  SetTenantStatusRequest,
   UpdateCatalogEntryRequest,
 } from '@/lib/types'
 
@@ -298,4 +317,107 @@ export function usePublishCatalogEntry(entryId: string) {
     mutationFn: () => publishCatalogEntry(entryId),
     onSuccess: invalidate,
   })
+}
+
+// --- Global platform admin dashboard (api/platform_admin.py, Prompt 28) ---
+// No `refetchInterval` anywhere below -- this is an operator dashboard a
+// human opens and reads, not a live-polling view; React Query's own
+// manual `refetch`/`invalidateQueries` after a mutation is enough.
+
+export function usePlatformTenants() {
+  return useQuery({ queryKey: ['platform-admin-tenants'], queryFn: listTenants })
+}
+
+export function useCreateTenant() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (payload: CreateTenantRequest) => createTenant(payload),
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: ['platform-admin-tenants'] })
+    },
+  })
+}
+
+export function useSetTenantStatus(tenantId: string) {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (payload: SetTenantStatusRequest) => setTenantStatus(tenantId, payload),
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: ['platform-admin-tenants'] })
+      void queryClient.invalidateQueries({ queryKey: ['platform-admin-audit-logs'] })
+    },
+  })
+}
+
+export function usePlatformUsers(params?: { tenantId?: string; roleName?: string; status?: string }) {
+  return useQuery({
+    queryKey: ['platform-admin-users', params ?? null],
+    queryFn: () => listPlatformUsers(params),
+  })
+}
+
+export function useAssignUserRole(userId: string) {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (payload: AssignRoleRequest) => assignUserRole(userId, payload),
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: ['platform-admin-users'] })
+      void queryClient.invalidateQueries({ queryKey: ['platform-admin-audit-logs'] })
+    },
+  })
+}
+
+export function useRemoveUserRole(userId: string) {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (roleName: string) => removeUserRole(userId, roleName),
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: ['platform-admin-users'] })
+      void queryClient.invalidateQueries({ queryKey: ['platform-admin-audit-logs'] })
+    },
+  })
+}
+
+export function usePlatformRoles() {
+  return useQuery({ queryKey: ['platform-admin-roles'], queryFn: listRoles })
+}
+
+export function usePlatformDatabases() {
+  return useQuery({ queryKey: ['platform-admin-databases'], queryFn: listPlatformDatabases })
+}
+
+export function useSemanticReviewQueue() {
+  return useQuery({
+    queryKey: ['platform-admin-semantic-review-queue'],
+    queryFn: getSemanticReviewQueue,
+  })
+}
+
+export function usePlatformJobs(status?: string) {
+  return useQuery({
+    queryKey: ['platform-admin-jobs', status ?? null],
+    queryFn: () => listPlatformJobs(status),
+  })
+}
+
+export function usePlatformMetrics() {
+  return useQuery({ queryKey: ['platform-admin-metrics'], queryFn: getPlatformMetrics })
+}
+
+export function useSecurityEvents(params?: { limit?: number; severity?: string; eventType?: string }) {
+  return useQuery({
+    queryKey: ['platform-admin-security-events', params ?? null],
+    queryFn: () => listSecurityEvents(params),
+  })
+}
+
+export function useAuditLogs(params?: { action?: string; resourceType?: string; outcome?: string }) {
+  return useQuery({
+    queryKey: ['platform-admin-audit-logs', params ?? null],
+    queryFn: () => listAuditLogs(params),
+  })
+}
+
+export function useConfigStatus() {
+  return useQuery({ queryKey: ['platform-admin-config-status'], queryFn: getConfigStatus })
 }

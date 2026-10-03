@@ -144,3 +144,15 @@ def require_identity_permission(permission: IdentityPermission):
         return user, session
 
     return _dependency
+
+
+#: Prompt 28 (`28_GLOBAL_PLATFORM_ADMIN_DASHBOARD_CONTRACT.md`): the one
+#: dependency every route in `api/platform_admin.py` uses. A plain
+#: `require_identity_permission(...)` application -- no new mechanism,
+#: since `PLATFORM_ADMIN` is checked exactly like every other granular
+#: permission this module already gates on. Deliberately *not* an ABAC
+#: check against any `tenant_id` (unlike `require_local_user` composed
+#: with `onboarding.policy`/`semantic.catalog_policy`'s own per-resource
+#: tenant comparisons) -- the entire point of this permission is
+#: cross-tenant visibility, so there is no tenant to scope it to.
+require_platform_admin = require_identity_permission(IdentityPermission.PLATFORM_ADMIN)

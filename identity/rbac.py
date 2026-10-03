@@ -70,6 +70,21 @@ class Permission(str, Enum):
     CATALOG_REVIEW = "catalog.review"
     RECOMMENDATION_REVIEW = "recommendation.review"
     RECOMMENDATION_MANAGE = "recommendation.manage"
+    # Prompt 28 (28_GLOBAL_PLATFORM_ADMIN_DASHBOARD_CONTRACT.md): the one
+    # permission that crosses tenant boundaries deliberately -- every
+    # other permission in this file is exercised through an ABAC check
+    # that scopes it to the actor's own tenant (see `onboarding.policy`/
+    # `semantic.catalog_policy`/`recommendation.governance_policy`'s
+    # shared "cross_tenant -> deny" pattern). `PLATFORM_ADMIN` is the
+    # opposite: it grants the operator-level dashboard
+    # (`api/platform_admin.py`) read/administer access *across every
+    # tenant*, which is why it is its own standalone permission/role
+    # rather than folded into `_ADMIN` -- a tenant's own "admin" account
+    # must never automatically see or act on another tenant's data just
+    # because it holds the tenant-scoped admin role (the exact "platform-
+    # admin versus tenant-admin" distinction this prompt's own testing
+    # requirement names).
+    PLATFORM_ADMIN = "platform.admin"
 
 
 #: Every permission's seed description, for the `permissions` table.
@@ -129,6 +144,11 @@ SEED_PERMISSIONS: tuple[tuple[Permission, str], ...] = (
     (
         Permission.RECOMMENDATION_MANAGE,
         "Force-expire a persisted recommendation (administrative override).",
+    ),
+    (
+        Permission.PLATFORM_ADMIN,
+        "Operate the platform-wide admin dashboard: view and administer every "
+        "tenant, not only the actor's own.",
     ),
 )
 
@@ -234,6 +254,15 @@ _SUPPORT: frozenset[Permission] = _USER | {
     Permission.USERS_READ,
     Permission.SESSIONS_REVOKE_ANY,
 }
+# Prompt 28: a genuine superset of _ADMIN (every tenant-admin capability,
+# plus PLATFORM_ADMIN itself) -- holding this role lets an operator both
+# run the cross-tenant dashboard *and* act within any single tenant's own
+# admin surface without needing a second role assignment. The crucial
+# property this role provides is additive, not substitutive: granting it
+# to an account never changes what plain `"admin"` means for anyone
+# else -- a tenant's own admin still has no cross-tenant visibility
+# unless *this* role is separately granted to them.
+_PLATFORM_ADMIN: frozenset[Permission] = _ADMIN | {Permission.PLATFORM_ADMIN}
 
 #: Seed data for a fresh identity database (`identity/bootstrap.py`):
 #: (name, description, is_system_role, granted permissions). The first
@@ -247,6 +276,13 @@ SEED_ROLES: tuple[tuple[str, str, bool, frozenset[Permission]], ...] = (
     ("auditor", "Read-only compliance/audit oversight across all users.", True, _AUDITOR),
     ("manager", "Day-to-day user/session oversight without full provisioning.", True, _MANAGER),
     ("support", "Helpdesk: look up accounts and revoke their sessions.", True, _SUPPORT),
+    (
+        "platform_admin",
+        "Operates the platform-wide admin dashboard across every tenant, in "
+        "addition to every tenant-admin capability.",
+        True,
+        _PLATFORM_ADMIN,
+    ),
 )
 
 #: The 4 role names `agent.authz.ROLE_PERMISSIONS` already knows -- a

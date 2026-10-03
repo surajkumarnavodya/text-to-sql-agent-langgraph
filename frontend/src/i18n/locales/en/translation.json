@@ -49,7 +49,8 @@
     "knowledgeSources": "Knowledge Sources",
     "mediaSearch": "Media Search",
     "dbOnboarding": "Database Onboarding",
-    "semanticReview": "SME Semantic Review"
+    "semanticReview": "SME Semantic Review",
+    "platformAdmin": "Platform Admin"
   },
   "header": {
     "openHistory": "Open chat history",

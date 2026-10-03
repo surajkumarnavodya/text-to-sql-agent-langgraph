@@ -1,4 +1,4 @@
-import { BookOpen, Database, ImageIcon, MessageSquare, Plug, ShieldCheck } from 'lucide-react'
+import { BookOpen, Database, ImageIcon, MessageSquare, Plug, ShieldAlert, ShieldCheck } from 'lucide-react'
 import { useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { NavLink, Outlet } from 'react-router-dom'
@@ -51,6 +51,14 @@ export function AppShell() {
   const canSeeReviewTabs = Boolean(
     localUser?.roles.includes('admin') || localUser?.roles.includes('analyst'),
   )
+  // Platform Admin (Prompt 28) is gated on a *different* dimension than
+  // the two tabs above -- `platform_admin`, never satisfied merely by
+  // holding the tenant-scoped `admin` role (see `identity.rbac
+  // .Permission.PLATFORM_ADMIN`'s own docstring for the full "platform-
+  // admin versus tenant-admin" rationale). Kept as its own boolean, not
+  // folded into `canSeeReviewTabs`, specifically so a tenant's own admin
+  // never sees a tab that would 403 for them.
+  const canSeePlatformAdmin = Boolean(localUser?.roles.includes('platform_admin'))
   const sidebarCollapsed = useSettingsStore((state) => state.sidebarCollapsed)
   // Passed to both UserMenu (attaches it to the avatar button) and
   // SettingsDialog (restores focus there on close) -- see
@@ -101,6 +109,9 @@ export function AppShell() {
               )}
               {canSeeReviewTabs && (
                 <NavTab to="/semantic-review" icon={ShieldCheck} label={t('nav.semanticReview')} />
+              )}
+              {canSeePlatformAdmin && (
+                <NavTab to="/platform-admin" icon={ShieldAlert} label={t('nav.platformAdmin')} />
               )}
             </nav>
 
