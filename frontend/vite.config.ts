@@ -36,6 +36,11 @@ const BACKEND_ROUTES = [
   '/share-invitations',
   // Client-database onboarding (api/onboarding.py, Prompt 08/26).
   '/onboarding',
+  // Tenant-aware semantic catalog (api/semantic_catalog.py, Prompt 09/27) --
+  // was missing here before Prompt 27, same real dev-only gap `/onboarding`
+  // had before Prompt 26 found and fixed it (`npm run dev` would 404 every
+  // call despite `npm run build`'s production output working fine).
+  '/semantic-catalog',
 ]
 
 export default defineConfig({

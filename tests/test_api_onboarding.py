@@ -447,3 +447,49 @@ class TestConnectionTestRateLimit:
 
         assert first_admin_first_call.status_code == 200
         assert second_admin_first_call.status_code == 200
+
+
+class TestReviewDecisionAudit:
+    """Prompt 27 (`27_SME_SEMANTIC_REVIEW_DASHBOARD_CONTRACT.md`)'s own
+    "audit" testing requirement -- an SME's confirm/reject decision on an
+    onboarding review item is now a structured `security.audit_log`
+    event, not silently unaudited."""
+
+    def test_deciding_a_review_item_emits_a_security_audit_event(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ):
+        events: list[tuple] = []
+        monkeypatch.setattr(
+            onboarding_mod,
+            "log_security_event",
+            lambda *args, **kwargs: events.append((args, kwargs)),
+        )
+
+        admin_tokens = _register(client, "admin12@tenant-a.example.com", role="admin")
+        admin_headers = _headers(admin_tokens)
+        job = _create_job(client, admin_headers)
+        client.post(
+            f"/onboarding/jobs/{job['id']}/discover",
+            json={"db_password": "unused"},
+            headers=admin_headers,
+        )
+        items = client.get(
+            f"/onboarding/jobs/{job['id']}/review-items", headers=admin_headers
+        ).json()
+        assert items
+
+        analyst_tokens = _register(client, "analyst3@tenant-a.example.com", role="analyst")
+        analyst_headers = _headers(analyst_tokens)
+        client.post(
+            f"/onboarding/jobs/{job['id']}/review-items/{items[0]['id']}/decide",
+            json={"decision": "confirmed"},
+            headers=analyst_headers,
+        )
+
+        assert len(events) == 1
+        (event_type, severity, _detail), kwargs = events[0]
+        assert event_type == "onboarding_review_item_decided"
+        assert severity == "info"
+        assert kwargs["decision"] == "confirmed"
+        assert kwargs["job_id"] == job["id"]
+        assert kwargs["item_id"] == items[0]["id"]

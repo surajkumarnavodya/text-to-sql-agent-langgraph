@@ -21,12 +21,25 @@ import {
   retryOnboardingJob,
   runOnboardingDiscovery,
 } from '@/lib/onboardingApi'
+import {
+  createCatalogEntry,
+  getCatalogEntry,
+  getCatalogEntryVersions,
+  listCatalogEntries,
+  publishCatalogEntry,
+  requestCatalogEntryChanges,
+  reviewCatalogEntry,
+  updateCatalogEntry,
+} from '@/lib/semanticCatalogApi'
 import type {
   Collection,
+  CreateCatalogEntryRequest,
   DecideReviewItemRequest,
   PublishJobRequest,
+  ReviewDecisionRequest,
   RunDiscoveryRequest,
   SensitivityCategory,
+  UpdateCatalogEntryRequest,
 } from '@/lib/types'
 
 export function useHealth() {
@@ -200,5 +213,89 @@ export function useRetryOnboardingJob(jobId: string) {
       void queryClient.invalidateQueries({ queryKey: ['onboarding-job', jobId] })
       void queryClient.invalidateQueries({ queryKey: ['onboarding-jobs'] })
     },
+  })
+}
+
+// --- Tenant-aware semantic catalog (semantic/catalog.py, api/semantic_catalog.py,
+// Prompt 09/10/27 -- the SME Semantic Review Dashboard) ---
+
+export function useCatalogEntries(params?: {
+  databaseId?: string
+  conceptType?: string
+  status?: string
+  includeConflicts?: boolean
+}) {
+  return useQuery({
+    queryKey: ['catalog-entries', params ?? null],
+    queryFn: () => listCatalogEntries(params),
+  })
+}
+
+export function useCatalogEntry(entryId: string | null) {
+  return useQuery({
+    queryKey: ['catalog-entry', entryId],
+    queryFn: () => getCatalogEntry(entryId as string),
+    enabled: entryId !== null,
+  })
+}
+
+export function useCatalogEntryVersions(
+  params: { conceptKey: string; databaseId: string; conceptType: string } | null,
+) {
+  return useQuery({
+    queryKey: ['catalog-entry-versions', params],
+    queryFn: () =>
+      getCatalogEntryVersions(params as { conceptKey: string; databaseId: string; conceptType: string }),
+    enabled: params !== null,
+  })
+}
+
+export function useCreateCatalogEntry() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (payload: CreateCatalogEntryRequest) => createCatalogEntry(payload),
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: ['catalog-entries'] })
+    },
+  })
+}
+
+function useInvalidateCatalogQueries(entryId: string) {
+  const queryClient = useQueryClient()
+  return () => {
+    void queryClient.invalidateQueries({ queryKey: ['catalog-entry', entryId] })
+    void queryClient.invalidateQueries({ queryKey: ['catalog-entries'] })
+  }
+}
+
+export function useUpdateCatalogEntry(entryId: string) {
+  const invalidate = useInvalidateCatalogQueries(entryId)
+  return useMutation({
+    mutationFn: (payload: UpdateCatalogEntryRequest) => updateCatalogEntry(entryId, payload),
+    onSuccess: invalidate,
+  })
+}
+
+export function useReviewCatalogEntry(entryId: string) {
+  const invalidate = useInvalidateCatalogQueries(entryId)
+  return useMutation({
+    mutationFn: (payload: ReviewDecisionRequest) => reviewCatalogEntry(entryId, payload),
+    onSuccess: invalidate,
+  })
+}
+
+export function useRequestCatalogEntryChanges(entryId: string) {
+  const invalidate = useInvalidateCatalogQueries(entryId)
+  return useMutation({
+    mutationFn: (payload: ReviewDecisionRequest) => requestCatalogEntryChanges(entryId, payload),
+    onSuccess: invalidate,
+  })
+}
+
+export function usePublishCatalogEntry(entryId: string) {
+  const invalidate = useInvalidateCatalogQueries(entryId)
+  return useMutation({
+    mutationFn: () => publishCatalogEntry(entryId),
+    onSuccess: invalidate,
   })
 }

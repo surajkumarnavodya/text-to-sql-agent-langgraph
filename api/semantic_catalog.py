@@ -68,7 +68,7 @@ from identity.repositories.semantic_catalog import (
 from identity.repositories.semantic_catalog import (
     update_draft_entry as _update_draft_entry,
 )
-from identity.repositories.users import get_user_permissions
+from identity.repositories.users import get_user_by_id, get_user_permissions
 from retrieval.embeddings import EmbeddingError
 from retrieval.ingestion import (
     business_concept_chunk_id_for_snapshot,
@@ -132,8 +132,20 @@ def _authorize(
         raise _forbidden()
 
 
+def _display_name(session: Session, user_id: uuid.UUID | None) -> str | None:
+    """Best-effort reviewer/publisher display-name lookup -- `None` for a
+    never-reviewed/-published entry, or for an account since deleted
+    (`ondelete="SET NULL"` on both FKs), never a reason this route fails."""
+    if user_id is None:
+        return None
+    user = get_user_by_id(session, user_id)
+    return user.display_name if user is not None else None
+
+
 def _entry_out(
-    entry: SemanticCatalogEntry, conflicts: list[SemanticCatalogEntry] | None = None
+    session: Session,
+    entry: SemanticCatalogEntry,
+    conflicts: list[SemanticCatalogEntry] | None = None,
 ) -> CatalogEntryOut:
     snapshot = entry_to_snapshot(entry)
     conflicts = conflicts or []
@@ -162,6 +174,10 @@ def _entry_out(
         truth_level=snapshot.truth_level.value,
         reviewed_at=entry.reviewed_at,
         review_notes=entry.review_notes,
+        reviewed_by_user_id=entry.reviewed_by_user_id,
+        reviewed_by_display_name=_display_name(session, entry.reviewed_by_user_id),
+        published_by_user_id=entry.published_by_user_id,
+        published_by_display_name=_display_name(session, entry.published_by_user_id),
         published_at=entry.published_at,
         created_at=entry.created_at,
         updated_at=entry.updated_at,
@@ -243,7 +259,7 @@ def create_catalog_entry(
         aggregation=payload.aggregation,
     )
     conflicts = _check_conflicts(session, entry)
-    return _entry_out(entry, conflicts)
+    return _entry_out(session, entry, conflicts)
 
 
 @router.get("/entries", response_model=list[CatalogEntryOut])
@@ -251,6 +267,16 @@ def list_catalog_entries(
     database_id: str | None = Query(default=None),
     concept_type: str | None = Query(default=None),
     status_filter: str | None = Query(default=None, alias="status"),
+    # Prompt 27 (27_SME_SEMANTIC_REVIEW_DASHBOARD_CONTRACT.md): off by
+    # default (zero behavior/latency change for every existing caller) --
+    # the SME review dashboard is the one caller that needs to prioritize
+    # conflicting entries and opts in explicitly. Reuses the same bounded
+    # `find_conflicting_published_entries` check `create`/`publish` already
+    # run -- one extra, already-scoped query per *published* entry in the
+    # result set (never for a draft/reviewed/superseded one, which can't
+    # itself be in conflict with another published entry's business name
+    # the way a live, published claim can).
+    include_conflicts: bool = Query(default=False),
     user_and_session: tuple[User, Session] = Depends(require_local_user),
 ) -> list[CatalogEntryOut]:
     user, session = user_and_session
@@ -267,7 +293,25 @@ def list_catalog_entries(
         concept_type=concept_type,
         status=status_filter,
     )
-    return [_entry_out(entry) for entry in entries]
+    if not include_conflicts:
+        return [_entry_out(session, entry) for entry in entries]
+    results = []
+    for entry in entries:
+        conflicts = (
+            find_conflicting_published_entries(
+                session,
+                tenant_id=entry.tenant_id,
+                database_id=entry.database_id,
+                concept_type=entry.concept_type,
+                business_name=entry.business_name,
+                synonyms=list(entry.synonyms or []),
+                exclude_concept_key=entry.concept_key,
+            )
+            if entry.status == "published"
+            else []
+        )
+        results.append(_entry_out(session, entry, conflicts))
+    return results
 
 
 @router.get("/entries/{entry_id}", response_model=CatalogEntryOut)
@@ -278,7 +322,7 @@ def get_catalog_entry(
     user, session = user_and_session
     entry = _require_entry(session, entry_id)
     _authorize(user, session, CatalogAction.VIEW_ENTRY, entry)
-    return _entry_out(entry)
+    return _entry_out(session, entry)
 
 
 @router.get("/entries/concept/{concept_key}/versions", response_model=list[CatalogEntryOut])
@@ -305,7 +349,7 @@ def get_catalog_entry_versions(
     # concept's history -- every version of one concept always shares
     # the same tenant_id (set once at creation, never changed).
     _authorize(user, session, CatalogAction.VIEW_ENTRY, versions[0])
-    return [_entry_out(entry) for entry in versions]
+    return [_entry_out(session, entry) for entry in versions]
 
 
 @router.patch("/entries/{entry_id}", response_model=CatalogEntryOut)
@@ -323,7 +367,16 @@ def update_catalog_entry(
         entry = _update_draft_entry(session, entry, **fields)
     except InvalidCatalogStatusTransitionError as exc:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
-    return _entry_out(entry)
+    log_security_event(
+        "semantic_catalog_entry_edited",
+        "info",
+        "An SME edited a draft semantic-catalog entry.",
+        entry_id=str(entry.id),
+        concept_key=entry.concept_key,
+        edited_fields=sorted(fields.keys()),
+        actor_user_id=str(user.id),
+    )
+    return _entry_out(session, entry)
 
 
 @router.post("/entries/{entry_id}/review", response_model=CatalogEntryOut)
@@ -340,7 +393,15 @@ def review_catalog_entry(
         entry = _mark_reviewed(session, entry, reviewed_by_user_id=user.id, notes=payload.notes)
     except InvalidCatalogStatusTransitionError as exc:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
-    return _entry_out(entry)
+    log_security_event(
+        "semantic_catalog_entry_reviewed",
+        "info",
+        "An SME approved a draft semantic-catalog entry to 'reviewed'.",
+        entry_id=str(entry.id),
+        concept_key=entry.concept_key,
+        actor_user_id=str(user.id),
+    )
+    return _entry_out(session, entry)
 
 
 @router.post("/entries/{entry_id}/request-changes", response_model=CatalogEntryOut)
@@ -357,7 +418,15 @@ def request_catalog_entry_changes(
         entry = _request_changes(session, entry, reviewed_by_user_id=user.id, notes=payload.notes)
     except InvalidCatalogStatusTransitionError as exc:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
-    return _entry_out(entry)
+    log_security_event(
+        "semantic_catalog_changes_requested",
+        "info",
+        "An SME sent a reviewed semantic-catalog entry back to 'draft' for changes.",
+        entry_id=str(entry.id),
+        concept_key=entry.concept_key,
+        actor_user_id=str(user.id),
+    )
+    return _entry_out(session, entry)
 
 
 @router.post("/entries/{entry_id}/publish", response_model=CatalogEntryOut)
@@ -403,5 +472,15 @@ def publish_catalog_entry(
         # dedicated backfill path -- a known, disclosed limitation, see
         # `09_SEMANTIC_CATALOG_CONTRACT.md`).
 
+    log_security_event(
+        "semantic_catalog_entry_published",
+        "info",
+        "An SME published a semantic-catalog entry -- it is now live in retrieval and "
+        "CONFIRMED_BUSINESS_TRUTH.",
+        entry_id=str(published.id),
+        concept_key=published.concept_key,
+        superseded_entry_id=str(superseded.id) if superseded is not None else None,
+        actor_user_id=str(user.id),
+    )
     conflicts = _check_conflicts(session, published)
-    return _entry_out(published, conflicts)
+    return _entry_out(session, published, conflicts)

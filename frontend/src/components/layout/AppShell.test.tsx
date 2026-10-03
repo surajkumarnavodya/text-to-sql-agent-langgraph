@@ -58,42 +58,46 @@ describe('AppShell background inert-while-modal-open', () => {
   })
 })
 
-// Prompt 26: Database Onboarding is the one nav tab gated on role (UX only
-// -- see DatabaseOnboarding.tsx's own docstring for why the real boundary
-// stays server-side). A regression here (an earlier version of the
-// gating selector returned a freshly-allocated array on every call,
+// Prompt 26/27: Database Onboarding and SME Semantic Review are the two nav
+// tabs gated on role (UX only -- see each page's own docstring for why the
+// real boundary stays server-side). A regression here (an earlier version
+// of the gating selector returned a freshly-allocated array on every call,
 // which breaks Zustand's snapshot-equality check and crashes the whole
 // shell with "Maximum update depth exceeded" -- caught by this file's
 // pre-existing tests above, not a hypothetical) would silently hide the
 // feature for an admin or show it to everyone.
-describe('AppShell Database Onboarding nav gating', () => {
+describe('AppShell role-gated review-tool nav gating', () => {
   const initialAuthState = useLocalAuthStore.getState()
 
   afterEach(() => {
     useLocalAuthStore.setState(initialAuthState, true)
   })
 
-  it('shows the Database Onboarding tab for an admin', () => {
+  it('shows both review tabs for an admin', () => {
     useLocalAuthStore.setState({ user: { roles: ['admin'] } } as never)
     renderAppShell()
     expect(screen.getByRole('link', { name: /database onboarding/i })).toBeInTheDocument()
+    expect(screen.getByRole('link', { name: /sme semantic review/i })).toBeInTheDocument()
   })
 
-  it('shows the Database Onboarding tab for an analyst', () => {
+  it('shows both review tabs for an analyst', () => {
     useLocalAuthStore.setState({ user: { roles: ['analyst'] } } as never)
     renderAppShell()
     expect(screen.getByRole('link', { name: /database onboarding/i })).toBeInTheDocument()
+    expect(screen.getByRole('link', { name: /sme semantic review/i })).toBeInTheDocument()
   })
 
-  it('hides the Database Onboarding tab for a plain user', () => {
+  it('hides both review tabs for a plain user', () => {
     useLocalAuthStore.setState({ user: { roles: ['user'] } } as never)
     renderAppShell()
     expect(screen.queryByRole('link', { name: /database onboarding/i })).not.toBeInTheDocument()
+    expect(screen.queryByRole('link', { name: /sme semantic review/i })).not.toBeInTheDocument()
   })
 
-  it('hides the Database Onboarding tab when signed out', () => {
+  it('hides both review tabs when signed out', () => {
     useLocalAuthStore.setState({ user: null } as never)
     renderAppShell()
     expect(screen.queryByRole('link', { name: /database onboarding/i })).not.toBeInTheDocument()
+    expect(screen.queryByRole('link', { name: /sme semantic review/i })).not.toBeInTheDocument()
   })
 })

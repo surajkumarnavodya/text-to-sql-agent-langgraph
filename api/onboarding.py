@@ -60,6 +60,7 @@ from db.connection import DatabaseConnectionConfig, build_connection_url, test_c
 from onboarding.jobs import OnboardingJobError, cancel_job, publish_job, retry_job
 from onboarding.jobs import run_discovery_stage as _run_discovery_stage
 from onboarding.policy import OnboardingAction, authorize_onboarding_action
+from security.audit_log import log_security_event
 from security.tenancy import resolve_actor_tenant_id
 
 logger = logging.getLogger(__name__)
@@ -329,6 +330,16 @@ def decide_review_item_route(
 
     item = _decide_review_item(
         session, item, decision=payload.decision, decided_by_user_id=user.id, notes=payload.notes
+    )
+    log_security_event(
+        "onboarding_review_item_decided",
+        "info",
+        "An SME recorded a confirm/reject decision on an onboarding review item.",
+        job_id=str(job.id),
+        item_id=str(item.id),
+        item_type=item.item_type,
+        decision=item.decision,
+        actor_user_id=str(user.id),
     )
     return _review_item_out(item)
 

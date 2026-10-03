@@ -1,4 +1,4 @@
-import { BookOpen, Database, ImageIcon, MessageSquare, Plug } from 'lucide-react'
+import { BookOpen, Database, ImageIcon, MessageSquare, Plug, ShieldCheck } from 'lucide-react'
 import { useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { NavLink, Outlet } from 'react-router-dom'
@@ -30,13 +30,17 @@ const SIDEBAR_ID = 'app-sidebar'
 export function AppShell() {
   const { t } = useTranslation()
   const [isSettingsOpen, setIsSettingsOpen] = useState(false)
-  // Database Onboarding is the one nav tab gated on role, rather than
-  // always visible like the others -- UX only (the real enforcement is
-  // server-side, see DatabaseOnboarding.tsx's own docstring), chosen here
-  // because unlike Chat/Knowledge Sources/Media Search, this page is
-  // entirely non-functional for an account with neither role (it has no
-  // "read-only" use for a plain user), so showing a tab that leads nowhere
-  // useful would be worse UX than omitting it.
+  // Database Onboarding and SME Semantic Review are the two nav tabs
+  // gated on role, rather than always visible like the others -- UX only
+  // (the real enforcement is server-side, see each page's own
+  // docstring), chosen here because unlike Chat/Knowledge Sources/Media
+  // Search, these pages are entirely non-functional for an account with
+  // neither role (they have no "read-only" use for a plain user), so
+  // showing a tab that leads nowhere useful would be worse UX than
+  // omitting it. Both share the identical admin/analyst role gate
+  // (ONBOARDING_MANAGE/ONBOARDING_REVIEW and CATALOG_MANAGE/
+  // CATALOG_REVIEW sit at the same two RBAC tiers -- see
+  // `identity/rbac.py`), so one boolean serves both.
   // Selects the already-stable `user` object itself, not a derived array --
   // a selector returning a freshly-allocated `[]` fallback on every call
   // (an earlier version of this line did exactly that) breaks Zustand's
@@ -44,7 +48,7 @@ export function AppShell() {
   // exceeded" infinite-loop guard, a real regression this app's own test
   // suite caught (AppShell.test.tsx).
   const localUser = useLocalAuthStore((state) => state.user)
-  const canSeeOnboarding = Boolean(
+  const canSeeReviewTabs = Boolean(
     localUser?.roles.includes('admin') || localUser?.roles.includes('analyst'),
   )
   const sidebarCollapsed = useSettingsStore((state) => state.sidebarCollapsed)
@@ -92,8 +96,11 @@ export function AppShell() {
               <NavTab to="/" icon={MessageSquare} label={t('nav.chat')} />
               <NavTab to="/knowledge-sources" icon={BookOpen} label={t('nav.knowledgeSources')} />
               <NavTab to="/media-search" icon={ImageIcon} label={t('nav.mediaSearch')} />
-              {canSeeOnboarding && (
+              {canSeeReviewTabs && (
                 <NavTab to="/db-onboarding" icon={Plug} label={t('nav.dbOnboarding')} />
+              )}
+              {canSeeReviewTabs && (
+                <NavTab to="/semantic-review" icon={ShieldCheck} label={t('nav.semanticReview')} />
               )}
             </nav>
 

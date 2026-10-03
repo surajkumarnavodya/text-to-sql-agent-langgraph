@@ -48,7 +48,8 @@
     "chat": "Chat",
     "knowledgeSources": "Knowledge Sources",
     "mediaSearch": "Media Search",
-    "dbOnboarding": "Database Onboarding"
+    "dbOnboarding": "Database Onboarding",
+    "semanticReview": "SME Semantic Review"
   },
   "header": {
     "openHistory": "Open chat history",

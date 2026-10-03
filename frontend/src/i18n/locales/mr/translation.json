@@ -48,7 +48,8 @@
     "chat": "चॅट",
     "knowledgeSources": "ज्ञान स्रोत",
     "mediaSearch": "मीडिया शोध",
-    "dbOnboarding": "डेटाबेस ऑनबोर्डिंग"
+    "dbOnboarding": "डेटाबेस ऑनबोर्डिंग",
+    "semanticReview": "विषय-तज्ज्ञ सिमेंटिक पुनरावलोकन"
   },
   "header": {
     "openHistory": "चॅट इतिहास उघडा",

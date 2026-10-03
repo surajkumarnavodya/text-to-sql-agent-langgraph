@@ -3129,6 +3129,122 @@ supports.
 **Read [`26_DATABASE_ONBOARDING_PORTAL_CONTRACT.md`](26_DATABASE_ONBOARDING_PORTAL_CONTRACT.md)**
 for the full prompt text and outcome summary.
 
+### SME Semantic Review Dashboard (Prompt 27)
+The first real frontend surface for the tenant-aware semantic catalog
+(`semantic/catalog.py`, `api/semantic_catalog.py`, Prompt 09/10) --
+`frontend/src/pages/SemanticReview.tsx`, a second role-gated nav tab
+(sharing Prompt 26's identical admin/analyst gate, since
+`CATALOG_MANAGE`/`CATALOG_REVIEW` sit at the same two RBAC tiers as
+`ONBOARDING_MANAGE`/`ONBOARDING_REVIEW`). Before this prompt, the
+catalog had **zero frontend** despite existing since Prompt 09 -- every
+entity/metric/dimension/domain lived only behind direct API calls.
+
+**Two real backend review systems exist, never bridged into one**
+(confirmed by inspection: nothing in `onboarding/` ever creates a
+`SemanticCatalogEntry` row). This dashboard is the catalog's own review
+surface -- the actual subject of this prompt's own "Revenue metric:
+source, proposed expression, evidence, confidence, version, reviewer"
+example -- plus a compact, linked-not-duplicated summary of onboarding
+jobs still `awaiting_review`, reusing the *existing* `ReviewItemsSection`
+component and `DatabaseOnboarding` page (Prompt 26) for the actual PII/
+relationship/semantic-label/golden-question review interaction rather
+than re-implementing that table a second time (master-contract rule 3).
+
+**The prompt's five actions (Confirm, Reject, Edit, Request
+Clarification, Defer) don't map one-to-one onto the catalog's three real
+transitions** (`identity.repositories.semantic_catalog
+.VALID_STATUS_TRANSITIONS`: draft→reviewed, reviewed→draft,
+reviewed→published) -- mapped honestly, disclosed in the page's own
+docstring rather than faked:
+- **Confirm** is context-sensitive: "Approve" (draft→reviewed, any
+  reviewer) or "Publish" (reviewed→published, admin/`CATALOG_MANAGE`
+  only), whichever transition the entry's current status allows.
+- **Reject has no backend equivalent for a catalog entry at all** --
+  there is no "rejected" `CatalogStatus`. The closest real action is
+  **Request Changes** (reviewed→draft, with notes), shown only for a
+  *reviewed* entry; a draft entry can only be approved, edited, or
+  deferred.
+- **Edit** is the real `PATCH` route, and only succeeds on a `draft`
+  entry (the one row this table ever allows an in-place edit on).
+- **Request Clarification** is the real `request-changes` route.
+- **Defer** makes no API call at all -- it advances the reviewer to the
+  next item in the priority-sorted queue, leaving the entry's real state
+  completely unchanged.
+
+**Prioritization is a disclosed, deterministic client-side heuristic**
+(`SemanticReview.tsx::priorityScore`) -- a conflict scores highest (two
+published claims can't both be right), then low confidence (<70%), then
+`concept_type == "metric"` ("high-impact": a metric definition feeds
+every KPI question that uses it) -- never a hidden model, matching
+`onboarding/semantic_inference.py`'s own transparent ambiguity-flag
+precedent.
+
+**Two real, additive backend gaps found and closed, both in
+`api/semantic_catalog.py`/`api/semantic_catalog_schemas.py`:**
+- `CatalogEntryOut` never surfaced *who* reviewed/published an entry
+  (`SemanticCatalogEntry.reviewed_by_user_id`/`published_by_user_id`
+  always existed on the ORM row; nothing read them back) -- now exposes
+  `reviewed_by_display_name`/`published_by_display_name` too (a
+  best-effort lookup, `None` once that account is deleted via the FK's
+  own `ondelete="SET NULL"`, never a reason the route fails), the literal
+  "reviewer" field the prompt's own metric example names.
+- `GET /semantic-catalog/entries` never recomputed conflicts (only
+  `create`/`publish` did, by design, per Prompt 10's own docstring) --
+  this dashboard needs to prioritize conflicting entries from the list
+  view, so a new opt-in `include_conflicts` query param (default `false`,
+  zero behavior/latency change for every pre-existing caller) reuses the
+  identical, already-bounded `find_conflicting_published_entries` check,
+  run only for a `published` entry in the result set (a draft/reviewed
+  row can't itself be in conflict with a published claim).
+
+**A real, pre-existing concurrency bug was found and fixed while writing
+this prompt's own required "concurrent review" test, not a hypothetical:**
+every status-transition function (`mark_reviewed`/`request_changes`/
+`publish_entry`/`update_draft_entry`) used to validate against the
+caller's own in-memory `entry.status` and then commit an *unconditioned*
+`UPDATE` -- two concurrent callers could both pass that check (racing to
+publish, or one editing a draft the instant another approves it) and
+both "succeed," silently losing the "only one caller's transition should
+ever win" guarantee a 409 is supposed to provide. Fixed by
+`identity.repositories.semantic_catalog._apply_transition`: one atomic
+`UPDATE ... WHERE id = entry.id AND status = expected_current`,
+portable across every SQL dialect this app supports -- no advisory lock
+or dialect-specific code needed. Proven under **real `threading.Thread`s**
+(`tests/test_api_semantic_catalog.py::TestConcurrentPublish`, mirroring
+Prompt 20's own `test_cross_tenant_shared_infrastructure.py` precedent for
+why a sequential test would pass even with the original bug). **Known,
+disclosed, narrower scope than the fix might imply**: this closes the
+single-row race (two callers transitioning the *same* entry); it does
+**not** close the separate, rarer race of two *different* draft versions
+of the *same concept* both reaching `published` concurrently with neither
+seeing the other as `previous_published` (no shared row to guard via a
+`WHERE` clause) -- a real, narrower, disclosed limitation, not silently
+glossed over.
+
+**Audit logging, the prompt's own explicit requirement, was missing for
+every ordinary state change before this prompt** (only Prompt 10's
+conflict-detection path called `security.audit_log.log_security_event`
+at all). Added to `update_catalog_entry`/`review_catalog_entry`/
+`request_catalog_entry_changes`/`publish_catalog_entry`
+(`api/semantic_catalog.py`) and `decide_review_item_route`
+(`api/onboarding.py`) -- six new, `"info"`-severity structured events,
+each carrying the entry/item id and the acting user id.
+
+**Known, disclosed limitations:** "Affected questions" (named in the
+prompt's own metric example) is not tracked anywhere in this backend --
+shown as an honest note in the UI, never fabricated. No deep link exists
+from the onboarding-jobs summary card into a specific job on
+`/db-onboarding` (that page's job selection is local component state,
+not a URL param) -- the link opens the page, the reviewer still has to
+pick the job themselves. The dashboard's own "+ New concept" form covers
+only the core + metric-specific fields, not every `CreateCatalogEntryRequest`
+field (relationships/business rules/examples/evidence are editable only
+via the existing `EditEntryCard`'s own narrower field set, or directly
+against the API).
+
+**Read [`27_SME_SEMANTIC_REVIEW_DASHBOARD_CONTRACT.md`](27_SME_SEMANTIC_REVIEW_DASHBOARD_CONTRACT.md)**
+for the full prompt text and outcome summary.
+
 
 ## How to run
 
