@@ -1,5 +1,14 @@
 # Production Checklist
 
+**Superseded (Prompt 25, 2026-10-03):**
+[`docs/PRODUCTION_READINESS_RELEASE_GATE.md`](PRODUCTION_READINESS_RELEASE_GATE.md)'s
+§6 "Release checklist" is now the current, authoritative go/no-go list —
+this file predates real authentication/RBAC/tenant isolation entirely
+(see the correction immediately below) and several other items here are
+now closed or superseded. Kept as historical detail, not deleted, since
+its non-auth items (read-only `DB_USER`, sensitive-column classification,
+`.env` handling) remain accurate.
+
 A concrete go/no-go checklist derived directly from this project's own
 2026-09-01 production-readiness audit (`docs/PRODUCTION_READINESS_REPORT.md`)
 — not a generic template. Work through this **per deployment**, not once
@@ -24,10 +33,17 @@ users each re-open several of these items.
       and not exposed by `docker compose config` output shared anywhere.**
       See `docs/DEPLOYMENT.md`'s "Production secrets."
 - [ ] **A reverse proxy with real authentication sits in front of any
-      deployment reachable beyond a trusted local network** — neither the
-      UI nor the API has real auth (`docs/RISK_REGISTER.md`'s R-001). The
-      optional `API_AUTH_TOKEN` is a hook, not a substitute — see
-      `docs/DEPLOYMENT.md`'s "Reverse proxy and auth."
+      deployment reachable beyond a trusted local network, unless `AUTH_MODE`
+      is already set to `oidc` or `local`.** *(Corrected 2026-10-03 — this
+      item previously claimed "neither the UI nor the API has real auth,"
+      which is no longer true: real OIDC/local-account authentication and
+      RBAC now exist and are the recommended production configuration —
+      see `docs/AUTHENTICATION.md`/`docs/AUTHORIZATION.md` and
+      `docs/RISK_REGISTER.md`'s R-001. A reverse proxy is still the right
+      answer for `AUTH_MODE=none`/`static_token`, which remain real,
+      lighter-weight options for a trusted-network deployment.)* The
+      optional `API_AUTH_TOKEN` is a hook, not a substitute for a real auth
+      mode — see `docs/DEPLOYMENT.md`'s "Reverse proxy and auth."
 - [ ] **You have read `SECURITY.md` in full**, specifically "What is
       explicitly not guaranteed" and "Bottom line" — this project
       explicitly states it has not been through an independent security

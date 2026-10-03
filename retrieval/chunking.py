@@ -587,6 +587,12 @@ def business_concept_chunk_from_catalog_entry(
         version=snapshot.version,
         tags=snapshot.synonyms,
         extra={
+            # Prompt 20: the owning tenant, in metadata the retriever can
+            # actually filter on. It was already present inside `source_id`,
+            # but only as part of an opaque string nothing parsed -- which
+            # meant a published concept belonging to one tenant was
+            # retrievable by any tenant sharing that database.
+            "tenant_id": snapshot.tenant_id,
             "concept_type": snapshot.concept_type.value,
             "concept_key": snapshot.concept_key,
             "business_name": snapshot.business_name,

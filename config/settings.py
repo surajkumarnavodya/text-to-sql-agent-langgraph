@@ -192,6 +192,29 @@ class DatabaseConnectionConfig(BaseModel):
     db_connection_string: SecretStr | None = None
     db_schema: str | None = None
     db_odbc_driver: str = "ODBC Driver 17 for SQL Server"
+    tenant_ids: tuple[str, ...] = ()
+    """Which tenants may query this connection (Prompt 20,
+    `DB_<NAME>_TENANT_IDS` in `.env`).
+
+    Empty (the default) means **shared by every tenant** -- which is
+    deliberately the backward-compatible behavior, since a single-tenant
+    deployment's one database is exactly that, and an existing `.env` that
+    says nothing about tenants must keep working identically. The moment an
+    operator lists even one tenant here, the connection becomes restricted
+    to that list: `Settings.databases_for_tenant` filters it out for
+    everybody else, and `api/main.py` resolves a requested database name
+    through that filtered view rather than the raw `databases` tuple, so a
+    caller in another tenant gets the same "unknown database" response a
+    genuinely nonexistent name gets (anti-enumeration, matching this
+    codebase's existing cross-tenant-denial-as-404 convention).
+
+    This is config, not data: it is read from the operator's `.env`, never
+    from a request. It is also deliberately a *connection*-level property
+    rather than a per-tenant copy of the connection -- one tenant per
+    customer database is the common shape, but a shared read-only reporting
+    database legitimately serves several, and expressing that as a list
+    avoids forcing an operator to duplicate credentials per tenant.
+    """
 
 
 def _parse_named_connections() -> tuple[DatabaseConnectionConfig, ...]:
@@ -263,10 +286,24 @@ def _parse_named_connections() -> tuple[DatabaseConnectionConfig, ...]:
                 db_odbc_driver=_env_str(
                     f"DB_{prefix}_ODBC_DRIVER", "ODBC Driver 17 for SQL Server"
                 ),
+                tenant_ids=_env_csv_tuple(f"DB_{prefix}_TENANT_IDS"),
             )
         )
 
     return tuple(connections)
+
+
+def _env_csv_tuple(key: str) -> tuple[str, ...]:
+    """Reads a comma-separated env var into a tuple of trimmed, non-empty
+    strings -- `()` for unset, blank, or all-whitespace.
+
+    Used for `DB_<NAME>_TENANT_IDS` (Prompt 20). Hand-written for the same
+    reason the rest of `_parse_named_connections` is: these keys carry a
+    runtime-determined `DB_<PREFIX>_` prefix, so Pydantic's own env decoding
+    can't reach them.
+    """
+    raw = _env_str(key, "")
+    return tuple(part.strip() for part in raw.split(",") if part.strip())
 
 
 def _format_validation_error(exc: ValidationError) -> str:
@@ -483,6 +520,47 @@ class Settings(BaseSettings):
             "a human clicks a button" action with a similar expected
             frequency, and splitting them out can be revisited if one
             route's real usage pattern needs a different budget.
+        enable_database_concurrency_limit: Whether `POST /execute` and
+            `agent.nodes.execute_sql_node` fast-fail once a configured
+            database already has `db_pool_size + db_max_overflow +
+            database_concurrency_limit_overhead` real executions in
+            flight against it, rather than letting the extra caller block
+            on `QueuePool` checkout for up to SQLAlchemy's own
+            `pool_timeout` (30s default) before failing anyway. Default
+            True: below saturation this changes nothing at all (the
+            limiter never trips); at saturation it turns a long blocking
+            wait into an immediate, clearly-worded rejection instead of an
+            opaque pool-timeout error, which is a strict improvement, not
+            a new restriction on any currently-working request. See
+            `agent.rate_limit.get_database_execution_limiter` and
+            `docs/SCALE_BASELINE.md`'s Prompt 22 entry.
+        database_concurrency_limit_overhead: Extra headroom added on top
+            of a database's own `db_pool_size + db_max_overflow` before
+            the limiter above trips -- 0 (default) means "fail exactly at
+            the point the pool itself would start blocking"; an operator
+            who'd rather let a few callers legitimately queue on the pool
+            before being fast-failed can widen this.
+        enable_result_cache: Whether `POST /execute` ("Confirm and Run")
+            may serve a cached `(columns, rows)` result for exact-text-
+            identical SQL against the same database instead of
+            re-executing it. Default False -- caching is a deliberate,
+            data-freshness-affecting operator opt-in, not a safe-by-default
+            accuracy aid (matching this codebase's convention for
+            `ENABLE_DOCUMENT_RAG`/`ENABLE_WEB_SEARCH`-class flags). Any SQL
+            referencing a `config.sensitive_columns`-classified restricted
+            column is never cached, regardless of this flag -- see
+            `db.result_cache.is_cacheable_sql`. Never applied to the
+            agent's own internal self-correction retry executions (those
+            aren't shown to the user and rarely repeat identical SQL
+            anyway) -- only to the user-facing "Confirm and Run" path.
+        result_cache_ttl_seconds: How long a cached result stays fresh
+            before it's treated as a miss and re-executed.
+        result_cache_max_entries: Bound on the number of distinct
+            (database, SQL) cache entries kept in memory at once,
+            LRU-evicted past this -- same bounded-cache shape as
+            `agent.rate_limit.BoundedLimiterCache`, for the same
+            unbounded-growth reason (a cache key here is derived from
+            caller-supplied SQL text).
         cost_estimation_enabled: Whether `db.query_cost` runs a proactive,
             non-executing cost estimate (EXPLAIN/SHOWPLAN) before running a
             validated query. Fails open regardless (see
@@ -558,6 +636,18 @@ class Settings(BaseSettings):
             server and the identity provider. Small and bounded
             deliberately -- a large value would meaningfully extend how
             long an expired token stays acceptable.
+        oidc_tenant_claim: Name of the IdP-signed JWT claim
+            `security.oidc.extract_tenant_id` reads a caller's tenant id
+            from (Prompt 20). `None` (the default) means the operator has
+            not mapped their IdP's own tenant concept onto this app's, so
+            every OIDC caller resolves to
+            `security.tenancy.DEFAULT_TENANT_ID` -- exactly this codebase's
+            pre-Prompt-20 behavior, so leaving it unset changes nothing.
+            Only ever read from a token whose signature has already been
+            verified against the issuer's live JWKS; a tenant id is never
+            accepted from a request header or body (see
+            `security/tenancy.py`'s rule 1 and
+            `reject_client_tenant_override`).
         oidc_role_claim: Name of the JWT claim `agent.authz` reads the
             caller's role(s) from (a single string or a list of strings,
             both accepted -- see `security/oidc.py::extract_roles`).
@@ -1649,6 +1739,11 @@ class Settings(BaseSettings):
     max_concurrent_ask_requests: int = Field(default=50, gt=0)
     max_concurrent_ask_requests_per_caller: int = Field(default=2, gt=0)
     api_action_rate_limit_per_minute: int = Field(default=20, gt=0)
+    enable_database_concurrency_limit: bool = True
+    database_concurrency_limit_overhead: int = Field(default=0, ge=0)
+    enable_result_cache: bool = False
+    result_cache_ttl_seconds: int = Field(default=30, gt=0)
+    result_cache_max_entries: int = Field(default=500, gt=0)
     cost_estimation_enabled: bool = True
     cost_estimation_timeout_seconds: int = Field(default=3, gt=0)
     cost_moderate_row_threshold: int = Field(default=50_000, gt=0)
@@ -1969,6 +2064,18 @@ class Settings(BaseSettings):
     enable_pii_data_verification: bool = False
     pii_data_verification_sample_size: int = Field(default=100, gt=0)
 
+    # Prompt 21 (enterprise security & data governance hardening):
+    # `POST /onboarding/jobs`, `.../discover`, and `.../publish`
+    # (api/onboarding.py) each open a live outbound connection to a
+    # caller-supplied db_host/db_port -- ONBOARDING_MANAGE-gated (admin
+    # only) already, but with no rate limit at all before this, `POST
+    # /onboarding/jobs` in particular was a repeatable TCP-connect oracle
+    # (its success/failure + classified error message leak host/port
+    # reachability) against any host/port the caller names. Per-user,
+    # hourly, mirrors `share_invite_rate_limit_per_hour`'s identical shape
+    # -- see `agent.rate_limit.get_onboarding_connection_test_limiter`.
+    onboarding_connection_rate_limit_per_hour: int = Field(default=10, gt=0)
+
     api_auth_token: SecretStr | None = None
     environment: Literal["development", "production"] = "development"
     oidc_issuer: str | None = None
@@ -1977,6 +2084,7 @@ class Settings(BaseSettings):
     oidc_algorithms: tuple[str, ...] = ("RS256",)
     oidc_clock_skew_seconds: int = Field(default=60, ge=0)
     oidc_role_claim: str = "roles"
+    oidc_tenant_claim: str | None = None
 
     # --- Google sign-in (identity/, security/google_oidc.py -- a specific
     # provider integrated into this app's own local accounts, distinct from
@@ -2485,6 +2593,37 @@ class Settings(BaseSettings):
         object.__setattr__(self, "ollama_allowed_models", base)
         return self
 
+    def databases_for_tenant(self, tenant_id: str | None) -> tuple[DatabaseConnectionConfig, ...]:
+        """Every configured connection this tenant may query, in
+        `databases`' own order (Prompt 20).
+
+        A connection with an empty `tenant_ids` is shared and always
+        included -- that is what keeps every existing single-tenant `.env`
+        behaving byte-for-byte as it did, since none of them set the new
+        variable. A connection with a non-empty `tenant_ids` is included
+        only for a tenant named in it.
+
+        `tenant_id=None` (no resolvable caller -- an anonymous request, or
+        one of the two indistinguishable-caller auth modes before a tenant
+        is resolved) returns **only the shared connections**, never a
+        tenant-restricted one: an unresolvable tenant must never be treated
+        as "matches everything," which is the deny-by-default posture every
+        ABAC check in this codebase already takes for an unknown tenant.
+
+        Deliberately a method on `Settings` rather than a free function in
+        `db/connection.py`: it is a pure question about configuration, and
+        keeping it here means `db/connection.py` (which must stay usable
+        with either a `Settings` or a single `DatabaseConnectionConfig` --
+        see `DbConnectionLike`) does not grow a tenant concept it has no
+        way to resolve.
+        """
+        return tuple(
+            connection
+            for connection in self.databases
+            if not connection.tenant_ids
+            or (tenant_id is not None and tenant_id in connection.tenant_ids)
+        )
+
     @property
     def auth_mode(self) -> Literal["none", "static_token", "oidc", "local"]:
         """The single dispatch point `api.auth.verify_api_key` (and
@@ -2768,11 +2907,15 @@ class _JsonLogFormatter(logging.Formatter):
         # a log-pipeline query for "no correlation id" is a natural `IS
         # NULL`, not a string-literal match on an internal placeholder.
         correlation_id = getattr(record, "correlation_id", None)
+        # Prompt 23: same "-" -> JSON null convention as correlation_id
+        # above, for `TenantIdLogFilter`'s own placeholder.
+        tenant_id = getattr(record, "tenant_id", None)
         payload: dict[str, object] = {
             "timestamp": self.formatTime(record, "%Y-%m-%dT%H:%M:%S%z"),
             "level": record.levelname,
             "logger": record.name,
             "correlation_id": None if correlation_id in (None, "-") else correlation_id,
+            "tenant_id": None if tenant_id in (None, "-") else tenant_id,
             "message": record.getMessage(),
         }
         if record.exc_info:
@@ -2788,11 +2931,12 @@ def configure_logging(level: str | None = None) -> None:
     reconfiguring a caller's logging setup.
 
     Every handler on the root logger gets `security.audit_log
-    .CorrelationIdLogFilter` attached, and the format includes
-    `correlation_id` -- this is what makes a request's correlation ID show
-    up on *every* log line (agent nodes, RAG, DB, external-call modules),
-    not just the dedicated `security.audit` event stream. See that filter's
-    docstring for the Phase 3 observability gap this closes.
+    .CorrelationIdLogFilter` and (Prompt 23) `TenantIdLogFilter` attached,
+    and the format includes `correlation_id`/`tenant_id` -- this is what
+    makes a request's correlation ID and tenant show up on *every* log
+    line (agent nodes, RAG, DB, external-call modules), not just the
+    dedicated `security.audit` event stream. See those filters'
+    docstrings for the observability gaps each closes.
 
     `Settings.log_format` picks the rendering: "text" (the default) is this
     codebase's original terminal-friendly pipe-delimited format, unchanged;
@@ -2801,7 +2945,7 @@ def configure_logging(level: str | None = None) -> None:
     log pipeline to ingest. Same underlying log records either way -- this
     only changes how they're rendered.
     """
-    from security.audit_log import CorrelationIdLogFilter
+    from security.audit_log import CorrelationIdLogFilter, TenantIdLogFilter
 
     settings = get_settings()
     resolved_level = (level or settings.log_level).upper()
@@ -2811,7 +2955,10 @@ def configure_logging(level: str | None = None) -> None:
     else:
         handler.setFormatter(
             logging.Formatter(
-                fmt="%(asctime)s | %(levelname)-8s | %(name)s | correlation_id=%(correlation_id)s | %(message)s",
+                fmt=(
+                    "%(asctime)s | %(levelname)-8s | %(name)s | "
+                    "correlation_id=%(correlation_id)s | tenant_id=%(tenant_id)s | %(message)s"
+                ),
                 datefmt="%H:%M:%S",
             )
         )
@@ -2821,5 +2968,7 @@ def configure_logging(level: str | None = None) -> None:
         force=True,
     )
     correlation_filter = CorrelationIdLogFilter()
+    tenant_filter = TenantIdLogFilter()
     for configured_handler in logging.getLogger().handlers:
         configured_handler.addFilter(correlation_filter)
+        configured_handler.addFilter(tenant_filter)

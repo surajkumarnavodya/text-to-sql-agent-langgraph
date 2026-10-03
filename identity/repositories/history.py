@@ -24,6 +24,21 @@ chronological, role-tagged view (`MessageRow`) for the API layer to
 serialize -- there is no separate unified `messages` table; `Prompt`/
 `AiOutput`'s own richer, asymmetric shapes (voice-correction fields,
 model/token/latency metadata) are preserved rather than flattened away.
+
+**Tenant scoping (Prompt 20).** `Conversation.tenant_id` is denormalized
+from its owner's `users.tenant_id` at creation time, and every read below
+additionally requires the two to still agree (`_tenant_matches_owner`). A
+cross-tenant read was already impossible through this module -- a user
+belongs to exactly one tenant and every query is `user_id`-scoped -- so
+this is deliberately defense in depth rather than the primary boundary:
+what it buys is that the invariant is now *explicit and independently
+testable* instead of merely implied by how today's queries happen to be
+written, and that a row whose tenant is somehow wrong (a bad backfill, a
+hand-written UPDATE, a user reassigned between tenants) becomes invisible
+rather than leaking. Fail-closed is the deliberate choice there: no code
+path in this repository moves a user between tenants, so a mismatch means
+something unexpected happened, and the safe response to that is to return
+nothing. See `docs/MULTI_TENANCY.md`.
 """
 
 from __future__ import annotations
@@ -35,9 +50,27 @@ from datetime import UTC, datetime
 from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
-from identity.models import AiOutput, Conversation, Prompt
+from identity.models import AiOutput, Conversation, Prompt, User
 
 _TITLE_MAX_LENGTH = 300
+
+
+def _tenant_matches_owner(user_id: uuid.UUID):
+    """A `WHERE` condition requiring a conversation's own `tenant_id` to
+    still equal its owner's current `users.tenant_id` (Prompt 20).
+
+    A correlated scalar subquery rather than an extra function parameter,
+    deliberately: it keeps every public signature in this module byte-for-
+    byte unchanged (so no caller can forget to pass a tenant, and no
+    existing test or route needed touching to gain the check), while still
+    putting the condition in the `WHERE` clause itself rather than in a
+    post-hoc filter -- the same "fold it into the query, never check it
+    afterwards" property this module's docstring already claims for
+    `user_id`. Cost is a primary-key lookup on an already-cached row, not a
+    scan.
+    """
+    owner_tenant = select(User.tenant_id).where(User.id == user_id).scalar_subquery()
+    return Conversation.tenant_id == owner_tenant
 
 
 def _derive_title(question: str) -> str:
@@ -59,9 +92,32 @@ def create_conversation(
     title: str | None = None,
     feature_type: str = "text_to_sql",
     metadata: dict | None = None,
+    tenant_id: str | None = None,
 ) -> Conversation:
+    """Creates one conversation owned by `user_id`.
+
+    `tenant_id` (Prompt 20) defaults to `None`, which means "read it from
+    the owner's own `users` row" -- the correct and safe default, since a
+    conversation's tenant is never anything other than its owner's. A
+    caller may pass it explicitly to save the lookup when it already has
+    the user row in hand. It is never accepted from a request (see
+    `security/tenancy.py`'s rule 1): `api/chat_persistence.py` and
+    `api/chat_history.py`, the only two callers, both derive it from the
+    authenticated `User`, never from the request body.
+    """
+    resolved_tenant = tenant_id
+    if resolved_tenant is None:
+        resolved_tenant = session.scalar(select(User.tenant_id).where(User.id == user_id))
+    if resolved_tenant is None:
+        # No such user. Letting the insert proceed with a guessed tenant
+        # would be worse than failing: `conversations.user_id` is itself a
+        # foreign key, so this insert is doomed anyway -- raising here just
+        # makes the real reason visible instead of surfacing as an opaque
+        # integrity error.
+        raise ValueError(f"Cannot create a conversation for unknown user {user_id!r}.")
     conversation = Conversation(
         user_id=user_id,
+        tenant_id=resolved_tenant,
         title=(title or None),
         feature_type=feature_type,
         status="active",
@@ -86,6 +142,7 @@ def get_conversation(
         select(Conversation).where(
             Conversation.id == conversation_id,
             Conversation.user_id == user_id,
+            _tenant_matches_owner(user_id),
             Conversation.deleted_at.is_(None),
         )
     )
@@ -109,7 +166,11 @@ def list_conversations(
     every mainstream chat product's own default.
     """
     order_column = func.coalesce(Conversation.last_message_at, Conversation.created_at)
-    conditions = [Conversation.user_id == user_id, Conversation.deleted_at.is_(None)]
+    conditions = [
+        Conversation.user_id == user_id,
+        _tenant_matches_owner(user_id),
+        Conversation.deleted_at.is_(None),
+    ]
     if not include_archived:
         conditions.append(Conversation.archived_at.is_(None))
 
@@ -365,6 +426,7 @@ def list_messages(
         .where(
             Prompt.conversation_id == conversation_id,
             Conversation.user_id == user_id,
+            _tenant_matches_owner(user_id),
             Conversation.deleted_at.is_(None),
             Prompt.deleted_at.is_(None),
         )
@@ -375,6 +437,7 @@ def list_messages(
         .where(
             AiOutput.conversation_id == conversation_id,
             Conversation.user_id == user_id,
+            _tenant_matches_owner(user_id),
             Conversation.deleted_at.is_(None),
         )
     ).all()
@@ -490,6 +553,7 @@ def search_history(
     title_matches = session.scalars(
         select(Conversation).where(
             Conversation.user_id == user_id,
+            _tenant_matches_owner(user_id),
             Conversation.deleted_at.is_(None),
             Conversation.title.ilike(pattern),
         )
@@ -500,6 +564,7 @@ def search_history(
         .join(Conversation, Conversation.id == Prompt.conversation_id)
         .where(
             Conversation.user_id == user_id,
+            _tenant_matches_owner(user_id),
             Conversation.deleted_at.is_(None),
             Prompt.deleted_at.is_(None),
             Prompt.final_content.ilike(pattern),
@@ -511,6 +576,7 @@ def search_history(
         .join(Conversation, Conversation.id == AiOutput.conversation_id)
         .where(
             Conversation.user_id == user_id,
+            _tenant_matches_owner(user_id),
             Conversation.deleted_at.is_(None),
             or_(AiOutput.content.ilike(pattern)),
         )

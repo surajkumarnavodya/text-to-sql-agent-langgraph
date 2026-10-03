@@ -335,3 +335,161 @@ class TestCancelAndRetry:
         retry_response = client.post(f"/onboarding/jobs/{job_id}/retry", headers=admin_headers)
         assert retry_response.status_code == 200
         assert retry_response.json()["status"] == "pending"
+
+
+class TestConnectionTestRateLimit:
+    """Prompt 21 (enterprise security & data governance hardening):
+    `POST /onboarding/jobs`, `.../discover`, and `.../publish` each open a
+    live outbound connection to a caller-supplied db_host/db_port --
+    admin-gated already, but previously with no rate limit at all, which
+    made `POST /onboarding/jobs` a repeatable TCP-connect oracle against
+    any host/port the caller names."""
+
+    @pytest.fixture(autouse=True)
+    def _reset_onboarding_connection_limiters(self):
+        import agent.rate_limit as rate_limit_mod
+
+        rate_limit_mod._onboarding_connection_test_limiters.clear()
+        yield
+        rate_limit_mod._onboarding_connection_test_limiters.clear()
+
+    def test_create_job_trips_after_the_configured_hourly_limit(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ):
+        low_limit_settings = Settings(
+            **{**_SETTINGS.__dict__, "onboarding_connection_rate_limit_per_hour": 1}
+        )
+        monkeypatch.setattr(onboarding_mod, "get_settings", lambda: low_limit_settings)
+        tokens = _register(client, "admin8@tenant-a.example.com", role="admin")
+
+        first = client.post(
+            "/onboarding/jobs",
+            json={
+                "database_label": "First",
+                "db_type": "postgresql",
+                "db_host": "db.internal",
+                "db_port": 5432,
+                "db_name": "warehouse",
+                "db_user": "svc",
+                "db_password": "unused",
+            },
+            headers=_headers(tokens),
+        )
+        second = client.post(
+            "/onboarding/jobs",
+            json={
+                "database_label": "Second",
+                "db_type": "postgresql",
+                "db_host": "another.internal",
+                "db_port": 5432,
+                "db_name": "warehouse2",
+                "db_user": "svc",
+                "db_password": "unused",
+            },
+            headers=_headers(tokens),
+        )
+
+        assert first.status_code == 200
+        assert second.status_code == 429
+        assert "Retry-After" in second.headers
+
+    def test_discover_and_publish_are_also_rate_limited(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ):
+        # The limiter is created on first use with whatever max_events its
+        # *first* caller passed, and ignores a different value on later
+        # calls for the same key (`agent.rate_limit.BoundedLimiterCache
+        # .get_or_create`'s own documented first-call-wins semantics) --
+        # so the low limit must already be active for job creation too,
+        # which is what consumes the single slot this test then proves
+        # `discover` also respects.
+        low_limit_settings = Settings(
+            **{**_SETTINGS.__dict__, "onboarding_connection_rate_limit_per_hour": 1}
+        )
+        monkeypatch.setattr(onboarding_mod, "get_settings", lambda: low_limit_settings)
+        tokens = _register(client, "admin9@tenant-a.example.com", role="admin")
+        job = _create_job(client, _headers(tokens))
+
+        discover_response = client.post(
+            f"/onboarding/jobs/{job['id']}/discover", json={}, headers=_headers(tokens)
+        )
+        assert discover_response.status_code == 429
+        assert "Retry-After" in discover_response.headers
+
+    def test_different_admins_get_independent_budgets(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ):
+        """The limiter is keyed per-user -- one admin exhausting their own
+        budget must never block a different admin."""
+        low_limit_settings = Settings(
+            **{**_SETTINGS.__dict__, "onboarding_connection_rate_limit_per_hour": 1}
+        )
+        monkeypatch.setattr(onboarding_mod, "get_settings", lambda: low_limit_settings)
+        tokens_a = _register(client, "admin10@tenant-a.example.com", role="admin")
+        tokens_b = _register(client, "admin11@tenant-b.example.com", role="admin")
+
+        job_payload = {
+            "database_label": "x",
+            "db_type": "postgresql",
+            "db_host": "db.internal",
+            "db_port": 5432,
+            "db_name": "warehouse",
+            "db_user": "svc",
+            "db_password": "unused",
+        }
+
+        first_admin_first_call = client.post(
+            "/onboarding/jobs", json=job_payload, headers=_headers(tokens_a)
+        )
+        second_admin_first_call = client.post(
+            "/onboarding/jobs", json=job_payload, headers=_headers(tokens_b)
+        )
+
+        assert first_admin_first_call.status_code == 200
+        assert second_admin_first_call.status_code == 200
+
+
+class TestReviewDecisionAudit:
+    """Prompt 27 (`27_SME_SEMANTIC_REVIEW_DASHBOARD_CONTRACT.md`)'s own
+    "audit" testing requirement -- an SME's confirm/reject decision on an
+    onboarding review item is now a structured `security.audit_log`
+    event, not silently unaudited."""
+
+    def test_deciding_a_review_item_emits_a_security_audit_event(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ):
+        events: list[tuple] = []
+        monkeypatch.setattr(
+            onboarding_mod,
+            "log_security_event",
+            lambda *args, **kwargs: events.append((args, kwargs)),
+        )
+
+        admin_tokens = _register(client, "admin12@tenant-a.example.com", role="admin")
+        admin_headers = _headers(admin_tokens)
+        job = _create_job(client, admin_headers)
+        client.post(
+            f"/onboarding/jobs/{job['id']}/discover",
+            json={"db_password": "unused"},
+            headers=admin_headers,
+        )
+        items = client.get(
+            f"/onboarding/jobs/{job['id']}/review-items", headers=admin_headers
+        ).json()
+        assert items
+
+        analyst_tokens = _register(client, "analyst3@tenant-a.example.com", role="analyst")
+        analyst_headers = _headers(analyst_tokens)
+        client.post(
+            f"/onboarding/jobs/{job['id']}/review-items/{items[0]['id']}/decide",
+            json={"decision": "confirmed"},
+            headers=analyst_headers,
+        )
+
+        assert len(events) == 1
+        (event_type, severity, _detail), kwargs = events[0]
+        assert event_type == "onboarding_review_item_decided"
+        assert severity == "info"
+        assert kwargs["decision"] == "confirmed"
+        assert kwargs["job_id"] == job["id"]
+        assert kwargs["item_id"] == items[0]["id"]

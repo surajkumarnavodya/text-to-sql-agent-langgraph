@@ -278,3 +278,149 @@ class TestRowsToJsonBinaryColumns:
 
     def test_none_input_returns_none(self):
         assert api_main._rows_to_json(None) is None
+
+
+class _AlwaysBusyLimiter:
+    """Stub for `agent.rate_limit.ConcurrencyLimiter` that always reports
+    the database as saturated -- used to test `/execute`'s rejection path
+    without needing to actually exhaust a real limiter's capacity."""
+
+    def try_acquire(self) -> bool:
+        return False
+
+    def release(self) -> None:  # pragma: no cover - never reached if try_acquire() is honored
+        raise AssertionError("release() must not be called when try_acquire() returned False")
+
+
+@pytest.fixture(autouse=True)
+def _reset_result_cache_and_database_limiters():
+    """`db.result_cache._result_cache` and `agent.rate_limit
+    ._database_execution_limiters` are both process-wide, first-call-wins
+    singletons (Prompt 22) -- reset before/after every test in this module
+    so one test's cached result or acquired slot can't leak into another's,
+    the same convention `test_api_ask.py::_reset_ask_concurrency_limiters`
+    already established for the sibling `/ask`-level limiters."""
+    import agent.rate_limit as rate_limit_module
+    import db.result_cache as result_cache_module
+
+    result_cache_module._result_cache = None
+    rate_limit_module._database_execution_limiters.clear()
+    yield
+    result_cache_module._result_cache = None
+    rate_limit_module._database_execution_limiters.clear()
+
+
+class TestDatabaseConcurrencyLimit:
+    """Prompt 22 (scale/performance hardening): `/execute` fast-fails with
+    a 429 once `agent.rate_limit.get_database_execution_limiter` reports
+    the target database's own connection pool as already saturated,
+    instead of letting the request block on `QueuePool` checkout."""
+
+    def test_rejected_with_429_when_database_is_saturated(self, monkeypatch, client):
+        monkeypatch.setattr(
+            "api.main.get_database_execution_limiter",
+            lambda name, max_concurrent: _AlwaysBusyLimiter(),
+        )
+
+        def _fail(*a, **k):
+            raise AssertionError("must not execute once the concurrency limiter rejects")
+
+        monkeypatch.setattr("api.main.execute_readonly_sql", _fail)
+
+        response = client.post("/execute", json={"sql": "SELECT 1"})
+
+        assert response.status_code == 429
+        assert "Retry-After" in response.headers
+
+    def test_disabled_flag_never_consults_the_limiter(self, monkeypatch, client):
+        settings = Settings(
+            **{**_BASE_SETTINGS.__dict__, "enable_database_concurrency_limit": False}
+        )
+        monkeypatch.setattr("api.main.get_settings", lambda: settings)
+
+        def _fail_if_called(name, max_concurrent):
+            raise AssertionError("limiter must not even be constructed when the flag is off")
+
+        monkeypatch.setattr("api.main.get_database_execution_limiter", _fail_if_called)
+        monkeypatch.setattr(
+            "api.main.execute_readonly_sql",
+            lambda sql, timeout, max_rows, engine=None: (["a"], [(1,)]),
+        )
+
+        response = client.post("/execute", json={"sql": "SELECT 1"})
+
+        assert response.status_code == 200
+        assert response.json()["status"] == "succeeded"
+
+
+class TestResultCache:
+    """Prompt 22 (scale/performance hardening): `/execute` may serve a
+    cached `(columns, rows)` result for exact-text-identical SQL against
+    the same database when `Settings.enable_result_cache` is on. Off by
+    default -- see `db/result_cache.py`'s module docstring."""
+
+    def test_disabled_by_default_never_caches_and_sets_no_cache_header(self, monkeypatch, client):
+        calls = 0
+
+        def _count(sql, timeout, max_rows, engine=None):
+            nonlocal calls
+            calls += 1
+            return ["a"], [(1,)]
+
+        monkeypatch.setattr("api.main.execute_readonly_sql", _count)
+
+        first = client.post("/execute", json={"sql": "SELECT a FROM t"})
+        second = client.post("/execute", json={"sql": "SELECT a FROM t"})
+
+        assert first.status_code == 200 and second.status_code == 200
+        assert calls == 2
+        assert "X-Cache" not in first.headers
+        assert "X-Cache" not in second.headers
+
+    def test_enabled_flag_misses_once_then_hits_on_identical_sql(self, monkeypatch, client):
+        settings = Settings(**{**_BASE_SETTINGS.__dict__, "enable_result_cache": True})
+        monkeypatch.setattr("api.main.get_settings", lambda: settings)
+        monkeypatch.setattr("db.result_cache.load_sensitive_columns", lambda: {})
+
+        calls = 0
+
+        def _count(sql, timeout, max_rows, engine=None):
+            nonlocal calls
+            calls += 1
+            return ["a"], [(1,)]
+
+        monkeypatch.setattr("api.main.execute_readonly_sql", _count)
+
+        first = client.post("/execute", json={"sql": "SELECT a FROM t"})
+        second = client.post("/execute", json={"sql": "SELECT a FROM t"})
+
+        assert first.status_code == 200 and second.status_code == 200
+        assert calls == 1, "second identical call should be served from the cache, not re-executed"
+        assert first.headers["X-Cache"] == "MISS"
+        assert second.headers["X-Cache"] == "HIT"
+        assert second.json()["result_rows"] == first.json()["result_rows"]
+
+    def test_restricted_column_sql_is_never_cached_even_when_enabled(self, monkeypatch, client):
+        settings = Settings(**{**_BASE_SETTINGS.__dict__, "enable_result_cache": True})
+        monkeypatch.setattr("api.main.get_settings", lambda: settings)
+        monkeypatch.setattr(
+            "db.result_cache.load_sensitive_columns",
+            lambda: {("customers", "ssn"): "restricted"},
+        )
+
+        calls = 0
+
+        def _count(sql, timeout, max_rows, engine=None):
+            nonlocal calls
+            calls += 1
+            return ["ssn"], [("123-45-6789",)]
+
+        monkeypatch.setattr("api.main.execute_readonly_sql", _count)
+
+        first = client.post("/execute", json={"sql": "SELECT ssn FROM customers"})
+        second = client.post("/execute", json={"sql": "SELECT ssn FROM customers"})
+
+        assert first.status_code == 200 and second.status_code == 200
+        assert calls == 2, "SQL referencing a restricted column must never be served from cache"
+        assert first.headers["X-Cache"] == "MISS"
+        assert second.headers["X-Cache"] == "MISS"

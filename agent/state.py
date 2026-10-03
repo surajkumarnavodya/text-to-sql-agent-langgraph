@@ -121,7 +121,10 @@ class AttemptRecord(TypedDict):
             "high_cost", "syntax_error", "missing_reference",
             "aggregate_nesting", "plan_not_satisfied", "timeout",
             "unknown_error", "schema_retrieval_error", "llm_error",
-            "off_topic", "rate_limited".
+            "off_topic", "rate_limited", "database_busy" (Prompt 22 --
+            the per-database execution concurrency limiter rejected this
+            attempt before any query was sent; see
+            `agent.rate_limit.get_database_execution_limiter`).
         error: The raw error message (validator or database), None on success.
         will_retry: Whether the graph will attempt another generation cycle.
     """

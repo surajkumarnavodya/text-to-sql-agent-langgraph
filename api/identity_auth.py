@@ -104,6 +104,11 @@ from security.google_oidc import (
     issue_signin_nonce,
     verify_google_id_token,
 )
+from security.tenancy import (
+    TenantResolutionError,
+    resolve_actor_tenant_id,
+    resolve_tenant_context,
+)
 
 router = APIRouter()
 
@@ -171,6 +176,28 @@ def _client_ip(request: Request) -> str:
     return resolve_client_ip(request, get_settings())
 
 
+def _resolve_login_tenant(session: Session, user: User) -> str:
+    """The tenant id to stamp into a freshly-minted access token, having
+    first confirmed that tenant is usable (Prompt 20).
+
+    Raises a generic `401` -- deliberately the exact same status and
+    message shape every other login/refresh failure in this module returns
+    -- if the user's tenant is missing, soft-deleted or `"suspended"`.
+    Distinguishing "your tenant is suspended" from "wrong credentials"
+    would turn this endpoint into an oracle for which accounts exist in
+    which tenant, the same anti-enumeration reasoning
+    `security.tenancy.TenantResolutionError` documents. The real reason is
+    logged server-side by `resolve_tenant_context` at WARNING.
+    """
+    try:
+        context = resolve_tenant_context(session, resolve_actor_tenant_id(user))
+    except TenantResolutionError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED, detail=exc.safe_message
+        ) from exc
+    return context.tenant_id
+
+
 def _user_out(user: User, roles: tuple[str, ...]) -> UserOut:
     return UserOut(
         id=user.id,
@@ -220,7 +247,14 @@ def _issue_tokens(
         # seeding hadn't run yet when the account was created.
         roles = ("user",)
 
-    access_token = create_access_token(str(user.id), roles, settings)
+    # Prompt 20: a suspended/deleted tenant is refused *here*, before any
+    # token is minted, so a suspension can't be ridden out on an
+    # already-issued token's remaining lifetime. `_resolve_login_tenant`
+    # raises the generic 401 every other login failure returns -- never a
+    # message distinguishing "your tenant is suspended" from "wrong
+    # password" (see `security.tenancy.TenantResolutionError`).
+    tenant_id = _resolve_login_tenant(session, user)
+    access_token = create_access_token(str(user.id), roles, settings, tenant_id=tenant_id)
     _, raw_refresh_token = create_session(
         session,
         user_id=user.id,
@@ -812,7 +846,11 @@ def refresh(
         )
 
     roles = get_user_roles(session, user_row.id) or ("user",)
-    access_token = create_access_token(str(user_row.id), roles, settings)
+    # Re-checked on every refresh, not just at login (Prompt 20) -- this is
+    # what bounds a tenant suspension's effect to one access-token lifetime
+    # at worst, rather than to the much longer refresh-token lifetime.
+    tenant_id = _resolve_login_tenant(session, user_row)
+    access_token = create_access_token(str(user_row.id), roles, settings, tenant_id=tenant_id)
     _set_refresh_cookie(response, new_raw_token, settings)
     record_signin_event(
         session,

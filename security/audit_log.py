@@ -45,6 +45,53 @@ logger = logging.getLogger("security.audit")
 _correlation_id: ContextVar[str | None] = ContextVar("correlation_id", default=None)
 
 
+# The current request's tenant, if resolved (Prompt 20). Same
+# `contextvars` mechanism and the same reasoning as `_correlation_id` above:
+# a security event is far more actionable when a reader can tell *whose*
+# tenant it came from, and threading an explicit `tenant_id=` argument
+# through all ~40 existing `log_security_event` call sites would have been a
+# large, error-prone diff where any missed site silently produces an
+# untagged event.
+#
+# Bound by `agent.graph.run_agent` and `agent.orchestrator.graph
+# .run_orchestrated` (both already receive `tenant_id` explicitly, and both
+# run on the same thread as every node that emits an event) and by
+# `api/auth.py` for its own authentication-failure events. Deliberately not
+# bound in the correlation-ID middleware: the tenant is not known yet at
+# that point, and FastAPI runs a sync dependency in its own copied context,
+# so a value set there would not be visible to the endpoint anyway.
+#
+# **Known limitation, inherited from `_correlation_id` rather than
+# introduced here:** a `contextvars` value does not cross a raw
+# `concurrent.futures.ThreadPoolExecutor` boundary (unlike anyio's
+# thread dispatch, which copies the context). `api/main.py`'s `/ask` pool is
+# such an executor -- which is exactly why this is bound *inside*
+# `run_orchestrated`/`run_agent`, on the worker side of that boundary,
+# rather than in the route handler.
+_tenant_id: ContextVar[str | None] = ContextVar("audit_tenant_id", default=None)
+
+
+def set_audit_tenant_id(value: str | None) -> Token[str | None]:
+    """Binds `value` as the tenant stamped onto this context's audit events.
+
+    Returns the `Token` needed to restore the previous value via
+    `reset_audit_tenant_id` -- callers must reset in a `finally` block so a
+    tenant never leaks into whatever reuses this thread/task next, exactly
+    as `set_correlation_id` requires.
+    """
+    return _tenant_id.set(value)
+
+
+def reset_audit_tenant_id(token: Token[str | None]) -> None:
+    """Restores the audit tenant to what it was before `set_audit_tenant_id`."""
+    _tenant_id.reset(token)
+
+
+def get_audit_tenant_id() -> str | None:
+    """Returns the tenant audit events are currently stamped with, or `None`."""
+    return _tenant_id.get()
+
+
 def set_correlation_id(value: str | None) -> Token[str | None]:
     """Binds `value` as the current context's correlation ID.
 
@@ -96,6 +143,33 @@ class CorrelationIdLogFilter(logging.Filter):
         return True
 
 
+class TenantIdLogFilter(logging.Filter):
+    """Stamps `record.tenant_id` from the current request context onto
+    every log record passing through the handler this filter is attached
+    to -- the identical mechanism `CorrelationIdLogFilter` above already
+    established, applied to the second piece of per-request context this
+    codebase tracks (Prompt 23, observability/evaluation/reliability).
+
+    Before this, a request's tenant was only visible on `security.audit`
+    events (`log_security_event` reads `_tenant_id` explicitly) -- every
+    *ordinary* `logger.info`/`.warning`/`.error` call (`agent/nodes.py`'s
+    `[timing]`/`[trace]` lines included) carried a correlation ID but no
+    tenant, making "which tenant's request produced this log line" only
+    answerable by also having the audit-event stream open at the same
+    time. Attaching this filter to the root handler
+    (`config.settings.configure_logging`) fixes that for every existing
+    call site with zero changes to any of those modules, exactly like
+    `CorrelationIdLogFilter` did for correlation IDs.
+
+    Renders as `"-"` (never the string `"None"`) when unbound, same
+    stable-width/greppability reasoning as `CorrelationIdLogFilter`.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        record.tenant_id = get_audit_tenant_id() or "-"
+        return True
+
+
 Severity = Literal["info", "warning", "critical"]
 
 _LEVEL_MAP: dict[Severity, int] = {
@@ -139,6 +213,11 @@ def log_security_event(
             `repr()` and capped via `truncate_for_log` -- callers do not
             need to pre-truncate attacker-controlled text themselves.
 
+    Stamps `tenant_id=` automatically when one is bound for this context
+    (Prompt 20, see `set_audit_tenant_id`) -- no call site passes it, and a
+    caller that explicitly passes `tenant_id=` as context still works, it
+    simply appears twice.
+
     Never raises: a logging bug must not be the reason an otherwise-normal
     request fails, the same fail-safe principle applied throughout this
     codebase's other non-critical-path logging.
@@ -152,6 +231,9 @@ def log_security_event(
         correlation_id = _correlation_id.get()
         if correlation_id is not None:
             message = f"{message} correlation_id={correlation_id}"
+        tenant_id = _tenant_id.get()
+        if tenant_id is not None:
+            message = f"{message} tenant_id={tenant_id}"
         if rendered_context:
             message = f"{message} {rendered_context}"
         logger.log(_LEVEL_MAP[severity], message)

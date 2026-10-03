@@ -104,9 +104,11 @@ a small, contained follow-up, not a rewrite.
 
 ## 3. Per-stage latency instrumentation (already existed, verified working)
 
-`agent/nodes.py::_timed_node` wraps every one of the graph's eleven nodes, timing each
-call (including every retry attempt) and both (a) logging `[timing] stage=<name>
-attempt=<n> duration_ms=<ms>` at INFO, and (b) appending a `StageTiming` entry to
+`agent/nodes.py::_timed_node` wraps every one of the graph's nodes (eighteen as of
+Prompt 17's `generate_recommendations` — see `CLAUDE.md`'s "Self-correcting retry
+loop" section for the current count and full list), timing each call (including every
+retry attempt) and both (a) logging `[timing] stage=<name> attempt=<n>
+duration_ms=<ms>` at INFO, and (b) appending a `StageTiming` entry to
 `AgentState["stage_timings"]`, which accumulates into `stage_timings_ms` in the
 benchmark's own result records. This is what `docs/PERFORMANCE_BASELINE.md`'s entire
 per-stage breakdown was built from — real, already-wired instrumentation, not something
@@ -116,6 +118,51 @@ request's full per-stage latency breakdown directly from logs (`grep correlation
 ... | grep '\[timing\]'`) — previously only possible by re-running the benchmark
 harness, which captures the same data into a JSON file instead of relying on log
 scraping.
+
+**Prompt 23 (observability, evaluation & reliability) added a second, additive log
+line per stage call: `[trace] stage=<name> attempt=<n> duration_ms=<ms> <fields>`** —
+the literal mechanism behind "failures can be attributed to a specific stage." Never
+replaces `[timing]` (kept byte-for-byte unchanged, since `scripts/profile_pipeline.py`
+parses it) — a tool that already greps for `[timing]` is unaffected. `<fields>` is
+built from whatever's actually meaningful for that particular call, each one read from
+already-existing, well-known `AgentState` keys with zero changes needed to any
+individual node's own return contract (the same "cross-cutting, no node needs to know
+this exists" principle `stage_timings` itself established):
+
+- `status` — the state's own `status` field after this node ran (e.g. `succeeded`,
+  `retrieving_schema`, `failed`).
+- `error_category` — `AgentState["last_error_category"]`, when this attempt set one
+  (e.g. `missing_reference`, `database_busy`, `metric_definition_not_used`).
+- `model` — `AgentState["selected_model"]`, once resolved (see "Configurable Ollama
+  model selection" in `CLAUDE.md`) — absent on every stage before schema retrieval.
+- `db_provider` — `AgentState["selected_database"]` (the configured connection *name*,
+  never a host/credential), once resolved.
+- `query_fingerprint` — a 16-character SHA-256 prefix of `AgentState["sql"]`
+  (`agent.nodes._query_fingerprint`), never the SQL text itself or anything derived
+  from a literal value in it — lets an operator see "did the SQL change between
+  attempt 1 and attempt 2" without it ever being logged in a form that could leak a
+  literal.
+- `result_size` — `AgentState["row_count"]` (a count, never the rows themselves),
+  present only after a successful `execute_sql`.
+
+Every field is entirely omitted (never rendered as a literal `None`) when not
+meaningful for that stage/outcome — e.g. no `[trace]` field at all appears before a
+database or model has been selected. `correlation_id`/`tenant_id` are **not** repeated
+inside `<fields>` — both are already stamped onto *every* log line, this one included,
+by the root-logger filters described in §1/§1a below.
+
+### 3a. Tenant propagation into every log line (Prompt 23)
+
+The identical gap §1 already closed for `correlation_id`, closed for `tenant_id`:
+before this, a request's tenant was only visible on `security.audit` events
+(`log_security_event` reads `security.audit_log._tenant_id` explicitly) — every
+*ordinary* `logger.info(...)` call (the `[timing]`/`[trace]` lines above included)
+carried a correlation ID but no tenant. `security.audit_log.TenantIdLogFilter`
+(attached to the root logger by `config.settings.configure_logging`, alongside
+`CorrelationIdLogFilter`) stamps `record.tenant_id` on every record the identical way,
+and the text/JSON log formats both render it (`tenant_id=%(tenant_id)s` in the text
+format; a `"tenant_id"` key, `null` when unbound, in the JSON format) — zero changes
+needed to any individual call site.
 
 `observability/llm_timing_capture.py::capture_llm_timings` separately captures
 Ollama's own reported `total_ms`/`load_ms`/`prompt_eval_ms`/`generation_ms` and token
@@ -183,8 +230,10 @@ public.
   at a scale where dashboards/alerting on live traffic (not just periodic benchmark
   runs) are needed, that's the point to introduce OpenTelemetry — a real, larger
   addition, not attempted here.
-- **Ordinary logs are prose/key=value, not JSON** (§2) — a log-pipeline integration
-  gap, not a data-loss one; the data is all present and greppable today.
+- **Resolved, no longer a gap (`Settings.log_format="json"`, enterprise scalability/
+  security assessment, 2026-09-27):** ordinary logs can render as one JSON object per
+  line for a real log-aggregation pipeline, opt-in, with the original prose/key=value
+  format kept as the unchanged default — see `config.settings._JsonLogFormatter`.
 - **Free-text question/SQL/insight content is unredacted in logs** (§4) — a disclosed,
   accepted tradeoff for debuggability, not a defect.
 - **The `security.audit` log stream is not tamper-evident** — already flagged as a

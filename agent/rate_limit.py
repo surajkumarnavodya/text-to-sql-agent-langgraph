@@ -45,6 +45,16 @@ scopes:
     data state model) -- a real multi-replica deployment needs to revisit
     this regardless (see Phase 3 above), so a per-caller refinement here
     specifically wasn't prioritized ahead of that.
+  - **Per-database execution concurrency** (`ConcurrencyLimiter`,
+    `get_database_execution_limiter`, Prompt 22 -- scale/performance
+    hardening): keyed by configured database name, sized from that
+    database's own `db_pool_size + db_max_overflow`. Distinct from the
+    `/ask`-level limiter above, which protects the API tier as a whole --
+    this protects one specific customer database's connection pool from
+    being saturated by several concurrent `/ask`/`/execute` calls routed
+    to it, turning what would otherwise be a blocking `QueuePool` checkout
+    wait (up to SQLAlchemy's own `pool_timeout`) into an immediate,
+    clearly-worded rejection.
 
 Every trip logs through this module's own logger (`agent.rate_limit` --
 distinct from `agent.nodes`'/`agent.input_guard`'s categories, so rate-limit
@@ -389,6 +399,47 @@ def get_per_caller_ask_concurrency_limiter(
     )
 
 
+DATABASE_CONCURRENCY_LIMIT_MESSAGE = (
+    "This database is handling too many queries right now -- please wait a moment and try again."
+)
+
+# Keyed by database name (`Settings.databases[i].name`) -- one configured
+# customer database's own connection pool
+# (`db_pool_size + db_max_overflow`, see `db/connection.py`) is a shared,
+# finite resource across every concurrent `/ask` and `/execute` call
+# routed to it, independent of (and not bounded by) the *API-tier*
+# `ask_requests_global`/`ask_requests_per_caller` limiters above, which
+# protect the FastAPI process, not any one customer database specifically.
+# Bounded the same way as `_per_caller_ask_concurrency_limiters` (database
+# names are operator-configured, not attacker-controlled, so unbounded
+# growth isn't a real risk here -- bounded anyway for the same
+# defense-in-depth reason `BoundedConcurrencyLimiterCache` exists at all).
+_database_execution_limiters = BoundedConcurrencyLimiterCache()
+
+
+def get_database_execution_limiter(database_name: str, max_concurrent: int) -> ConcurrencyLimiter:
+    """Returns the in-flight execution limiter for one configured database,
+    creating it on first use for that name -- same first-call-wins
+    singleton pattern as `get_ask_concurrency_limiter`.
+
+    `max_concurrent` is normally `db_pool_size + db_max_overflow +
+    database_concurrency_limit_overhead` for that specific database's own
+    config (`Settings.enable_database_concurrency_limit`) -- sized so the
+    limiter trips at (or just past) the exact point `QueuePool` checkout
+    would otherwise start blocking, turning that blocking wait into an
+    immediate, clearly-worded rejection instead. Checked by
+    `agent.nodes.execute_sql_node` and `api/main.py`'s `POST /execute`,
+    both of which run real, row-returning execution against the database
+    -- never by `db.query_cost`'s own cost-estimation round trip, which is
+    cheap and plan-only, not a real query.
+    """
+    return _database_execution_limiters.get_or_create(
+        database_name,
+        max_concurrent=max_concurrent,
+        name=f"database_execution[{database_name}]",
+    )
+
+
 def get_media_generation_limiter(
     max_calls_per_window: int, window_seconds: float
 ) -> SlidingWindowRateLimiter:
@@ -490,4 +541,33 @@ def get_share_invite_limiter(caller_key: str, max_per_hour: int) -> SlidingWindo
         max_events=max_per_hour,
         window_seconds=3600.0,
         name=f"share_invite[{caller_key}]",
+    )
+
+
+# Keyed by the authenticated caller's own user id (Prompt 21 -- enterprise
+# security & data governance hardening) -- `POST /onboarding/jobs`,
+# `.../discover`, and `.../publish` (api/onboarding.py) each open a live
+# outbound connection to a caller-supplied db_host/db_port, every one
+# already gated behind the admin-only ONBOARDING_MANAGE permission. That
+# permission check happens in the route body (`api/onboarding.py::_authorize`),
+# not as a FastAPI dependency, so this limiter's own key is the resolved
+# `user.id` rather than an `AuthIdentity` subject -- same shape as
+# `_share_invite_limiters` above, just keyed from the identity/session auth
+# system onboarding.py actually uses.
+_onboarding_connection_test_limiters = BoundedLimiterCache()
+
+
+def get_onboarding_connection_test_limiter(
+    caller_key: str, max_per_hour: int
+) -> SlidingWindowRateLimiter:
+    """Returns the per-caller limiter for `POST /onboarding/jobs`, `.../discover`,
+    and `.../publish` -- see `_onboarding_connection_test_limiters`'s own
+    comment for why this exists. Metered per-hour, same reasoning as
+    `get_share_invite_limiter`: a legitimate admin onboarding one database
+    tests/discovers/publishes it a handful of times, not dozens per hour."""
+    return _onboarding_connection_test_limiters.get_or_create(
+        caller_key,
+        max_events=max_per_hour,
+        window_seconds=3600.0,
+        name=f"onboarding_connection_test[{caller_key}]",
     )

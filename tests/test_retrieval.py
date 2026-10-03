@@ -237,3 +237,129 @@ class TestKnowledgeChunksHelper:
         )
         chunks = build_knowledge_chunks("default", "fake-model", 16, knowledge_dir, 500, 50)
         assert all(c.embedding_dimensions == 16 for c in chunks)
+
+
+class TestTenantScopedBusinessConcepts:
+    """Prompt 20: a published semantic-catalog concept belongs to exactly one
+    tenant, and two tenants can legitimately share one configured database --
+    so a `BUSINESS_CONCEPT` chunk must never reach another tenant's prompt.
+
+    Operator-authored chunks (schema introspection, `data/knowledge/*.yaml`)
+    carry no tenant and stay shared, which is what keeps a pre-Prompt-20
+    index working untouched.
+    """
+
+    @staticmethod
+    def _concept(object_name: str, text: str, tenant_id: str | None) -> Chunk:
+        extra = {"concept_type": "metric"}
+        if tenant_id is not None:
+            extra["tenant_id"] = tenant_id
+        return Chunk(
+            chunk_id=make_chunk_id("shared_db", None, object_name, ChunkType.BUSINESS_CONCEPT),
+            chunk_type=ChunkType.BUSINESS_CONCEPT,
+            text=text,
+            database_id="shared_db",
+            source_id=f"semantic_catalog:{tenant_id}:{object_name}",
+            content_hash=f"hash-{object_name}",
+            embedding_model="fake",
+            embedding_dimensions=8,
+            extra=extra,
+        )
+
+    def _store_with(self, chunks):
+        store = InMemoryVectorStore()
+        provider = FakeEmbeddingProvider(dimensions=16)
+        store.upsert_documents("shared_db", chunks, provider.embed_batch([c.text for c in chunks]))
+        return store, provider
+
+    def test_a_concept_published_by_another_tenant_is_never_returned(self, tmp_path: Path):
+        settings = _settings(tmp_path, retrieval_top_k_business_concepts=3)
+        text = "Net revenue means invoiced amount minus credit notes."
+        store, provider = self._store_with([self._concept("net_revenue", text, "tenant_a")])
+
+        result = retrieve_business_context(
+            text,
+            "shared_db",
+            (),
+            settings,
+            vector_store=store,
+            embedding_provider=provider,
+            tenant_id="tenant_b",
+        )
+
+        assert result.items == []
+
+    def test_the_owning_tenant_does_receive_it(self, tmp_path: Path):
+        settings = _settings(tmp_path, retrieval_top_k_business_concepts=3)
+        text = "Net revenue means invoiced amount minus credit notes."
+        store, provider = self._store_with([self._concept("net_revenue", text, "tenant_a")])
+
+        result = retrieve_business_context(
+            text,
+            "shared_db",
+            (),
+            settings,
+            vector_store=store,
+            embedding_provider=provider,
+            tenant_id="tenant_a",
+        )
+
+        assert [item.chunk.chunk_type for item in result.items] == [ChunkType.BUSINESS_CONCEPT]
+
+    def test_an_operator_authored_chunk_with_no_tenant_stays_shared(self, tmp_path: Path):
+        """Schema/knowledge content is deployment configuration shared by
+        every tenant permitted to query that database, not one tenant's
+        private content -- so an absent tenant must resolve to the default
+        tenant and remain visible to it."""
+        settings = _settings(tmp_path)
+        text = "Table Orders holds one row per customer order."
+        chunk = Chunk(
+            chunk_id=make_chunk_id("shared_db", None, "Orders", ChunkType.TABLE),
+            chunk_type=ChunkType.TABLE,
+            text=text,
+            database_id="shared_db",
+            source_id="table:Orders",
+            content_hash="hash-orders",
+            embedding_model="fake",
+            embedding_dimensions=8,
+        )
+        store, provider = self._store_with([chunk])
+
+        result = retrieve_business_context(
+            text,
+            "shared_db",
+            (),
+            settings,
+            vector_store=store,
+            embedding_provider=provider,
+            tenant_id="default",
+        )
+
+        assert len(result.items) == 1
+
+    def test_the_result_metadata_records_which_tenant_it_was_scoped_to(self, tmp_path: Path):
+        settings = _settings(tmp_path)
+        text = "Table Orders holds one row per customer order."
+        chunk = Chunk(
+            chunk_id=make_chunk_id("shared_db", None, "Orders", ChunkType.TABLE),
+            chunk_type=ChunkType.TABLE,
+            text=text,
+            database_id="shared_db",
+            source_id="table:Orders",
+            content_hash="hash-orders",
+            embedding_model="fake",
+            embedding_dimensions=8,
+        )
+        store, provider = self._store_with([chunk])
+
+        result = retrieve_business_context(
+            text,
+            "shared_db",
+            (),
+            settings,
+            vector_store=store,
+            embedding_provider=provider,
+            tenant_id="default",
+        )
+
+        assert result.metadata["tenant_id"] == "default"

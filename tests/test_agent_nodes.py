@@ -24,6 +24,7 @@ from sqlalchemy.exc import SQLAlchemyError
 
 from agent.exceptions import OllamaUnavailableError, SchemaRetrievalError
 from agent.nodes import (
+    _query_fingerprint,
     build_analytical_plan_node,
     classify_analytical_intent_node,
     classify_followup_node,
@@ -296,7 +297,7 @@ class TestRetrieveGoldenExamplesNode:
         ]
         monkeypatch.setattr(
             "agent.nodes.retrieve_golden_examples",
-            lambda question, db_name, settings: fake_examples,
+            lambda question, db_name, settings, tenant_id=None: fake_examples,
         )
 
         result = retrieve_golden_examples_node(
@@ -308,7 +309,8 @@ class TestRetrieveGoldenExamplesNode:
 
     def test_no_matches_returns_none_not_empty_list(self, monkeypatch):
         monkeypatch.setattr(
-            "agent.nodes.retrieve_golden_examples", lambda question, db_name, settings: []
+            "agent.nodes.retrieve_golden_examples",
+            lambda question, db_name, settings, tenant_id=None: [],
         )
 
         result = retrieve_golden_examples_node({"question": "anything", "selected_database": None})
@@ -338,7 +340,7 @@ class TestRetrieveGoldenExamplesNode:
         accuracy aid, not a required step (same philosophy as
         plan_query_node)."""
 
-        def _raise(question, db_name, settings):
+        def _raise(question, db_name, settings, tenant_id=None):
             raise RuntimeError("chroma unavailable")
 
         monkeypatch.setattr("agent.nodes.retrieve_golden_examples", _raise)
@@ -353,8 +355,9 @@ class TestRetrieveGoldenExamplesNode:
     def test_defaults_to_the_default_database_when_none_selected(self, monkeypatch):
         captured = {}
 
-        def _capture(question, db_name, settings):
+        def _capture(question, db_name, settings, tenant_id=None):
             captured["db_name"] = db_name
+            captured["tenant_id"] = tenant_id
             return []
 
         monkeypatch.setattr("agent.nodes.retrieve_golden_examples", _capture)
@@ -362,6 +365,40 @@ class TestRetrieveGoldenExamplesNode:
         retrieve_golden_examples_node({"question": "anything", "selected_database": None})
 
         assert captured["db_name"] == "default"
+
+    def test_passes_the_requests_tenant_through_to_retrieval(self, monkeypatch):
+        """Prompt 20: the node must forward `state["tenant_id"]` (resolved
+        once by `run_agent` from the verified identity) so only this
+        tenant's own approved examples can reach the generation prompt."""
+        captured = {}
+
+        def _capture(question, db_name, settings, tenant_id=None):
+            captured["tenant_id"] = tenant_id
+            return []
+
+        monkeypatch.setattr("agent.nodes.retrieve_golden_examples", _capture)
+
+        retrieve_golden_examples_node(
+            {"question": "anything", "selected_database": "default", "tenant_id": "tenant_a"}
+        )
+
+        assert captured["tenant_id"] == "tenant_a"
+
+    def test_a_state_without_a_tenant_falls_back_to_the_default_tenant(self, monkeypatch):
+        """Never `None`: an absent tenant must resolve to the default tenant,
+        not to "no filter," which would be the one value that could widen
+        retrieval across tenants."""
+        captured = {}
+
+        def _capture(question, db_name, settings, tenant_id=None):
+            captured["tenant_id"] = tenant_id
+            return []
+
+        monkeypatch.setattr("agent.nodes.retrieve_golden_examples", _capture)
+
+        retrieve_golden_examples_node({"question": "anything", "selected_database": "default"})
+
+        assert captured["tenant_id"] == "default"
 
 
 class TestClassifyAnalyticalIntentNode:
@@ -1511,6 +1548,115 @@ class TestEstimateQueryCostNode:
         assert route_after_cost_estimate(result) != "execute_sql"
 
 
+class TestQueryFingerprint:
+    """Prompt 23 (observability, evaluation & reliability):
+    `_query_fingerprint` backs `_timed_node`'s `[trace]` log line's
+    `query_fingerprint` field -- a hash, never SQL text or anything
+    derived from it, so a literal value can never leak into a log."""
+
+    def test_none_for_no_sql(self):
+        assert _query_fingerprint(None) is None
+
+    def test_none_for_empty_string(self):
+        assert _query_fingerprint("") is None
+
+    def test_same_sql_produces_the_same_fingerprint(self):
+        a = _query_fingerprint("SELECT id FROM customers")
+        b = _query_fingerprint("SELECT id FROM customers")
+        assert a == b
+
+    def test_different_sql_produces_a_different_fingerprint(self):
+        a = _query_fingerprint("SELECT id FROM customers")
+        b = _query_fingerprint("SELECT id FROM orders")
+        assert a != b
+
+    def test_never_contains_the_original_sql_text_or_a_literal(self):
+        fingerprint = _query_fingerprint("SELECT ssn FROM customers WHERE ssn = '123-45-6789'")
+        assert "123-45-6789" not in fingerprint
+        assert "ssn" not in fingerprint
+        assert "SELECT" not in fingerprint
+
+
+class TestTimedNodeTraceLogging:
+    """Prompt 23: `_timed_node`'s wrapper emits an additive `[trace]` log
+    line (never replacing the pre-existing `[timing]` one
+    `scripts/profile_pipeline.py` parses) carrying status/error-category/
+    model/db-provider/query-fingerprint/result-size whenever the stage
+    actually has one -- the literal mechanism behind "failures can be
+    attributed to a specific stage" without needing per-node code changes."""
+
+    def test_execute_sql_success_trace_includes_db_provider_fingerprint_and_result_size(
+        self, monkeypatch, caplog
+    ):
+        monkeypatch.setattr(
+            "agent.nodes.execute_readonly_sql",
+            lambda sql, timeout, max_rows, engine=None: (["id"], [(1,), (2,)]),
+        )
+        state: AgentState = {
+            "sql": "SELECT id FROM customers",
+            "retry_count": 0,
+            "selected_database": "default",
+        }
+
+        with caplog.at_level("INFO", logger="agent.nodes"):
+            execute_sql_node(state)
+
+        trace_lines = [r.message for r in caplog.records if r.message.startswith("[trace]")]
+        assert len(trace_lines) == 1
+        line = trace_lines[0]
+        assert "stage=execute_sql" in line
+        assert "status='succeeded'" in line
+        assert "db_provider='default'" in line
+        assert "result_size=2" in line
+        assert "query_fingerprint=" in line
+        assert "SELECT id FROM customers" not in line
+
+    def test_trace_omits_fields_that_are_not_applicable(self, caplog):
+        """A node call with no SQL/model/database in play yet (nothing has
+        been generated or selected) must not render `model=`/
+        `db_provider=`/`query_fingerprint=`/`result_size=` as literal
+        `None` placeholders -- each is omitted outright rather than
+        rendered empty."""
+        state: AgentState = {"question": "anything", "selected_database": None}
+
+        with caplog.at_level("INFO", logger="agent.nodes"):
+            retrieve_golden_examples_node(state)
+
+        trace_lines = [r.message for r in caplog.records if r.message.startswith("[trace]")]
+        assert len(trace_lines) == 1
+        line = trace_lines[0]
+        assert "model=" not in line
+        assert "db_provider=" not in line
+        assert "query_fingerprint=" not in line
+        assert "result_size=" not in line
+
+    def test_database_busy_rejection_trace_includes_error_category(self, monkeypatch, caplog):
+        class _AlwaysBusyLimiter:
+            def try_acquire(self) -> bool:
+                return False
+
+            def release(self) -> None:
+                raise AssertionError("must not be called")
+
+        monkeypatch.setattr(
+            "agent.nodes.get_database_execution_limiter",
+            lambda name, max_concurrent: _AlwaysBusyLimiter(),
+        )
+        state: AgentState = {
+            "sql": "SELECT id FROM customers",
+            "retry_count": 0,
+            "selected_database": "default",
+        }
+
+        with caplog.at_level("INFO", logger="agent.nodes"):
+            execute_sql_node(state)
+
+        trace_lines = [r.message for r in caplog.records if r.message.startswith("[trace]")]
+        assert len(trace_lines) == 1
+        assert "error_category='database_busy'" in trace_lines[0]
+        assert "status='failed'" in trace_lines[0]
+
+
 class TestExecuteSqlNode:
     def test_success_populates_results(self, monkeypatch):
         monkeypatch.setattr(
@@ -1823,6 +1969,88 @@ class TestExecuteSqlNode:
 
         assert result["status"] == "succeeded"
         assert result["low_confidence_notice"] is None
+
+    def test_database_concurrency_limit_rejects_without_executing_or_retrying(self, monkeypatch):
+        """Prompt 22 (scale/performance hardening): a saturated per-database
+        execution limiter fast-fails the attempt (never executes, never
+        retries) rather than blocking on `QueuePool` checkout."""
+
+        class _AlwaysBusyLimiter:
+            def try_acquire(self) -> bool:
+                return False
+
+            def release(self) -> None:
+                raise AssertionError("release() must not be called when try_acquire() failed")
+
+        monkeypatch.setattr(
+            "agent.nodes.get_database_execution_limiter",
+            lambda name, max_concurrent: _AlwaysBusyLimiter(),
+        )
+
+        def _fail(*args, **kwargs):
+            raise AssertionError("must not execute once the concurrency limiter rejects")
+
+        monkeypatch.setattr("agent.nodes.execute_readonly_sql", _fail)
+
+        state: AgentState = {
+            "sql": "SELECT id FROM customers",
+            "retry_count": 0,
+            "selected_database": "default",
+        }
+        result = execute_sql_node(state)
+
+        assert result["status"] == "failed"
+        assert result["last_error_category"] == "database_busy"
+        assert result["attempt_history"][0]["outcome"] == "database_busy"
+        assert result["attempt_history"][0]["will_retry"] is False
+        assert route_after_execution(result) == "failed"
+
+    def test_database_concurrency_limit_releases_the_slot_after_success(self, monkeypatch):
+        """The acquired slot must be released in a `finally`, not only on
+        the happy path, so a long-running process doesn't leak capacity."""
+        import agent.rate_limit as rate_limit_module
+
+        rate_limit_module._database_execution_limiters.clear()
+        monkeypatch.setattr(
+            "agent.nodes.execute_readonly_sql",
+            lambda sql, timeout, max_rows, engine=None: (["id"], [(1,)]),
+        )
+
+        state: AgentState = {
+            "sql": "SELECT id FROM customers",
+            "retry_count": 0,
+            "selected_database": "default",
+        }
+        execute_sql_node(state)
+
+        limiter = rate_limit_module.get_database_execution_limiter("default", max_concurrent=30)
+        assert len(limiter) == 0
+
+    def test_disabled_flag_never_consults_the_limiter(self, monkeypatch, _mock_settings):
+        monkeypatch.setattr(
+            "agent.nodes.get_settings",
+            lambda: Settings(
+                **{**_mock_settings.__dict__, "enable_database_concurrency_limit": False}
+            ),
+        )
+
+        def _fail_if_called(name, max_concurrent):
+            raise AssertionError("limiter must not even be constructed when the flag is off")
+
+        monkeypatch.setattr("agent.nodes.get_database_execution_limiter", _fail_if_called)
+        monkeypatch.setattr(
+            "agent.nodes.execute_readonly_sql",
+            lambda sql, timeout, max_rows, engine=None: (["id"], [(1,)]),
+        )
+
+        state: AgentState = {
+            "sql": "SELECT id FROM customers",
+            "retry_count": 0,
+            "selected_database": "default",
+        }
+        result = execute_sql_node(state)
+
+        assert result["status"] == "succeeded"
 
 
 class TestComputeAnalyticsNode:

@@ -359,6 +359,85 @@ bypassed.
   balancer, which this project's `OLLAMA_HOST` config doesn't currently
   abstract over (one URL, not a pool).
 
+## Backup & recovery
+
+Prompt 25 (production readiness & release gate) closed a real,
+previously-disclosed gap: no backup/recovery procedure existed anywhere
+in this project's docs. Scoped honestly: this app is a **read-only**
+client of whatever business database you connect it to
+(`db.connection.get_read_only_engine`) — it never writes to that
+database and has no opinion on, or mechanism for, backing it up. That
+remains entirely your own infrastructure's responsibility, same as
+before. What follows is a real procedure for the things *this app itself
+owns*.
+
+- **The identity database (only if `LOCAL_AUTH_ENABLED=true`)** — a
+  normal Postgres database (`AUTH_DATABASE_URL`), containing accounts,
+  sessions, chat history, onboarding jobs, the semantic catalog, and
+  recommendation governance records. Back it up with standard Postgres
+  tooling (`pg_dump`/`pg_basebackup`/your managed Postgres provider's own
+  snapshot feature) on whatever schedule your data-retention policy
+  requires — this app has no special requirements beyond "it's an
+  ordinary Postgres database." Restore with the matching `pg_restore`/
+  snapshot-restore, then confirm `alembic -c identity/alembic.ini
+  current` reports the expected head revision before letting traffic
+  back in.
+- **The Chroma vector index** (`CHROMA_PERSIST_DIR`, default
+  `embeddings/.chroma/`) — deliberately **not a backup/restore target**.
+  It's a derived cache: `python scripts/build_embeddings.py --force`
+  rebuilds it from the live connected database's own schema from
+  scratch, and `python -m scripts.ingest_schema --database-id <name>`
+  rebuilds the business-context knowledge-base collection from
+  `data/knowledge/*.yaml`. Losing this directory entirely just means the
+  next startup (or an explicit `POST /schema/refresh`) pays the
+  embedding cost again — no data is actually lost, since the source of
+  truth is the live database's own schema, not this cache.
+- **`.env`/configuration** — this app deliberately never persists your
+  `.env` anywhere itself (`.gitignore`d, `.dockerignore`d). Keep your own
+  copy in a secrets manager or an encrypted, access-controlled location
+  outside this repo — losing it means re-entering every connection
+  string/API key/secret by hand, not losing application data, but still
+  worth treating as a real recovery dependency.
+- **Golden examples / message feedback** (`embeddings/golden_examples.py`,
+  `feedback/store.py`) — both live inside the same Chroma persist
+  directory as the schema index above. A full loss means these
+  human-curated few-shot examples and feedback history are gone (unlike
+  the schema index, there's no live source to rebuild them from) —
+  if this content matters to your deployment, back up
+  `CHROMA_PERSIST_DIR` as a filesystem-level backup (a plain directory
+  copy/snapshot), separate from the identity database's own Postgres
+  backup above.
+
+## Rollback
+
+Also new in this pass — a documented procedure where none existed.
+
+- **Application code**: both base images in the `Dockerfile` are
+  digest-pinned, and your own built application image should be tagged
+  per release (e.g. by git SHA or version), not just `latest`. Rolling
+  back is redeploying the previous tag — no code-level rollback
+  mechanism is needed beyond your own image tagging discipline.
+- **Identity database schema**: `alembic -c identity/alembic.ini
+  downgrade -1` reverts the most recently applied migration;
+  `downgrade <revision>` targets a specific one. Every one of this
+  project's 9 migrations has a real `downgrade()` function (verified by
+  direct read, not assumed) — but as with any schema downgrade, verify
+  against a copy of production data first if the migration you're
+  reverting involved a data transformation, not just a schema change
+  (Alembic reverts schema; it does not re-derive data your application
+  logic computed forward).
+- **A bad new feature, without a code rollback at all**: every optional
+  feature added since Prompt 08 (onboarding, semantic catalog,
+  recommendation governance, Query Store intelligence, multi-tenancy's
+  own per-database tenant binding, the result cache, the per-database
+  concurrency limiter, ...) is gated behind its own `.env` flag,
+  defaulting to the behavior that existed before that feature shipped.
+  Setting the flag back (e.g. `ENABLE_RESULT_CACHE=false`,
+  `ENABLE_DATABASE_CONCURRENCY_LIMIT=false`) and restarting the process
+  is almost always faster and safer than rolling back a container image,
+  and is the first thing to try if a specific feature (not the whole
+  application) is suspected.
+
 ## If you outgrow this
 
 Kubernetes becomes worth the operational overhead once you need: multiple

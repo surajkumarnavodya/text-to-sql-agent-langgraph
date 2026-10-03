@@ -66,6 +66,7 @@ from jwt import PyJWKClient
 
 from config.settings import Settings
 from security.audit_log import log_security_event
+from security.tenancy import DEFAULT_TENANT_ID
 
 logger = logging.getLogger(__name__)
 
@@ -111,11 +112,28 @@ class AuthIdentity:
             mode-specific policy if it ever needs to (e.g. today it does
             not distinguish, but the field exists so that's a policy
             decision, not a missing-data problem).
+        tenant_id: Which tenant this caller belongs to (Prompt 20) -- read
+            by `security.tenancy.resolve_tenant_id_for_identity`, which is
+            the only thing that should read it. **Always set from a
+            signature-verified source, never from a request body, query
+            parameter or header**: this app's own JWT `tid` claim for
+            `mode="local"` (minted server-side from the user's own
+            `users.tenant_id` row), the IdP-signed claim named by
+            `Settings.oidc_tenant_claim` for `mode="oidc"`, and
+            `security.tenancy.DEFAULT_TENANT_ID` for the two
+            indistinguishable-caller modes (`"none"`/`"static_token"`),
+            where there is no per-caller tenant to resolve at all. Defaults
+            to `DEFAULT_TENANT_ID` so every pre-Prompt-20 construction site
+            -- including the ones in tests -- keeps producing exactly the
+            identity it did before, which is what makes this addition
+            behavior-preserving rather than merely backward compatible at
+            the type level.
     """
 
     subject: str
     roles: tuple[str, ...]
     mode: Literal["none", "static_token", "oidc", "local"]
+    tenant_id: str = DEFAULT_TENANT_ID
 
 
 def real_caller_subject(identity: AuthIdentity) -> str | None:
@@ -160,6 +178,36 @@ def extract_roles(claims: Mapping[str, Any], role_claim: str) -> tuple[str, ...]
     if isinstance(value, list | tuple):
         return tuple(str(item) for item in value if isinstance(item, str) and item)
     return ()
+
+
+def extract_tenant_id(claims: Mapping[str, Any], tenant_claim: str | None) -> str:
+    """Reads `tenant_claim` out of an **already signature-verified** JWT's
+    claims, falling back to `security.tenancy.DEFAULT_TENANT_ID`.
+
+    Only ever called from `validate_token` below, after the decode that
+    verified the token against the issuer's live JWKS -- so the value this
+    returns is the IdP's own assertion about the caller, not something the
+    client chose. That distinction is the whole reason this is acceptable
+    under `security/tenancy.py`'s rule 1 ("never trust unverified client
+    tenant IDs"); an unsigned header would not be.
+
+    `tenant_claim=None` (`Settings.oidc_tenant_claim` unset, the default)
+    means the operator has not mapped their IdP's tenant concept onto this
+    app's, so every OIDC caller resolves to the single default tenant --
+    identical to this codebase's pre-Prompt-20 behavior. A configured claim
+    that is missing, empty, or not a string resolves to the default too
+    rather than to "no tenant": `DEFAULT_TENANT_ID` is the most restrictive
+    answer available (it is simply where every existing row lives), so
+    falling back to it can never widen access, whereas failing the request
+    outright would lock out every caller the moment one IdP stopped
+    emitting the claim.
+    """
+    if tenant_claim is None:
+        return DEFAULT_TENANT_ID
+    value = claims.get(tenant_claim)
+    if isinstance(value, str) and value:
+        return value
+    return DEFAULT_TENANT_ID
 
 
 def _discover_jwks_url(issuer: str) -> str:
@@ -277,4 +325,5 @@ def validate_token(token: str, settings: Settings) -> AuthIdentity:
         raise TokenValidationError("Token is missing a subject claim.")
 
     roles = extract_roles(claims, settings.oidc_role_claim)
-    return AuthIdentity(subject=subject, roles=roles, mode="oidc")
+    tenant_id = extract_tenant_id(claims, settings.oidc_tenant_claim)
+    return AuthIdentity(subject=subject, roles=roles, mode="oidc", tenant_id=tenant_id)

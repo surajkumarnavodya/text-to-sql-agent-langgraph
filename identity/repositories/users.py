@@ -15,6 +15,7 @@ from identity.models import Permission as PermissionModel
 from identity.models import Role, RolePermission, User, UserRole
 from identity.rbac import DEFAULT_ROLE_NAME
 from identity.security import hash_password
+from security.tenancy import DEFAULT_TENANT_ID
 
 
 def _aware_utc(value: datetime | None) -> datetime | None:
@@ -61,6 +62,7 @@ def create_user(
     username: str | None = None,
     status: str = "active",
     role_name: str = DEFAULT_ROLE_NAME,
+    tenant_id: str = DEFAULT_TENANT_ID,
 ) -> User:
     """Creates a new user with a hashed password and the given default role
     assigned. `status` is the caller's responsibility to set correctly
@@ -79,6 +81,23 @@ def create_user(
     rather than calling this directly, so the identity-link row is created
     in the same transaction.
 
+    `tenant_id` (Prompt 20) is which tenant the new account belongs to --
+    the single server-side fact every tenant check in this codebase
+    subsequently resolves from (`security.tenancy.resolve_actor_tenant_id`).
+    Defaults to `security.tenancy.DEFAULT_TENANT_ID`, so every existing
+    caller creates an account in exactly the tenant it implicitly created
+    one in before this parameter existed. **No request body, query parameter
+    or header anywhere in `api/` reaches it**: all four real call sites
+    (self-registration in `api/identity_auth.py`, the first-admin bootstrap
+    in `identity/bootstrap.py`, Google sign-up in
+    `identity/repositories/external_identities.py`, and
+    `eval/load/seed_users.py`) leave it at the default, so a non-default
+    tenant can only ever be assigned by an operator running code directly
+    against the database -- there is no self-service tenant selection to
+    abuse. Note the `RESTRICT` foreign key onto `tenants.id`: an unknown
+    tenant id fails the insert on PostgreSQL rather than silently creating
+    an orphaned account.
+
     Raises:
         DuplicateUserError: `email` (normalized) already exists.
     """
@@ -87,6 +106,7 @@ def create_user(
         raise DuplicateUserError(f"A user with email {normalized_email!r} already exists.")
 
     user = User(
+        tenant_id=tenant_id,
         email=normalized_email,
         username=username,
         display_name=display_name,

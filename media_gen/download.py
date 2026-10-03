@@ -22,6 +22,13 @@ re-resolve a different address between the check and `requests.get`) --
 acceptable here since the realistic threat is a malicious *response URL*
 from a compromised provider, not an active attacker racing DNS against
 this one low-value internal call.
+
+Prompt 21 (enterprise security & data governance hardening): every
+rejection in `_validate_download_url` now also emits a
+`security.audit_log.log_security_event("ssrf_blocked", ...)` -- a real,
+previously-disclosed gap (this module's own SSRF *defense* existed and was
+tested, but a blocked attempt left no structured signal anywhere, unlike
+every other rejection class in this app).
 """
 
 from __future__ import annotations
@@ -33,6 +40,7 @@ from urllib.parse import urljoin, urlparse
 import requests
 
 from media_gen.client import MediaGenerationError
+from security.audit_log import log_security_event
 from security.redaction import redact_secrets
 
 _DEFAULT_CONTENT_TYPE = "application/octet-stream"
@@ -90,11 +98,24 @@ def _validate_download_url(url: str) -> None:
     at all."""
     parsed = urlparse(url)
     if parsed.scheme != "https":
+        log_security_event(
+            "ssrf_blocked",
+            "warning",
+            "Refused to download generated media over a non-HTTPS scheme.",
+            reason="non_https_scheme",
+            scheme=parsed.scheme,
+        )
         raise MediaGenerationError(
             f"Refusing to download generated media over non-HTTPS scheme: {parsed.scheme!r}"
         )
     hostname = parsed.hostname
     if not hostname:
+        log_security_event(
+            "ssrf_blocked",
+            "warning",
+            "Refused to download generated media: provider response URL has no hostname.",
+            reason="no_hostname",
+        )
         raise MediaGenerationError("Refusing to download generated media: URL has no hostname")
 
     try:
@@ -105,6 +126,15 @@ def _validate_download_url(url: str) -> None:
     for _family, _type, _proto, _canonname, sockaddr in addrinfo:
         ip = ipaddress.ip_address(sockaddr[0])
         if any(ip in network for network in _BLOCKED_IP_NETWORKS):
+            log_security_event(
+                "ssrf_blocked",
+                "warning",
+                "Refused to download generated media from a private/internal address -- "
+                "possible SSRF attempt via a malicious provider response.",
+                reason="private_or_reserved_address",
+                host=hostname,
+                resolved_ip=str(ip),
+            )
             raise MediaGenerationError(
                 f"Refusing to download generated media from a private/internal "
                 f"address ({ip}) -- possible SSRF attempt via a malicious provider response"

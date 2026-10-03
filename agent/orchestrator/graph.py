@@ -87,6 +87,7 @@ from agent.orchestrator.nodes import (
 from agent.orchestrator.state import OrchestratorState
 from agent.state import AgentState, ConversationExchange
 from config.settings import get_settings
+from security.audit_log import reset_audit_tenant_id, set_audit_tenant_id
 
 logger = logging.getLogger(__name__)
 
@@ -205,8 +206,12 @@ def run_orchestrated(
         tenant_id: Same shape and meaning as `agent.graph.run_agent`'s
             parameter of the same name -- forwarded unchanged on both the
             short-circuit path (directly to `run_agent`) and the
-            multi-source path (`OrchestratorState["tenant_id"]`). Nothing
-            reads it yet on either path.
+            multi-source path (`OrchestratorState["tenant_id"]`). Read
+            (Prompt 20) by `retrieve_schema_node`'s database routing,
+            `retrieve_golden_examples_node`, `retrieve_business_context_node`,
+            `generate_recommendations_node`'s performance snapshot, and the
+            per-tenant metrics rollup -- plus bound here as the tenant every
+            `security.audit_log` event from this run is stamped with.
         forecast_horizon: Same shape and meaning as `agent.graph.run_agent`'s
             parameter of the same name -- already validated by `api/main.py`'s
             `/ask` handler. Passed directly to `run_agent` on the
@@ -289,7 +294,16 @@ def run_orchestrated(
         "attachment_result": None,
         "synthesized_answer": None,
     }
-    final_state = compiled_graph.invoke(initial_state)
+    # Prompt 20: binds this run's tenant for every `security.audit_log
+    # .log_security_event` any routed source emits (document/policy RAG, web
+    # search, media, attachments -- not just the SQL path, which
+    # `agent.graph.run_agent` binds for itself). Nested binding is safe:
+    # `run_agent` sets and resets its own token inside this one.
+    audit_token = set_audit_tenant_id(tenant_id)
+    try:
+        final_state = compiled_graph.invoke(initial_state)
+    finally:
+        reset_audit_tenant_id(audit_token)
     logger.info(
         "Orchestrated run finished: status=%s sources_used=%s",
         final_state.get("status"),

@@ -104,6 +104,17 @@ class CatalogEntryOut(BaseModel):
     truth_level: str
     reviewed_at: datetime | None
     review_notes: str | None
+    # Prompt 27 (27_SME_SEMANTIC_REVIEW_DASHBOARD_CONTRACT.md): the ORM row
+    # always recorded who reviewed/published an entry
+    # (`identity.models.SemanticCatalogEntry.reviewed_by_user_id`/
+    # `published_by_user_id`); this response simply never surfaced it until
+    # now. `*_display_name` is a best-effort lookup (`None` once the
+    # reviewing/publishing account is deleted, since the FK is
+    # `ondelete="SET NULL"`) -- never a reason the route itself fails.
+    reviewed_by_user_id: uuid.UUID | None = None
+    reviewed_by_display_name: str | None = None
+    published_by_user_id: uuid.UUID | None = None
+    published_by_display_name: str | None = None
     published_at: datetime | None
     created_at: datetime
     updated_at: datetime

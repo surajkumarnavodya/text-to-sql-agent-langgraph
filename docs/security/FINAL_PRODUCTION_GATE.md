@@ -1,5 +1,14 @@
 # Final Production Gate — Release Matrix
 
+> **Superseded (Prompt 25, 2026-10-03):**
+> [`../PRODUCTION_READINESS_RELEASE_GATE.md`](../PRODUCTION_READINESS_RELEASE_GATE.md)'s
+> §2 extends this matrix with the rows that changed since (Rate Limiting,
+> Monitoring, Backup/Recovery, Dependencies, plus a new Rollback row) and
+> the rows this prompt's broader scope added (Tenant Isolation, Database
+> Safety, Onboarding, Semantic Catalog, Analytics, Recommendations, AI
+> Accuracy, Prompt-Injection Benchmark, Scale). Every row below not listed
+> there is unchanged and still accurate.
+
 **Date:** 2026-09-18. **Method:** every row below is backed by either (a)
 an actually-executed test/scanner run this session (command shown in
 `docs/security/PRODUCTION_SECURITY_READINESS_REPORT.md`'s evidence

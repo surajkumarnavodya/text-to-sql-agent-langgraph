@@ -1,6 +1,7 @@
-"""Idempotent identity-database seeding: the RBAC seed data
-(`identity/rbac.py`'s `SEED_ROLES`/`SEED_PERMISSIONS`) and, optionally, the
-very first admin account.
+"""Idempotent identity-database seeding: the default tenant
+(`identity.models.Tenant`), the RBAC seed data (`identity/rbac.py`'s
+`SEED_ROLES`/`SEED_PERMISSIONS`) and, optionally, the very first admin
+account.
 
 Both operations are safe to call repeatedly (on every app startup, or by
 re-running `scripts/bootstrap_admin.py` by hand) -- neither ever creates a
@@ -16,11 +17,42 @@ from sqlalchemy.orm import Session
 
 from config.settings import Settings
 from identity.models import Permission as PermissionModel
-from identity.models import Role, RolePermission, User
+from identity.models import Role, RolePermission, Tenant, User
 from identity.rbac import SEED_PERMISSIONS, SEED_ROLES
 from identity.repositories.users import create_user, get_user_by_email
+from security.tenancy import DEFAULT_TENANT_ID
 
 logger = logging.getLogger(__name__)
+
+
+def ensure_default_tenant(session: Session) -> Tenant:
+    """Inserts the `security.tenancy.DEFAULT_TENANT_ID` tenant row if it
+    doesn't already exist, returning it either way.
+
+    Must run before any user is created: `users.tenant_id` is a `RESTRICT`
+    foreign key onto `tenants.id` defaulting to `"default"`, so on
+    PostgreSQL (production) an insert into `users` fails outright without
+    this row. The Alembic migration that adds the column
+    (`a4c7e2b9d6f5_multi_tenant_boundary`) seeds the same row for an
+    already-migrated database; this function is what keeps a freshly
+    `Base.metadata.create_all`-built database -- every test, and
+    `scripts/bootstrap_admin.py` against an empty database -- consistent
+    with a migrated one, rather than two subtly different schemas.
+
+    Idempotent, like everything else in this module: an existing tenant row
+    is returned untouched, including a status an operator has since changed
+    by hand (this never resets a suspended `"default"` tenant back to
+    `"active"`).
+    """
+    existing = session.scalar(select(Tenant).where(Tenant.id == DEFAULT_TENANT_ID))
+    if existing is not None:
+        return existing
+    tenant = Tenant(id=DEFAULT_TENANT_ID, name="Default", status="active")
+    session.add(tenant)
+    session.commit()
+    session.refresh(tenant)
+    logger.info("[bootstrap] created default tenant %r", DEFAULT_TENANT_ID)
+    return tenant
 
 
 def seed_rbac(session: Session) -> None:
@@ -32,7 +64,20 @@ def seed_rbac(session: Session) -> None:
     untouched (including any grants an operator has since added or removed
     by hand) -- this only ever *adds* what's missing, never resets
     anything back to the seed defaults. Safe to call on every app startup.
+
+    Also calls `ensure_default_tenant` first (Prompt 20). Deliberately
+    folded in here rather than left as a second call every caller has to
+    remember: this function is already *the* idempotent "make a fresh
+    identity database usable" entry point that every caller (
+    `scripts/bootstrap_admin.py`, `eval/load/seed_users.py`, and every test
+    fixture that builds a `create_all` schema) runs exactly once before
+    creating any user -- and creating a user without the default tenant row
+    present violates `users.tenant_id`'s `RESTRICT` foreign key on
+    PostgreSQL. Splitting it out would have meant a dozen call sites each
+    able to forget it, with the failure only showing up in production.
     """
+    ensure_default_tenant(session)
+
     permission_rows: dict[str, PermissionModel] = {
         row.code: row for row in session.scalars(select(PermissionModel)).all()
     }

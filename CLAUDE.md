@@ -109,7 +109,10 @@ below, and `docs/MULTI_SOURCE_GUIDE.md` for how to configure each source.
 
 - `config/` — all tunables (model name, Ollama host, DB connection fields,
   Chroma path, row limit, timeout, max retries) live in `config/settings.py`,
-  sourced from `.env`. Never hardcode a model name, path, or connection
+  sourced from `.env`. `DatabaseConnectionConfig.tenant_ids`
+  (`DB_<NAME>_TENANT_IDS`) and `Settings.databases_for_tenant` are Prompt
+  20's per-tenant connection binding; empty means shared by every tenant,
+  which is what every existing `.env` gets. Never hardcode a model name, path, or connection
   detail anywhere else — import from here. `Settings` (a
   `pydantic_settings.BaseSettings` — see "Pydantic-based configuration and
   validation" below) is a passive config bag; it validates *individual*
@@ -463,9 +466,14 @@ below, and `docs/MULTI_SOURCE_GUIDE.md` for how to configure each source.
 - `identity/` — this app's own self-hosted user accounts (optional, off by
   default — `Settings.local_auth_enabled`), the *only* ORM (SQLAlchemy 2.0
   declarative) and the *only* real (Alembic) migrations anywhere in this
-  codebase — see `identity/__init__.py`'s own docstring for why this is a
+  codebase. **Prompt 20** added `identity.models.Tenant` (26 tables now)
+  plus `users.tenant_id`/`conversations.tenant_id` and
+  `identity/repositories/tenants.py` — see "Multi-tenant enterprise
+  architecture" below — see `identity/__init__.py`'s own docstring for why this is a
   deliberate exception to the rest of the codebase's "raw SQLAlchemy Core +
-  idempotent `ensure_schema()`" convention. `models.py` (25 tables:
+  idempotent `ensure_schema()`" convention. `models.py` (26 tables:
+  `Tenant` (Prompt 20 -- the isolation boundary every tenant check now
+  resolves from),
   accounts/RBAC, sessions/tokens, `Conversation`/`Prompt`/`AiOutput`
   for chat history, **Prompt 08**
   (`08_ONBOARDING_ENGINE_CONTRACT.md`)'s `OnboardingJob`/
@@ -2557,6 +2565,686 @@ summary (3308/3308 backend tests passing, up from 3272 before this
 prompt), and the disclosed, honest scope boundaries (most notably: no
 live SQL Server instance with Query Store enabled was available to
 verify the DMV queries against real data in this pass).
+
+### Multi-tenant enterprise architecture (Prompt 20)
+Tenant isolation became a first-class platform boundary. Before this,
+`tenant_id` already existed on five tables and four deny-by-default ABAC
+policy modules genuinely compared it — but `security.tenancy
+.resolve_actor_tenant_id` returned **one hardcoded constant for every
+user**, so no two real callers could ever be in different tenants and every
+one of those comparisons was vacuous in practice. The *shape* of tenant
+isolation existed; the *fact* of it did not. `identity.models.Tenant` is now
+a real table, `users.tenant_id` a real `RESTRICT` foreign key onto it, and
+an actor's tenant is read from their own account row — **no call site of
+either resolver function had to change** for those four policy modules to
+become load-bearing, which was the entire reason resolution was routed
+through one module in the first place.
+
+**Invariants that must not regress:**
+- **A tenant id is never read from anything a client sends.** It comes only
+  from a `User` row this server loaded, this app's own signature-verified
+  JWT `tid` claim (minted by `identity.security.create_access_token` from
+  that row), or an IdP-signed claim named by `Settings.oidc_tenant_claim`.
+  `security.tenancy.reject_client_tenant_override` additionally **refuses**
+  (400) any request carrying `X-Tenant-Id`/`X-Tenant`/`Tenant-Id`/
+  `X-Tenant-Override`, at `api/auth.py`'s single authentication chokepoint,
+  before anything is authenticated — including in `AUTH_MODE=none`.
+  Refusing rather than ignoring is deliberate: ignoring is safe today but
+  leaves no signal if a future proxy config starts forwarding one.
+- **Unknown means deny, never "default".**
+  `security.tenancy.resolve_tenant_context` is the one gate, failing closed
+  on a missing/soft-deleted/`"suspended"` tenant and on `None`, so a
+  suspension takes effect across every tenant-scoped route at once rather
+  than needing a per-route check. Every failure logs the real reason
+  server-side but raises one generic `safe_message` — a caller must not be
+  able to tell "no such tenant" from "suspended" from "not yours".
+- **Status is read live, never cached.** Login *and* refresh both re-check
+  it, bounding a suspension's effect to one access-token lifetime rather
+  than the much longer refresh-token lifetime.
+- **A shared database still needs per-tenant caches and retrieval.** Two
+  tenants may legitimately share one configured connection, which is what
+  makes these partitions load-bearing rather than redundant: the
+  `POST /execute` result cache key is `(tenant_id, database_name, sql)` (it
+  sits *after* every authorization gate, so it cannot rely on one), a golden
+  example carries `tenant_id` in both its document id and filterable
+  metadata (plus a per-document re-check behind the Chroma `where` filter —
+  never trust the store to have applied it), and a published
+  semantic-catalog chunk now records `tenant_id` in queryable metadata
+  rather than only inside an opaque `source_id` string nothing parsed (the
+  one real cross-tenant leak this prompt found and closed).
+  Operator-authored chunks — live schema introspection and
+  `data/knowledge/*.yaml` — deliberately carry no tenant and stay shared:
+  that is deployment configuration, not one tenant's private content.
+- **`observability.metrics.PerformanceMetrics` partitions per tenant** and
+  `GET /metrics/performance` returns only the caller's own slice. The route
+  is admin-gated, but this codebase has no platform-admin-versus-tenant-admin
+  distinction, so admin-gating alone would have let one tenant's admin read
+  another's latency/status/cache numbers. `snapshot()` with no argument keeps
+  its merged, process-wide meaning for operator use and is deliberately not
+  reachable over HTTP.
+- **`DB_<NAME>_TENANT_IDS` binds a connection to specific tenants.** Unset
+  (the default, and what every existing `.env` has) means shared by every
+  tenant — so the upgrade changes nothing. Once set,
+  `Settings.databases_for_tenant` filters it out everywhere:
+  `POST /execute` and `GET /schema/tables` resolve names through that view
+  (cross-tenant name → the same 404 a nonexistent name gets,
+  anti-enumeration), and `embeddings.retriever.select_database` never even
+  scores it, so a question can't be routed to — or have schema retrieved
+  from — a database the asking tenant may not use.
+- **The migration is non-destructive.**
+  `a4c7e2b9d6f5_multi_tenant_boundary` seeds the `default` tenant row
+  *before* either new column exists (no window in which an existing row
+  violates the new FKs), and both columns are `NOT NULL` with
+  `server_default='default'` — precisely the value
+  `resolve_actor_tenant_id` already returned. `identity.bootstrap
+  .ensure_default_tenant` is called from `seed_rbac` (deliberately folded
+  in, so none of the dozen callers can forget it) to keep a
+  `create_all`-built database consistent with a migrated one.
+
+- **Shared model infrastructure carries no tenant context.** The cached
+  `ollama.Client` and the compiled LangGraph graph are process-wide
+  singletons; a tenant is a plain value in the per-request `AgentState`
+  dict (the identical `selected_database`/`selected_model` pattern), never a
+  field on the graph or a mutation of the cached `Settings`. The one piece
+  of ambient state this prompt adds — `security.audit_log
+  .set_audit_tenant_id`, which stamps `tenant_id=` onto every security event
+  without touching ~40 call sites — is a `ContextVar` bound and reset in a
+  `try`/`finally` around the graph invocation. Proven under **real
+  concurrency** (`tests/security/test_cross_tenant_shared_infrastructure.py`),
+  mirroring `tests/test_model_selection_concurrency.py`'s own threading
+  regression test for the identical bug class: a sequential test would pass
+  even with a global-mutation bug.
+
+**Known limitations, named rather than left to be rediscovered:** the five
+pre-existing `tenant_id` columns still have no FK onto `tenants` (adding one
+could fail mid-upgrade on a real deployment for a modest integrity gain);
+`AUTH_MODE=none`/`static_token` are not meaningful tenant boundaries (every
+caller under either is indistinguishable by design); there is no
+self-service tenant assignment and no admin route for tenants (CRUD exists
+in `identity/repositories/tenants.py`, unexposed); no code path moves a user
+between tenants, and `identity.repositories.history._tenant_matches_owner`
+fails *closed* if a conversation's tenant ever disagrees with its owner's;
+attachments/rate limits/concurrency limits are keyed by caller identity, not
+tenant, so a noisy-neighbour tenant can still consume a shared global
+budget; **PII classification (`config/sensitive_columns.yaml`) and RBAC
+role/permission *definitions* remain global** — both are deliberately scoped
+out rather than half-done, since making either per-tenant means moving it
+out of shared seed data into a governed, reviewable store; and **no live
+two-tenant deployment has been exercised** — every invariant above is
+covered against an in-memory SQLite identity database.
+
+**Read [`docs/MULTI_TENANCY.md`](docs/MULTI_TENANCY.md)** for the full
+decision record, the per-resource isolation table, and every disclosed
+limitation.
+
+### Scale/performance hardening: result cache + per-database execution limiter (Prompt 22)
+Two additions, both aimed at behavior under saturation rather than at the
+common case:
+
+- **`agent.rate_limit.get_database_execution_limiter`** — a per-configured-
+  database in-flight execution cap, sized from that database's own
+  `db_pool_size + db_max_overflow + database_concurrency_limit_overhead`.
+  Distinct from the `/ask`-level limiters, which protect the API tier as a
+  whole; this protects one customer database's connection pool. Checked by
+  `agent.nodes.execute_sql_node` and `POST /execute` (both run real,
+  row-returning execution), never by `db.query_cost`'s plan-only round
+  trip. **Below saturation it never trips**, so it restricts nothing that
+  currently works; at saturation it turns a blocking `QueuePool` checkout
+  wait (up to SQLAlchemy's 30s `pool_timeout`) into an immediate, clearly
+  worded rejection. A rejection is **never retried** —
+  `last_error_category="database_busy"`, same reasoning as the TIMEOUT
+  category: retrying into an already-saturated database spends retry budget
+  on something a retry can't fix.
+- **`db/result_cache.py`** — an opt-in (`ENABLE_RESULT_CACHE`, default
+  **off**), short-TTL, bounded (TTL+LRU) cache for `POST /execute`'s
+  `(columns, rows)`, keyed by `(tenant_id, database_name, sql)` and surfaced
+  via an `X-Cache: HIT`/`MISS` response header. Off by default because
+  caching trades data freshness, which is an operator decision, not a
+  safe-by-default accuracy aid. **Never caches SQL referencing a
+  `config.sensitive_columns`-classified "restricted" column**, regardless of
+  the flag or the executing caller's own permission — the cache has no
+  per-caller partitioning, so anything sensitivity-classified is excluded
+  entirely rather than reasoning about who may see a hit. Never applied to
+  the agent's own internal self-correction retries (those aren't shown to
+  the user, and a retry changing the SQL text is the whole point of a
+  retry). Exact-text match only, not semantic — the narrow, safe slice of
+  `docs/SCALE_OUT_PROMPT.md` Phase 4's larger deferred idea.
+
+Both feed three new **cumulative** (not rolling-window) counters on
+`observability.metrics.MetricsSnapshot` — `result_cache_hits`/
+`result_cache_misses`/`database_concurrency_rejections` — reusing that
+module's existing singleton/lock rather than standing up a second metrics
+object. Cumulative deliberately: a cache's value proposition is its hit
+*rate* over the process's life, which a bounded window of the most recent
+`max_requests` would understate for a long-running, low-traffic deployment.
+
+### Enterprise security & data governance hardening (Prompt 21)
+A comprehensive, route-by-route deterministic-security audit
+(`21_ENTERPRISE_SECURITY_DATA_GOVERNANCE_CONTRACT.md`) — not a new
+subsystem. The headline finding is reassuring rather than alarming: RBAC
+coverage across every route in `api/` is solid (every mutating/expensive
+route already has a real permission/identity dependency; no route is
+missing auth entirely, no sibling routes in the same router carry
+inconsistent permission levels), CORS wildcard-rejection, the SQL AST
+validator, and restricted-column enforcement are all unchanged and
+intact, and every langgraph/langchain/chromadb CVE already triaged in
+`docs/security/CVE_TRIAGE.md` was re-verified genuinely unreachable
+against the *current* codebase (zero new `CachePolicy`/`Checkpointer`/
+`ChatOpenAI` usage introduced since that triage) and already covered by
+CI's own justified `--ignore-vuln` allowlist.
+
+**Three real, scoped gaps were found and closed:**
+- **SSRF rejections weren't audit-logged**
+  (`media_gen/download.py::_validate_download_url`) — a real,
+  previously-disclosed gap (`docs/security/PRODUCTION_SECURITY_READINESS_REPORT.md`'s
+  P1-6, dated 2026-09-18), confirmed still open. The SSRF *defense* itself
+  was already correct and tested; a blocked attempt simply left no
+  `security.audit_log` trail, unlike every other rejection class in this
+  app. All three rejection points (non-HTTPS scheme, no hostname,
+  private/reserved resolved address) now call `log_security_event
+  ("ssrf_blocked", ...)` — covering both of this function's callers
+  (media generation and AI-guided image editing) from the one shared
+  implementation. A DNS resolution failure is deliberately **not** logged
+  under this event type — no address was ever evaluated against the
+  blocklist, so it isn't an SSRF rejection.
+- **`POST /feedback/golden-example`/`POST /feedback/message`**
+  (`api/main.py`) had no rate limit at all — the only mutating,
+  store-writing routes in that file inconsistent with `/execute`/
+  `/schema/refresh`'s existing `enforce_api_action_rate_limit` coverage, a
+  floodable data-poisoning vector against the golden-example/feedback
+  stores. Fixed by adding the identical call under two new action names
+  (`"feedback_golden_example"`/`"feedback_message"`), reusing the existing
+  `API_ACTION_RATE_LIMIT_PER_MINUTE` control — no new setting needed.
+- **`POST /onboarding/jobs`/`.../discover`/`.../publish`**
+  (`api/onboarding.py`) each open a live outbound connection to a
+  caller-supplied `db_host`/`db_port` with no rate limit at all.
+  `ONBOARDING_MANAGE`-gated (admin-only) already, but `POST
+  /onboarding/jobs` in particular was a repeatable TCP-connect oracle —
+  its success/failure plus classified failure-reason message leak
+  host/port reachability — against any host/port an authenticated admin
+  names. New `agent.rate_limit.get_onboarding_connection_test_limiter`
+  (identical shape to the existing `get_share_invite_limiter`: per-user,
+  hourly, a `BoundedLimiterCache`-backed `SlidingWindowRateLimiter`) +
+  `Settings.onboarding_connection_rate_limit_per_hour` (default `10`),
+  checked via a shared `api.onboarding._enforce_connection_test_rate_limit`
+  helper called immediately after each route's own `_authorize(...)` --
+  an unauthorized caller is denied on its own terms first, never counted
+  against this budget.
+
+**Found and re-verified, not fixed (already correct):** onboarding's own
+SQL-evaluation path (`onboarding/evaluation.py`) deliberately does **not**
+run generated SQL through `config.sensitive_columns`-restricted-column
+enforcement — correctly so, since at onboarding time the only caller is
+the admin who already supplied the raw database password directly (no
+narrower-permission role exists yet for a database still being onboarded,
+and the classification doesn't apply to an unprofiled database), unlike
+`validate_sql_node`'s restricted-column gate, which exists specifically to
+bound what an *under-privileged* caller's LLM-generated SQL may reach.
+
+**Known, disclosed limitations carried forward, not re-closed this
+pass** (already named in `docs/security/PRODUCTION_SECURITY_READINESS_REPORT.md`,
+confirmed still accurate as of this session): DAST has never been run
+against a live deployment; OIDC has never been verified end-to-end
+against a live Identity Provider; malware scanning (`clamav`) has never
+been verified against a real daemon; no backup/recovery procedure is
+documented. All four are environment-blocked (this sandboxed session has
+no live, network-reachable deployment, no real IdP, and no real ClamAV
+daemon to test against), not oversights. `mypy .`'s error count grew from
+117 (2026-09-19) to 340 across 56 files — confirmed via a fresh run that
+100% of the growth is confined to `tests/`/`eval/security_benchmark/`
+`AgentState`-vs-`dict` type-looseness (a pre-existing, disclosed category
+this project already scoped out as "a real, bounded, separate
+mypy-hygiene pass"), **zero new errors in any production security-relevant
+module** (`agent/`, `api/`, `db/`, `security/`, `identity/`).
+
+**Read [`docs/security-changelog.md`](docs/security-changelog.md)'s
+2026-10-02 entry** for the dated, audit-trail-formatted record of the two
+rate-limit additions, and
+[`21_ENTERPRISE_SECURITY_DATA_GOVERNANCE_CONTRACT.md`](21_ENTERPRISE_SECURITY_DATA_GOVERNANCE_CONTRACT.md)
+for the full prompt text and outcome summary.
+
+### Observability, evaluation & reliability (Prompt 23)
+Two additive pieces, reusing far more existing machinery than it added:
+per-stage tracing that threads correlation ID, tenant, and
+stage-specific metadata through every log line (extending `agent.nodes
+._timed_node`, `security/audit_log.py`, and `config.settings
+.configure_logging` — all pre-existing), and a new, fully-deterministic
+`eval/component_benchmark/` covering the four domains that had zero
+evaluation-dataset coverage before this prompt.
+
+**Tracing.** `agent.nodes._timed_node` (already wraps every one of the
+graph's nodes, see "Self-correcting retry loop" above) now also emits an
+additive `[trace] stage=<name> attempt=<n> duration_ms=<ms> <fields>`
+log line alongside its pre-existing `[timing]` one (kept byte-for-byte
+unchanged — `scripts/profile_pipeline.py` parses it). `<fields>` —
+`status`/`error_category`/`model`/`db_provider`/`query_fingerprint`/
+`result_size` — are read from already-existing `AgentState` keys with
+**zero changes to any individual node's own return contract**, the
+identical "cross-cutting, no node needs to know this exists" principle
+`stage_timings` itself already established; each is omitted outright
+(never a literal `None`) when not meaningful for that stage.
+`query_fingerprint` (`agent.nodes._query_fingerprint`) is a bare SHA-256
+prefix of the SQL text — never the text itself or anything derived from
+a literal value in it, a stronger guarantee than a masked-literal preview
+(`db.query_store._mask_literals`'s own, different use case) would give.
+`security/audit_log.py` gained `TenantIdLogFilter` (identical mechanism
+to the pre-existing `CorrelationIdLogFilter`, wired in alongside it by
+`config.settings.configure_logging`) — closing a real, found gap: a
+request's tenant was previously visible only on `security.audit` events,
+never on an ordinary `logger.info(...)` call (the `[timing]`/`[trace]`
+lines included). Together, this is the literal mechanism behind this
+prompt's acceptance criterion: a single `grep correlation_id=<id>` now
+surfaces one request's full stage-by-stage trace — including which
+stage set an error category, which model/database it used, and whether
+its result set was empty — without needing a second monitoring system.
+
+**Evaluation.** `eval/component_benchmark/` (new) covers **semantic**
+(governed-metric rendering determinism, `agent.llm_client
+._build_mandatory_metrics_block`), **planning** (the analytical-plan
+validator, `agent.plan_validator.validate_plan`), **analytics** (the
+deterministic analytics engine, `analytics.engine
+.compute_analytics_result`), and **recommendations** (the evidence-first
+recommendation engine, `recommendation.engine.generate_recommendations`)
+— the four domains Prompt 23 named that had no dedicated evaluation
+dataset at all before this pass (each already has its own, much more
+fine-grained pytest unit-test suite from the prompt that introduced it;
+this is a smaller set of named, realistic, regression-tracked scenarios,
+a qualitatively different thing from unit coverage, not a re-run of it).
+Every case calls a real production function **directly**, never a mock
+— all four domains are pure/deterministic with no I/O, which is what
+makes this the first `eval/` harness that's also wired into the ordinary
+`pytest` suite (`tests/test_eval_component_benchmark.py`) rather than
+staying a manual script, unlike `eval/runner.py`/`eval/security_benchmark
+/runner.py`, both of which need a live database and/or LLM this
+environment doesn't have. `eval/component_benchmark/regression.py` is a
+deliberately small, new, **case-level** (binary pass/fail per named
+case) regression gate against a committed baseline
+(`eval/baselines/component_benchmark_latest.json`) — not a reuse of
+`eval/regression.py`'s own metric-drift/tolerance-band logic, which is
+shaped for the SQL benchmark's scored accuracy/latency metrics and has
+no equivalent concept here. `scripts/run_component_benchmark.py` is the
+operator-facing CLI (`--save-baseline`/`--check-regression`), mirroring
+`scripts/run_benchmark.py`'s own flag shape.
+
+**Reused, not duplicated — the three domains this prompt also named that
+already had real coverage:** "SQL" is the existing, mature
+`eval/benchmark/*.yaml` harness (`eval/runner.py`/`eval/regression.py`,
+manual, needs a live DB+LLM); "security" is `eval/security_benchmark/`
+(the 500-case prompt-injection benchmark); "tenant isolation" is
+`tests/security/test_cross_tenant_isolation.py`/
+`test_cross_tenant_shared_infrastructure.py` — a real, CI-enforced
+pytest regression suite, arguably a *stronger* regression gate than a
+parallel YAML dataset would be, since it already runs on every PR. None
+of these three got a parallel dataset built alongside them.
+
+**Known limitations, disclosed rather than hidden:** the component
+benchmark's "planning"/"analytics"/"recommendations" cases are
+hand-authored and necessarily non-exhaustive (28 cases across 4
+domains) — they catch a *regression* in already-identified, realistic
+scenarios, not every possible input shape (that's what each domain's own
+much larger pytest suite is for). `[trace]`'s `model`/`db_provider`
+fields reflect whichever model/database was *selected* for this
+question, not a live token-count/dollar-cost figure — no per-call
+token/cost metadata is captured anywhere in this pass (Ollama's own
+`total_ms`/token-count breakdown, captured by `observability
+.llm_timing_capture.capture_llm_timings`, remains a separate,
+pre-existing, benchmark-only mechanism, not merged into this log-line
+trace). No new distributed-tracing backend (OpenTelemetry spans,
+Prometheus histograms) was introduced — unchanged, deliberate posture,
+see `docs/OBSERVABILITY.md`'s own "Known gaps" section.
+
+**Read [`docs/OBSERVABILITY.md`](docs/OBSERVABILITY.md)**'s §3/§3a for
+the full `[trace]`/tenant-propagation design, and
+[`23_OBSERVABILITY_EVALUATION_RELIABILITY_CONTRACT.md`](23_OBSERVABILITY_EVALUATION_RELIABILITY_CONTRACT.md)
+for the full prompt text and outcome summary.
+
+### Full integration & regression (Prompt 24)
+A validation pass, not a new-feature pass — the mandatory review of
+Prompt 01's baseline against everything built since found one real,
+structural gap: **nothing in this codebase had ever proven the 18 real
+LangGraph nodes compose correctly through the actual compiled graph.**
+Every existing test either called one node function directly in
+isolation (`tests/test_agent_nodes.py`) or mocked `agent.graph.run_agent`
+itself at the API boundary (`tests/test_api_ask.py`,
+`tests/test_orchestrator.py`) — confirmed by grepping every `run_agent(`
+call site in the test suite, not assumed. New
+`tests/test_full_pipeline_integration.py` closes this: five tests that
+invoke the real, compiled graph end-to-end, mocking only the genuine
+network/DB boundary (`agent.nodes.retrieve_relevant_schema`/
+`retrieve_golden_examples`/`retrieve_business_context`, the seven
+`*_from_llm` functions in `agent/llm_client.py`, and
+`agent.nodes.execute_readonly_sql`) — covering the basic Text-to-SQL
+journey; the self-correction retry loop *actually looping* through the
+real conditional edges (not just `route_after_execution` returning the
+right string in isolation, already covered elsewhere); a declining-
+revenue result flowing through the real `analytics.engine
+.compute_analytics_result` → real `recommendation.engine
+.generate_recommendations` → real insight generation together in one
+run; `review_metric_conformance_node` actually engaging mid-run when a
+governing metric is retrieved; and an injection attempt being rejected
+before any generation/execution mock could even be reached. **All five
+passed without needing any production-code fix** — real, measured
+confirmation that the graph still composes correctly across every
+Prompt-9-through-23 feature at once, not an assumption.
+
+**Two further gaps found and closed while comparing against the Prompt
+01 baseline, both documentation/test-coverage drift, neither a behavior
+regression:**
+- `tests/test_sql_agent_integration.py
+  ::test_existing_nodes_are_all_still_present` had silently drifted out
+  of sync with the real graph — missing `retrieve_business_context`
+  (Prompt 9), `classify_analytical_intent` (Prompt 11),
+  `review_metric_conformance` (Prompt 10), and `generate_recommendations`
+  (Prompt 17) from its own checklist (a subset-containment check, so the
+  gap never failed, it just silently under-tested four of eighteen real
+  nodes). Now an exhaustive equality check instead, so a future added or
+  removed node must touch this test too.
+- `docs/ARCHITECTURE.md`'s `StateGraph` diagram and per-node prose
+  walkthrough were stale since roughly Prompt 8/9 — still describing
+  "the twelve nodes" and completely missing all six nodes added since.
+  Updated to the real, current eighteen-node graph, mermaid diagram
+  included, plus the two new retry-table rows (`metric_definition_not_used`,
+  `database_busy`) Prompts 10/22 added without ever reaching that table.
+
+**Confirmed already adequate, deliberately not duplicated:** the
+"new-client onboarding" journey (`tests/test_api_onboarding.py
+::TestFullLifecycle::test_create_discover_review_publish` — a real
+create → discover → review → publish lifecycle against a real SQLite
+target database) and the "unauthorized access" journey
+(`tests/test_api_authz.py`'s vertical/horizontal privilege-escalation,
+missing/invalid-role, and expired/invalid-credential suites) both
+already had real end-to-end coverage before this pass. The frontend
+test suite (292 tests, `frontend/`'s own `vitest`) and production build
+(`npm run build`) were both run fresh in this session and confirmed
+green/clean — zero backend-driven frontend regressions.
+
+**Read
+[`24_FULL_INTEGRATION_REGRESSION_CONTRACT.md`](24_FULL_INTEGRATION_REGRESSION_CONTRACT.md)**
+for the full prompt text and outcome summary.
+
+### Production readiness & release gate (Prompt 25)
+Before this pass, production-readiness guidance was scattered across six
+overlapping documents accumulated over three prior sessions — and two of
+them had gone actively **wrong**, not just stale:
+`docs/RISK_REGISTER.md`'s R-001 title still read "No authentication or
+per-user authorization by default," and `docs/PRODUCTION_CHECKLIST.md`
+still said "neither the UI nor the API has real auth." Both predate the
+real OIDC/local-account/RBAC/tenant-isolation system that has existed for
+several prompts now — both corrected in place this pass, with a pointer
+to the current evidence, not deleted. The two broader reports
+(`docs/PRODUCTION_READINESS_REPORT.md`'s 2026-09-01 69/100 score,
+`docs/security/PRODUCTION_SECURITY_READINESS_REPORT.md`'s 2026-09-18
+verdict) were simply frozen snapshots — the first predates the entire
+auth system and 23 further prompts of work; the second predates Prompts
+19-24 (Query Store, multi-tenancy, this project's own Prompt 21 security
+audit, scale hardening, observability, full-pipeline integration
+testing) entirely. Both now carry an explicit "superseded by" pointer at
+the top, kept as historical evidence rather than rewritten.
+
+New **`docs/PRODUCTION_READINESS_RELEASE_GATE.md`** is now the single,
+current, authoritative source — extending (not replacing) `docs/security
+/FINAL_PRODUCTION_GATE.md`'s own well-evidenced 25-row matrix with the
+rows that changed since September (Rate Limiting, Monitoring, Backup/
+Recovery, Dependencies — each re-verified fresh, not assumed) and a new
+set of rows this prompt's own broader scope required and no prior
+document covered at all: Tenant Isolation, Database Safety, Onboarding
+Engine, Semantic Catalog/Governed Metrics, Analytics Correctness,
+Recommendation Evidence, AI Accuracy, the Prompt-Injection Benchmark, and
+Scale. **Honest finding, not glossed over:** the only real Text-to-SQL
+accuracy numbers that exist (`docs/EVALUATION_CURRENT.md`'s 92.5%/42.3%/
+50%) are from a live run dated 2026-09-16 — 13 prompts of real pipeline
+changes ago — and could not be re-measured in this pass for the same
+reason every other live-infrastructure gap in this codebase stays open:
+no live Ollama instance or database exists in this sandboxed
+environment. Flagged as a new P1, not silently assumed still accurate.
+
+**Two P1 findings were concretely closeable here and were closed**:
+`docs/DEPLOYMENT.md` gained real **Backup & Recovery** (what this app
+itself owns — the optional identity Postgres database via standard
+`pg_dump`/`alembic downgrade`, the fully-regenerable Chroma vector index,
+`.env`/configuration — explicitly *not* the operator's own connected
+business database, which remains correctly out of scope since this app
+is only ever a read-only client of it) and **Rollback** (digest-pinned/
+tag-addressable container images, `alembic downgrade` — every one of
+this project's 9 migrations confirmed to have a real `downgrade()` by
+direct read — and the fact that every feature added since Prompt 08 is
+behind its own `.env` flag, so disabling a flag is almost always a
+faster, safer "rollback" than a code/image rollback at all) sections,
+neither of which existed before this pass despite being a named,
+disclosed gap since the 2026-09-18 report.
+
+**The three P0 findings carried forward unchanged, still genuinely
+environment-blocked**: DAST has never been run (no staging environment/
+scanner available), OIDC has never been verified against a live Identity
+Provider (none available), and malware scanning (ships disabled by
+default) has never been verified against a real ClamAV daemon (none
+available) — identical constraints every prior session already
+disclosed, not newly discovered, not newly closed.
+
+**Verdict: CONDITIONALLY READY** (a real change from the prior
+engagement's NOT READY framing) — not because any environment-blocked
+item closed, but because this pass freshly re-verified that everything
+built across Prompts 9 through 24 still holds up under direct
+re-inspection, and closed every gap that was actually fixable without
+live infrastructure.
+
+**Read [`docs/PRODUCTION_READINESS_RELEASE_GATE.md`](docs/PRODUCTION_READINESS_RELEASE_GATE.md)**
+for the full gate matrix, P0-P3 findings, release checklist,
+prerequisites, and post-release monitoring plan, and
+[`25_PRODUCTION_READINESS_RELEASE_GATE_CONTRACT.md`](25_PRODUCTION_READINESS_RELEASE_GATE_CONTRACT.md)
+for the full prompt text and outcome summary.
+
+### Database Onboarding Portal (Prompt 26)
+The first real frontend workflow built on top of Prompt 08's onboarding
+engine — `frontend/src/pages/DatabaseOnboarding.tsx`, a new, role-gated
+nav tab (`frontend/src/components/layout/AppShell.tsx`), using
+`api/onboarding.py`'s 10 real routes end to end with **no mock or
+placeholder data anywhere in the page**. A new `frontend/src/lib
+/onboardingApi.ts` (thin `request()` wrappers, mirroring `lib/identityApi
+.ts`'s own precedent) and matching types in `lib/types.ts` are the only
+new API surface; `frontend/src/hooks/queries.ts` gained the React Query
+hooks. `vite.config.ts`'s dev-proxy `BACKEND_ROUTES` list was missing
+`/onboarding` entirely — a real, necessary fix found during inspection,
+not something this page could have worked around.
+
+**Deliberately honest about what the real backend does, not a literal
+reading of a generic wizard outline** — `DatabaseOnboarding.tsx`'s own
+docstring states every one of these, so a future reader doesn't have to
+rediscover them by reading `onboarding/jobs.py` again:
+- **"Test connection" and "create job" are the same backend call**
+  (`POST /onboarding/jobs` tests the connection and only creates the job
+  if it succeeds) — one combined "Test connection & create job" action,
+  not two buttons for a distinction the backend doesn't make.
+- **"Start semantic analysis" and "generate golden questions" are not
+  separate steps** — both already happen inside `POST .../discover`
+  (Prompt 08's own `run_discovery_stage`); their results (semantic-label
+  and golden-question review items) simply appear once discovery
+  finishes.
+- **"Run evaluation" is not a pre-publish action** — it happens
+  automatically inside `POST .../publish` (`publish_job`'s own
+  `evaluate_candidates` call); its result is the `evaluation_report`
+  artifact shown once the job reaches `published`.
+- **No "create/select tenant" step exists** — a job's tenant is resolved
+  server-side from the caller's own account
+  (`security.tenancy.resolve_actor_tenant_id`) and is never a
+  client-supplied value (`docs/MULTI_TENANCY.md` rule 1); this UI never
+  presents a selector for a value the server would ignore.
+- **Progress is an honest loading state, not a fabricated multi-stage
+  bar.** `POST .../discover`/`POST .../publish` are synchronous, no-
+  background-worker calls (`onboarding/jobs.py`'s own module docstring)
+  — there is no intermediate signal to poll, so the UI shows a live
+  elapsed-time counter (`useElapsedSeconds`, reused, not duplicated)
+  while the one request is in flight, never invented intermediate steps.
+- **"Cancellation" of an in-flight discover/publish call is client-side
+  only**, disclosed as such in the UI copy — there is no server-side
+  mechanism to interrupt a running call (same no-background-worker
+  design); `POST .../cancel` genuinely works, but only against a job in
+  a resting (non-terminal, not-mid-call) state.
+- **No dedicated "profiling" display** — the backend never returns raw
+  column-profile statistics to any caller; they only ever feed semantic-
+  label inference and PII confidence internally. The one real, exposed
+  profiling-derived number (`duplicate_key_count`) is shown, honestly
+  labeled, in the discovery summary alongside table/view/relationship/
+  PII/golden-question counts.
+- **"Show schemas/tables/views/relationships"** is served entirely from
+  `OnboardingReviewItem`s already returned by `GET .../review-items` --
+  `semantic_label` items (one per non-view column, Prompt 08's own
+  `infer_semantic_labels` docstring: "One `SemanticLabel` per non-view
+  column") double as the schema/column browser, grouped by table in the
+  UI's "Schema & columns" tab; no new backend endpoint was needed or
+  added. Views are not individually itemized (semantic labeling skips
+  them by design) — disclosed in the discovery-summary count, not hidden.
+
+**Permission gating, UX-only by this codebase's own stated principle**
+(`AuthGate.tsx`'s own docstring: "no UI-level restriction is a security
+boundary anywhere in this codebase") — the nav tab itself is hidden for
+an account with neither `admin` nor `analyst` in its roles (the one nav
+tab gated this way, see `docs/navigation-and-actions.md`'s updated
+table), "New job"/discover/publish/cancel/retry are admin-only inside
+the page, and review-item confirm/reject is admin-or-analyst — all
+re-enforced server-side regardless (`identity/rbac.py`'s own
+`ONBOARDING_MANAGE`/`ONBOARDING_REVIEW` grants, unchanged by this prompt).
+
+**A real regression found and fixed during this pass, not merely
+avoided**: an early version of the nav-tab role check
+(`useLocalAuthStore((state) => state.user?.roles ?? [])`) returned a
+freshly-allocated array on every call when no user was signed in —
+breaking Zustand's snapshot-equality check and crashing the entire shell
+with React's "Maximum update depth exceeded" guard. Caught by this
+app's own pre-existing `AppShell.test.tsx` suite, not discovered by
+manual testing — fixed by selecting the already-stable `user` object
+itself and deriving `.includes(...)` checks outside the selector.
+
+**Known, disclosed limitations:** the wizard's own UI text is in
+English only (the nav label is translated across all 5 locales, matching
+`MediaSearch.tsx`'s own precedent of translating the minimum bar rather
+than every string on a large new page); the password re-entry fields for
+discover/publish/retry are a real, disclosed consequence of this app's
+own "never persist a connection secret" design (`identity.models
+.OnboardingJob`'s own docstring), not an oversight; a job's "+ New job"
+form does not support `DB_CONNECTION_STRING`-style full-URL connections,
+only the discrete-field shape `CreateOnboardingJobRequest` already
+supports.
+
+**Read [`26_DATABASE_ONBOARDING_PORTAL_CONTRACT.md`](26_DATABASE_ONBOARDING_PORTAL_CONTRACT.md)**
+for the full prompt text and outcome summary.
+
+### SME Semantic Review Dashboard (Prompt 27)
+The first real frontend surface for the tenant-aware semantic catalog
+(`semantic/catalog.py`, `api/semantic_catalog.py`, Prompt 09/10) --
+`frontend/src/pages/SemanticReview.tsx`, a second role-gated nav tab
+(sharing Prompt 26's identical admin/analyst gate, since
+`CATALOG_MANAGE`/`CATALOG_REVIEW` sit at the same two RBAC tiers as
+`ONBOARDING_MANAGE`/`ONBOARDING_REVIEW`). Before this prompt, the
+catalog had **zero frontend** despite existing since Prompt 09 -- every
+entity/metric/dimension/domain lived only behind direct API calls.
+
+**Two real backend review systems exist, never bridged into one**
+(confirmed by inspection: nothing in `onboarding/` ever creates a
+`SemanticCatalogEntry` row). This dashboard is the catalog's own review
+surface -- the actual subject of this prompt's own "Revenue metric:
+source, proposed expression, evidence, confidence, version, reviewer"
+example -- plus a compact, linked-not-duplicated summary of onboarding
+jobs still `awaiting_review`, reusing the *existing* `ReviewItemsSection`
+component and `DatabaseOnboarding` page (Prompt 26) for the actual PII/
+relationship/semantic-label/golden-question review interaction rather
+than re-implementing that table a second time (master-contract rule 3).
+
+**The prompt's five actions (Confirm, Reject, Edit, Request
+Clarification, Defer) don't map one-to-one onto the catalog's three real
+transitions** (`identity.repositories.semantic_catalog
+.VALID_STATUS_TRANSITIONS`: draft→reviewed, reviewed→draft,
+reviewed→published) -- mapped honestly, disclosed in the page's own
+docstring rather than faked:
+- **Confirm** is context-sensitive: "Approve" (draft→reviewed, any
+  reviewer) or "Publish" (reviewed→published, admin/`CATALOG_MANAGE`
+  only), whichever transition the entry's current status allows.
+- **Reject has no backend equivalent for a catalog entry at all** --
+  there is no "rejected" `CatalogStatus`. The closest real action is
+  **Request Changes** (reviewed→draft, with notes), shown only for a
+  *reviewed* entry; a draft entry can only be approved, edited, or
+  deferred.
+- **Edit** is the real `PATCH` route, and only succeeds on a `draft`
+  entry (the one row this table ever allows an in-place edit on).
+- **Request Clarification** is the real `request-changes` route.
+- **Defer** makes no API call at all -- it advances the reviewer to the
+  next item in the priority-sorted queue, leaving the entry's real state
+  completely unchanged.
+
+**Prioritization is a disclosed, deterministic client-side heuristic**
+(`SemanticReview.tsx::priorityScore`) -- a conflict scores highest (two
+published claims can't both be right), then low confidence (<70%), then
+`concept_type == "metric"` ("high-impact": a metric definition feeds
+every KPI question that uses it) -- never a hidden model, matching
+`onboarding/semantic_inference.py`'s own transparent ambiguity-flag
+precedent.
+
+**Two real, additive backend gaps found and closed, both in
+`api/semantic_catalog.py`/`api/semantic_catalog_schemas.py`:**
+- `CatalogEntryOut` never surfaced *who* reviewed/published an entry
+  (`SemanticCatalogEntry.reviewed_by_user_id`/`published_by_user_id`
+  always existed on the ORM row; nothing read them back) -- now exposes
+  `reviewed_by_display_name`/`published_by_display_name` too (a
+  best-effort lookup, `None` once that account is deleted via the FK's
+  own `ondelete="SET NULL"`, never a reason the route fails), the literal
+  "reviewer" field the prompt's own metric example names.
+- `GET /semantic-catalog/entries` never recomputed conflicts (only
+  `create`/`publish` did, by design, per Prompt 10's own docstring) --
+  this dashboard needs to prioritize conflicting entries from the list
+  view, so a new opt-in `include_conflicts` query param (default `false`,
+  zero behavior/latency change for every pre-existing caller) reuses the
+  identical, already-bounded `find_conflicting_published_entries` check,
+  run only for a `published` entry in the result set (a draft/reviewed
+  row can't itself be in conflict with a published claim).
+
+**A real, pre-existing concurrency bug was found and fixed while writing
+this prompt's own required "concurrent review" test, not a hypothetical:**
+every status-transition function (`mark_reviewed`/`request_changes`/
+`publish_entry`/`update_draft_entry`) used to validate against the
+caller's own in-memory `entry.status` and then commit an *unconditioned*
+`UPDATE` -- two concurrent callers could both pass that check (racing to
+publish, or one editing a draft the instant another approves it) and
+both "succeed," silently losing the "only one caller's transition should
+ever win" guarantee a 409 is supposed to provide. Fixed by
+`identity.repositories.semantic_catalog._apply_transition`: one atomic
+`UPDATE ... WHERE id = entry.id AND status = expected_current`,
+portable across every SQL dialect this app supports -- no advisory lock
+or dialect-specific code needed. Proven under **real `threading.Thread`s**
+(`tests/test_api_semantic_catalog.py::TestConcurrentPublish`, mirroring
+Prompt 20's own `test_cross_tenant_shared_infrastructure.py` precedent for
+why a sequential test would pass even with the original bug). **Known,
+disclosed, narrower scope than the fix might imply**: this closes the
+single-row race (two callers transitioning the *same* entry); it does
+**not** close the separate, rarer race of two *different* draft versions
+of the *same concept* both reaching `published` concurrently with neither
+seeing the other as `previous_published` (no shared row to guard via a
+`WHERE` clause) -- a real, narrower, disclosed limitation, not silently
+glossed over.
+
+**Audit logging, the prompt's own explicit requirement, was missing for
+every ordinary state change before this prompt** (only Prompt 10's
+conflict-detection path called `security.audit_log.log_security_event`
+at all). Added to `update_catalog_entry`/`review_catalog_entry`/
+`request_catalog_entry_changes`/`publish_catalog_entry`
+(`api/semantic_catalog.py`) and `decide_review_item_route`
+(`api/onboarding.py`) -- six new, `"info"`-severity structured events,
+each carrying the entry/item id and the acting user id.
+
+**Known, disclosed limitations:** "Affected questions" (named in the
+prompt's own metric example) is not tracked anywhere in this backend --
+shown as an honest note in the UI, never fabricated. No deep link exists
+from the onboarding-jobs summary card into a specific job on
+`/db-onboarding` (that page's job selection is local component state,
+not a URL param) -- the link opens the page, the reviewer still has to
+pick the job themselves. The dashboard's own "+ New concept" form covers
+only the core + metric-specific fields, not every `CreateCatalogEntryRequest`
+field (relationships/business rules/examples/evidence are editable only
+via the existing `EditEntryCard`'s own narrower field set, or directly
+against the API).
+
+**Read [`27_SME_SEMANTIC_REVIEW_DASHBOARD_CONTRACT.md`](27_SME_SEMANTIC_REVIEW_DASHBOARD_CONTRACT.md)**
+for the full prompt text and outcome summary.
+
 
 ## How to run
 

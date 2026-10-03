@@ -21,6 +21,7 @@ ChromaDB/embedding runtime.
 
 from __future__ import annotations
 
+import threading
 import uuid
 from collections.abc import Iterator
 
@@ -541,3 +542,223 @@ class TestConflictDetection:
 
         other_tenant_entry = _create_entry(client, _headers(tenant_b_tokens), concept_key="clv-alt")
         assert other_tenant_entry["conflicting_entry_ids"] == []
+
+
+class TestIncludeConflictsOnList:
+    """Prompt 27 (`27_SME_SEMANTIC_REVIEW_DASHBOARD_CONTRACT.md`): the SME
+    review dashboard needs to prioritize conflicting entries from the list
+    view, which never recomputed conflicts before this prompt."""
+
+    def test_default_list_never_reports_conflicts(self, client: TestClient):
+        admin_tokens = _register(client, "admin19@tenant-a.example.com", role="admin")
+        admin_headers = _headers(admin_tokens)
+        analyst_tokens = _register(client, "analyst12@tenant-a.example.com", role="analyst")
+        analyst_headers = _headers(analyst_tokens)
+
+        existing = _create_entry(client, admin_headers, concept_key="clv")
+        client.post(
+            f"/semantic-catalog/entries/{existing['id']}/review", json={}, headers=analyst_headers
+        )
+        client.post(f"/semantic-catalog/entries/{existing['id']}/publish", headers=admin_headers)
+        _create_entry(
+            client,
+            admin_headers,
+            concept_key="clv-alt",
+            business_name="Customer Lifetime Value (alt definition)",
+        )
+
+        response = client.get("/semantic-catalog/entries", headers=admin_headers)
+        assert response.status_code == 200
+        assert all(entry["conflicting_entry_ids"] == [] for entry in response.json())
+
+    def test_include_conflicts_true_reports_them_for_a_published_entry(self, client: TestClient):
+        admin_tokens = _register(client, "admin20@tenant-a.example.com", role="admin")
+        admin_headers = _headers(admin_tokens)
+        analyst_tokens = _register(client, "analyst13@tenant-a.example.com", role="analyst")
+        analyst_headers = _headers(analyst_tokens)
+
+        existing = _create_entry(client, admin_headers, concept_key="clv")
+        client.post(
+            f"/semantic-catalog/entries/{existing['id']}/review", json={}, headers=analyst_headers
+        )
+        client.post(f"/semantic-catalog/entries/{existing['id']}/publish", headers=admin_headers)
+        conflicting = _create_entry(
+            client,
+            admin_headers,
+            concept_key="clv-alt",
+            business_name="Customer Lifetime Value (alt definition)",
+        )
+        client.post(
+            f"/semantic-catalog/entries/{conflicting['id']}/review",
+            json={},
+            headers=analyst_headers,
+        )
+        client.post(f"/semantic-catalog/entries/{conflicting['id']}/publish", headers=admin_headers)
+
+        response = client.get(
+            "/semantic-catalog/entries",
+            params={"include_conflicts": "true"},
+            headers=admin_headers,
+        )
+        assert response.status_code == 200
+        by_id = {entry["id"]: entry for entry in response.json()}
+        assert by_id[existing["id"]]["conflicting_entry_ids"] == [conflicting["id"]]
+        assert by_id[conflicting["id"]]["conflicting_entry_ids"] == [existing["id"]]
+
+    def test_include_conflicts_true_leaves_a_draft_entry_unconflicted(self, client: TestClient):
+        """A draft/reviewed entry is never itself reported as conflicting
+        -- only a *published* entry's business name can collide with
+        another published claim; `list_catalog_entries` only runs the
+        conflict check for entries whose own `status == "published"`."""
+        admin_tokens = _register(client, "admin21@tenant-a.example.com", role="admin")
+        admin_headers = _headers(admin_tokens)
+        analyst_tokens = _register(client, "analyst14@tenant-a.example.com", role="analyst")
+        analyst_headers = _headers(analyst_tokens)
+
+        existing = _create_entry(client, admin_headers, concept_key="clv")
+        client.post(
+            f"/semantic-catalog/entries/{existing['id']}/review", json={}, headers=analyst_headers
+        )
+        client.post(f"/semantic-catalog/entries/{existing['id']}/publish", headers=admin_headers)
+        draft_conflict = _create_entry(
+            client,
+            admin_headers,
+            concept_key="clv-alt",
+            business_name="Customer Lifetime Value (alt definition)",
+        )
+
+        response = client.get(
+            "/semantic-catalog/entries",
+            params={"include_conflicts": "true"},
+            headers=admin_headers,
+        )
+        assert response.status_code == 200
+        by_id = {entry["id"]: entry for entry in response.json()}
+        assert by_id[draft_conflict["id"]]["conflicting_entry_ids"] == []
+
+
+class TestReviewerDisplayNames:
+    """Prompt 27: `reviewed_by_display_name`/`published_by_display_name`
+    -- the ORM row always recorded who reviewed/published an entry; this
+    response simply never surfaced it before this prompt."""
+
+    def test_reviewed_and_published_entry_reports_both_reviewer_names(self, client: TestClient):
+        admin_tokens = _register(client, "admin22@tenant-a.example.com", role="admin")
+        admin_headers = _headers(admin_tokens)
+        analyst_tokens = _register(client, "analyst15@tenant-a.example.com", role="analyst")
+        analyst_headers = _headers(analyst_tokens)
+
+        entry = _create_entry(client, admin_headers)
+        assert entry["reviewed_by_display_name"] is None
+        assert entry["published_by_display_name"] is None
+
+        reviewed = client.post(
+            f"/semantic-catalog/entries/{entry['id']}/review", json={}, headers=analyst_headers
+        ).json()
+        assert reviewed["reviewed_by_display_name"] == "analyst15"
+        assert reviewed["published_by_display_name"] is None
+
+        published = client.post(
+            f"/semantic-catalog/entries/{entry['id']}/publish", headers=admin_headers
+        ).json()
+        assert published["reviewed_by_display_name"] == "analyst15"
+        assert published["published_by_display_name"] == "admin22"
+
+
+class TestConcurrentPublish:
+    """Prompt 27's own explicit testing requirement ("concurrent
+    review"). Found a real, pre-existing bug while writing this: every
+    status-transition function used to validate against the caller's own
+    in-memory `entry.status` and then commit an *unconditioned* `UPDATE`
+    -- two concurrent callers could both pass that check and both
+    "succeed," silently losing the "only one should win" guarantee a 409
+    is supposed to provide. Fixed via `identity.repositories
+    .semantic_catalog._apply_transition`'s conditional `UPDATE ... WHERE
+    status = expected_current`; this test proves the fix holds under
+    real `threading.Thread`s, not just sequential calls (a sequential
+    test would pass even with the original bug, since there'd be no
+    window for both calls to read the same pre-transition status)."""
+
+    def test_two_concurrent_publish_calls_on_the_same_entry_only_one_succeeds(
+        self, client: TestClient
+    ):
+        admin_tokens = _register(client, "admin23@tenant-a.example.com", role="admin")
+        admin_headers = _headers(admin_tokens)
+        analyst_tokens = _register(client, "analyst16@tenant-a.example.com", role="analyst")
+        analyst_headers = _headers(analyst_tokens)
+
+        entry = _create_entry(client, admin_headers)
+        client.post(
+            f"/semantic-catalog/entries/{entry['id']}/review", json={}, headers=analyst_headers
+        )
+
+        results: list[int] = []
+        results_lock = threading.Lock()
+
+        def _publish() -> None:
+            response = client.post(
+                f"/semantic-catalog/entries/{entry['id']}/publish", headers=admin_headers
+            )
+            with results_lock:
+                results.append(response.status_code)
+
+        threads = [threading.Thread(target=_publish) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=10)
+
+        assert sorted(results) == [200, 409]
+
+        # Exactly one published row for this concept -- never two, and
+        # never zero.
+        get_response = client.get(f"/semantic-catalog/entries/{entry['id']}", headers=admin_headers)
+        assert get_response.json()["status"] == "published"
+
+
+class TestReviewActionAudit:
+    """Prompt 27's own "audit" testing requirement -- every SME state
+    change on a catalog entry (edit/review/request-changes/publish) is
+    now a structured `security.audit_log` event."""
+
+    def test_every_state_change_emits_its_own_audit_event(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ):
+        events: list[tuple] = []
+        monkeypatch.setattr(
+            catalog_mod,
+            "log_security_event",
+            lambda *args, **kwargs: events.append(args[0]),
+        )
+
+        admin_tokens = _register(client, "admin24@tenant-a.example.com", role="admin")
+        admin_headers = _headers(admin_tokens)
+        analyst_tokens = _register(client, "analyst17@tenant-a.example.com", role="analyst")
+        analyst_headers = _headers(analyst_tokens)
+
+        entry = _create_entry(client, admin_headers)
+        client.patch(
+            f"/semantic-catalog/entries/{entry['id']}",
+            json={"description": "updated"},
+            headers=admin_headers,
+        )
+        client.post(
+            f"/semantic-catalog/entries/{entry['id']}/review", json={}, headers=analyst_headers
+        )
+        client.post(
+            f"/semantic-catalog/entries/{entry['id']}/request-changes",
+            json={},
+            headers=analyst_headers,
+        )
+        client.post(
+            f"/semantic-catalog/entries/{entry['id']}/review", json={}, headers=analyst_headers
+        )
+        client.post(f"/semantic-catalog/entries/{entry['id']}/publish", headers=admin_headers)
+
+        assert events == [
+            "semantic_catalog_entry_edited",
+            "semantic_catalog_entry_reviewed",
+            "semantic_catalog_changes_requested",
+            "semantic_catalog_entry_reviewed",
+            "semantic_catalog_entry_published",
+        ]

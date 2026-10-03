@@ -30,6 +30,7 @@ from semantic.catalog import (
     CatalogStatus,
 )
 from sqlalchemy import select
+from sqlalchemy import update as sa_update
 from sqlalchemy.orm import Session
 
 from identity.models import SemanticCatalogEntry
@@ -38,15 +39,86 @@ from identity.models import SemanticCatalogEntry
 class InvalidCatalogStatusTransitionError(Exception):
     """Raised when a caller attempts a status transition
     `semantic.catalog.VALID_STATUS_TRANSITIONS` doesn't allow from the
-    entry's current status (e.g. publishing a still-`draft` entry)."""
+    entry's current status (e.g. publishing a still-`draft` entry), *or*
+    when `_apply_transition`'s own conditional `UPDATE` finds the row's
+    real, committed status no longer matches what this caller's
+    in-memory `entry` object expected -- see that function's own
+    docstring for why both checks exist."""
 
 
 def _assert_transition_valid(entry: SemanticCatalogEntry, target: CatalogStatus) -> None:
+    """A fast, friendly first-pass check against the already-loaded
+    in-memory `entry.status` -- correct for the overwhelmingly common
+    non-concurrent case (e.g. rejecting an attempt to publish a
+    still-draft entry outright), but **not** by itself a safe guard
+    against a race between two concurrent callers (see
+    `_apply_transition`, which is what actually prevents that)."""
     current = CatalogStatus(entry.status)
     if target not in VALID_STATUS_TRANSITIONS.get(current, frozenset()):
         raise InvalidCatalogStatusTransitionError(
             f"Cannot move a {current.value!r} entry to {target.value!r}."
         )
+
+
+def _apply_transition(
+    session: Session,
+    entry: SemanticCatalogEntry,
+    *,
+    expected_current: CatalogStatus,
+    values: dict[str, Any],
+) -> None:
+    """Atomically applies `values` (which may or may not include a
+    `status` change) to `entry`'s row via one conditional `UPDATE ...
+    WHERE id = entry.id AND status = expected_current`, rather than the
+    "read in Python, mutate attributes, commit" pattern every caller used
+    before this prompt.
+
+    **Why this matters**: `_assert_transition_valid` (and
+    `update_draft_entry`'s own "must still be draft" check) only ever
+    inspect *this session's own, possibly stale, already-loaded*
+    `entry.status` -- it says nothing about what another concurrent
+    caller may have already committed. Two reviewers racing to publish
+    the same reviewed entry (or one reviewer editing a draft at the exact
+    moment another approves it to `"reviewed"`) could both pass that
+    in-memory check and then both issue an unconditioned `UPDATE ... SET
+    status = ... WHERE id = ...` that always "succeeds" regardless of the
+    row's real current status -- silently losing the "only one caller's
+    transition should ever win" guarantee the 409 response is supposed
+    to provide (a real, found-and-fixed bug, not a hypothetical -- see
+    `27_SME_SEMANTIC_REVIEW_DASHBOARD_CONTRACT.md`'s own concurrency
+    test). The `WHERE status = expected_current` clause makes the
+    database itself the single point of truth: at most one concurrent
+    caller's `UPDATE` can ever match it, so at most one can ever report
+    success for the same transition -- portable across every SQL dialect
+    this app supports, no advisory lock or dialect-specific code needed.
+
+    Raises:
+        InvalidCatalogStatusTransitionError: if the row's real,
+            currently-committed status no longer equals
+            `expected_current` (rowcount 0) -- the race was caught.
+    """
+    if not values:
+        # A no-op edit (e.g. `PATCH` with an empty body) -- nothing to
+        # set, so there is no `UPDATE ... SET` to issue (an empty `SET`
+        # clause is invalid SQL). Still re-reads the row fresh, the same
+        # "reflect the real committed state" guarantee every other path
+        # through this function provides.
+        session.refresh(entry)
+        return
+    result = session.execute(
+        sa_update(SemanticCatalogEntry)
+        .where(SemanticCatalogEntry.id == entry.id)
+        .where(SemanticCatalogEntry.status == expected_current.value)
+        .values(**values)
+    )
+    if result.rowcount == 0:
+        session.rollback()
+        raise InvalidCatalogStatusTransitionError(
+            f"Entry {entry.id} is no longer {expected_current.value!r} -- another "
+            "reviewer's decision was already recorded."
+        )
+    session.commit()
+    session.refresh(entry)
 
 
 def next_version_for_concept_key(
@@ -200,15 +272,17 @@ def update_draft_entry(
         InvalidCatalogStatusTransitionError: if `entry.status` isn't
             `"draft"` -- an edit is not itself a status transition, but
             this reuses the same guard for the one invariant that
-            actually matters here ("a non-draft row is immutable").
+            actually matters here ("a non-draft row is immutable"). Also
+            raised if the row's real, currently-committed status stopped
+            being `"draft"` between this caller's read and this call
+            (e.g. a reviewer approved it to `"reviewed"` in the same
+            instant) -- see `_apply_transition`'s own docstring.
     """
     if CatalogStatus(entry.status) != CatalogStatus.DRAFT:
         raise InvalidCatalogStatusTransitionError(
             f"Cannot edit a {entry.status!r} entry -- only a 'draft' entry is mutable."
         )
-    for key, value in fields.items():
-        setattr(entry, key, value)
-    session.commit()
+    _apply_transition(session, entry, expected_current=CatalogStatus.DRAFT, values=dict(fields))
     return entry
 
 
@@ -224,11 +298,17 @@ def mark_reviewed(
     .REVIEWED`'s own docstring for why this is a distinct state from
     `"published"`)."""
     _assert_transition_valid(entry, CatalogStatus.REVIEWED)
-    entry.status = "reviewed"
-    entry.reviewed_by_user_id = reviewed_by_user_id
-    entry.reviewed_at = datetime.now(UTC)
-    entry.review_notes = notes  # type: ignore[assignment]
-    session.commit()
+    _apply_transition(
+        session,
+        entry,
+        expected_current=CatalogStatus.DRAFT,
+        values={
+            "status": CatalogStatus.REVIEWED.value,
+            "reviewed_by_user_id": reviewed_by_user_id,
+            "reviewed_at": datetime.now(UTC),
+            "review_notes": notes,
+        },
+    )
     return entry
 
 
@@ -243,11 +323,17 @@ def request_changes(
     revision -- still a review decision (records the same reviewer/notes
     fields `mark_reviewed` does), just the opposite outcome."""
     _assert_transition_valid(entry, CatalogStatus.DRAFT)
-    entry.status = "draft"
-    entry.reviewed_by_user_id = reviewed_by_user_id
-    entry.reviewed_at = datetime.now(UTC)
-    entry.review_notes = notes  # type: ignore[assignment]
-    session.commit()
+    _apply_transition(
+        session,
+        entry,
+        expected_current=CatalogStatus.REVIEWED,
+        values={
+            "status": CatalogStatus.DRAFT.value,
+            "reviewed_by_user_id": reviewed_by_user_id,
+            "reviewed_at": datetime.now(UTC),
+            "review_notes": notes,
+        },
+    )
     return entry
 
 
@@ -282,13 +368,19 @@ def publish_entry(
         .where(SemanticCatalogEntry.status == "published")
     )
 
-    entry.status = "published"
-    entry.published_by_user_id = published_by_user_id
-    entry.published_at = datetime.now(UTC)
+    values: dict[str, Any] = {
+        "status": CatalogStatus.PUBLISHED.value,
+        "published_by_user_id": published_by_user_id,
+        "published_at": datetime.now(UTC),
+    }
     if previous_published is not None:
-        entry.supersedes_id = previous_published.id
+        values["supersedes_id"] = previous_published.id
+        # Flushed/committed atomically together with `entry`'s own
+        # conditional UPDATE inside `_apply_transition` -- a lost race on
+        # `entry` itself (rowcount 0) rolls this attribute change back
+        # too, never leaving `previous_published` half-superseded.
         previous_published.status = "superseded"
-    session.commit()
+    _apply_transition(session, entry, expected_current=CatalogStatus.REVIEWED, values=values)
     return entry, previous_published
 
 

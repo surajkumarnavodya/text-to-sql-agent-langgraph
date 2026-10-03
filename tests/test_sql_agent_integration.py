@@ -194,26 +194,44 @@ class TestGraphStructure:
         assert ("build_analytical_plan", "plan_query") in edges
 
     def test_existing_nodes_are_all_still_present(self):
-        """Adding the new node must never remove an existing one."""
+        """Adding a new node must never remove an existing one.
+
+        Prompt 24 (full integration & regression) found this list had
+        drifted out of sync with the real graph: `retrieve_business_
+        context` (Prompt 9), `classify_analytical_intent` (Prompt 11),
+        `review_metric_conformance` (Prompt 10), and `generate_
+        recommendations` (Prompt 17) had each been added to
+        `agent/graph.py` without ever being added here, silently
+        undertesting four of the graph's eighteen real nodes. Now checked
+        against an exhaustive equality, not just a subset containment, so
+        this can't silently drift again -- a future added/removed node
+        must touch this test too.
+        """
         graph = build_graph()
         node_names = set(graph.get_graph().nodes.keys())
-        for expected in (
+        # LangGraph always adds its own implicit "__start__"/"__end__"
+        # nodes alongside every one this app registered via `add_node`.
+        node_names -= {"__start__", "__end__"}
+        assert node_names == {
             "sanitize_input",
             "classify_followup",
             "retrieve_schema",
             "retrieve_golden_examples",
+            "retrieve_business_context",
+            "classify_analytical_intent",
             "build_analytical_plan",
             "plan_query",
             "generate_sql",
             "review_sql",
+            "review_metric_conformance",
             "validate_sql",
             "estimate_cost",
             "execute_sql",
             "compute_analytics",
             "generate_forecast",
+            "generate_recommendations",
             "generate_insight",
-        ):
-            assert expected in node_names
+        }
 
     def test_classify_analytical_intent_has_no_conditional_routing(self):
         """Prompt 11's analytical `ambiguity_flags` must NEVER short-

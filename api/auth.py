@@ -43,8 +43,9 @@ from identity.exceptions import LocalTokenValidationError
 from identity.security import looks_like_local_token, validate_local_token
 
 from config.settings import get_settings
-from security.audit_log import log_security_event
+from security.audit_log import log_security_event, set_audit_tenant_id
 from security.oidc import AuthIdentity, TokenValidationError, validate_token
+from security.tenancy import TenantResolutionError, reject_client_tenant_override
 
 _BEARER_PREFIX = "Bearer "
 
@@ -92,8 +93,28 @@ def verify_api_key(request: Request, authorization: str | None = Header(default=
     value itself, which would turn the audit log into its own
     credential-leakage surface (see `security/oidc.py`'s own docstring for
     the same principle applied to JWT claims).
+
+    Prompt 20 (multi-tenant): refuses outright, before authenticating
+    anything, any request carrying a client-supplied tenant header
+    (`security.tenancy.CLIENT_TENANT_HEADERS`). A tenant is always resolved
+    server-side -- from the signature-verified `tid` claim this app minted,
+    or an IdP-signed OIDC claim -- so such a header can only be a
+    misconfiguration or an attempt to assert a tenant, and in both cases a
+    loud failure beats silently ignoring it. This is the single chokepoint
+    every authenticated route already passes through, so no route needs a
+    check of its own. Checked *before* `auth_mode == "none"` returns, so
+    even a development-mode deployment never accepts one.
     """
     settings = get_settings()
+
+    try:
+        reject_client_tenant_override(request.headers)
+    except TenantResolutionError:
+        _log_auth_failed(request, "client_supplied_tenant_header")
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="A tenant must not be supplied by the client.",
+        ) from None
 
     if settings.auth_mode == "none":
         request.state.auth_identity = _DEV_MODE_IDENTITY
@@ -125,9 +146,31 @@ def verify_api_key(request: Request, authorization: str | None = Header(default=
             except LocalTokenValidationError:
                 claims = None
             if claims is not None:
-                request.state.auth_identity = AuthIdentity(
-                    subject=claims.subject, roles=claims.roles, mode="local"
+                # `claims.tenant_id` comes from the signature-verified
+                # `tid` claim this server itself minted from the user's own
+                # `users.tenant_id` row (Prompt 20) -- never from anything
+                # the client sent. See `security/tenancy.py`'s rule 1.
+                # Named distinctly from the OIDC block's own `identity`
+                # below, which is legitimately rebound to `None` on a failed
+                # validation -- sharing the name would make this one's type
+                # `AuthIdentity | None` for no reason.
+                local_identity = AuthIdentity(
+                    subject=claims.subject,
+                    roles=claims.roles,
+                    mode="local",
+                    tenant_id=claims.tenant_id,
                 )
+                request.state.auth_identity = local_identity
+                # Prompt 20: stamps this request's tenant onto any
+                # `security.audit_log` event emitted later *in this same
+                # context* (e.g. an authorization denial in
+                # `api/identity_authz.py`). Deliberately never reset here:
+                # FastAPI runs this sync dependency in its own copied
+                # context, which is discarded when the request ends, so
+                # there is nothing to leak into a later request. The
+                # agent-side binding that does need an explicit reset lives
+                # in `agent.graph.run_agent` -- see that call site.
+                set_audit_tenant_id(local_identity.tenant_id)
                 return
         # Falls through to OIDC/static-token below -- a token that isn't
         # locally issued (or fails local validation) may still be valid

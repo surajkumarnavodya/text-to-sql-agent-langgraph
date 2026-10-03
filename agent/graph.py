@@ -250,6 +250,7 @@ from agent.nodes import (
 from agent.state import AgentState, ConversationExchange
 from config.settings import get_settings
 from observability.metrics import get_default_metrics
+from security.audit_log import reset_audit_tenant_id, set_audit_tenant_id
 
 logger = logging.getLogger(__name__)
 
@@ -549,7 +550,21 @@ def run_agent(
     # bonus) so a future config change can't reintroduce this.
     recursion_limit = 20 + effective_max_retries * 10
     run_start = time.perf_counter()
-    final_state = compiled_graph.invoke(initial_state, config={"recursion_limit": recursion_limit})
+    # Prompt 20: binds this run's tenant so every `security.audit_log
+    # .log_security_event` emitted by a node below (input rejections, SQL
+    # safety violations, sensitive-column blocks, schema anomalies) is stamped
+    # with it, without threading an explicit argument through ~40 call sites.
+    # Bound here rather than in the route handler because `api/main.py`'s
+    # `/ask` pool is a raw `ThreadPoolExecutor`, which does not copy
+    # `contextvars` -- this is the worker side of that boundary. Reset in
+    # `finally` so the value can never leak into whatever reuses this thread.
+    audit_token = set_audit_tenant_id(tenant_id)
+    try:
+        final_state = compiled_graph.invoke(
+            initial_state, config={"recursion_limit": recursion_limit}
+        )
+    finally:
+        reset_audit_tenant_id(audit_token)
     total_duration_ms = (time.perf_counter() - run_start) * 1000
     logger.info(
         "Agent run finished: status=%s retries=%d followup_classification=%s has_insight=%s "
@@ -569,7 +584,13 @@ def run_agent(
     # observability aid (see observability/metrics.py's own docstring).
     try:
         get_default_metrics().record_agent_run(
-            final_state.get("stage_timings", []), total_duration_ms, final_state.get("status")
+            final_state.get("stage_timings", []),
+            total_duration_ms,
+            final_state.get("status"),
+            # Prompt 20: this run's timings land in its own tenant's window,
+            # never a shared one -- `GET /metrics/performance` reads only the
+            # requesting caller's own tenant back out.
+            tenant_id=final_state.get("tenant_id"),
         )
     except Exception:
         logger.warning("Failed to record performance metrics for this run", exc_info=True)

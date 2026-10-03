@@ -850,3 +850,176 @@ export interface SharedConversation {
   viewer_role: 'owner' | 'member' | 'public_link'
   turns: ProjectedTurn[]
 }
+
+// --- Client-database onboarding (onboarding/, api/onboarding.py) -- mirrors
+// api/onboarding_schemas.py exactly. `db_password` is request-only on the
+// three request types below; it is never a field on `OnboardingJob` --
+// the backend never persists it (see identity/models.py's own docstring),
+// so there is nothing for this UI to accidentally display back. ---
+
+export type OnboardingJobStatus =
+  | 'pending'
+  | 'discovering'
+  | 'awaiting_review'
+  | 'publishing'
+  | 'published'
+  | 'failed'
+  | 'cancelled'
+
+export type OnboardingReviewItemType =
+  | 'pii_classification'
+  | 'relationship'
+  | 'semantic_label'
+  | 'golden_question'
+
+export type OnboardingReviewDecision = 'pending' | 'confirmed' | 'rejected'
+
+export interface CreateOnboardingJobRequest {
+  database_label: string
+  db_type: string
+  db_host?: string | null
+  db_port?: number | null
+  db_name?: string | null
+  db_user?: string | null
+  db_password?: string | null
+  db_schema?: string | null
+}
+
+export interface RunDiscoveryRequest {
+  db_password?: string | null
+  verify_relationships_with_data?: boolean
+  verify_pii_with_data?: boolean
+}
+
+export interface PublishJobRequest {
+  db_password?: string | null
+}
+
+export interface DecideReviewItemRequest {
+  decision: 'confirmed' | 'rejected'
+  notes?: string | null
+}
+
+export interface OnboardingJob {
+  id: string
+  database_label: string
+  db_type: string
+  db_host: string | null
+  db_port: number | null
+  db_name: string | null
+  db_user: string | null
+  db_schema: string | null
+  status: OnboardingJobStatus
+  current_stage: string | null
+  error_message: string | null
+  retry_count: number
+  discovery_summary: Record<string, unknown> | null
+  version: number
+  created_at: string
+  updated_at: string
+}
+
+export interface OnboardingReviewItem {
+  id: string
+  item_type: OnboardingReviewItemType
+  table_name: string | null
+  column_name: string | null
+  subject: string
+  payload: Record<string, unknown>
+  confidence: number
+  is_ambiguous: boolean
+  decision: OnboardingReviewDecision
+  decided_at: string | null
+  decision_notes: string | null
+  created_at: string
+}
+
+export interface OnboardingArtifact {
+  id: string
+  artifact_type: 'semantic_contract' | 'golden_questions' | 'evaluation_report'
+  content: Record<string, unknown>
+  version: number
+  created_at: string
+}
+
+// --- Tenant-aware semantic catalog (semantic/catalog.py, api/semantic_catalog.py)
+// -- mirrors api/semantic_catalog_schemas.py exactly. Prompt 09/10, with
+// `reviewed_by_display_name`/`published_by_display_name`/
+// `conflicting_entry_ids`/`conflicting_entry_names` surfaced for the first
+// time by the SME review dashboard (Prompt 27). ---
+
+export type CatalogConceptType = 'entity' | 'metric' | 'dimension' | 'domain'
+export type CatalogStatus = 'draft' | 'reviewed' | 'published' | 'superseded'
+
+export interface CreateCatalogEntryRequest {
+  database_id: string
+  concept_type: CatalogConceptType
+  concept_key: string
+  business_name: string
+  technical_name?: string | null
+  description?: string
+  grain?: string | null
+  keys?: string[]
+  relationships?: Record<string, unknown>[]
+  domain?: string | null
+  synonyms?: string[]
+  business_rules?: string[]
+  examples?: string[]
+  evidence?: Record<string, unknown>[]
+  confidence?: number
+  owner?: string | null
+  approved_expression?: string | null
+  source_tables?: string[]
+  filters?: string[]
+  dimensions?: string[]
+  aggregation?: string | null
+}
+
+export type UpdateCatalogEntryRequest = Partial<
+  Omit<CreateCatalogEntryRequest, 'database_id' | 'concept_type' | 'concept_key'>
+>
+
+export interface ReviewDecisionRequest {
+  notes?: string | null
+}
+
+export interface CatalogEntryOut {
+  id: string
+  tenant_id: string
+  database_id: string
+  concept_type: CatalogConceptType
+  concept_key: string
+  business_name: string
+  technical_name: string | null
+  description: string
+  grain: string | null
+  keys: string[]
+  relationships: Record<string, unknown>[]
+  domain: string | null
+  synonyms: string[]
+  business_rules: string[]
+  examples: string[]
+  evidence: Record<string, unknown>[]
+  confidence: number
+  status: CatalogStatus
+  owner: string | null
+  version: number
+  supersedes_id: string | null
+  truth_level: string
+  reviewed_at: string | null
+  review_notes: string | null
+  reviewed_by_user_id: string | null
+  reviewed_by_display_name: string | null
+  published_by_user_id: string | null
+  published_by_display_name: string | null
+  published_at: string | null
+  created_at: string
+  updated_at: string
+  approved_expression: string | null
+  source_tables: string[]
+  filters: string[]
+  dimensions: string[]
+  aggregation: string | null
+  conflicting_entry_ids: string[]
+  conflicting_entry_names: string[]
+}
