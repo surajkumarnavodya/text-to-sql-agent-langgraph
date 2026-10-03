@@ -12,6 +12,14 @@ This report does not assume anything documented elsewhere in the repo
 found to be inaccurate during this audit and are called out explicitly
 below.
 
+> **Superseded (Prompt 25, 2026-10-03):**
+> [`docs/PRODUCTION_READINESS_RELEASE_GATE.md`](PRODUCTION_READINESS_RELEASE_GATE.md)
+> is now the current, authoritative production-readiness verdict — this
+> report's own 69/100 score and every category score below is a frozen
+> 2026-09-01 snapshot (Streamlit still existed; there was no
+> authentication/RBAC/tenancy system at all; 23 further prompts of work
+> have landed since). Kept as historical detail, not deleted or rescored.
+
 > **Addendum (not re-scored):** since this report's 2026-09-01 audit, the
 > SQL pipeline gained two nodes directly targeting the AI-accuracy gap
 > flagged below (agentic query planning + a plan-conformance

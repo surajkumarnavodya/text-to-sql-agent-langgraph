@@ -7,6 +7,19 @@ it does not re-derive evidence already established in
 `INCIDENT_RESPONSE.md`, `OIDC_E2E_TEST.md`, `DAST_REPORT.md`, or
 `THREAT_MODEL.md` — it classifies and rules on it.
 
+> **Superseded (Prompt 25, 2026-10-03):**
+> [`../PRODUCTION_READINESS_RELEASE_GATE.md`](../PRODUCTION_READINESS_RELEASE_GATE.md)
+> is now the current, authoritative production-readiness document — this
+> report predates Prompts 19-24 (SQL Server Query Store intelligence,
+> multi-tenant architecture, a dedicated enterprise-security hardening
+> pass, scale/performance hardening, observability/evaluation, and
+> full-pipeline integration validation). Its three P0 findings (DAST,
+> live-OIDC verification, live malware-scanner verification) remain open
+> and environment-blocked exactly as stated below — nothing in the newer
+> work closed them, since none of it had access to a staging environment,
+> a live IdP, or a real ClamAV daemon either. Kept as historical evidence,
+> not re-derived or rescored.
+
 ## 1. Executive Summary
 
 This application's **tested, code-level security architecture is

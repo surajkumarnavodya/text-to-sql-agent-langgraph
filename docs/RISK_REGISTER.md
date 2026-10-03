@@ -29,9 +29,24 @@ maintainer (`GOVERNANCE.md`'s "Ownership").
 
 ## Open items
 
-### R-001 — No authentication or per-user authorization by default
+### R-001 — No authentication or per-user authorization by default (title kept for history; see Prompt 25 note below — this is now CLOSED, not merely mitigated)
 
-**Severity:** Critical (if deployed beyond single-user/local use) · **Status:** Mitigated
+**Severity:** Critical (if deployed beyond single-user/local use) · **Status:** CLOSED (was: Mitigated)
+
+**Update (Prompt 25, 2026-10-03):** this entry's own *title* is now
+actively misleading if read on its own — real authentication and
+per-user authorization are not just "mitigated," they're a real,
+default-available, extensively tested system (unchanged status quo since
+the Phase 1-3 updates below, restated here because a reader skimming
+titles alone, not bodies, would reasonably conclude otherwise). Prompt 20
+additionally added real multi-tenancy on top of this (tenant resolved
+only from a server-signed token claim, never a client-supplied header;
+deny-by-default on an unresolvable/suspended tenant) — see
+`docs/MULTI_TENANCY.md` and
+`docs/PRODUCTION_READINESS_RELEASE_GATE.md`'s §3 for the current,
+authoritative statement. `docs/PRODUCTION_CHECKLIST.md`'s own
+now-corrected "neither the UI nor the API has real auth" line was the
+same misreading, closed the same way.
 
 **Update (2026 Phase 1/2, restated here since this entry had gone stale):**
 real authentication (`security/oidc.py` — standard OIDC/JWT validation

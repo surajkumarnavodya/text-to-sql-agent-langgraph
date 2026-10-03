@@ -2962,6 +2962,78 @@ green/clean — zero backend-driven frontend regressions.
 [`24_FULL_INTEGRATION_REGRESSION_CONTRACT.md`](24_FULL_INTEGRATION_REGRESSION_CONTRACT.md)**
 for the full prompt text and outcome summary.
 
+### Production readiness & release gate (Prompt 25)
+Before this pass, production-readiness guidance was scattered across six
+overlapping documents accumulated over three prior sessions — and two of
+them had gone actively **wrong**, not just stale:
+`docs/RISK_REGISTER.md`'s R-001 title still read "No authentication or
+per-user authorization by default," and `docs/PRODUCTION_CHECKLIST.md`
+still said "neither the UI nor the API has real auth." Both predate the
+real OIDC/local-account/RBAC/tenant-isolation system that has existed for
+several prompts now — both corrected in place this pass, with a pointer
+to the current evidence, not deleted. The two broader reports
+(`docs/PRODUCTION_READINESS_REPORT.md`'s 2026-09-01 69/100 score,
+`docs/security/PRODUCTION_SECURITY_READINESS_REPORT.md`'s 2026-09-18
+verdict) were simply frozen snapshots — the first predates the entire
+auth system and 23 further prompts of work; the second predates Prompts
+19-24 (Query Store, multi-tenancy, this project's own Prompt 21 security
+audit, scale hardening, observability, full-pipeline integration
+testing) entirely. Both now carry an explicit "superseded by" pointer at
+the top, kept as historical evidence rather than rewritten.
+
+New **`docs/PRODUCTION_READINESS_RELEASE_GATE.md`** is now the single,
+current, authoritative source — extending (not replacing) `docs/security
+/FINAL_PRODUCTION_GATE.md`'s own well-evidenced 25-row matrix with the
+rows that changed since September (Rate Limiting, Monitoring, Backup/
+Recovery, Dependencies — each re-verified fresh, not assumed) and a new
+set of rows this prompt's own broader scope required and no prior
+document covered at all: Tenant Isolation, Database Safety, Onboarding
+Engine, Semantic Catalog/Governed Metrics, Analytics Correctness,
+Recommendation Evidence, AI Accuracy, the Prompt-Injection Benchmark, and
+Scale. **Honest finding, not glossed over:** the only real Text-to-SQL
+accuracy numbers that exist (`docs/EVALUATION_CURRENT.md`'s 92.5%/42.3%/
+50%) are from a live run dated 2026-09-16 — 13 prompts of real pipeline
+changes ago — and could not be re-measured in this pass for the same
+reason every other live-infrastructure gap in this codebase stays open:
+no live Ollama instance or database exists in this sandboxed
+environment. Flagged as a new P1, not silently assumed still accurate.
+
+**Two P1 findings were concretely closeable here and were closed**:
+`docs/DEPLOYMENT.md` gained real **Backup & Recovery** (what this app
+itself owns — the optional identity Postgres database via standard
+`pg_dump`/`alembic downgrade`, the fully-regenerable Chroma vector index,
+`.env`/configuration — explicitly *not* the operator's own connected
+business database, which remains correctly out of scope since this app
+is only ever a read-only client of it) and **Rollback** (digest-pinned/
+tag-addressable container images, `alembic downgrade` — every one of
+this project's 9 migrations confirmed to have a real `downgrade()` by
+direct read — and the fact that every feature added since Prompt 08 is
+behind its own `.env` flag, so disabling a flag is almost always a
+faster, safer "rollback" than a code/image rollback at all) sections,
+neither of which existed before this pass despite being a named,
+disclosed gap since the 2026-09-18 report.
+
+**The three P0 findings carried forward unchanged, still genuinely
+environment-blocked**: DAST has never been run (no staging environment/
+scanner available), OIDC has never been verified against a live Identity
+Provider (none available), and malware scanning (ships disabled by
+default) has never been verified against a real ClamAV daemon (none
+available) — identical constraints every prior session already
+disclosed, not newly discovered, not newly closed.
+
+**Verdict: CONDITIONALLY READY** (a real change from the prior
+engagement's NOT READY framing) — not because any environment-blocked
+item closed, but because this pass freshly re-verified that everything
+built across Prompts 9 through 24 still holds up under direct
+re-inspection, and closed every gap that was actually fixable without
+live infrastructure.
+
+**Read [`docs/PRODUCTION_READINESS_RELEASE_GATE.md`](docs/PRODUCTION_READINESS_RELEASE_GATE.md)**
+for the full gate matrix, P0-P3 findings, release checklist,
+prerequisites, and post-release monitoring plan, and
+[`25_PRODUCTION_READINESS_RELEASE_GATE_CONTRACT.md`](25_PRODUCTION_READINESS_RELEASE_GATE_CONTRACT.md)
+for the full prompt text and outcome summary.
+
 
 ## How to run
 
