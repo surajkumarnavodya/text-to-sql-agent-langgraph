@@ -47,7 +47,8 @@
   "nav": {
     "chat": "Chat",
     "knowledgeSources": "Sources de connaissances",
-    "mediaSearch": "Recherche de médias"
+    "mediaSearch": "Recherche de médias",
+    "dbOnboarding": "Intégration de base de données"
   },
   "header": {
     "openHistory": "Ouvrir l'historique du chat",

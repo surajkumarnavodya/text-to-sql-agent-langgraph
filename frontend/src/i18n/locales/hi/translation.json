@@ -47,7 +47,8 @@
   "nav": {
     "chat": "चैट",
     "knowledgeSources": "ज्ञान स्रोत",
-    "mediaSearch": "मीडिया खोज"
+    "mediaSearch": "मीडिया खोज",
+    "dbOnboarding": "डेटाबेस ऑनबोर्डिंग"
   },
   "header": {
     "openHistory": "चैट इतिहास खोलें",

@@ -47,7 +47,8 @@
   "nav": {
     "chat": "Chat",
     "knowledgeSources": "Knowledge Sources",
-    "mediaSearch": "Media Search"
+    "mediaSearch": "Media Search",
+    "dbOnboarding": "Database Onboarding"
   },
   "header": {
     "openHistory": "Open chat history",

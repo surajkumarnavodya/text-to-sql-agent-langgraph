@@ -1,7 +1,8 @@
 import { render, screen } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { MemoryRouter, Route, Routes } from 'react-router-dom'
-import { describe, expect, it, vi } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
+import { useLocalAuthStore } from '@/store/localAuthStore'
 import { AppShell } from './AppShell'
 
 // Sidebar/MobileNav pull in chatStore/localAuthStore and a fair amount of
@@ -54,5 +55,45 @@ describe('AppShell background inert-while-modal-open', () => {
     expect(screen.getByRole('dialog')).toBeInTheDocument()
     const background = screen.getByText('Sidebar stub').closest('div.flex.h-full')
     expect(background).toHaveAttribute('inert')
+  })
+})
+
+// Prompt 26: Database Onboarding is the one nav tab gated on role (UX only
+// -- see DatabaseOnboarding.tsx's own docstring for why the real boundary
+// stays server-side). A regression here (an earlier version of the
+// gating selector returned a freshly-allocated array on every call,
+// which breaks Zustand's snapshot-equality check and crashes the whole
+// shell with "Maximum update depth exceeded" -- caught by this file's
+// pre-existing tests above, not a hypothetical) would silently hide the
+// feature for an admin or show it to everyone.
+describe('AppShell Database Onboarding nav gating', () => {
+  const initialAuthState = useLocalAuthStore.getState()
+
+  afterEach(() => {
+    useLocalAuthStore.setState(initialAuthState, true)
+  })
+
+  it('shows the Database Onboarding tab for an admin', () => {
+    useLocalAuthStore.setState({ user: { roles: ['admin'] } } as never)
+    renderAppShell()
+    expect(screen.getByRole('link', { name: /database onboarding/i })).toBeInTheDocument()
+  })
+
+  it('shows the Database Onboarding tab for an analyst', () => {
+    useLocalAuthStore.setState({ user: { roles: ['analyst'] } } as never)
+    renderAppShell()
+    expect(screen.getByRole('link', { name: /database onboarding/i })).toBeInTheDocument()
+  })
+
+  it('hides the Database Onboarding tab for a plain user', () => {
+    useLocalAuthStore.setState({ user: { roles: ['user'] } } as never)
+    renderAppShell()
+    expect(screen.queryByRole('link', { name: /database onboarding/i })).not.toBeInTheDocument()
+  })
+
+  it('hides the Database Onboarding tab when signed out', () => {
+    useLocalAuthStore.setState({ user: null } as never)
+    renderAppShell()
+    expect(screen.queryByRole('link', { name: /database onboarding/i })).not.toBeInTheDocument()
   })
 })

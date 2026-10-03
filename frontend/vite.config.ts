@@ -34,6 +34,8 @@ const BACKEND_ROUTES = [
   // own security spec calls out by name.
   '/share-view',
   '/share-invitations',
+  // Client-database onboarding (api/onboarding.py, Prompt 08/26).
+  '/onboarding',
 ]
 
 export default defineConfig({

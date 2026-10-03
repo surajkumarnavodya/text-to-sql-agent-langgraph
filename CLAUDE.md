@@ -3034,6 +3034,101 @@ prerequisites, and post-release monitoring plan, and
 [`25_PRODUCTION_READINESS_RELEASE_GATE_CONTRACT.md`](25_PRODUCTION_READINESS_RELEASE_GATE_CONTRACT.md)
 for the full prompt text and outcome summary.
 
+### Database Onboarding Portal (Prompt 26)
+The first real frontend workflow built on top of Prompt 08's onboarding
+engine — `frontend/src/pages/DatabaseOnboarding.tsx`, a new, role-gated
+nav tab (`frontend/src/components/layout/AppShell.tsx`), using
+`api/onboarding.py`'s 10 real routes end to end with **no mock or
+placeholder data anywhere in the page**. A new `frontend/src/lib
+/onboardingApi.ts` (thin `request()` wrappers, mirroring `lib/identityApi
+.ts`'s own precedent) and matching types in `lib/types.ts` are the only
+new API surface; `frontend/src/hooks/queries.ts` gained the React Query
+hooks. `vite.config.ts`'s dev-proxy `BACKEND_ROUTES` list was missing
+`/onboarding` entirely — a real, necessary fix found during inspection,
+not something this page could have worked around.
+
+**Deliberately honest about what the real backend does, not a literal
+reading of a generic wizard outline** — `DatabaseOnboarding.tsx`'s own
+docstring states every one of these, so a future reader doesn't have to
+rediscover them by reading `onboarding/jobs.py` again:
+- **"Test connection" and "create job" are the same backend call**
+  (`POST /onboarding/jobs` tests the connection and only creates the job
+  if it succeeds) — one combined "Test connection & create job" action,
+  not two buttons for a distinction the backend doesn't make.
+- **"Start semantic analysis" and "generate golden questions" are not
+  separate steps** — both already happen inside `POST .../discover`
+  (Prompt 08's own `run_discovery_stage`); their results (semantic-label
+  and golden-question review items) simply appear once discovery
+  finishes.
+- **"Run evaluation" is not a pre-publish action** — it happens
+  automatically inside `POST .../publish` (`publish_job`'s own
+  `evaluate_candidates` call); its result is the `evaluation_report`
+  artifact shown once the job reaches `published`.
+- **No "create/select tenant" step exists** — a job's tenant is resolved
+  server-side from the caller's own account
+  (`security.tenancy.resolve_actor_tenant_id`) and is never a
+  client-supplied value (`docs/MULTI_TENANCY.md` rule 1); this UI never
+  presents a selector for a value the server would ignore.
+- **Progress is an honest loading state, not a fabricated multi-stage
+  bar.** `POST .../discover`/`POST .../publish` are synchronous, no-
+  background-worker calls (`onboarding/jobs.py`'s own module docstring)
+  — there is no intermediate signal to poll, so the UI shows a live
+  elapsed-time counter (`useElapsedSeconds`, reused, not duplicated)
+  while the one request is in flight, never invented intermediate steps.
+- **"Cancellation" of an in-flight discover/publish call is client-side
+  only**, disclosed as such in the UI copy — there is no server-side
+  mechanism to interrupt a running call (same no-background-worker
+  design); `POST .../cancel` genuinely works, but only against a job in
+  a resting (non-terminal, not-mid-call) state.
+- **No dedicated "profiling" display** — the backend never returns raw
+  column-profile statistics to any caller; they only ever feed semantic-
+  label inference and PII confidence internally. The one real, exposed
+  profiling-derived number (`duplicate_key_count`) is shown, honestly
+  labeled, in the discovery summary alongside table/view/relationship/
+  PII/golden-question counts.
+- **"Show schemas/tables/views/relationships"** is served entirely from
+  `OnboardingReviewItem`s already returned by `GET .../review-items` --
+  `semantic_label` items (one per non-view column, Prompt 08's own
+  `infer_semantic_labels` docstring: "One `SemanticLabel` per non-view
+  column") double as the schema/column browser, grouped by table in the
+  UI's "Schema & columns" tab; no new backend endpoint was needed or
+  added. Views are not individually itemized (semantic labeling skips
+  them by design) — disclosed in the discovery-summary count, not hidden.
+
+**Permission gating, UX-only by this codebase's own stated principle**
+(`AuthGate.tsx`'s own docstring: "no UI-level restriction is a security
+boundary anywhere in this codebase") — the nav tab itself is hidden for
+an account with neither `admin` nor `analyst` in its roles (the one nav
+tab gated this way, see `docs/navigation-and-actions.md`'s updated
+table), "New job"/discover/publish/cancel/retry are admin-only inside
+the page, and review-item confirm/reject is admin-or-analyst — all
+re-enforced server-side regardless (`identity/rbac.py`'s own
+`ONBOARDING_MANAGE`/`ONBOARDING_REVIEW` grants, unchanged by this prompt).
+
+**A real regression found and fixed during this pass, not merely
+avoided**: an early version of the nav-tab role check
+(`useLocalAuthStore((state) => state.user?.roles ?? [])`) returned a
+freshly-allocated array on every call when no user was signed in —
+breaking Zustand's snapshot-equality check and crashing the entire shell
+with React's "Maximum update depth exceeded" guard. Caught by this
+app's own pre-existing `AppShell.test.tsx` suite, not discovered by
+manual testing — fixed by selecting the already-stable `user` object
+itself and deriving `.includes(...)` checks outside the selector.
+
+**Known, disclosed limitations:** the wizard's own UI text is in
+English only (the nav label is translated across all 5 locales, matching
+`MediaSearch.tsx`'s own precedent of translating the minimum bar rather
+than every string on a large new page); the password re-entry fields for
+discover/publish/retry are a real, disclosed consequence of this app's
+own "never persist a connection secret" design (`identity.models
+.OnboardingJob`'s own docstring), not an oversight; a job's "+ New job"
+form does not support `DB_CONNECTION_STRING`-style full-URL connections,
+only the discrete-field shape `CreateOnboardingJobRequest` already
+supports.
+
+**Read [`26_DATABASE_ONBOARDING_PORTAL_CONTRACT.md`](26_DATABASE_ONBOARDING_PORTAL_CONTRACT.md)**
+for the full prompt text and outcome summary.
+
 
 ## How to run
 

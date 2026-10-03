@@ -9,6 +9,7 @@ import { watchSystemTheme, applyThemeMode } from '@/lib/theme'
 import { AcceptInvitation } from '@/pages/AcceptInvitation'
 import { AuthCallback } from '@/pages/AuthCallback'
 import { Chat } from '@/pages/Chat'
+import { DatabaseOnboarding } from '@/pages/DatabaseOnboarding'
 import { KnowledgeSources } from '@/pages/KnowledgeSources'
 import { MediaSearch } from '@/pages/MediaSearch'
 import { SharedConversation } from '@/pages/SharedConversation'
@@ -60,6 +61,7 @@ export function App() {
           <Route path="/" element={<Chat />} />
           <Route path="/knowledge-sources" element={<KnowledgeSources />} />
           <Route path="/media-search" element={<MediaSearch />} />
+          <Route path="/db-onboarding" element={<DatabaseOnboarding />} />
           {/* Accepting an invitation requires being signed in -- placed
               inside AuthGate so an unauthenticated visitor sees the
               ordinary sign-in screen first, then lands here once

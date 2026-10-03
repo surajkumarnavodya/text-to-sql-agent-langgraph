@@ -9,7 +9,25 @@ import {
   refreshSchema,
   uploadDocument,
 } from '@/lib/api'
-import type { Collection, SensitivityCategory } from '@/lib/types'
+import {
+  cancelOnboardingJob,
+  createOnboardingJob,
+  decideOnboardingReviewItem,
+  getOnboardingJob,
+  listOnboardingArtifacts,
+  listOnboardingJobs,
+  listOnboardingReviewItems,
+  publishOnboardingJob,
+  retryOnboardingJob,
+  runOnboardingDiscovery,
+} from '@/lib/onboardingApi'
+import type {
+  Collection,
+  DecideReviewItemRequest,
+  PublishJobRequest,
+  RunDiscoveryRequest,
+  SensitivityCategory,
+} from '@/lib/types'
 
 export function useHealth() {
   return useQuery({ queryKey: ['health'], queryFn: getHealth, staleTime: 30_000 })
@@ -78,6 +96,109 @@ export function useDeleteDocument() {
     mutationFn: deleteDocument,
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: ['documents'] })
+    },
+  })
+}
+
+// --- Client-database onboarding (onboarding/, api/onboarding.py, Prompt 26) ---
+// No `refetchInterval`/polling anywhere below: `POST .../discover` and
+// `POST .../publish` are synchronous backend calls (no background worker,
+// see onboarding/jobs.py's own module docstring for why) -- each mutation's
+// own response already carries the job's final status, so there is no
+// in-between state a poll would ever observe that the mutation result
+// doesn't already have.
+
+export function useOnboardingJobs() {
+  return useQuery({ queryKey: ['onboarding-jobs'], queryFn: listOnboardingJobs })
+}
+
+export function useOnboardingJob(jobId: string | null) {
+  return useQuery({
+    queryKey: ['onboarding-job', jobId],
+    queryFn: () => getOnboardingJob(jobId as string),
+    enabled: jobId !== null,
+  })
+}
+
+export function useOnboardingReviewItems(jobId: string | null) {
+  return useQuery({
+    queryKey: ['onboarding-review-items', jobId],
+    queryFn: () => listOnboardingReviewItems(jobId as string),
+    enabled: jobId !== null,
+  })
+}
+
+export function useOnboardingArtifacts(jobId: string | null) {
+  return useQuery({
+    queryKey: ['onboarding-artifacts', jobId],
+    queryFn: () => listOnboardingArtifacts(jobId as string),
+    enabled: jobId !== null,
+  })
+}
+
+export function useCreateOnboardingJob() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: createOnboardingJob,
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: ['onboarding-jobs'] })
+    },
+  })
+}
+
+export function useRunOnboardingDiscovery(jobId: string) {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (payload: RunDiscoveryRequest) => runOnboardingDiscovery(jobId, payload),
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: ['onboarding-job', jobId] })
+      void queryClient.invalidateQueries({ queryKey: ['onboarding-jobs'] })
+      void queryClient.invalidateQueries({ queryKey: ['onboarding-review-items', jobId] })
+    },
+  })
+}
+
+export function useDecideOnboardingReviewItem(jobId: string) {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({ itemId, payload }: { itemId: string; payload: DecideReviewItemRequest }) =>
+      decideOnboardingReviewItem(jobId, itemId, payload),
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: ['onboarding-review-items', jobId] })
+    },
+  })
+}
+
+export function usePublishOnboardingJob(jobId: string) {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (payload: PublishJobRequest) => publishOnboardingJob(jobId, payload),
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: ['onboarding-job', jobId] })
+      void queryClient.invalidateQueries({ queryKey: ['onboarding-jobs'] })
+      void queryClient.invalidateQueries({ queryKey: ['onboarding-artifacts', jobId] })
+    },
+  })
+}
+
+export function useCancelOnboardingJob(jobId: string) {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: () => cancelOnboardingJob(jobId),
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: ['onboarding-job', jobId] })
+      void queryClient.invalidateQueries({ queryKey: ['onboarding-jobs'] })
+    },
+  })
+}
+
+export function useRetryOnboardingJob(jobId: string) {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: () => retryOnboardingJob(jobId),
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: ['onboarding-job', jobId] })
+      void queryClient.invalidateQueries({ queryKey: ['onboarding-jobs'] })
     },
   })
 }

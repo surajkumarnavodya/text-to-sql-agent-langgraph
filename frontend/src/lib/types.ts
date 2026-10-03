@@ -850,3 +850,94 @@ export interface SharedConversation {
   viewer_role: 'owner' | 'member' | 'public_link'
   turns: ProjectedTurn[]
 }
+
+// --- Client-database onboarding (onboarding/, api/onboarding.py) -- mirrors
+// api/onboarding_schemas.py exactly. `db_password` is request-only on the
+// three request types below; it is never a field on `OnboardingJob` --
+// the backend never persists it (see identity/models.py's own docstring),
+// so there is nothing for this UI to accidentally display back. ---
+
+export type OnboardingJobStatus =
+  | 'pending'
+  | 'discovering'
+  | 'awaiting_review'
+  | 'publishing'
+  | 'published'
+  | 'failed'
+  | 'cancelled'
+
+export type OnboardingReviewItemType =
+  | 'pii_classification'
+  | 'relationship'
+  | 'semantic_label'
+  | 'golden_question'
+
+export type OnboardingReviewDecision = 'pending' | 'confirmed' | 'rejected'
+
+export interface CreateOnboardingJobRequest {
+  database_label: string
+  db_type: string
+  db_host?: string | null
+  db_port?: number | null
+  db_name?: string | null
+  db_user?: string | null
+  db_password?: string | null
+  db_schema?: string | null
+}
+
+export interface RunDiscoveryRequest {
+  db_password?: string | null
+  verify_relationships_with_data?: boolean
+  verify_pii_with_data?: boolean
+}
+
+export interface PublishJobRequest {
+  db_password?: string | null
+}
+
+export interface DecideReviewItemRequest {
+  decision: 'confirmed' | 'rejected'
+  notes?: string | null
+}
+
+export interface OnboardingJob {
+  id: string
+  database_label: string
+  db_type: string
+  db_host: string | null
+  db_port: number | null
+  db_name: string | null
+  db_user: string | null
+  db_schema: string | null
+  status: OnboardingJobStatus
+  current_stage: string | null
+  error_message: string | null
+  retry_count: number
+  discovery_summary: Record<string, unknown> | null
+  version: number
+  created_at: string
+  updated_at: string
+}
+
+export interface OnboardingReviewItem {
+  id: string
+  item_type: OnboardingReviewItemType
+  table_name: string | null
+  column_name: string | null
+  subject: string
+  payload: Record<string, unknown>
+  confidence: number
+  is_ambiguous: boolean
+  decision: OnboardingReviewDecision
+  decided_at: string | null
+  decision_notes: string | null
+  created_at: string
+}
+
+export interface OnboardingArtifact {
+  id: string
+  artifact_type: 'semantic_contract' | 'golden_questions' | 'evaluation_report'
+  content: Record<string, unknown>
+  version: number
+  created_at: string
+}

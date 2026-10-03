@@ -20,6 +20,7 @@ guess which of two copies to update, or accidentally leaves one stale.
 | SQL context (schema, plan, validation, results) | Inline, per conversation turn (`TurnCard.tsx`'s collapsible sections) | **Not** a persistent right-side panel — see "Why no separate context panel" below |
 | Image editing | Image attachment chip / message actions only | Opens `ImageEditor` (lazy-loaded) for that specific attachment; never appears in `SettingsDialog` or any global menu |
 | Page navigation (Chat / Knowledge Sources / Media Search) | Header nav tabs | Plain client-side routes (`react-router`), unrelated to account/settings actions, kept in the header since it's genuine cross-page navigation, not a duplicated setting |
+| Database Onboarding (Prompt 26) | Header nav tab, **gated on role** (`admin`/`analyst`, read from `useLocalAuthStore`) | The one nav tab that isn't always visible — unlike every other entry in this table, it has no useful read-only purpose for an account with neither role, so it's omitted rather than shown leading nowhere. UX-only gating; the real enforcement is server-side (`api/onboarding.py`'s own `ONBOARDING_MANAGE`/`ONBOARDING_REVIEW` checks) |
 
 ## Theme: the one deliberate exception, and why
 
