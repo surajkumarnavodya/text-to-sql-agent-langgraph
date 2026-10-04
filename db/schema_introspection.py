@@ -318,6 +318,37 @@ def _build_column_info(col: ReflectedColumn) -> ColumnInfo:
     )
 
 
+def _unique_column_sets(
+    inspector: Inspector, name: str, schema: str | None
+) -> tuple[tuple[str, ...], ...]:
+    """Column sets that are guaranteed unique in one table.
+
+    Prefers the dialect's own UNIQUE-constraint reflection. Some dialects do not
+    implement it -- SQLAlchemy 2.0's mssql dialect raises NotImplementedError --
+    so fall back to UNIQUE indexes, which enforce the same guarantee for the
+    relationship-inference check. An unsupported or failing reflection yields no
+    unique sets rather than skipping the whole table.
+    """
+    try:
+        return tuple(
+            tuple(uc["column_names"])
+            for uc in inspector.get_unique_constraints(name, schema=schema)
+            if uc.get("column_names")
+        )
+    except NotImplementedError:
+        pass
+    try:
+        return tuple(
+            tuple(ix["column_names"])
+            for ix in inspector.get_indexes(name, schema=schema)
+            if ix.get("unique")
+            and ix.get("column_names")
+            and all(col is not None for col in ix["column_names"])
+        )
+    except NotImplementedError:
+        return ()
+
+
 def _introspect_one(
     inspector: Inspector,
     name: str,
@@ -359,11 +390,7 @@ def _introspect_one(
             for fk in inspector.get_foreign_keys(name, schema=schema)
             if fk.get("constrained_columns") and fk.get("referred_table")
         )
-        unique_constraints = tuple(
-            tuple(uc["column_names"])
-            for uc in inspector.get_unique_constraints(name, schema=schema)
-            if uc.get("column_names")
-        )
+        unique_constraints = _unique_column_sets(inspector, name, schema)
 
     ddl = render_ddl(name, columns, foreign_keys, is_view=is_view)
 

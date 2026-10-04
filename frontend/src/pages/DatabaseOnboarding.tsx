@@ -15,6 +15,7 @@ import {
   useOnboardingJobs,
   useOnboardingReviewItems,
   usePublishOnboardingJob,
+  useRegisterOnboardingJobForChat,
   useRetryOnboardingJob,
   useRunOnboardingDiscovery,
 } from '@/hooks/queries'
@@ -247,6 +248,68 @@ function JobWorkspace({
           </CardContent>
         </Card>
       )}
+
+      {current.status === 'published' && canManage && (
+        <Card>
+          <CardHeader>
+            <CardTitle className="text-sm">Chat availability</CardTitle>
+          </CardHeader>
+          <CardContent>
+            <ChatRegistrationAction job={current} />
+          </CardContent>
+        </Card>
+      )}
+    </div>
+  )
+}
+
+/** Registers a published database as a configured chat connection (`.env`
+ * `DB_CONNECTIONS` + this process). Publish does this automatically; this
+ * covers a job published before that existed, or one whose registration
+ * failed. Re-enter the password -- it is used once and never stored. */
+function ChatRegistrationAction({ job }: { job: OnboardingJob }) {
+  const register = useRegisterOnboardingJobForChat(job.id)
+  const [password, setPassword] = useState('')
+  const [error, setError] = useState<string | null>(null)
+  const [message, setMessage] = useState<string | null>(null)
+
+  const handleRegister = async () => {
+    setError(null)
+    setMessage(null)
+    try {
+      const result = await register.mutateAsync({ db_password: password || null })
+      setPassword('')
+      setMessage(
+        result.newly_added
+          ? `Available to chat as "${result.connection_name}".`
+          : `Already available to chat as "${result.connection_name}".`,
+      )
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : 'Could not make this database available to chat.')
+    }
+  }
+
+  return (
+    <div className="flex flex-col gap-2 rounded-md border border-[var(--border)] p-3">
+      <p className="text-xs text-[var(--muted-foreground)]">
+        Chat only answers questions from databases listed in the server configuration. Registering
+        adds this database there and indexes its schema.
+      </p>
+      <label className="text-xs font-medium text-[var(--muted-foreground)]" htmlFor={`chat-pw-${job.id}`}>
+        Re-enter the database password to make it available to chat
+      </label>
+      <input
+        id={`chat-pw-${job.id}`}
+        type="password"
+        value={password}
+        onChange={(event) => setPassword(event.target.value)}
+        className="w-full rounded-md border border-[var(--border)] bg-[var(--background)] px-3 py-1.5 text-sm"
+      />
+      {error && <p className="text-sm text-[var(--danger)]">{error}</p>}
+      {message && <p className="text-sm text-[var(--success)]">{message}</p>}
+      <Button size="sm" onClick={handleRegister} disabled={register.isPending}>
+        {register.isPending ? 'Registering…' : 'Make available to chat'}
+      </Button>
     </div>
   )
 }

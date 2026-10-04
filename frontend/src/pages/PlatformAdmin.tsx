@@ -25,7 +25,6 @@ import {
 } from '@/hooks/queries'
 import { ApiError } from '@/lib/api'
 import type { PlatformUserOut, TenantOut } from '@/lib/types'
-import { useLocalAuthStore } from '@/store/localAuthStore'
 
 /** The global platform-admin dashboard -- Prompt 28, gated on
  * `identity.rbac.Permission.PLATFORM_ADMIN` (the `platform_admin` role),

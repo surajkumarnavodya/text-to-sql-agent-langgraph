@@ -31,6 +31,7 @@ import {
   listOnboardingJobs,
   listOnboardingReviewItems,
   publishOnboardingJob,
+  registerOnboardingJobForChat,
   retryOnboardingJob,
   runOnboardingDiscovery,
 } from '@/lib/onboardingApi'
@@ -238,6 +239,17 @@ export function usePublishOnboardingJob(jobId: string) {
       void queryClient.invalidateQueries({ queryKey: ['onboarding-job', jobId] })
       void queryClient.invalidateQueries({ queryKey: ['onboarding-jobs'] })
       void queryClient.invalidateQueries({ queryKey: ['onboarding-artifacts', jobId] })
+    },
+  })
+}
+
+export function useRegisterOnboardingJobForChat(jobId: string) {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (payload: PublishJobRequest) => registerOnboardingJobForChat(jobId, payload),
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: ['health'] })
+      void queryClient.invalidateQueries({ queryKey: ['schema-tables'] })
     },
   })
 }
@@ -526,7 +538,12 @@ export function useTenantAuditEvents() {
 }
 
 export function useTenantRecommendations() {
-  return useQuery({ queryKey: ['tenant-admin-recommendations'], queryFn: listTenantRecommendations })
+  // Wrapped so React Query's query-context argument is not passed through as
+  // `listRecommendations`'s optional filters parameter.
+  return useQuery({
+    queryKey: ['tenant-admin-recommendations'],
+    queryFn: () => listTenantRecommendations(),
+  })
 }
 
 export function useTenantRecommendationQualityMetrics() {

@@ -101,7 +101,10 @@ export function AppShell() {
               </span>
             </div>
 
-              <nav aria-label="Primary navigation" className="flex gap-1">
+              {/* min-w-0 + overflow-x-auto: on mid-width windows the tabs scroll
+                  inside the header instead of being clipped off-screen by the
+                  root's overflow-hidden. */}
+              <nav aria-label="Primary navigation" className="flex min-w-0 flex-1 gap-1 overflow-x-auto">
                 {screens.map((screen) => {
                   const presentation = SCREEN_PRESENTATION[screen.id]
                   if (!presentation) return null

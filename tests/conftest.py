@@ -73,6 +73,23 @@ def _isolate_settings_from_real_environment(monkeypatch: pytest.MonkeyPatch) -> 
 
 
 @pytest.fixture(autouse=True)
+def _isolate_published_database_registration(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A publish in any test must never write the real project `.env`.
+
+    Points the registration at a temporary file and turns off the in-process
+    `os.environ` update, so a publish test can't leak a `DB_CONNECTIONS` entry
+    into the real configuration or into later tests.
+    """
+    import api.onboarding as onboarding_routes
+    import onboarding.env_registration as env_registration
+
+    monkeypatch.setattr(env_registration, "DEFAULT_ENV_PATH", tmp_path / "test.env")
+    monkeypatch.setattr(onboarding_routes, "apply_to_runtime", lambda result: None)
+
+
+@pytest.fixture(autouse=True)
 def _clear_process_singleton_caches() -> None:
     """Clears the `functools.cache`/`lru_cache`-backed singletons built once
     per process (compiled LangGraph graphs, the cached Ollama client, the
