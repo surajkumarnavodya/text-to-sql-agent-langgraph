@@ -2205,7 +2205,7 @@ class Settings(BaseSettings):
     web_search_provider: str = "tavily"
     web_search_api_key: SecretStr | None = None
     web_search_max_results: int = Field(default=5, gt=0)
-    web_search_answer_max_tokens: int = Field(default=1200, gt=0)
+    web_search_answer_max_tokens: int = Field(default=2400, gt=0)
     enable_media_generation: bool = False
     ima_api_key: SecretStr | None = None
     ima_api_base_url: str = "https://api.imastudio.com"
