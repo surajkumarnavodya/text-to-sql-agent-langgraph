@@ -69,11 +69,11 @@ export function ConversationList({
   return (
     <>
       {groups.map((group) => (
-        <div key={group.key} className="mb-3">
-          <p className="px-1 py-1.5 text-xs font-semibold uppercase tracking-wide text-[var(--muted-foreground)]">
+        <div key={group.key} className="mb-2">
+          <p className="px-1 py-1 text-[11px] font-semibold uppercase tracking-wide text-[var(--muted-foreground)]">
             {t(GROUP_LABEL_KEYS[group.key])}
           </p>
-          <div className="flex flex-col gap-0.5">
+          <div className="flex flex-col gap-px">
             {group.items.map((conversation) => (
               <ConversationListItem
                 key={conversation.id}

@@ -384,24 +384,6 @@ export function groupConversationsByRecency(
     .filter((group) => group.items.length > 0)
 }
 
-/** Compact "3m ago"/"Yesterday"-style timestamp for a history item --
- * deliberately never the raw ISO string or a full date+time, which would
- * read as a technical/internal detail rather than a normal chat product
- * timestamp. */
-export function formatRelativeTime(iso: string): string {
-  const then = new Date(iso).getTime()
-  const diffSeconds = Math.max(0, Math.round((Date.now() - then) / 1000))
-  if (diffSeconds < 60) return 'Just now'
-  const diffMinutes = Math.round(diffSeconds / 60)
-  if (diffMinutes < 60) return `${diffMinutes}m ago`
-  const diffHours = Math.round(diffMinutes / 60)
-  if (diffHours < 24) return `${diffHours}h ago`
-  const diffDays = Math.round(diffHours / 24)
-  if (diffDays === 1) return 'Yesterday'
-  if (diffDays < 7) return `${diffDays}d ago`
-  return new Date(iso).toLocaleDateString(undefined, { month: 'short', day: 'numeric' })
-}
-
 export const MAX_FOLLOWUP_EXCHANGES = 3
 
 export function newHistoryEntry(

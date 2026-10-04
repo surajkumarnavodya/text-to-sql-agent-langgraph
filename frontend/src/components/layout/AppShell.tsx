@@ -16,6 +16,7 @@ import { cn } from '@/lib/utils'
 import { useNavigation } from '@/hooks/queries'
 import { useSettingsStore } from '@/store/settingsStore'
 import { MobileNav } from './MobileNav'
+import { ScreenMenu, type ScreenMenuGroup } from './ScreenMenu'
 import { SettingsDialog } from './SettingsDialog'
 import { Sidebar } from './Sidebar'
 import { SidebarToggle } from './SidebarToggle'
@@ -36,6 +37,17 @@ const SCREEN_PRESENTATION: Record<string, { icon: typeof MessageSquare; labelKey
   tenant_admin: { icon: Building2, labelKey: 'nav.tenantAdmin' },
   platform_admin: { icon: ShieldAlert, labelKey: 'nav.platformAdmin' },
 }
+
+/** The one screen kept as a top-level header tab. Every other screen the
+ * server lists goes into the header's Menu dropdown (ScreenMenu). */
+const PRIMARY_SCREEN_ID = 'chat'
+
+/** Menu sections, in display order, keyed by the server's `group` field. */
+const MENU_GROUPS: { key: 'workspace' | 'review' | 'administration'; labelKey: string }[] = [
+  { key: 'workspace', labelKey: 'nav.groupWorkspace' },
+  { key: 'review', labelKey: 'nav.groupReview' },
+  { key: 'administration', labelKey: 'nav.groupAdministration' },
+]
 
 /** Full-viewport application shell: a persistent left conversation-history
  * sidebar (>=lg viewports, collapsible to an icon rail) + main workspace.
@@ -60,6 +72,20 @@ export function AppShell() {
   // shown rather than guessed at.
   const navigation = useNavigation()
   const screens = navigation.data?.items ?? []
+  // Only screens the server listed AND this file knows how to draw. Anything
+  // the server doesn't list is never present here, so it can't appear in the
+  // header or the menu.
+  const drawableScreens = screens.flatMap((screen) => {
+    const presentation = SCREEN_PRESENTATION[screen.id]
+    if (!presentation) return []
+    return [{ id: screen.id, path: screen.path, group: screen.group, icon: presentation.icon, label: t(presentation.labelKey) }]
+  })
+  const primaryScreens = drawableScreens.filter((screen) => screen.id === PRIMARY_SCREEN_ID)
+  const menuGroups: ScreenMenuGroup[] = MENU_GROUPS.map(({ key, labelKey }) => ({
+    key,
+    labelKey,
+    items: drawableScreens.filter((screen) => screen.id !== PRIMARY_SCREEN_ID && screen.group === key),
+  })).filter((group) => group.items.length > 0)
   const sidebarCollapsed = useSettingsStore((state) => state.sidebarCollapsed)
   // Passed to both UserMenu (attaches it to the avatar button) and
   // SettingsDialog (restores focus there on close) -- see
@@ -101,22 +127,11 @@ export function AppShell() {
               </span>
             </div>
 
-              {/* min-w-0 + overflow-x-auto: on mid-width windows the tabs scroll
-                  inside the header instead of being clipped off-screen by the
-                  root's overflow-hidden. */}
-              <nav aria-label="Primary navigation" className="flex min-w-0 flex-1 gap-1 overflow-x-auto">
-                {screens.map((screen) => {
-                  const presentation = SCREEN_PRESENTATION[screen.id]
-                  if (!presentation) return null
-                  return (
-                    <NavTab
-                      key={screen.id}
-                      to={screen.path}
-                      icon={presentation.icon}
-                      label={t(presentation.labelKey)}
-                    />
-                  )
-                })}
+              <nav aria-label="Primary navigation" className="flex min-w-0 flex-1 items-center gap-1">
+                {primaryScreens.map((screen) => (
+                  <NavTab key={screen.id} to={screen.path} icon={screen.icon} label={screen.label} />
+                ))}
+                {menuGroups.length > 0 && <ScreenMenu groups={menuGroups} />}
               </nav>
 
             <div className="ml-auto flex items-center gap-1.5">
@@ -156,7 +171,7 @@ function NavTab({ to, icon: Icon, label }: { to: string; icon: typeof MessageSqu
       aria-label={label}
       className={({ isActive }) =>
         cn(
-          'flex items-center gap-1.5 rounded-md px-2.5 py-1.5 text-sm font-medium transition-colors sm:px-3',
+          'flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-md px-2.5 py-1.5 text-sm font-medium transition-colors sm:px-3',
           isActive
             ? 'bg-[var(--accent-soft)] text-[var(--accent)]'
             : 'text-[var(--muted-foreground)] hover:bg-[var(--muted)] hover:text-[var(--foreground)]',

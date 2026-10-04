@@ -52,7 +52,11 @@
     "semanticReview": "SME Semantic Review",
     "recommendations": "Recommendations",
     "platformAdmin": "Platform Admin",
-    "tenantAdmin": "Tenant Admin"
+    "tenantAdmin": "Tenant Admin",
+    "menu": "Menu",
+    "groupWorkspace": "Workspace",
+    "groupReview": "Review",
+    "groupAdministration": "Administration"
   },
   "header": {
     "openHistory": "Open chat history",

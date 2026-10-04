@@ -1,5 +1,6 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
-import { render, screen, waitFor } from '@testing-library/react'
+import { render, screen, waitFor, within } from '@testing-library/react'
+import userEvent from '@testing-library/user-event'
 import { MemoryRouter } from 'react-router-dom'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { App } from '@/App'
@@ -115,12 +116,13 @@ describe('header navigation reflects the same server decision', () => {
     renderAppAt('/')
 
     const primary = await screen.findByRole('navigation', { name: 'Primary navigation' })
-    await waitFor(() => expect(primary.querySelectorAll('a').length).toBeGreaterThan(0))
-    const names = Array.from(primary.querySelectorAll('a')).map((link) => link.getAttribute('aria-label'))
-    expect(names).toEqual(
-      expect.arrayContaining(['Chat', 'Knowledge Sources', 'Media Search', 'Recommendations', 'Database Onboarding', 'SME Semantic Review']),
+    await waitFor(() => expect(within(primary).getByRole('link', { name: 'Chat' })).toBeInTheDocument())
+    await userEvent.click(within(primary).getByRole('button', { name: 'Menu' }))
+    const items = screen.getAllByRole('menuitem').map((item) => item.textContent?.trim())
+    expect(items).toEqual(
+      expect.arrayContaining(['Knowledge Sources', 'Media Search', 'Recommendations', 'Database Onboarding', 'SME Semantic Review']),
     )
-    expect(names).not.toContain('Tenant Admin')
-    expect(names).not.toContain('Platform Admin')
+    expect(items).not.toContain('Tenant Admin')
+    expect(items).not.toContain('Platform Admin')
   })
 })

@@ -1,4 +1,4 @@
-import { Check, MoreHorizontal, Pencil, Share2, Trash2, X } from 'lucide-react'
+import { Check, Loader2, MoreHorizontal, Pencil, Share2, Trash2, X } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
 import { Button } from '@/components/ui/button'
 import {
@@ -7,25 +7,8 @@ import {
   DropdownMenuItem,
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu'
-import { formatRelativeTime, type ConversationSummary } from '@/lib/history'
+import type { ConversationSummary } from '@/lib/history'
 import { cn } from '@/lib/utils'
-
-const STATUS_TONE: Record<string, string> = {
-  succeeded: 'bg-[var(--success)]',
-  failed: 'bg-[var(--danger)]',
-  rejected: 'bg-[var(--danger)]',
-  rate_limited: 'bg-[var(--warning)]',
-  needs_clarification: 'bg-[var(--warning)]',
-}
-
-function StatusDot({ status }: { status: string }) {
-  return (
-    <span
-      className={cn('inline-block h-1.5 w-1.5 rounded-full', STATUS_TONE[status] ?? 'bg-[var(--muted-foreground)]')}
-      aria-hidden="true"
-    />
-  )
-}
 
 export interface ConversationListItemProps {
   conversation: ConversationSummary
@@ -60,12 +43,11 @@ export function ConversationListItem({
   onShare,
 }: ConversationListItemProps) {
   const { t } = useTranslation()
-  const lastEntry = conversation.entries.at(-1)
 
   return (
     <div
       className={cn(
-        'group flex items-center gap-1 rounded-md px-2 py-2 text-left text-sm transition-colors',
+        'group flex items-center gap-1 rounded px-2 py-1 text-left text-[13px] leading-5 transition-colors',
         isActive ? 'bg-[var(--accent-soft)] text-[var(--accent)]' : 'hover:bg-[var(--muted)]',
       )}
     >
@@ -80,7 +62,7 @@ export function ConversationListItem({
               if (event.key === 'Escape') onCancelRename()
             }}
             aria-label={t('history.rename')}
-            className="h-7 flex-1 rounded border border-[var(--border)] bg-[var(--input)] px-1.5 text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--focus-ring)]"
+            className="h-6 flex-1 rounded border border-[var(--border)] bg-[var(--input)] px-1.5 text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--focus-ring)]"
           />
           <Button size="icon" variant="ghost" onClick={onCommitRename} aria-label={t('common.save')}>
             <Check className="h-3.5 w-3.5" />
@@ -95,25 +77,22 @@ export function ConversationListItem({
             type="button"
             onClick={onSelect}
             aria-current={isActive ? 'true' : undefined}
-            className="flex min-w-0 flex-1 flex-col items-start gap-0.5 text-left"
+            className="flex min-w-0 flex-1 items-center gap-1.5 text-left"
           >
-            <span className="w-full truncate font-medium">{conversation.title}</span>
-            <span className="flex items-center gap-1.5 text-xs text-[var(--muted-foreground)]">
-              {isActive && isLoading ? t('history.loadingConversation') : formatRelativeTime(conversation.updatedAt)}
-              {lastEntry && (
-                <>
-                  <span aria-hidden="true">·</span>
-                  <StatusDot status={lastEntry.agentStatus} />
-                </>
-              )}
-            </span>
+            <span className="min-w-0 flex-1 truncate font-medium">{conversation.title}</span>
+            {isActive && isLoading && (
+              <>
+                <Loader2 className="h-3 w-3 shrink-0 animate-spin" aria-hidden="true" />
+                <span className="sr-only">{t('history.loadingConversation')}</span>
+              </>
+            )}
           </button>
           <DropdownMenu>
             <DropdownMenuTrigger asChild>
               <Button
                 size="icon"
                 variant="ghost"
-                className="shrink-0 opacity-0 focus-visible:opacity-100 group-hover:opacity-100"
+                className="h-6 w-6 shrink-0 p-0 opacity-0 focus-visible:opacity-100 group-hover:opacity-100"
                 aria-label={`${t('history.rename')} / ${t('share.menuItem')} / ${t('history.delete')}`}
               >
                 <MoreHorizontal className="h-3.5 w-3.5" />

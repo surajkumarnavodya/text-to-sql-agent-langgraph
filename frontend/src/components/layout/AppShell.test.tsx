@@ -45,6 +45,17 @@ function signOut() {
 
 beforeEach(() => serveNavigation(vi.mocked(navigationApi.getNavigation), null))
 
+/** Non-Chat screens live in the header's Menu dropdown. Opens it (once) and
+ * returns the matching menu item, or null if no menu is rendered at all. */
+async function findScreenItem(name: RegExp) {
+  // `hidden: true`: while the menu is open, Radix marks the rest of the page
+  // aria-hidden, so the trigger must be looked up past that to toggle it.
+  const trigger = screen.queryByRole('button', { name: 'Menu', hidden: true })
+  if (!trigger) return null
+  if (trigger.getAttribute('aria-expanded') !== 'true') await userEvent.click(trigger)
+  return screen.queryByRole('menuitem', { name })
+}
+
 /** Renders and waits until the server navigation response has been applied.
  * Without this, a `queryByRole(...).not` assertion passes before any tab data
  * has arrived, which proves nothing. */
@@ -111,29 +122,29 @@ describe('AppShell role-gated review-tool nav gating', () => {
   it('shows both review tabs for an admin', async () => {
     signInAs(['admin'])
     await renderAndSettle()
-    expect(screen.getByRole('link', { name: /database onboarding/i })).toBeInTheDocument()
-    expect(screen.getByRole('link', { name: /sme semantic review/i })).toBeInTheDocument()
+    expect(await findScreenItem(/database onboarding/i)).toBeInTheDocument()
+    expect(await findScreenItem(/sme semantic review/i)).toBeInTheDocument()
   })
 
   it('shows both review tabs for an analyst', async () => {
     signInAs(['analyst'])
     await renderAndSettle()
-    expect(screen.getByRole('link', { name: /database onboarding/i })).toBeInTheDocument()
-    expect(screen.getByRole('link', { name: /sme semantic review/i })).toBeInTheDocument()
+    expect(await findScreenItem(/database onboarding/i)).toBeInTheDocument()
+    expect(await findScreenItem(/sme semantic review/i)).toBeInTheDocument()
   })
 
   it('hides both review tabs for a plain user', async () => {
     signInAs(['user'])
     await renderAndSettle()
-    expect(screen.queryByRole('link', { name: /database onboarding/i })).not.toBeInTheDocument()
-    expect(screen.queryByRole('link', { name: /sme semantic review/i })).not.toBeInTheDocument()
+    expect(await findScreenItem(/database onboarding/i)).toBeNull()
+    expect(await findScreenItem(/sme semantic review/i)).toBeNull()
   })
 
   it('hides both review tabs when signed out', async () => {
     signOut()
     await renderAndSettle()
-    expect(screen.queryByRole('link', { name: /database onboarding/i })).not.toBeInTheDocument()
-    expect(screen.queryByRole('link', { name: /sme semantic review/i })).not.toBeInTheDocument()
+    expect(await findScreenItem(/database onboarding/i)).toBeNull()
+    expect(await findScreenItem(/sme semantic review/i)).toBeNull()
   })
 })
 
@@ -153,19 +164,19 @@ describe('AppShell Platform Admin nav gating', () => {
   it('hides the Platform Admin tab for a plain tenant admin', async () => {
     signInAs(['admin'])
     await renderAndSettle()
-    expect(screen.queryByRole('link', { name: /platform admin/i })).not.toBeInTheDocument()
+    expect(await findScreenItem(/platform admin/i)).toBeNull()
   })
 
   it('shows the Platform Admin tab only for the platform_admin role', async () => {
     signInAs(['platform_admin'])
     await renderAndSettle()
-    expect(screen.getByRole('link', { name: /platform admin/i })).toBeInTheDocument()
+    expect(await findScreenItem(/platform admin/i)).toBeInTheDocument()
   })
 
   it('hides the Platform Admin tab when signed out', async () => {
     signOut()
     await renderAndSettle()
-    expect(screen.queryByRole('link', { name: /platform admin/i })).not.toBeInTheDocument()
+    expect(await findScreenItem(/platform admin/i)).toBeNull()
   })
 })
 
@@ -183,30 +194,30 @@ describe('AppShell Tenant Admin nav gating', () => {
   it('shows the Tenant Admin tab for an admin', async () => {
     signInAs(['admin'])
     await renderAndSettle()
-    expect(screen.getByRole('link', { name: /tenant admin/i })).toBeInTheDocument()
+    expect(await findScreenItem(/tenant admin/i)).toBeInTheDocument()
   })
 
   it('shows the Tenant Admin tab for an auditor', async () => {
     signInAs(['auditor'])
     await renderAndSettle()
-    expect(screen.getByRole('link', { name: /tenant admin/i })).toBeInTheDocument()
+    expect(await findScreenItem(/tenant admin/i)).toBeInTheDocument()
   })
 
   it('shows the Tenant Admin tab for a manager', async () => {
     signInAs(['manager'])
     await renderAndSettle()
-    expect(screen.getByRole('link', { name: /tenant admin/i })).toBeInTheDocument()
+    expect(await findScreenItem(/tenant admin/i)).toBeInTheDocument()
   })
 
   it('hides the Tenant Admin tab for a plain user or analyst', async () => {
     signInAs(['analyst'])
     await renderAndSettle()
-    expect(screen.queryByRole('link', { name: /tenant admin/i })).not.toBeInTheDocument()
+    expect(await findScreenItem(/tenant admin/i)).toBeNull()
   })
 
   it('hides the Tenant Admin tab when signed out', async () => {
     signOut()
     await renderAndSettle()
-    expect(screen.queryByRole('link', { name: /tenant admin/i })).not.toBeInTheDocument()
+    expect(await findScreenItem(/tenant admin/i)).toBeNull()
   })
 })
