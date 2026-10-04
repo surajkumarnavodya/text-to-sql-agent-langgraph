@@ -1218,6 +1218,9 @@ class HealthResponse(BaseModel):
     ollama: ComponentHealth
     voice_enabled: bool
     media_search_enabled: bool
+    # Whether "Anyone with the link" sharing is allowed on this server. Lets the
+    # share dialog hide an option the server would otherwise refuse with a 400.
+    share_public_links_enabled: bool = False
     # Capability discovery for the React dashboard's login gate
     # (frontend/src/store/localAuthStore.ts) -- same "an infra flag the
     # frontend reads from GET /health, not a build-time guess" shape as

@@ -5,6 +5,13 @@ import * as shareApi from '@/lib/shareApi'
 import type { Share } from '@/lib/types'
 import { ShareModal } from './ShareModal'
 
+// The dialog reads the server's public-link setting from /health. Enabled here
+// so the "anyone with the link" path is exercised; the disabled case has its own test below.
+const health = vi.hoisted(() => ({ share_public_links_enabled: true }))
+vi.mock('@/hooks/queries', () => ({
+  useHealth: () => ({ data: health }),
+}))
+
 vi.mock('@/lib/shareApi', async (importOriginal) => {
   const actual = await importOriginal<typeof import('@/lib/shareApi')>()
   return {
@@ -145,11 +152,27 @@ describe('ShareModal', () => {
     await waitFor(() => expect(shareApi.revokeShare).toHaveBeenCalledWith('conv-1', 1))
   })
 
-  it('never renders the raw link value anywhere except right after create/regenerate', async () => {
-    vi.mocked(shareApi.getShare).mockResolvedValue(makeShare({ access_mode: 'invite_only' }))
+  it('shows the invitee link (share id, gated by membership) and never a one-time public token for invite-only sharing', async () => {
+    const share = makeShare({ access_mode: 'invite_only' })
+    vi.mocked(shareApi.getShare).mockResolvedValue(share)
     render(<ShareModal conversationId="conv-1" conversationTitle="My chat" onClose={vi.fn()} />)
 
     await waitFor(() => screen.getByText(/only invited people/i))
-    expect(screen.queryByText(/\/shared\//)).not.toBeInTheDocument()
+    expect(screen.getByText(new RegExp(`/shared/${share.id}`))).toBeInTheDocument()
+    expect(screen.queryByText(/regenerate/i)).not.toBeInTheDocument()
+  })
+
+  it('offers "anyone with the link" as unavailable, with the reason, when the server has public links off', async () => {
+    health.share_public_links_enabled = false
+    try {
+      vi.mocked(shareApi.getShare).mockResolvedValue(makeShare({ access_mode: 'invite_only' }))
+      render(<ShareModal conversationId="conv-1" conversationTitle="My chat" onClose={vi.fn()} />)
+
+      await waitFor(() => screen.getByText(/only invited people/i))
+      expect(screen.getByRole('radio', { name: /anyone with the link/i })).toBeDisabled()
+      expect(screen.getByText(/turned off on this server/i)).toBeInTheDocument()
+    } finally {
+      health.share_public_links_enabled = true
+    }
   })
 })

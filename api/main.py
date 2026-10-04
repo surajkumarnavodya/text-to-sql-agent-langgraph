@@ -1036,6 +1036,9 @@ def health(response: Response) -> HealthResponse:
         databases=databases,
         ollama=ollama_health,
         voice_enabled=settings.enable_voice_mode,
+        share_public_links_enabled=bool(
+            settings.enable_conversation_sharing and settings.share_public_links_enabled
+        ),
         media_search_enabled=settings.enable_media_search,
         local_auth_enabled=settings.local_auth_enabled,
         # `google_client_id` is a PUBLIC identifier, never a secret (see

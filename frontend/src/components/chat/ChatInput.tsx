@@ -65,7 +65,7 @@ function resizeToFitContent(el: HTMLTextAreaElement): void {
  * straight into the textarea, same as if it had been typed -- the user
  * reviews/edits it there and presses the existing Send button (or Enter)
  * to confirm; nothing is ever auto-submitted. */
-export function ChatInput() {
+export function ChatInput({ onSend }: { onSend?: () => void } = {}) {
   const { t } = useTranslation()
   const [value, setValue] = useState('')
   // True only while `value` is (still) exactly what voice transcription
@@ -196,11 +196,15 @@ export function ChatInput() {
             : (item.editedDataUrl ?? URL.createObjectURL(item.file)),
       }))
 
-    const entry = await askQuestion(trimmed, {
+    // Start the request first, then let the host screen react (the shared
+    // view navigates to the chat screen, which shows this pending question).
+    const pendingAnswer = askQuestion(trimmed, {
       originatedFromVoice: voiceOriginated,
       attachmentIds: submissionAttachmentIds,
       sentAttachments,
     })
+    onSend?.()
+    const entry = await pendingAnswer
 
     // Clear the composer's pending attachment chips once the backend has
     // actually accepted and answered the request -- a non-empty

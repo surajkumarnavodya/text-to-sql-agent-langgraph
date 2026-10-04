@@ -3,7 +3,7 @@ import { MemoryRouter, Route, Routes } from 'react-router-dom'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import * as shareApi from '@/lib/shareApi'
 import type { SharedConversation as SharedConversationData } from '@/lib/types'
-import { SharedConversation } from './SharedConversation'
+import { SharedConversation, SharedEntry } from './SharedConversation'
 
 const { FakeApiError } = vi.hoisted(() => {
   class FakeApiError extends Error {
@@ -23,9 +23,17 @@ vi.mock('@/lib/shareApi', async (importOriginal) => {
   const actual = await importOriginal<typeof import('@/lib/shareApi')>()
   return { ...actual, getSharedConversation: vi.fn() }
 })
+const auth = vi.hoisted(() => ({ user: null as null | { id: string } }))
 vi.mock('@/store/localAuthStore', () => ({
-  useLocalAuthStore: { getState: () => ({ initialize: vi.fn().mockResolvedValue(undefined) }) },
+  useLocalAuthStore: Object.assign(
+    (selector: (state: { user: typeof auth.user }) => unknown) => selector({ user: auth.user }),
+    { getState: () => ({ initialize: vi.fn().mockResolvedValue(undefined) }) },
+  ),
 }))
+vi.mock('@/components/layout/AppShell', () => ({
+  AppShell: ({ children }: { children: React.ReactNode }) => <div data-testid="app-shell">{children}</div>,
+}))
+vi.mock('@/components/chat/ChatInput', () => ({ ChatInput: () => <div data-testid="composer" /> }))
 
 function renderAt(ref: string) {
   return render(
@@ -98,7 +106,7 @@ describe('SharedConversation', () => {
     vi.mocked(shareApi.getSharedConversation).mockResolvedValue(makeConversation())
     renderAt('share-1')
 
-    await waitFor(() => expect(screen.getByText('How many orders were there?')).toBeInTheDocument())
+    await waitFor(() => expect(screen.getAllByText('How many orders were there?').length).toBeGreaterThan(0))
     expect(screen.getByText('There were 42 orders.')).toBeInTheDocument()
     expect(screen.getByText('SELECT COUNT(*) FROM orders')).toBeInTheDocument()
   })
@@ -136,5 +144,65 @@ describe('SharedConversation', () => {
 
     await waitFor(() => screen.getByText('Revenue last quarter'))
     expect(screen.getByText(/snapshot captured/i)).toBeInTheDocument()
+  })
+})
+
+describe('SharedEntry -- signed-in vs anonymous viewers', () => {
+  afterEach(() => {
+    auth.user = null
+  })
+
+  function renderEntry(ref: string) {
+    return render(
+      <MemoryRouter initialEntries={[`/shared/${ref}`]}>
+        <Routes>
+          <Route path="/shared/:ref" element={<SharedEntry />} />
+        </Routes>
+      </MemoryRouter>,
+    )
+  }
+
+  it('gives a signed-in viewer the normal app shell with the new-chat composer', async () => {
+    auth.user = { id: 'u1' }
+    vi.mocked(shareApi.getSharedConversation).mockResolvedValue(makeConversation())
+    renderEntry('share-1')
+
+    await waitFor(() => expect(screen.getByText('There were 42 orders.')).toBeInTheDocument())
+    expect(screen.getByTestId('app-shell')).toBeInTheDocument()
+    expect(screen.getByTestId('composer')).toBeInTheDocument()
+  })
+
+  it('keeps anonymous visitors on the standalone page, with no app shell and no composer', async () => {
+    auth.user = null
+    vi.mocked(shareApi.getSharedConversation).mockResolvedValue(makeConversation())
+    renderEntry('share-1')
+
+    await waitFor(() => expect(screen.getByText('There were 42 orders.')).toBeInTheDocument())
+    expect(screen.queryByTestId('app-shell')).not.toBeInTheDocument()
+    expect(screen.queryByTestId('composer')).not.toBeInTheDocument()
+  })
+})
+
+describe('SharedEntry -- sidebar history for a signed-in viewer', () => {
+  afterEach(() => {
+    auth.user = null
+  })
+
+  it('loads the signed-in viewer\'s chat history, since this route sits outside AuthGate', async () => {
+    const { useChatStore } = await import('@/store/chatStore')
+    const hydrate = vi.fn().mockResolvedValue(undefined)
+    useChatStore.setState({ hydrateHistoryFromServer: hydrate } as never)
+    auth.user = { id: 'u1' }
+    vi.mocked(shareApi.getSharedConversation).mockResolvedValue(makeConversation())
+
+    render(
+      <MemoryRouter initialEntries={['/shared/share-1']}>
+        <Routes>
+          <Route path="/shared/:ref" element={<SharedEntry />} />
+        </Routes>
+      </MemoryRouter>,
+    )
+
+    await waitFor(() => expect(hydrate).toHaveBeenCalled())
   })
 })

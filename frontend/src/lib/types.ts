@@ -676,6 +676,8 @@ export interface HealthResponse {
   status: 'ok' | 'degraded'
   databases: DatabaseHealth[]
   ollama: ComponentHealth
+  /** Whether "Anyone with the link" sharing is allowed on this server. */
+  share_public_links_enabled?: boolean
   voice_enabled: boolean
   media_search_enabled: boolean
   local_auth_enabled: boolean

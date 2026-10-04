@@ -17,7 +17,7 @@ import { MediaSearch } from '@/pages/MediaSearch'
 import { PlatformAdmin } from '@/pages/PlatformAdmin'
 import { SemanticReview } from '@/pages/SemanticReview'
 import { TenantAdmin } from '@/pages/TenantAdmin'
-import { SharedConversation } from '@/pages/SharedConversation'
+import { SharedEntry } from '@/pages/SharedConversation'
 import { useSettingsStore } from '@/store/settingsStore'
 
 export function App() {
@@ -55,7 +55,7 @@ export function App() {
             SharedConversation.tsx's own docstring), so this deliberately
             sits outside both AuthGate and AppShell rather than needing a
             second, parallel "public mode" inside either. */}
-        <Route path="/shared/:ref" element={<SharedConversation />} />
+        <Route path="/shared/:ref" element={<SharedEntry />} />
         <Route
           element={
             <AuthGate>

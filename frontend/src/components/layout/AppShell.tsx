@@ -9,7 +9,7 @@ import {
   ShieldAlert,
   ShieldCheck,
 } from 'lucide-react'
-import { useRef, useState } from 'react'
+import { useRef, useState, type ReactNode } from 'react'
 import { useTranslation } from 'react-i18next'
 import { Outlet } from 'react-router-dom'
 import { cn } from '@/lib/utils'
@@ -64,7 +64,7 @@ const MENU_GROUPS: { key: 'workspace' | 'review' | 'administration'; labelKey: s
  * open/closed state is owned here, as the single instance in the whole
  * app -- `UserMenu`'s "Settings" item just calls `setIsSettingsOpen(true)`,
  * it does not own or mount its own dialog. */
-export function AppShell() {
+export function AppShell({ children }: { children?: ReactNode } = {}) {
   const { t } = useTranslation()
   const [isSettingsOpen, setIsSettingsOpen] = useState(false)
   // Role-based navigation (Prompt 32): the screens this caller may open come
@@ -145,7 +145,7 @@ export function AppShell() {
               edge) with its content centered inside via its own max-w
               wrapper. */}
           <main className="relative min-h-0 min-w-0 flex-1 overflow-hidden">
-            <Outlet />
+            {children ?? <Outlet />}
           </main>
         </div>
       </div>

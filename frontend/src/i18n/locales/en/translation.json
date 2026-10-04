@@ -425,6 +425,11 @@
     "generalAccess": "General access",
     "accessInviteOnly": "Only invited people",
     "accessAnyoneWithLink": "Anyone with the link",
+    "accessInviteOnlyHint": "Only people you invite can open it, after signing in.",
+    "accessAnyoneWithLinkHint": "Anyone who has the link can view a read-only copy.",
+    "publicLinksOff": "Turned off on this server, so links can't be opened by anyone. Ask your administrator to enable it.",
+    "linkLabel": "Link",
+    "regenerateNote": "Links that open for anyone are shown once. Create a new one to copy it again.",
     "widenAccessWarning": "Anyone who has this link will be able to view this conversation.",
     "regenerateLink": "Regenerate link",
     "copyLink": "Copy link",
@@ -460,7 +465,10 @@
     "unavailable": "This shared conversation is unavailable. It may have been removed, expired, or revoked.",
     "turnFailed": "This response could not be completed.",
     "resultTruncated": "Showing a partial result.",
-    "attachmentUnavailable": "unavailable"
+    "attachmentUnavailable": "unavailable",
+    "openWorkspace": "Open workspace",
+    "signIn": "Sign in",
+    "readOnlyNote": "Read-only shared copy. Nothing here can run queries or change data."
   },
   "acceptInvitation": {
     "working": "Accepting invitation...",

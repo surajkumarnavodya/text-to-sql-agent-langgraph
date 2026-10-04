@@ -36,7 +36,7 @@ vi.mock('@/pages/PlatformAdmin', () => ({ PlatformAdmin: () => <p>Page: platform
 vi.mock('@/pages/TenantAdmin', () => ({ TenantAdmin: () => <p>Page: tenant_admin</p> }))
 vi.mock('@/pages/AcceptInvitation', () => ({ AcceptInvitation: () => null }))
 vi.mock('@/pages/AuthCallback', () => ({ AuthCallback: () => null }))
-vi.mock('@/pages/SharedConversation', () => ({ SharedConversation: () => null }))
+vi.mock('@/pages/SharedConversation', () => ({ SharedEntry: () => null, SharedConversation: () => null }))
 
 const initialAuthState = useLocalAuthStore.getState()
 
