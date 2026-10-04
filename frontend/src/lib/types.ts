@@ -555,6 +555,8 @@ export interface AskResponse {
   rate_limit_message: string | null
   clarification_message: string | null
   failure_explanation: string | null
+  /** Server-side pipeline time for this question, ms -- persisted with the turn. */
+  answer_duration_ms?: number | null
   error_history: string[]
   sources_used: string[]
   synthesized_answer: string | null
@@ -906,6 +908,7 @@ export interface PersistedResultSnapshot {
  * gracefully against rather than assume. */
 export interface ServerMessageMetadata {
   schema_version?: number
+  answer_duration_ms?: number | null
   status?: AgentStatus
   sources_used?: string[]
   database?: string | null

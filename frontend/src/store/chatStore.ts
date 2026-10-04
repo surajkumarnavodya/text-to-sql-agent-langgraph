@@ -420,7 +420,10 @@ export const useChatStore = create<ChatState>((set, get) => ({
       if (currentAbortController === controller) currentAbortController = null
     }
 
-    const answerDurationMs = performance.now() - startedAt
+    // Prefer the server's own measurement, so the live badge matches what a
+    // reopened conversation shows. Fall back to this browser's timing only
+    // when the server didn't report one.
+    const answerDurationMs = finalState.answer_duration_ms ?? performance.now() - startedAt
     const entry = newHistoryEntry(
       question,
       finalState,

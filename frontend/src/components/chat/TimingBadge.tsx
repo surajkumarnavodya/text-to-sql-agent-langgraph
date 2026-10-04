@@ -5,7 +5,7 @@ import { cn } from '@/lib/utils'
 
 type TimingBadgeProps =
   | { mode: 'pending'; startedAt: number }
-  | { mode: 'done'; durationMs: number }
+  | { mode: 'done'; durationMs: number | null }
 
 /** Perplexity/ChatGPT-style "Thinking Ns" -> "Answered in Ns" pill.
  *
@@ -22,7 +22,8 @@ export function TimingBadge(props: TimingBadgeProps) {
     props.mode === 'pending' ? props.startedAt : 0,
     props.mode === 'pending',
   )
-  const seconds = props.mode === 'pending' ? liveSeconds : props.durationMs / 1000
+  if (props.mode === 'done' && props.durationMs === null) return null
+  const seconds = props.mode === 'pending' ? liveSeconds : (props.durationMs ?? 0) / 1000
 
   return (
     <div

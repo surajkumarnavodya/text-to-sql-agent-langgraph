@@ -50,7 +50,7 @@ beforeEach(() => serveNavigation(vi.mocked(navigationApi.getNavigation), null))
 async function findScreenItem(name: RegExp) {
   // `hidden: true`: while the menu is open, Radix marks the rest of the page
   // aria-hidden, so the trigger must be looked up past that to toggle it.
-  const trigger = screen.queryByRole('button', { name: 'Menu', hidden: true })
+  const trigger = screen.queryByRole('button', { name: 'AI Workspace', hidden: true })
   if (!trigger) return null
   if (trigger.getAttribute('aria-expanded') !== 'true') await userEvent.click(trigger)
   return screen.queryByRole('menuitem', { name })

@@ -3,6 +3,7 @@ import {
   lazy,
   Suspense,
   useEffect,
+  useLayoutEffect,
   useRef,
   useState,
   type ChangeEvent,
@@ -35,7 +36,7 @@ const ImageEditor = lazy(() =>
   import('@/components/image/ImageEditor').then((module) => ({ default: module.ImageEditor })),
 )
 
-const MAX_WORDS = 250
+const MAX_WORDS = 500
 // Caps how tall the box can grow before it scrolls internally instead --
 // otherwise a very long question could push the send button (and
 // eventually the whole input bar) off-screen.
@@ -46,6 +47,11 @@ function countWords(text: string): number {
   return trimmed === '' ? 0 : trimmed.split(/\s+/).length
 }
 
+/** Sizes the textarea to its content: one line when empty or short, growing
+ * with each wrapped/entered line up to MAX_HEIGHT_PX, then scrolling. The
+ * CSS `min-h-10` keeps the one-line minimum level with the 40px send and mic
+ * buttons. Setting `auto` first lets the box also shrink again when text is
+ * removed. */
 function resizeToFitContent(el: HTMLTextAreaElement): void {
   el.style.height = 'auto'
   el.style.height = `${Math.min(el.scrollHeight, MAX_HEIGHT_PX)}px`
@@ -131,11 +137,10 @@ export function ChatInput() {
   }
 
   // Once a finished transcript lands in `value` (voice.phase back to
-  // 'idle' after having been 'transcribing'), resize + focus the textarea
-  // for editing, same as a user would expect after typing.
+  // 'idle' after having been 'transcribing'), focus the textarea for
+  // editing, same as a user would expect after typing.
   useEffect(() => {
     if (voice.phase === 'idle' && fromVoice && textareaRef.current) {
-      resizeToFitContent(textareaRef.current)
       textareaRef.current.focus()
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps -- only react to phase changes, not every value/fromVoice change
@@ -158,7 +163,6 @@ export function ChatInput() {
     if (chartFollowup.handled) {
       setValue('')
       setFromVoice(false)
-      if (textareaRef.current) textareaRef.current.style.height = 'auto'
       toast({
         title: chartFollowup.message,
         variant: chartFollowup.applied ? 'success' : 'info',
@@ -169,12 +173,8 @@ export function ChatInput() {
     const voiceOriginated = fromVoice
     setValue('')
     setFromVoice(false)
-    // Collapse back to a single line once the question is sent -- without
-    // this the box would stay at whatever height the last question grew
-    // to, since the auto-resize below only ever grows/shrinks in response
-    // to a change event, and clearing the value programmatically doesn't
-    // fire one.
-    if (textareaRef.current) textareaRef.current.style.height = 'auto'
+    // Clearing `value` below collapses the box back to one line (see the
+    // layout effect above).
 
     // An immutable snapshot of what's attached right now, taken before the
     // request is built -- both for this question's own chat bubble (below)
@@ -230,7 +230,6 @@ export function ChatInput() {
     const next = words.length > MAX_WORDS ? words.slice(0, MAX_WORDS).join(' ') : el.value
     setValue(next)
     if (fromVoice && next.trim() === '') setFromVoice(false)
-    resizeToFitContent(el)
   }
 
   const handleKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>) => {
@@ -254,178 +253,187 @@ export function ChatInput() {
   const displayValue = isListening ? voice.liveCaption : value
   const voiceLocked = isListening || isTranscribing || isSpeaking
 
+  // Re-fit the box whenever the shown text changes by any route -- typing,
+  // paste, a finished voice transcript, live captions, or being cleared
+  // after send -- not only on a keystroke. Runs before paint, so there is no
+  // one-frame height jump.
+  useLayoutEffect(() => {
+    if (textareaRef.current) resizeToFitContent(textareaRef.current)
+  }, [displayValue])
+
   return (
-    <div
-      onDragOver={(event) => {
-        event.preventDefault()
-        setIsDraggingOver(true)
-      }}
-      onDragLeave={() => setIsDraggingOver(false)}
-      onDrop={handleDrop}
-      onPaste={handlePaste}
-      className={`flex flex-col gap-1 rounded-2xl border p-3 shadow-sm transition-shadow focus-within:border-[var(--accent)] focus-within:shadow-md ${
-        isDraggingOver ? 'border-[var(--accent)] bg-[var(--accent-soft)]' : 'border-[var(--border)] bg-[var(--card)]'
-      }`}
-    >
-      {attachments.attachments.length > 0 && (
-        <div className="flex flex-col gap-1.5 border-b border-[var(--border)] pb-2">
-          <div className="flex flex-wrap gap-2">
-            {attachments.attachments.map((item) => (
-              <ChatAttachmentChip
-                key={item.id}
-                attachment={item}
-                onEdit={item.kind === 'image' ? () => setEditingImageId(item.id) : undefined}
-                onRemove={() => attachments.removeAttachment(item.id)}
-                onView={item.kind === 'image' ? () => setViewingImageId(item.id) : undefined}
-                onExtractText={
-                  item.kind === 'image' && capabilities.data?.ocr ? () => setOcrImageId(item.id) : undefined
-                }
-                onResize={
-                  item.kind === 'image' && capabilities.data?.image_resize
-                    ? () => setResizeImageId(item.id)
-                    : undefined
-                }
-                onRemoveText={
-                  item.kind === 'image' && capabilities.data?.image_text_removal
-                    ? () => setRemoveTextImageId(item.id)
-                    : undefined
-                }
-              />
-            ))}
+    <div className="flex flex-col gap-1.5">
+      <div
+        onDragOver={(event) => {
+          event.preventDefault()
+          setIsDraggingOver(true)
+        }}
+        onDragLeave={() => setIsDraggingOver(false)}
+        onDrop={handleDrop}
+        onPaste={handlePaste}
+        className={`flex flex-col gap-1 rounded-2xl border p-3 shadow-sm transition-shadow focus-within:border-[var(--accent)] focus-within:shadow-md ${
+          isDraggingOver ? 'border-[var(--accent)] bg-[var(--accent-soft)]' : 'border-[var(--border)] bg-[var(--card)]'
+        }`}
+      >
+        {attachments.attachments.length > 0 && (
+          <div className="flex flex-col gap-1.5 border-b border-[var(--border)] pb-2">
+            <div className="flex flex-wrap gap-2">
+              {attachments.attachments.map((item) => (
+                <ChatAttachmentChip
+                  key={item.id}
+                  attachment={item}
+                  onEdit={item.kind === 'image' ? () => setEditingImageId(item.id) : undefined}
+                  onRemove={() => attachments.removeAttachment(item.id)}
+                  onView={item.kind === 'image' ? () => setViewingImageId(item.id) : undefined}
+                  onExtractText={
+                    item.kind === 'image' && capabilities.data?.ocr ? () => setOcrImageId(item.id) : undefined
+                  }
+                  onResize={
+                    item.kind === 'image' && capabilities.data?.image_resize
+                      ? () => setResizeImageId(item.id)
+                      : undefined
+                  }
+                  onRemoveText={
+                    item.kind === 'image' && capabilities.data?.image_text_removal
+                      ? () => setRemoveTextImageId(item.id)
+                      : undefined
+                  }
+                />
+              ))}
+            </div>
           </div>
-        </div>
-      )}
-      <div className="flex items-end gap-2">
-        <textarea
-          ref={textareaRef}
-          value={displayValue}
-          onChange={handleChange}
-          onKeyDown={handleKeyDown}
-          placeholder={
-            isListening && !voice.isSupported ? t('voice.unsupportedCaption') : t('chat.placeholder')
-          }
-          aria-label={t('chat.placeholder')}
-          disabled={disabled || voiceLocked}
-          readOnly={isListening || isTranscribing}
-          rows={1}
-          className="min-h-10 max-h-60 flex-1 resize-none overflow-y-auto bg-transparent px-1 py-1.5 text-sm leading-normal focus-visible:outline-none"
-        />
-        <ImageUploader onFilesSelected={(files) => void attachments.addFiles(files)} disabled={disabled} />
-        {showVoiceButton && (
+        )}
+        <div className="flex items-end gap-2">
+          <textarea
+            ref={textareaRef}
+            value={displayValue}
+            onChange={handleChange}
+            onKeyDown={handleKeyDown}
+            placeholder={
+              isListening && !voice.isSupported ? t('voice.unsupportedCaption') : t('chat.placeholder')
+            }
+            aria-label={t('chat.placeholder')}
+            // Typing stays open while an answer is pending, so the next question
+          // can be drafted. Only voice capture/playback locks the box.
+          disabled={voiceLocked}
+            readOnly={isListening || isTranscribing}
+            rows={1}
+            className="min-h-10 max-h-60 flex-1 resize-none overflow-y-auto bg-transparent px-1 py-2 text-sm leading-6 focus-visible:outline-none"
+          />
+          <ImageUploader onFilesSelected={(files) => void attachments.addFiles(files)} disabled={disabled} />
+          {showVoiceButton && (
+            <Button
+              variant="secondary"
+              size="icon"
+              onClick={() => {
+                if (isListening) voice.stopListening()
+                else if (!voiceLocked) void voice.start()
+              }}
+              disabled={disabled || isTranscribing || isSpeaking}
+              aria-label={isListening ? t('voice.stopConversation') : t('voice.startConversation')}
+              title={isListening ? t('voice.stopConversation') : t('voice.startConversation')}
+              className="rounded-xl"
+            >
+              {isListening ? (
+                <Square className="h-4 w-4" />
+              ) : isTranscribing || isSpeaking ? (
+                <Loader2 className="h-4 w-4 animate-spin" />
+              ) : (
+                <Mic className="h-4 w-4" />
+              )}
+            </Button>
+          )}
           <Button
-            variant="secondary"
+            variant={disabled ? 'secondary' : 'primary'}
             size="icon"
-            onClick={() => {
-              if (isListening) voice.stopListening()
-              else if (!voiceLocked) void voice.start()
-            }}
-            disabled={disabled || isTranscribing || isSpeaking}
-            aria-label={isListening ? t('voice.stopConversation') : t('voice.startConversation')}
-            title={isListening ? t('voice.stopConversation') : t('voice.startConversation')}
+            onClick={() => (disabled ? cancelPendingQuestion() : void submit())}
+            // Stop is always available the instant a question is pending --
+            // there is no real token stream to interrupt (see
+            // docs/frontend-ui-audit.md), but the single outstanding /ask
+            // request can genuinely be aborted (AbortController, chatStore
+            // .cancelPendingQuestion), so this is a real cancel, not a fake one.
+            disabled={!disabled && (voiceLocked || !value.trim() || attachments.isUploading)}
+            aria-label={disabled ? t('common.stop') : t('chat.send')}
+            title={disabled ? t('common.stop') : t('chat.send')}
             className="rounded-xl"
           >
-            {isListening ? (
-              <Square className="h-4 w-4" />
-            ) : isTranscribing || isSpeaking ? (
-              <Loader2 className="h-4 w-4 animate-spin" />
-            ) : (
-              <Mic className="h-4 w-4" />
-            )}
+            {disabled ? <Square className="h-4 w-4" /> : <Send className="h-4 w-4" />}
           </Button>
+        </div>
+        {editingImage && (
+          // Suspense fallback is intentionally invisible (null): the editor
+          // dialog itself isn't mounted/visible until the lazy chunk
+          // resolves, so there's nothing on screen to show a spinner over
+          // yet -- the "Edit" button's own disabled/pressed state is the
+          // only loading affordance for the brief chunk-fetch window.
+          <Suspense fallback={null}>
+            <ImageEditor
+              open={editingImageId !== null}
+              onOpenChange={(open) => !open && setEditingImageId(null)}
+              imageSrc={editingImage.editedDataUrl ?? editingImage.previewUrl ?? ''}
+              fileName={editingImage.file.name}
+              onSave={(dataUrl) => attachments.setEditedImage(editingImage.id, dataUrl)}
+            />
+          </Suspense>
         )}
-        <Button
-          variant={disabled ? 'secondary' : 'primary'}
-          size="icon"
-          onClick={() => (disabled ? cancelPendingQuestion() : void submit())}
-          // Stop is always available the instant a question is pending --
-          // there is no real token stream to interrupt (see
-          // docs/frontend-ui-audit.md), but the single outstanding /ask
-          // request can genuinely be aborted (AbortController, chatStore
-          // .cancelPendingQuestion), so this is a real cancel, not a fake one.
-          disabled={!disabled && (voiceLocked || !value.trim() || attachments.isUploading)}
-          aria-label={disabled ? t('common.stop') : t('chat.send')}
-          title={disabled ? t('common.stop') : t('chat.send')}
-          className="rounded-xl"
-        >
-          {disabled ? <Square className="h-4 w-4" /> : <Send className="h-4 w-4" />}
-        </Button>
+        {viewingImage && (
+          <ImageViewer
+            open={viewingImageId !== null}
+            onOpenChange={(open) => !open && setViewingImageId(null)}
+            imageSrc={viewingImage.editedDataUrl ?? viewingImage.previewUrl ?? ''}
+            altText={viewingImage.file.name}
+          />
+        )}
+        {ocrImage?.attachmentId && (
+          <OcrResultDialog
+            open={ocrImageId !== null}
+            onOpenChange={(open) => !open && setOcrImageId(null)}
+            attachmentId={ocrImage.attachmentId}
+            filename={ocrImage.file.name}
+          />
+        )}
+        {resizeImage?.attachmentId && (
+          <ResizeImageDialog
+            open={resizeImageId !== null}
+            onOpenChange={(open) => !open && setResizeImageId(null)}
+            attachmentId={resizeImage.attachmentId}
+            filename={resizeImage.file.name}
+            previewUrl={resizeImage.editedDataUrl ?? resizeImage.previewUrl}
+            presets={capabilities.data?.resize_presets ?? []}
+            maxDimension={capabilities.data?.max_resize_dimension_px ?? 4096}
+            onResized={(result) => resizeImageId && replaceWithProcessedResult(resizeImageId, result, resizeImage.file.name)}
+          />
+        )}
+        {removeTextImage?.attachmentId && (
+          <RemoveTextDialog
+            open={removeTextImageId !== null}
+            onOpenChange={(open) => !open && setRemoveTextImageId(null)}
+            attachmentId={removeTextImage.attachmentId}
+            filename={removeTextImage.file.name}
+            previewUrl={removeTextImage.editedDataUrl ?? removeTextImage.previewUrl}
+            maxRegions={capabilities.data?.max_text_removal_regions ?? 20}
+            onEdited={(result) =>
+              removeTextImageId && replaceWithProcessedResult(removeTextImageId, result, removeTextImage.file.name)
+            }
+          />
+        )}
       </div>
-      <div className="flex items-center justify-between">
-        {voice.error ? (
-          <span className="text-[11px] text-[var(--danger)]">{t(voice.error)}</span>
-        ) : isSpeaking ? (
-          <span className="flex items-center gap-1 text-[11px] text-[var(--muted-foreground)]">
-            <Volume2 className="h-3 w-3" /> {t('voice.speaking')}
-          </span>
-        ) : (
-          <span />
-        )}
+      {voice.error && <p className="px-1 text-xs text-[var(--danger)]">{t(voice.error)}</p>}
+      {isSpeaking && (
+        <p className="flex items-center gap-1 px-1 text-xs text-[var(--muted-foreground)]">
+          <Volume2 className="h-3 w-3" /> {t('voice.speaking')}
+        </p>
+      )}
+      <div className="flex items-start justify-between gap-3 px-1">
+        <p className="text-xs text-[var(--muted-foreground)]">{t('chat.disclaimer')}</p>
         <span
-          className={`text-[11px] ${
+          className={`shrink-0 text-xs ${
             wordCount >= MAX_WORDS ? 'text-[var(--danger)]' : 'text-[var(--muted-foreground)]'
           }`}
         >
           {wordCount} / {MAX_WORDS} {t('chat.words')}
         </span>
       </div>
-
-      {editingImage && (
-        // Suspense fallback is intentionally invisible (null): the editor
-        // dialog itself isn't mounted/visible until the lazy chunk
-        // resolves, so there's nothing on screen to show a spinner over
-        // yet -- the "Edit" button's own disabled/pressed state is the
-        // only loading affordance for the brief chunk-fetch window.
-        <Suspense fallback={null}>
-          <ImageEditor
-            open={editingImageId !== null}
-            onOpenChange={(open) => !open && setEditingImageId(null)}
-            imageSrc={editingImage.editedDataUrl ?? editingImage.previewUrl ?? ''}
-            fileName={editingImage.file.name}
-            onSave={(dataUrl) => attachments.setEditedImage(editingImage.id, dataUrl)}
-          />
-        </Suspense>
-      )}
-      {viewingImage && (
-        <ImageViewer
-          open={viewingImageId !== null}
-          onOpenChange={(open) => !open && setViewingImageId(null)}
-          imageSrc={viewingImage.editedDataUrl ?? viewingImage.previewUrl ?? ''}
-          altText={viewingImage.file.name}
-        />
-      )}
-      {ocrImage?.attachmentId && (
-        <OcrResultDialog
-          open={ocrImageId !== null}
-          onOpenChange={(open) => !open && setOcrImageId(null)}
-          attachmentId={ocrImage.attachmentId}
-          filename={ocrImage.file.name}
-        />
-      )}
-      {resizeImage?.attachmentId && (
-        <ResizeImageDialog
-          open={resizeImageId !== null}
-          onOpenChange={(open) => !open && setResizeImageId(null)}
-          attachmentId={resizeImage.attachmentId}
-          filename={resizeImage.file.name}
-          previewUrl={resizeImage.editedDataUrl ?? resizeImage.previewUrl}
-          presets={capabilities.data?.resize_presets ?? []}
-          maxDimension={capabilities.data?.max_resize_dimension_px ?? 4096}
-          onResized={(result) => resizeImageId && replaceWithProcessedResult(resizeImageId, result, resizeImage.file.name)}
-        />
-      )}
-      {removeTextImage?.attachmentId && (
-        <RemoveTextDialog
-          open={removeTextImageId !== null}
-          onOpenChange={(open) => !open && setRemoveTextImageId(null)}
-          attachmentId={removeTextImage.attachmentId}
-          filename={removeTextImage.file.name}
-          previewUrl={removeTextImage.editedDataUrl ?? removeTextImage.previewUrl}
-          maxRegions={capabilities.data?.max_text_removal_regions ?? 20}
-          onEdited={(result) =>
-            removeTextImageId && replaceWithProcessedResult(removeTextImageId, result, removeTextImage.file.name)
-          }
-        />
-      )}
     </div>
   )
 }

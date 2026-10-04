@@ -10,7 +10,7 @@ export function PopoverContent({ className, ...props }: PopoverPrimitive.Popover
       <PopoverPrimitive.Content
         sideOffset={8}
         className={cn(
-          'z-50 rounded-lg border border-[var(--border)] bg-[var(--card)] p-3 shadow-lg outline-none',
+          'z-50 rounded-lg border border-[var(--border)] bg-[var(--popover-surface)] text-[var(--card-foreground)] p-3 shadow-lg outline-none',
           className,
         )}
         {...props}

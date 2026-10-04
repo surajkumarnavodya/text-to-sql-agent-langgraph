@@ -75,9 +75,9 @@ export function ToastProvider({ children }: { children: ReactNode }) {
 }
 
 const VARIANT_CLASSES: Record<ToastVariant, string> = {
-  success: 'border-[var(--success)]/40 bg-[var(--success)]/10',
-  error: 'border-[var(--danger)]/40 bg-[var(--danger)]/10',
-  info: 'border-[var(--border)] bg-[var(--card)]',
+  success: 'border-[var(--success)]/40 bg-[color-mix(in_srgb,var(--success)_10%,var(--popover-surface))]',
+  error: 'border-[var(--danger)]/40 bg-[color-mix(in_srgb,var(--danger)_10%,var(--popover-surface))]',
+  info: 'border-[var(--border)] bg-[var(--popover-surface)]',
 }
 
 function ToastCard({ item, onDismiss }: { item: ToastItem; onDismiss: () => void }) {

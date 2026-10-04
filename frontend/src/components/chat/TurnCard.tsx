@@ -59,6 +59,14 @@ const BLOCKED_STATUSES = new Set([
  * of interactive state below (the SQL editor, Confirm-and-Run, golden
  * feedback) is scoped to *this* entry via its entryId, so editing one
  * turn's SQL box can never affect another's. */
+/** When the question was asked, in the browser's locale -- e.g. "Oct 4, 2026, 10:32 AM".
+ * Unparseable timestamps render as nothing rather than "Invalid Date". */
+function formatTurnTime(timestamp: string): string {
+  const date = new Date(timestamp)
+  if (Number.isNaN(date.getTime())) return ''
+  return date.toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' })
+}
+
 export function TurnCard({ entry, isMultiDb }: { entry: QueryHistoryEntry; isMultiDb: boolean }) {
   const { t } = useTranslation()
   const setEditableSql = useChatStore((state) => state.setEditableSql)
@@ -92,6 +100,9 @@ export function TurnCard({ entry, isMultiDb }: { entry: QueryHistoryEntry; isMul
       <div className="flex flex-col gap-3 pl-10">
         <div className="flex flex-wrap items-center gap-2">
           <TimingBadge mode="done" durationMs={entry.answerDurationMs} />
+          <time dateTime={entry.timestamp} className="text-xs text-[var(--muted-foreground)]">
+            {formatTurnTime(entry.timestamp)}
+          </time>
           {answerMarkdown && (
             <>
               <CopyAnswerButton answer={answerMarkdown} />

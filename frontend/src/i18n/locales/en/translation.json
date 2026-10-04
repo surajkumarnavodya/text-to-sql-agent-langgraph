@@ -1,6 +1,6 @@
 {
   "app": {
-    "title": "Text-to-SQL Dashboard",
+    "title": "AI-Powered Conversational Intelligence",
     "subtitle": "Ask a question in plain English — get validated, read-only SQL, a live result table, and an auto-picked chart."
   },
   "auth": {
@@ -53,7 +53,7 @@
     "recommendations": "Recommendations",
     "platformAdmin": "Platform Admin",
     "tenantAdmin": "Tenant Admin",
-    "menu": "Menu",
+    "menu": "AI Workspace",
     "groupWorkspace": "Workspace",
     "groupReview": "Review",
     "groupAdministration": "Administration"
@@ -156,7 +156,8 @@
     "followingUpOn": "Following up on",
     "sourcesLabel": "Sources",
     "words": "words",
-    "noRecordedAnswer": "This message has no recorded answer."
+    "noRecordedAnswer": "This message has no recorded answer.",
+    "disclaimer": "AI may make mistakes. Please verify results before relying on them."
   },
   "sql": {
     "title": "Generated SQL",

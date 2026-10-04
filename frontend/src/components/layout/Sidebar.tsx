@@ -1,6 +1,7 @@
 import { Plus } from 'lucide-react'
 import { useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
+import { useNavigate } from 'react-router-dom'
 import { ConversationList } from '@/components/chat/ConversationList'
 import { ConversationSearch } from '@/components/chat/ConversationSearch'
 import { ConversationSearchResults } from '@/components/chat/ConversationSearchResults'
@@ -63,20 +64,28 @@ export function Sidebar({ onNavigate, collapsed = false }: SidebarProps) {
         conversation.title.toLowerCase().includes(search.query.trim().toLowerCase()),
       )
 
+  // The conversation list only exists on the chat screen, so starting or
+  // opening a chat from any other AI Workspace page must also take the user
+  // back to the chat route -- otherwise the chat state changes out of sight.
+  const navigate = useNavigate()
+
   const handleNewChat = () => {
     startNewChat()
+    navigate('/')
     onNavigate?.()
   }
 
   const handleSelect = (id: string) => {
     if (renamingId) return
     void loadConversation(id)
+    navigate('/')
     onNavigate?.()
   }
 
   const handleSelectSearchResult = (hit: SearchHit) => {
     void loadConversation(hit.conversation_id)
     search.clear()
+    navigate('/')
     onNavigate?.()
   }
 

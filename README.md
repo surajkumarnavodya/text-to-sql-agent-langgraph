@@ -1,6 +1,6 @@
 <div align="center">
 
-<h1>Text-to-SQL Dashboard</h1>
+<h1>AI-Powered Conversational Intelligence</h1>
 
 <p><strong>Ask your own database a question in plain English — get validated, read-only SQL you review before it ever runs.</strong></p>
 

@@ -34,7 +34,7 @@ class ConversationExchangeIn(BaseModel):
 class AskRequest(BaseModel):
     """The upper bound on `question`'s length is deliberately NOT duplicated
     here as a `Field(max_length=...)` -- it's config-driven
-    (`Settings.max_question_length`, default 500, overridable via `.env`)
+    (`Settings.max_question_length`, default 5000, overridable via `.env`)
     and already enforced downstream by `agent.input_guard.check_input`
     (the "too_long" `RejectionReason`), which is the single source of
     truth for it. A static schema-level cap would either hardcode a wrong
@@ -796,6 +796,14 @@ class AskResponse(BaseModel):
     rate_limit_message: str | None = None
     clarification_message: str | None = None
     failure_explanation: str | None = None
+    answer_duration_ms: float | None = Field(
+        default=None,
+        description=(
+            "Server-side wall time of this question's pipeline run, in milliseconds. "
+            "Persisted with the turn, so a reopened conversation shows the same figure "
+            "the live answer did. Null when the request never reached the pipeline."
+        ),
+    )
     error_history: list[str] = Field(default_factory=list)
     sources_used: list[str] = Field(
         default_factory=list,

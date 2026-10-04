@@ -1196,6 +1196,7 @@ def ask(
     and does not do today (a correlation token, not yet a server-side
     session key).
     """
+    started_at = time.perf_counter()
     session_id = payload.session_id or str(uuid.uuid4())
     settings = get_settings()
     caller_key = _rate_limit_key(identity, request, settings)
@@ -1361,6 +1362,9 @@ def ask(
     # docstring for why persistence is built from this already-computed
     # response rather than re-deriving anything from raw `final_state`.
     ask_response = _ask_response_from_state(final_state, session_id)
+    ask_response = ask_response.model_copy(
+        update={"answer_duration_ms": (time.perf_counter() - started_at) * 1000}
+    )
 
     persisted_conversation_id: str | None = None
     persisted_message_id: str | None = None

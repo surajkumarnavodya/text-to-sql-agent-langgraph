@@ -1,5 +1,6 @@
 import { render, screen } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
+import { MemoryRouter, useLocation } from 'react-router-dom'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { newHistoryEntry, type ConversationSummary } from '@/lib/history'
 import type { AskResponse } from '@/lib/types'
@@ -23,7 +24,11 @@ const { searchChatHistory } = await import('@/lib/identityApi')
 // header's UserMenu/SettingsDialog (see UserMenu.test.tsx), so this file
 // no longer needs a QueryClientProvider wrapper.
 function renderSidebar(props: Parameters<typeof Sidebar>[0] = {}) {
-  return render(<Sidebar {...props} />)
+  return render(
+    <MemoryRouter>
+      <Sidebar {...props} />
+    </MemoryRouter>,
+  )
 }
 
 function makeFinalState(): AskResponse {
@@ -244,5 +249,25 @@ describe('Sidebar', () => {
         timeout: 2000,
       })
     })
+  })
+})
+
+function RoutePathProbe() {
+  return <div data-testid="route-path">{useLocation().pathname}</div>
+}
+
+describe('Sidebar -- starting a chat from another AI Workspace page', () => {
+  it('New Chat returns the user to the chat route', async () => {
+    render(
+      <MemoryRouter initialEntries={['/media-search']}>
+        <Sidebar />
+        <RoutePathProbe />
+      </MemoryRouter>,
+    )
+    expect(screen.getByTestId('route-path')).toHaveTextContent('/media-search')
+
+    await userEvent.click(screen.getByRole('button', { name: /new chat/i }))
+
+    expect(screen.getByTestId('route-path')).toHaveTextContent(/^\/$/)
   })
 })

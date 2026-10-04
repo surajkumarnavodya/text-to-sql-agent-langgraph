@@ -116,8 +116,8 @@ describe('header navigation reflects the same server decision', () => {
     renderAppAt('/')
 
     const primary = await screen.findByRole('navigation', { name: 'Primary navigation' })
-    await waitFor(() => expect(within(primary).getByRole('link', { name: 'Chat' })).toBeInTheDocument())
-    await userEvent.click(within(primary).getByRole('button', { name: 'Menu' }))
+    expect(within(primary).queryByRole('link', { name: 'Chat' })).not.toBeInTheDocument()
+    await userEvent.click(await within(primary).findByRole('button', { name: 'AI Workspace' }))
     const items = screen.getAllByRole('menuitem').map((item) => item.textContent?.trim())
     expect(items).toEqual(
       expect.arrayContaining(['Knowledge Sources', 'Media Search', 'Recommendations', 'Database Onboarding', 'SME Semantic Review']),

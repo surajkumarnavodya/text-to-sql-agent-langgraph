@@ -71,7 +71,7 @@ export default defineConfig({
       // explicit NetworkOnly guard on every backend route.
       includeAssets: ['icon-192.png', 'icon-512.png', 'icon-512-maskable.png', 'apple-touch-icon.png'],
       manifest: {
-        name: 'Text-to-SQL Dashboard',
+        name: 'AI-Powered Conversational Intelligence',
         short_name: 'Text-to-SQL',
         description:
           'Ask questions about your data in plain English and get validated, read-only SQL, results, and charts.',

@@ -11,7 +11,7 @@ export function DropdownMenuContent({ className, ...props }: DropdownMenuPrimiti
         sideOffset={4}
         align="end"
         className={cn(
-          'z-50 min-w-36 rounded-lg border border-[var(--border)] bg-[var(--card)] p-1 shadow-lg outline-none',
+          'z-50 min-w-36 rounded-lg border border-[var(--border)] bg-[var(--popover-surface)] text-[var(--card-foreground)] p-1 shadow-lg outline-none',
           className,
         )}
         {...props}

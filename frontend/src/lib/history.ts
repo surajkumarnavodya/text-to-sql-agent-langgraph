@@ -60,9 +60,10 @@ export interface QueryHistoryEntry {
   tables: string[]
   timestamp: string
   finalState: AskResponse
-  /** Wall-clock time the /ask call itself took, for the "Answered in Ns"
-   * badge (mirrors Perplexity/ChatGPT's "Researched Ns" pattern). */
-  answerDurationMs: number
+  /** How long the answer took, for the "Answered in Ns" badge. Null when no
+   * time was recorded (legacy turns saved before timing was persisted) -- the
+   * badge is then hidden rather than shown as 0s. */
+  answerDurationMs: number | null
   /** Current contents of this turn's own SQL editor -- starts as
    * `finalState.sql`, but the user may edit it before confirming. */
   editableSql: string
@@ -308,7 +309,7 @@ export function serverMessagesToQueryHistory(rows: ServerMessage[]): QueryHistor
       tables: finalState.schema_tables.map((table) => table.table_name),
       timestamp: userRow.created_at,
       finalState,
-      answerDurationMs: 0,
+      answerDurationMs: assistantRow?.metadata?.answer_duration_ms ?? null,
       editableSql: resultSnapshot?.normalized_sql ?? sql ?? '',
       confirmedColumns: resultSnapshot?.columns ?? null,
       confirmedRows: resultSnapshot?.rows ?? null,
@@ -389,7 +390,7 @@ export const MAX_FOLLOWUP_EXCHANGES = 3
 export function newHistoryEntry(
   question: string,
   finalState: AskResponse,
-  answerDurationMs: number,
+  answerDurationMs: number | null,
   originatedFromVoice = false,
   sentAttachments: SentAttachmentPreview[] = [],
 ): QueryHistoryEntry {

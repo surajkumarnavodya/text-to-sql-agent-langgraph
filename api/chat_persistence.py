@@ -179,6 +179,7 @@ def _build_history_metadata(
         "schema_version": _METADATA_SCHEMA_VERSION,
         "status": ask_response.status,
         "sources_used": list(ask_response.sources_used),
+        "answer_duration_ms": ask_response.answer_duration_ms,
         "database": ask_response.database,
         "model": ask_response.model,
         "sql": ask_response.sql,

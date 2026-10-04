@@ -188,3 +188,36 @@ describe('ChatInput -- attachment composer lifecycle', () => {
     expect(api.askQuestion).toHaveBeenCalledTimes(1)
   })
 })
+
+describe('ChatInput -- composer layout', () => {
+  it('shows the AI disclaimer below the composer', () => {
+    renderChatInput()
+    expect(screen.getByText('AI may make mistakes. Please verify results before relying on them.')).toBeInTheDocument()
+  })
+
+  it('starts as a single-line textarea', () => {
+    renderChatInput()
+    const textarea = screen.getByRole('textbox', { name: /ask|question|placeholder/i }) as HTMLTextAreaElement
+    expect(textarea.rows).toBe(1)
+  })
+})
+
+describe('ChatInput -- typing while an answer is pending', () => {
+  afterEach(() => {
+    useChatStore.setState({ pendingQuestion: null } as never)
+  })
+
+  it('keeps the textbox editable and offers stop instead of send while the agent works', async () => {
+    useChatStore.setState({ pendingQuestion: { question: 'first', startedAt: Date.now() } } as never)
+    renderChatInput()
+
+    const textarea = screen.getByRole('textbox', { name: /chat|ask|placeholder/i }) as HTMLTextAreaElement
+    expect(textarea).toBeEnabled()
+    expect(textarea).not.toHaveAttribute('readonly')
+    await userEvent.type(textarea, 'next question')
+    expect(textarea.value).toBe('next question')
+
+    expect(screen.queryByRole('button', { name: /^send$/i })).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /stop/i })).toBeInTheDocument()
+  })
+})

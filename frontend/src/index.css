@@ -99,6 +99,8 @@
      so it gets its own tokens instead of inheriting --card's transparency. */
   --modal-backdrop: #05050a;
   --modal-surface: #ffffff;
+  /* Floating menus (dropdown, popover, toast): opaque, so page content never shows through. */
+  --popover-surface: #ffffff;
   --modal-surface-foreground: var(--foreground);
 
   /* Z-index layers -- named stacking tiers instead of ad hoc numbers, so a
@@ -146,6 +148,7 @@
      bubbles), but a modal panel meant to fully occlude the page must never
      let the backdrop/page show through it. */
   --modal-surface: #151324;
+  --popover-surface: #151324;
 
   --shadow-color: 260 60% 3%;
 
@@ -188,6 +191,7 @@
   --color-sql-result-bg: var(--sql-result-bg);
   --color-modal-backdrop: var(--modal-backdrop);
   --color-modal-surface: var(--modal-surface);
+  --color-popover-surface: var(--popover-surface);
   --color-modal-surface-foreground: var(--modal-surface-foreground);
   --radius-lg: var(--radius);
   --radius-md: calc(var(--radius) - 0.25rem);

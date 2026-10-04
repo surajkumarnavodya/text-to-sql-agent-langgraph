@@ -256,3 +256,26 @@ describe('serverMessagesToQueryHistory -- truncated/missing persistence', () => 
     expect(entry.sql).toBeNull()
   })
 })
+
+describe('serverMessagesToQueryHistory -- answer timing and time', () => {
+  it('restores the saved answer duration and the turn time, so a reopened chat shows the real figure', () => {
+    const rows = [
+      userRow('How many orders are there?'),
+      assistantRow('Query succeeded.', {
+        schema_version: 2,
+        sources_used: [],
+        sql: 'SELECT COUNT(*) FROM orders',
+        answer_duration_ms: 4321.5,
+      }),
+    ]
+    const [entry] = serverMessagesToQueryHistory(rows)
+    expect(entry.answerDurationMs).toBe(4321.5)
+    expect(entry.timestamp).toBe('2026-01-01T00:00:00Z')
+  })
+
+  it('a turn saved before timing existed has no duration, not a fabricated 0', () => {
+    const rows = [userRow('Old question?'), assistantRow('Old answer.', { schema_version: 2, sources_used: [] })]
+    const [entry] = serverMessagesToQueryHistory(rows)
+    expect(entry.answerDurationMs).toBeNull()
+  })
+})

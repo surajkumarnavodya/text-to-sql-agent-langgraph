@@ -11,7 +11,7 @@ import {
 } from 'lucide-react'
 import { useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
-import { NavLink, Outlet } from 'react-router-dom'
+import { Outlet } from 'react-router-dom'
 import { cn } from '@/lib/utils'
 import { useNavigation } from '@/hooks/queries'
 import { useSettingsStore } from '@/store/settingsStore'
@@ -38,9 +38,10 @@ const SCREEN_PRESENTATION: Record<string, { icon: typeof MessageSquare; labelKey
   platform_admin: { icon: ShieldAlert, labelKey: 'nav.platformAdmin' },
 }
 
-/** The one screen kept as a top-level header tab. Every other screen the
- * server lists goes into the header's Menu dropdown (ScreenMenu). */
-const PRIMARY_SCREEN_ID = 'chat'
+/** Screens the header never shows, neither as a tab nor in the AI Workspace
+ * menu. Chat is still the default route ("/"); it is reached from the
+ * sidebar's New chat action and history, not from the header. */
+const HIDDEN_SCREEN_IDS = new Set(['chat'])
 
 /** Menu sections, in display order, keyed by the server's `group` field. */
 const MENU_GROUPS: { key: 'workspace' | 'review' | 'administration'; labelKey: string }[] = [
@@ -77,14 +78,13 @@ export function AppShell() {
   // header or the menu.
   const drawableScreens = screens.flatMap((screen) => {
     const presentation = SCREEN_PRESENTATION[screen.id]
-    if (!presentation) return []
+    if (!presentation || HIDDEN_SCREEN_IDS.has(screen.id)) return []
     return [{ id: screen.id, path: screen.path, group: screen.group, icon: presentation.icon, label: t(presentation.labelKey) }]
   })
-  const primaryScreens = drawableScreens.filter((screen) => screen.id === PRIMARY_SCREEN_ID)
   const menuGroups: ScreenMenuGroup[] = MENU_GROUPS.map(({ key, labelKey }) => ({
     key,
     labelKey,
-    items: drawableScreens.filter((screen) => screen.id !== PRIMARY_SCREEN_ID && screen.group === key),
+    items: drawableScreens.filter((screen) => !HIDDEN_SCREEN_IDS.has(screen.id) && screen.group === key),
   })).filter((group) => group.items.length > 0)
   const sidebarCollapsed = useSettingsStore((state) => state.sidebarCollapsed)
   // Passed to both UserMenu (attaches it to the avatar button) and
@@ -128,9 +128,6 @@ export function AppShell() {
             </div>
 
               <nav aria-label="Primary navigation" className="flex min-w-0 flex-1 items-center gap-1">
-                {primaryScreens.map((screen) => (
-                  <NavTab key={screen.id} to={screen.path} icon={screen.icon} label={screen.label} />
-                ))}
                 {menuGroups.length > 0 && <ScreenMenu groups={menuGroups} />}
               </nav>
 
@@ -159,31 +156,5 @@ export function AppShell() {
         triggerRef={userMenuTriggerRef}
       />
     </div>
-  )
-}
-
-function NavTab({ to, icon: Icon, label }: { to: string; icon: typeof MessageSquare; label: string }) {
-  return (
-    <NavLink
-      to={to}
-      end
-      title={label}
-      aria-label={label}
-      className={({ isActive }) =>
-        cn(
-          'flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-md px-2.5 py-1.5 text-sm font-medium transition-colors sm:px-3',
-          isActive
-            ? 'bg-[var(--accent-soft)] text-[var(--accent)]'
-            : 'text-[var(--muted-foreground)] hover:bg-[var(--muted)] hover:text-[var(--foreground)]',
-        )
-      }
-    >
-      <Icon className="h-4 w-4" />
-      {/* Icon-only below sm to keep the header from overflowing on narrow
-          viewports -- the NavLink's own aria-label/title above still give
-          every state (including screen readers and a hover tooltip) the
-          full name even when the text is visually hidden. */}
-      <span className="hidden sm:inline">{label}</span>
-    </NavLink>
   )
 }

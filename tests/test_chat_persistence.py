@@ -190,6 +190,15 @@ class TestAnswerTextForHistory:
 
 
 class TestBuildHistoryMetadata:
+    def test_saves_the_answer_duration_so_a_reopened_turn_can_show_it(self):
+        response = _ask_response(answer_duration_ms=4321.5)
+        metadata = _build_history_metadata(response, _BASE_SETTINGS, attachment_refs=[])
+        assert metadata["answer_duration_ms"] == 4321.5
+
+    def test_missing_duration_is_saved_as_null_not_zero(self):
+        metadata = _build_history_metadata(_ask_response(), _BASE_SETTINGS, attachment_refs=[])
+        assert metadata["answer_duration_ms"] is None
+
     def test_captures_real_sources_used_never_fabricated_empty(self):
         response = _ask_response(sources_used=["documents", "web"], synthesized_answer="Combined")
         metadata = _build_history_metadata(response, _BASE_SETTINGS, attachment_refs=[])

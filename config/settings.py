@@ -1732,7 +1732,7 @@ class Settings(BaseSettings):
     request_timeout_seconds: int = Field(default=600, gt=0)
     llm_max_tokens: int = Field(default=1024, gt=0)
     insight_max_tokens: int = Field(default=120, gt=0)
-    max_question_length: int = Field(default=500, gt=0)
+    max_question_length: int = Field(default=5000, gt=0)
     max_conversation_history_turns: int = Field(default=20, gt=0)
     question_rate_limit_per_minute: int = Field(default=10, gt=0)
     llm_call_rate_limit_per_minute: int = Field(default=20, gt=0)

@@ -1,22 +1,29 @@
-import { Database } from 'lucide-react'
-import { useTranslation } from 'react-i18next'
 import { ChatInput } from '@/components/chat/ChatInput'
 import { ChatLiveRegion } from '@/components/chat/ChatLiveRegion'
 import { PendingTurn } from '@/components/chat/PendingTurn'
-import { SuggestedPrompts } from '@/components/chat/SuggestedPrompts'
 import { TurnCard } from '@/components/chat/TurnCard'
+import { useEffect, useRef } from 'react'
 import { useHealth } from '@/hooks/queries'
 import { useChatStore } from '@/store/chatStore'
 
 export function Chat() {
-  const { t } = useTranslation()
   const health = useHealth()
 
   const queryHistory = useChatStore((state) => state.queryHistory)
   const pendingQuestion = useChatStore((state) => state.pendingQuestion)
-  const askQuestion = useChatStore((state) => state.askQuestion)
 
   const isMultiDb = (health.data?.databases.length ?? 0) > 1
+
+  // Keep the newest turn in view, like the history list reaching its bottom:
+  // when a question is added or an answer lands, scroll the message region to
+  // its end. Motion is skipped for reduced-motion users.
+  const scrollRef = useRef<HTMLDivElement>(null)
+  useEffect(() => {
+    const el = scrollRef.current
+    if (!el) return
+    const reduceMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches
+    el.scrollTo({ top: el.scrollHeight, behavior: reduceMotion ? 'auto' : 'smooth' })
+  }, [queryHistory.length, pendingQuestion])
 
   return (
     // Full-width, single-scrollbar layout (matches ChatGPT): this outer
@@ -35,31 +42,22 @@ export function Chat() {
         pendingQuestion={pendingQuestion}
         latestEntryId={queryHistory.at(-1)?.entryId ?? null}
       />
-      <div className="min-h-0 flex-1 overflow-y-auto">
-        <div className="mx-auto max-w-4xl px-4 py-6">
-          {queryHistory.length === 0 && !pendingQuestion && (
-            <div className="flex min-h-[60vh] flex-col items-center justify-center gap-5 text-center">
-              <span className="flex h-12 w-12 items-center justify-center rounded-2xl bg-[var(--accent-soft)] text-[var(--accent)]">
-                <Database className="h-6 w-6" />
-              </span>
-              <div className="flex flex-col gap-1.5">
-                <h1 className="text-2xl font-semibold tracking-tight">{t('workspace.heading')}</h1>
-                <p className="max-w-md text-sm text-[var(--muted-foreground)]">{t('workspace.subheading')}</p>
-              </div>
-              <SuggestedPrompts onSelect={(prompt) => void askQuestion(prompt)} />
-            </div>
-          )}
-
+      <div ref={scrollRef} className="min-h-0 flex-1 overflow-y-auto">
+        <div className="mx-auto flex min-h-full max-w-4xl flex-col px-4 pb-4 pt-6">
           <div className="flex flex-col gap-8">
             {queryHistory.map((entry) => (
               <TurnCard key={entry.entryId} entry={entry} isMultiDb={isMultiDb} />
             ))}
             {pendingQuestion && <PendingTurn pendingQuestion={pendingQuestion} />}
           </div>
+
+          {/* Sticky at the bottom of the scroll region: the composer stays in view
+              while the messages scroll beneath it, and the scrollbar itself runs
+              all the way to the bottom edge of the page. */}
+          <div className="sticky bottom-0 mt-auto bg-[var(--background)] pb-4 pt-2">
+            <ChatInput />
+          </div>
         </div>
-      </div>
-      <div className="mx-auto w-full max-w-4xl px-4 pb-4">
-        <ChatInput />
       </div>
     </div>
   )
