@@ -171,12 +171,19 @@ def build_connection_url(settings: DbConnectionLike) -> URL | str:
     if db_type == "mssql":
         query["driver"] = settings.db_odbc_driver
 
+    # A SQL Server named or LocalDB instance ("(localdb)\MSSQLLocalDB",
+    # "HOST\INSTANCE") is addressed by instance name, not by a TCP port --
+    # appending ",<port>" to it produces a host the driver cannot resolve.
+    # Named instances get no port; everything else keeps the usual behavior.
+    is_named_instance = db_type == "mssql" and "\\" in (settings.db_host or "")
+    port = None if is_named_instance else (settings.db_port or info.default_port)
+
     return URL.create(
         drivername=info.drivername,
         username=settings.db_user or None,
         password=settings.db_password.get_secret_value() if settings.db_password else None,
         host=settings.db_host,
-        port=settings.db_port or info.default_port,
+        port=port,
         database=settings.db_name,
         query=query,
     )

@@ -41,7 +41,7 @@ from identity.repositories.onboarding import (
 )
 from identity.repositories.onboarding import decide_review_item as _decide_review_item
 from identity.repositories.users import get_user_permissions
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, text
 from sqlalchemy.orm import Session
 
 from agent.rate_limit import get_onboarding_connection_test_limiter
@@ -56,7 +56,15 @@ from api.onboarding_schemas import (
     RunDiscoveryRequest,
 )
 from config.settings import ConfigurationError, get_settings
+from embeddings.schema_indexer import refresh_schema_index
 from db.connection import DatabaseConnectionConfig, build_connection_url, test_connection
+from onboarding.env_registration import (
+    PublishedDatabase,
+    RegistrationResult,
+    apply_to_runtime,
+    register_published_database,
+    rollback_registration,
+)
 from onboarding.jobs import OnboardingJobError, cancel_job, publish_job, retry_job
 from onboarding.jobs import run_discovery_stage as _run_discovery_stage
 from onboarding.policy import OnboardingAction, authorize_onboarding_action
@@ -395,13 +403,118 @@ def publish_onboarding_job(
 
     engine = _engine_for_job(job, payload.db_password)
     try:
+        # Publish evaluates candidate SQL with fail-open handling, so without this
+        # check a wrong password would still publish the job and only fail later.
+        _require_working_connection(engine)
         try:
             job = publish_job(session, job, engine)
         except OnboardingJobError as exc:
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+        _register_published_job(job, payload.db_password, engine)
     finally:
         engine.dispose()
     return _job_out(job)
+
+
+def _require_working_connection(engine) -> None:
+    """Refuses to publish when the database can't be reached with the password entered.
+
+    Leaves the job in `awaiting_review`, so the operator can retry with the
+    right password.
+    """
+    try:
+        with engine.connect() as connection:
+            connection.execute(text("SELECT 1"))
+    except Exception as exc:  # noqa: BLE001 - any connection failure blocks publish
+        logger.warning("[onboarding] publish refused: connection check failed (%s)", type(exc).__name__)
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=(
+                "Could not connect to this database with the password entered, so the job was "
+                "not published. Check the password and try again."
+            ),
+        ) from exc
+
+
+@router.post("/jobs/{job_id}/register-for-chat")
+def register_published_job_for_chat(
+    job_id: uuid.UUID,
+    payload: PublishJobRequest,
+    user_and_session: tuple[User, Session] = Depends(require_local_user),
+) -> dict[str, object]:
+    """Makes an already-published job's database available to chat.
+
+    Publishing before chat registration existed (or a registration that failed
+    after publish) leaves the job published but absent from `.env`. This route
+    re-runs only the registration step, using the same password re-entry the
+    publish route requires. Idempotent: an already-registered database returns
+    its existing connection name with `newly_added=false`.
+    """
+    user, session = user_and_session
+    job = _require_job(session, job_id)
+    _authorize(user, session, OnboardingAction.PUBLISH, job)
+    _enforce_connection_test_rate_limit(user)
+    if job.status != "published":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Only a published job can be made available to chat (status is {job.status!r}).",
+        )
+
+    engine = _engine_for_job(job, payload.db_password)
+    try:
+        result = _register_published_job(job, payload.db_password, engine)
+    finally:
+        engine.dispose()
+    if result is None:
+        # Nothing was written to .env: the connection check or indexing failed first.
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=(
+                "Could not connect to this database with the password entered, so it was not "
+                "added to chat. Check the password and try again."
+            ),
+        )
+    return {"connection_name": result.connection_name, "newly_added": result.newly_added}
+
+
+def _register_published_job(job, db_password: str | None, engine) -> RegistrationResult | None:
+    """Makes a published database available to chat as a configured connection.
+
+    Writes its `DB_CONNECTIONS` entry to `.env`, applies it to this process, and
+    indexes its schema so question routing can select it. The job is already
+    published by the time this runs, so a failure here is logged and returns
+    None -- it never undoes the publish.
+    """
+    # Order: verify the password first, so a wrong or blank password never reaches
+    # .env. Then write and apply the entry (indexing looks it up in live settings),
+    # then index. If indexing fails, roll the registration back completely.
+    try:
+        with engine.connect() as connection:
+            connection.execute(text("SELECT 1"))
+        result = register_published_database(
+            PublishedDatabase(
+                label=job.database_label,
+                job_id=str(job.id),
+                db_type=job.db_type,
+                host=job.db_host or "",
+                port=job.db_port,
+                name=job.db_name or "",
+                user=job.db_user,
+                password=db_password,
+                schema=job.db_schema,
+            )
+        )
+        apply_to_runtime(result)
+        if result.newly_added:
+            try:
+                refresh_schema_index(engine, result.connection_name, get_settings(), force=True)
+            except Exception:
+                rollback_registration(result)
+                raise
+        return result
+    except Exception:  # noqa: BLE001 - publish already committed; never fail it here
+        logger.exception("[onboarding] job %s could not be registered for chat", job.id)
+        return None
 
 
 @router.post("/jobs/{job_id}/cancel", response_model=OnboardingJobOut)

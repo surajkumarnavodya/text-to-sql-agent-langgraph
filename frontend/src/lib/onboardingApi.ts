@@ -72,6 +72,19 @@ export function publishOnboardingJob(
   })
 }
 
+/** Makes an already-published job's database available to chat (`.env` +
+ * this process's configured connections). Re-enter the password, same as
+ * publish: it is used once and never stored. */
+export function registerOnboardingJobForChat(
+  jobId: string,
+  payload: PublishJobRequest,
+): Promise<{ connection_name: string; newly_added: boolean }> {
+  return request<{ connection_name: string; newly_added: boolean }>(
+    `/onboarding/jobs/${jobId}/register-for-chat`,
+    { method: 'POST', body: JSON.stringify(payload) },
+  )
+}
+
 export function cancelOnboardingJob(jobId: string): Promise<OnboardingJob> {
   return request<OnboardingJob>(`/onboarding/jobs/${jobId}/cancel`, { method: 'POST' })
 }
