@@ -28,6 +28,8 @@ from typing import Any
 from analytics.engine import compute_analytics_result
 from analytics.forecasting import generate_forecast
 from analytics.models import AnalyticsResult
+from governance.request_policy import evaluate_request
+from governance.result_policy import govern_rows_for_caller
 from recommendation.engine import RecommendationInputs, generate_recommendations
 from retrieval.retriever import extract_governing_metrics, retrieve_business_context
 from sqlalchemy.exc import SQLAlchemyError
@@ -440,6 +442,30 @@ def sanitize_input_node(state: AgentState) -> dict[str, Any]:
             "rejection_message": message,
             "conversation_history": sanitized_history,
         }
+
+    # Data-governance request policy (governance/request_policy.py): a
+    # deterministic, role-aware refusal for high-risk request shapes (credentials,
+    # individual HR/healthcare/BFSI decisions, privileged legal content, prompt-
+    # based override attempts). Runs before schema retrieval, SQL generation, or
+    # any database access, and reuses the rejection path above.
+    if settings.enable_request_governance:
+        verdict = evaluate_request(result.cleaned_question, state.get("caller_roles", ()))
+        if verdict.is_blocking:
+            log_security_event(
+                "governance_decision",
+                "warning",
+                "A question was refused by the data-governance request policy before any "
+                "schema retrieval or LLM call.",
+                domain=verdict.domain,
+                category=verdict.category,
+                decision=verdict.decision.value,
+            )
+            return {
+                "status": "rejected",
+                "rejection_reason": "policy_refused",
+                "rejection_message": verdict.message,
+                "conversation_history": sanitized_history,
+            }
 
     return {
         "question": result.cleaned_question,
@@ -1980,6 +2006,10 @@ def execute_sql_node(state: AgentState) -> dict[str, Any]:
             attempt_number,
         )
 
+    # Result-level governance (governance/result_policy.py): protected before the
+    # insight step, the recommendation engine, or the UI sees the values.
+    if settings.enable_result_governance:
+        rows = govern_rows_for_caller(columns, rows, state.get("caller_roles", ()))
     return {
         "result_columns": columns,
         "result_rows": rows,

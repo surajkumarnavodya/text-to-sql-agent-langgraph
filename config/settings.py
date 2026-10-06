@@ -1741,6 +1741,13 @@ class Settings(BaseSettings):
     api_action_rate_limit_per_minute: int = Field(default=20, gt=0)
     enable_database_concurrency_limit: bool = True
     database_concurrency_limit_overhead: int = Field(default=0, ge=0)
+    # Data-privacy governance (governance/): request-level domain refusals
+    # (before any source runs) and result-level protection (restricted-column
+    # masking, secret redaction). Both are no-ops for data with nothing
+    # classified and no secret-shaped text, so the defaults change nothing for
+    # a plain deployment. Turn off only to roll back.
+    enable_request_governance: bool = True
+    enable_result_governance: bool = True
     enable_result_cache: bool = False
     result_cache_ttl_seconds: int = Field(default=30, gt=0)
     result_cache_max_entries: int = Field(default=500, gt=0)

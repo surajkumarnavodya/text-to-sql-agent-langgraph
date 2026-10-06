@@ -45,6 +45,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from analytics.engine import compute_analytics_result
 from analytics.visualization import build_chart_spec
+from governance.result_policy import govern_rows_for_caller
 
 from agent.authz import Permission
 from agent.exceptions import AgentError
@@ -1562,6 +1563,11 @@ def execute(
                     tenant_id, database_name, execution_sql, columns, rows
                 )
 
+    # Result-level governance (governance/result_policy.py), applied per caller
+    # AFTER the result cache: the cache holds raw rows, so a cache hit is masked
+    # for this caller's own roles exactly as a fresh execution would be.
+    if settings.enable_result_governance:
+        rows = govern_rows_for_caller(columns, rows, identity.roles)
     result_df = pd.DataFrame(rows, columns=columns)
     column_types: dict[str, str] = dict(classify_columns(result_df)) if not result_df.empty else {}
     recommendation = recommend_chart(result_df, column_types)
