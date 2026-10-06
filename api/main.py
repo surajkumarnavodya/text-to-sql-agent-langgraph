@@ -45,6 +45,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from analytics.engine import compute_analytics_result
 from analytics.visualization import build_chart_spec
+from governance.result_policy import govern_rows_for_caller
 
 from agent.authz import Permission
 from agent.exceptions import AgentError
@@ -70,6 +71,7 @@ from agent.rate_limit import (
 from agent.result_charting import classify_columns, recommend_chart
 from agent.sql_validator import enforce_row_limit, qualify_table_schema, validate_sql
 from agent.state import ConversationExchange
+from api.analyst import router as analyst_router
 from api.attachments import router as attachments_router
 from api.authz import require_permission
 from api.chat_history import router as chat_history_router
@@ -128,6 +130,7 @@ from api.schemas import (
     VisualizationSpecOut,
 )
 from api.semantic_catalog import router as semantic_catalog_router
+from api.semantic_intelligence import router as semantic_intelligence_router
 from api.shares import router as shares_router
 from api.tenant_admin import router as tenant_admin_router
 from api.voice import router as voice_router
@@ -377,6 +380,7 @@ app = FastAPI(
     version="0.1.0",
     lifespan=lifespan,
 )
+app.include_router(analyst_router)
 app.include_router(attachments_router)
 app.include_router(documents_router)
 app.include_router(media_router)
@@ -389,6 +393,7 @@ app.include_router(chat_history_router)
 app.include_router(shares_router)
 app.include_router(onboarding_router)
 app.include_router(semantic_catalog_router)
+app.include_router(semantic_intelligence_router)
 app.include_router(recommendation_governance_router)
 app.include_router(platform_admin_router)
 app.include_router(tenant_admin_router)
@@ -1562,6 +1567,11 @@ def execute(
                     tenant_id, database_name, execution_sql, columns, rows
                 )
 
+    # Result-level governance (governance/result_policy.py), applied per caller
+    # AFTER the result cache: the cache holds raw rows, so a cache hit is masked
+    # for this caller's own roles exactly as a fresh execution would be.
+    if settings.enable_result_governance:
+        rows = govern_rows_for_caller(columns, rows, identity.roles)
     result_df = pd.DataFrame(rows, columns=columns)
     column_types: dict[str, str] = dict(classify_columns(result_df)) if not result_df.empty else {}
     recommendation = recommend_chart(result_df, column_types)

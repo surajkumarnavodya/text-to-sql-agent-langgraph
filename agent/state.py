@@ -46,7 +46,7 @@ AgentStatus = Literal[
 # defense-in-depth backstop for anything the gate's cheaper pre-filter
 # missed). Both land on the same "rejected" status/reason space so the UI
 # has one place to look, regardless of which layer caught it.
-RejectionReason = Literal["too_long", "empty", "injection_detected", "off_topic"]
+RejectionReason = Literal["too_long", "empty", "injection_detected", "off_topic", "policy_refused"]
 
 
 class TableSchema(TypedDict):

@@ -26,6 +26,8 @@ import re
 from collections.abc import Hashable
 from typing import Any, Literal, cast
 
+from governance.request_policy import evaluate_request
+
 from agent.authz import Permission, has_role_permission
 from agent.graph import run_agent
 from agent.orchestrator.state import (
@@ -622,6 +624,19 @@ def router_node(state: OrchestratorState) -> dict[str, Any]:
             "source instead, which may not match what you asked for. Contact an "
             "administrator if you need access."
         )
+
+    # Data-governance request policy (governance/request_policy.py). A refused
+    # question must not be answered by a document, web, or media source it never
+    # needed. Routing it to "sql" alone makes the SQL path's own input-sanitization
+    # step return the refusal before any database access.
+    if settings.enable_request_governance:
+        request_verdict = evaluate_request(question, caller_roles)
+        if request_verdict.is_blocking:
+            sources = ["sql"]
+            reasoning += (
+                f" (data-governance refusal: {request_verdict.category} -- "
+                "routed to the SQL path, which returns the refusal)"
+            )
 
     route_decision: RouteDecision = {
         "sources": sources,

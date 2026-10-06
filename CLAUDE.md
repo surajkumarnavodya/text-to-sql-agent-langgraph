@@ -3552,6 +3552,33 @@ for the full prompt text and outcome summary.
 
 ---
 
+## Prompts 33-35: AI analysis layers (2026-10)
+
+Three optional layers, all off by default. Each has a contract document with
+full design and limitations. Read those before changing them.
+
+- **AI Data Analyst** (`agent/analyst/`, `api/analyst.py`, `33_AI_DATA_ANALYST_AGENT_CONTRACT.md`).
+  A LangGraph loop (understand, then execute and analyze in a loop, then recommend, then explain)
+  that runs each sub-question through `agent.graph.run_agent`. The analyst never generates or
+  executes SQL itself. Every step is charged against a budget from `agent/analyst/budget.py`,
+  a pure function, so a stop is deterministic and reported. A planner failure falls back to
+  the plain single-question path.
+- **Multi-agent supervisor** (`agent/multiagent/`, `34_MULTI_AGENT_SUPERVISOR_CONTRACT.md`).
+  A plain-Python supervisor with fixed routing, not an LLM mesh. Each specialist has an
+  `AgentSpec` (allowed tools, truth-level ceiling, cost). The `ToolGateway` enforces the
+  allowlist and refuses identity fields in tool input. Breakers are scoped per tenant. Claims
+  must cite evidence the supervisor issued. Conflicts are withheld or superseded by a fixed
+  rule, never by agent order.
+- **Semantic intelligence** (`semantic/intelligence/`, `35_SEMANTIC_INTELLIGENCE_CONTRACT.md`).
+  Deterministic synonym, ambiguity, conflict and relationship detection over the catalog, with
+  versioned findings in the `semantic_findings` table (migration `a1f5c9e3b7d2`) and a
+  risk-ordered queue. Every finding is `ai_inference`. Only publishing a catalog entry confirms
+  it, and a finding never changes one.
+
+Shared invariant for all three: the LLM and any agent may propose, never decide. Every SQL run
+goes through the governed pipeline, every tool call through its permission check, and every
+result carries its truth level.
+
 ## How to run
 
 See `README.md` for full setup. Short version:

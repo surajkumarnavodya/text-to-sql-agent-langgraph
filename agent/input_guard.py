@@ -58,7 +58,7 @@ from security.sanitization import normalize_text, truncate_for_log
 
 logger = logging.getLogger(__name__)
 
-RejectionReason = Literal["too_long", "empty", "injection_detected", "off_topic"]
+RejectionReason = Literal["too_long", "empty", "injection_detected", "off_topic", "policy_refused"]
 
 # Phrases that attempt to redirect the model's behavior rather than ask a
 # database question. Sourced from `security.injection_patterns` -- the
@@ -138,6 +138,11 @@ _MESSAGES: dict[RejectionReason, str] = {
     "off_topic": (
         "I can only answer questions about {db_name}. Try asking something "
         "like 'total sales by year.'"
+    ),
+    # Fallback only: sanitize_input_node sends the specific governance
+    # verdict's own message (governance.request_policy) for this reason.
+    "policy_refused": (
+        "This request can't be answered under this application's data-governance rules."
     ),
 }
 

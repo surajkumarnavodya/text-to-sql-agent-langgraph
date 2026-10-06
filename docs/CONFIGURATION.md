@@ -300,6 +300,28 @@ startup" hook, so a newly-added permission (like the ones sharing needs)
 is invisible to existing roles until this is run. See
 `docs/SHARING_SECURITY.md`'s "External configuration / staging steps".
 
+## AI analysis layers (optional, all off by default)
+
+See the Prompt 33/34/35 contract documents for design and limitations. Every
+limit below is a server-side stop rule that a request cannot raise.
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `ENABLE_DATA_ANALYST_AGENT` | `false` | Enables `POST /analyst/investigate`. |
+| `ANALYST_MAX_STEPS` | `12` | Charged node executions per analysis. |
+| `ANALYST_MAX_SUBQUERIES` | `4` | Sub-questions run per analysis (planner and follow-ups). |
+| `ANALYST_MAX_LLM_CALLS` | `2` | The analyst's own planner LLM calls. |
+| `ANALYST_MAX_FOLLOWUPS` | `2` | Anomaly follow-ups per analysis. |
+| `ANALYST_TIMEOUT_SECONDS` | `180` | Wall-clock deadline, checked between steps. |
+| `ANALYST_MAX_RECOMMENDATIONS` | `10` | Recommendations kept in a report. |
+| `ENABLE_MULTI_AGENT_SUPERVISOR` | `false` | Enables `POST /analyst/supervise`. |
+| `MULTIAGENT_MAX_AGENT_CALLS` | `16` | Specialist invocations per turn. |
+| `MULTIAGENT_MAX_COST_UNITS` | `40` | Cost units per turn (governed SQL 5, planner 3, engines 1, control 0). |
+| `MULTIAGENT_CIRCUIT_FAILURE_THRESHOLD` | `3` | Consecutive failures that open an agent's breaker (scoped per tenant). |
+| `MULTIAGENT_CIRCUIT_COOLDOWN_SECONDS` | `60` | Time before an open breaker allows one probe. |
+| `ENABLE_SEMANTIC_INTELLIGENCE` | `false` | Enables `/semantic-intelligence/*`. |
+| `SEMANTIC_INTELLIGENCE_MAX_FINDINGS` | `500` | Most findings one run persists (riskiest first). Any excess is reported as truncated. |
+
 ## Multi-source router (optional, off by default)
 
 See [`docs/MULTI_SOURCE_GUIDE.md`](MULTI_SOURCE_GUIDE.md) for a walkthrough

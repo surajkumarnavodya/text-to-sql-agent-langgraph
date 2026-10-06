@@ -236,6 +236,36 @@ an enterprise SOC schedule:
   model** — this is the accuracy + adversarial regression check, and it's
   cheap enough that "after every relevant
   change" is the realistic bar, not "periodically."
+
+## Request and result governance (`governance/`)
+
+Two deterministic controls sit in the live pipeline. Both are on by default
+and are no-ops for data with nothing classified and no secret-shaped text.
+
+- **Request policy** (`governance/request_policy.py`, called from
+  `agent.nodes.sanitize_input_node` and `agent.orchestrator.nodes.router_node`).
+  A refused question ends before schema retrieval, SQL generation, or any
+  source runs. Rules cover prompt-based bypass attempts, credential requests,
+  payment credentials, individual prescriptions and diagnoses, privileged legal
+  content, fraud labels, individual credit decisions, individual employment
+  actions, and individual ranking. Rules for individual salary and appraisal
+  apply only to callers without `VIEW_RESTRICTED_COLUMNS`. Authorization comes
+  from roles only. Claims made inside the question never unlock anything.
+- **Result policy** (`governance/result_policy.py`, called from
+  `agent.nodes.execute_sql_node` and `POST /execute`). Values in columns
+  classified "restricted" in `config/sensitive_columns.yaml` are masked for
+  callers without `VIEW_RESTRICTED_COLUMNS`. String cells containing
+  connection strings, passwords, or tokens are redacted. On `POST /execute`
+  this runs after the result cache, so cached rows are masked per caller.
+
+Rollback: set `ENABLE_REQUEST_GOVERNANCE=false` or
+`ENABLE_RESULT_GOVERNANCE=false`.
+
+Not covered by these controls: small-group suppression, per-domain policy
+objects, and the 18-domain mapping. Those need the classification and
+domain-to-table mapping to be reviewed first (see "Data classification
+policy" above). Technical controls support privacy and governance
+requirements. They are not a compliance determination.
 - **Review `scripts/monitoring_summary.py`'s output weekly** during active
   development (and before/after any change to rate limits, cost
   thresholds, or the input-guard patterns specifically) — see

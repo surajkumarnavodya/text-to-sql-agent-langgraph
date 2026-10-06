@@ -431,6 +431,35 @@ resolved path stays inside the configured library root before opening it.
 404 when media search is disabled, `media_id` is unknown, or the
 underlying file has moved/been deleted.
 
+### AI analysis: analyst, supervisor and semantic intelligence (optional, off by default)
+
+All routes below require an authenticated local account and return 404 while
+their feature flag is off. Full design and limitations are in the Prompt 33/34/35
+contract documents.
+
+- **`POST /analyst/investigate`** (flag `ENABLE_DATA_ANALYST_AGENT`). Requires `ASK` and `EXECUTE_SQL`.
+  Body: `{"question": str, "conversation_history": [...], "model": str | null}`.
+  Returns `status`, `stop_reason`, `subquestions`, `evidence` (each with a `truth_level`),
+  `recommendations` (always `ai_inference`), `open_items`, `trace`, `usage` and `report_markdown`.
+  A tenant, roles or budget field in the body is a 422.
+- **`POST /analyst/supervise`** (flag `ENABLE_MULTI_AGENT_SUPERVISOR`). Same request and identity rules.
+  Returns `status`, `claims` (each with `agent`, `task_id`, `truth_level`, `grounded_in`),
+  `conflicts` (agents and keys only, never values), `violation_count`, `open_items`, `trace`, `usage`
+  and `report_markdown`.
+- **`POST /semantic-intelligence/run?database_id=`** (flag `ENABLE_SEMANTIC_INTELLIGENCE`). Requires catalog review.
+  Analyses one database's catalog and persists up to `SEMANTIC_INTELLIGENCE_MAX_FINDINGS` findings. Returns the
+  counts (created, updated, unchanged, truncated) and the top findings.
+- **`GET /semantic-intelligence/findings?database_id=&status=`**. The review queue, riskiest first.
+- **`POST /semantic-intelligence/findings/{id}/decision`**. Body: `{"decision": "accept" | "dismiss", "note": str | null}`.
+  Changes review state only. A second decision is a 409.
+- **`POST /semantic-intelligence/findings/{id}/rollback`** (catalog manage). Body: `{"to_version": int}`.
+- **`GET /semantic-intelligence/impact/{concept_key}?database_id=&proposed_source_tables=`**. What depends on a
+  concept, and what a source-table change would affect.
+- **`POST /semantic-intelligence/entries/{entry_id}/rollback`** (catalog manage). Body: `{"target_version": int}`.
+  Creates a new draft from an older version. The published row is not touched.
+
+Cross-tenant resources and databases a tenant may not use return 404, not 403.
+
 ### Other routes
 
 `POST /execute` (SQL "Confirm and Run" equivalent), `POST /schema/refresh`,

@@ -1741,6 +1741,13 @@ class Settings(BaseSettings):
     api_action_rate_limit_per_minute: int = Field(default=20, gt=0)
     enable_database_concurrency_limit: bool = True
     database_concurrency_limit_overhead: int = Field(default=0, ge=0)
+    # Data-privacy governance (governance/): request-level domain refusals
+    # (before any source runs) and result-level protection (restricted-column
+    # masking, secret redaction). Both are no-ops for data with nothing
+    # classified and no secret-shaped text, so the defaults change nothing for
+    # a plain deployment. Turn off only to roll back.
+    enable_request_governance: bool = True
+    enable_result_governance: bool = True
     enable_result_cache: bool = False
     result_cache_ttl_seconds: int = Field(default=30, gt=0)
     result_cache_max_entries: int = Field(default=500, gt=0)
@@ -1951,6 +1958,54 @@ class Settings(BaseSettings):
     # when a column's null rate, within one result, is at least this
     # fraction.
     recommendation_null_rate_threshold: float = Field(default=0.2, ge=0.0, le=1.0)
+
+    # --- Prompt 33 (AI Data Analyst agent, agent/analyst/): a bounded,
+    # multi-step analysis loop that reuses the governed Text-to-SQL pipeline
+    # (agent.graph.run_agent) per sub-question. Off by default -- the existing
+    # /ask path is unchanged whether or not this is on. Every limit below is a
+    # hard, deterministic stop rule (agent.analyst.budget), never an LLM
+    # judgment.
+    enable_data_analyst_agent: bool = False
+    # Total node executions allowed across one analysis (understand/execute/
+    # analyze). Explain and recommend are deterministic and never charged.
+    analyst_max_steps: int = Field(default=12, gt=0)
+    # How many sub-questions (each one a full run_agent call) one analysis may
+    # execute, planner-produced and investigation follow-ups combined.
+    analyst_max_subqueries: int = Field(default=4, gt=0)
+    # LLM calls the analyst itself makes (the decomposition planner). Each
+    # sub-question's own LLM calls are bounded separately by run_agent.
+    analyst_max_llm_calls: int = Field(default=2, gt=0)
+    # Follow-up investigation sub-questions an anomaly may spawn, total.
+    analyst_max_followups: int = Field(default=2, ge=0)
+    # Wall-clock budget for one analysis, checked between nodes. A sub-question
+    # already in flight finishes; no new one starts after the deadline.
+    analyst_timeout_seconds: float = Field(default=180.0, gt=0.0)
+    analyst_max_recommendations: int = Field(default=10, gt=0)
+
+    # --- Prompt 34 (multi-agent supervisor, agent/multiagent/): a deterministic
+    # supervisor that routes one turn across typed specialist agents. Off by
+    # default -- /analyst/investigate and /ask are unchanged either way. The
+    # budgets below are per turn, enforced before each agent call.
+    enable_multi_agent_supervisor: bool = False
+    # Specialist invocations allowed in one supervised turn (every agent call,
+    # including governance and recommendation).
+    multiagent_max_agent_calls: int = Field(default=16, gt=0)
+    # Cost units one turn may spend. Each agent's spec charges its own cost
+    # (e.g. governed SQL 5, planner 3, an engine 1, pure control 0).
+    multiagent_max_cost_units: int = Field(default=40, gt=0)
+    # Consecutive failures that open an agent's circuit breaker, and how long
+    # it stays open before one probe call is allowed.
+    multiagent_circuit_failure_threshold: int = Field(default=3, gt=0)
+    multiagent_circuit_cooldown_seconds: float = Field(default=60.0, gt=0.0)
+
+    # --- Prompt 35 (semantic intelligence, semantic/intelligence/): deterministic
+    # synonym, ambiguity, conflict and relationship detection over the governed
+    # catalog, persisted as a risk-ordered review queue. Off by default. It
+    # reads and writes review candidates only, never catalog content.
+    enable_semantic_intelligence: bool = False
+    # Most findings one analysis run persists (riskiest first). Anything beyond
+    # this is reported as `findings_truncated`, never silently dropped.
+    semantic_intelligence_max_findings: int = Field(default=500, gt=0)
     # recommendation.engine's CUSTOMER/PRODUCT concentration rules fire
     # when a single ranked label's share of the total (percent, 0-100) is
     # at least this.
