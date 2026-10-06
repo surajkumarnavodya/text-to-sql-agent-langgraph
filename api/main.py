@@ -71,6 +71,7 @@ from agent.rate_limit import (
 from agent.result_charting import classify_columns, recommend_chart
 from agent.sql_validator import enforce_row_limit, qualify_table_schema, validate_sql
 from agent.state import ConversationExchange
+from api.analyst import router as analyst_router
 from api.attachments import router as attachments_router
 from api.authz import require_permission
 from api.chat_history import router as chat_history_router
@@ -129,6 +130,7 @@ from api.schemas import (
     VisualizationSpecOut,
 )
 from api.semantic_catalog import router as semantic_catalog_router
+from api.semantic_intelligence import router as semantic_intelligence_router
 from api.shares import router as shares_router
 from api.tenant_admin import router as tenant_admin_router
 from api.voice import router as voice_router
@@ -378,6 +380,7 @@ app = FastAPI(
     version="0.1.0",
     lifespan=lifespan,
 )
+app.include_router(analyst_router)
 app.include_router(attachments_router)
 app.include_router(documents_router)
 app.include_router(media_router)
@@ -390,6 +393,7 @@ app.include_router(chat_history_router)
 app.include_router(shares_router)
 app.include_router(onboarding_router)
 app.include_router(semantic_catalog_router)
+app.include_router(semantic_intelligence_router)
 app.include_router(recommendation_governance_router)
 app.include_router(platform_admin_router)
 app.include_router(tenant_admin_router)

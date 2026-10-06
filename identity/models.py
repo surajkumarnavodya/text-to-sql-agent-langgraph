@@ -1473,3 +1473,54 @@ class Tenant(Base):
     updated_at: Mapped[datetime] = _updated_at()
     deleted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=True)
     metadata_json: Mapped[dict] = mapped_column("metadata", _METADATA_JSON, nullable=True)
+
+
+class SemanticFinding(Base):
+    """One semantic-intelligence review candidate (Prompt 35,
+    `34`-series `semantic/intelligence/`).
+
+    Every finding is AI_INFERENCE: a detector's suggestion about the catalog,
+    never confirmed business truth. Confirming a finding does not change any
+    catalog entry. Only publishing an entry makes it CONFIRMED.
+
+    Identity: `(tenant_id, database_id, finding_key)`. `finding_key` hashes the
+    finding's kind and its subjects' concept keys, so re-running the analysis
+    updates the same row rather than adding a duplicate.
+
+    Versioning: when a re-run changes the content (detected by `content_hash`),
+    the previous content is appended to `history` and `version` is bumped. A
+    decision is recorded on the row (`status`, `decided_by_user_id`,
+    `decision_note`). A rollback restores an earlier `history` snapshot as a new
+    version. Nothing in `history` is ever edited or removed.
+    """
+
+    __tablename__ = "semantic_findings"
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id", "database_id", "finding_key", name="uq_semantic_findings_scope_key"
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    tenant_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    database_id: Mapped[str] = mapped_column(String(200), nullable=False, index=True)
+    finding_key: Mapped[str] = mapped_column(String(64), nullable=False)
+    kind: Mapped[str] = mapped_column(String(32), nullable=False)
+    title: Mapped[str] = mapped_column(String(300), nullable=False)
+    content: Mapped[dict] = mapped_column(_METADATA_JSON, nullable=False, default=dict)
+    content_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    confidence: Mapped[float] = mapped_column(Float, nullable=False)
+    truth_level: Mapped[str] = mapped_column(String(32), nullable=False, default="ai_inference")
+    risk_score: Mapped[int] = mapped_column(Integer, nullable=False)
+    risk_tier: Mapped[str] = mapped_column(String(8), nullable=False)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="open")
+    version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    history: Mapped[list] = mapped_column(_METADATA_JSON, nullable=False, default=list)
+    decided_by_user_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    decision_note: Mapped[str] = mapped_column(Text, nullable=True)
+    decided_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    created_at: Mapped[datetime] = _created_at()
+    updated_at: Mapped[datetime] = _updated_at()

@@ -24,8 +24,14 @@ def call_ollama(
     settings: Settings,
     max_tokens: int,
     temperature: float = 0.0,
+    model: str | None = None,
 ) -> str:
     """Runs one Ollama chat call and returns the response text.
+
+    `model` overrides `Settings.ollama_model` for this one call (Prompt 33's
+    analyst planner passes the caller's validated model choice through here);
+    `None` keeps the pre-existing default, so every existing caller is
+    unchanged.
 
     Raises:
         OllamaUnavailableError: if the Ollama server can't be reached --
@@ -38,7 +44,7 @@ def call_ollama(
     )
     try:
         response = client.chat(
-            model=settings.ollama_model,
+            model=model or settings.ollama_model,
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
