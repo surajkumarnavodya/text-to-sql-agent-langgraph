@@ -14,6 +14,7 @@ import { ChatMessage } from './ChatMessage'
 import { CopyAnswerButton } from './CopyAnswerButton'
 import { DownloadAnswerButton } from './DownloadAnswerButton'
 import { QueryPlanPanel } from './QueryPlanPanel'
+import { ReadAloudButton } from './ReadAloudButton'
 import { ResponseFeedbackWidget } from './ResponseFeedbackWidget'
 import { RetryTimeline } from './RetryTimeline'
 import { SchemaContextPanel } from './SchemaContextPanel'
@@ -107,6 +108,7 @@ export function TurnCard({ entry, isMultiDb }: { entry: QueryHistoryEntry; isMul
             <>
               <CopyAnswerButton answer={answerMarkdown} />
               <DownloadAnswerButton question={entry.question} answer={answerMarkdown} />
+              <ReadAloudButton entryId={entry.entryId} answer={answerMarkdown} />
               <ResponseFeedbackWidget entryId={entry.entryId} />
             </>
           )}

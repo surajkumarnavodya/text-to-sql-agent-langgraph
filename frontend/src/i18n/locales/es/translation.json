@@ -89,6 +89,20 @@
     "database": "Base de datos",
     "model": "Modelo"
   },
+  "readAloud": {
+    "read": "Leer en voz alta",
+    "reading": "Leyendo…",
+    "paused": "En pausa",
+    "pause": "Pausar",
+    "pauseReading": "Pausar lectura",
+    "resume": "Reanudar",
+    "resumeReading": "Reanudar lectura",
+    "stopReading": "Detener lectura",
+    "retry": "Reintentar lectura",
+    "unsupported": "La lectura en voz alta no es compatible con este navegador.",
+    "empty": "No hay texto de respuesta para leer.",
+    "failed": "No se pudo leer esta respuesta en voz alta."
+  },
   "voice": {
     "settingsLabel": "Modo de voz",
     "startConversation": "Iniciar conversación de voz",

@@ -97,6 +97,20 @@
     "database": "Database",
     "model": "Model"
   },
+  "readAloud": {
+    "read": "Read aloud",
+    "reading": "Reading…",
+    "paused": "Paused",
+    "pause": "Pause",
+    "pauseReading": "Pause reading",
+    "resume": "Resume",
+    "resumeReading": "Resume reading",
+    "stopReading": "Stop reading",
+    "retry": "Retry reading",
+    "unsupported": "Read aloud is not supported in this browser.",
+    "empty": "There is no answer text to read.",
+    "failed": "Could not read this answer aloud."
+  },
   "voice": {
     "settingsLabel": "Voice mode",
     "startConversation": "Start voice conversation",

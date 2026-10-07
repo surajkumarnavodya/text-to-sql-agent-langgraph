@@ -1,6 +1,7 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { render, screen } from '@testing-library/react'
 import { describe, expect, it } from 'vitest'
+import { ToastProvider } from '@/components/ui/toast'
 import { newHistoryEntry, withConfirmedResult } from '@/lib/history'
 import { askState, rankingResult } from '@/test/analyticsFixtures'
 import { TurnCard } from './TurnCard'
@@ -9,7 +10,9 @@ function renderTurn(entry: ReturnType<typeof newHistoryEntry>) {
   const queryClient = new QueryClient()
   return render(
     <QueryClientProvider client={queryClient}>
-      <TurnCard entry={entry} isMultiDb={false} />
+      <ToastProvider>
+        <TurnCard entry={entry} isMultiDb={false} />
+      </ToastProvider>
     </QueryClientProvider>,
   )
 }

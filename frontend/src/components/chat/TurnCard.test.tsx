@@ -1,6 +1,7 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { render, screen } from '@testing-library/react'
 import { describe, expect, it } from 'vitest'
+import { ToastProvider } from '@/components/ui/toast'
 import { isSqlResult, newHistoryEntry } from '@/lib/history'
 import type { AskResponse } from '@/lib/types'
 import { TurnCard } from './TurnCard'
@@ -8,12 +9,15 @@ import { TurnCard } from './TurnCard'
 // ResultsTable (rendered once a turn has confirmedColumns/confirmedRows)
 // reads schema-table metadata via react-query's useSchemaTables() -- a real
 // QueryClientProvider is required for any render path that can reach it,
-// same convention ChatInput.test.tsx already uses.
+// same convention ChatInput.test.tsx already uses. ToastProvider is needed
+// because the answer's Read aloud button reports through useToast().
 function renderTurnCard(props: React.ComponentProps<typeof TurnCard>) {
   const queryClient = new QueryClient()
   return render(
     <QueryClientProvider client={queryClient}>
-      <TurnCard {...props} />
+      <ToastProvider>
+        <TurnCard {...props} />
+      </ToastProvider>
     </QueryClientProvider>,
   )
 }
